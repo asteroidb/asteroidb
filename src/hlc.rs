@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// A snapshot of the Hybrid Logical Clock at a point in time.
 ///
 /// Ordering: physical time first, then logical counter, then node_id for total ordering.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct HlcTimestamp {
     /// Physical timestamp in milliseconds since UNIX epoch.
     pub physical: u64,
