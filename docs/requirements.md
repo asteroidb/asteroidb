@@ -77,6 +77,8 @@
 - MVP は `ack_frontier` を一次実装とすること
 - `ack_frontier` は最低限、`authority_id` / `frontier_hlc` / `key_range` / `policy_version` / `digest_hash` を含むこと
 - `majority_certificate` は data-plane の `get_certified` から実験導入し、検証後に control-plane へ横展開すること
+- MVP の `majority_certificate` は Ed25519 個別署名集約方式を採用すること
+- 将来は Threshold 署名 (BLS 等) へ拡張可能とすること
 - 証明対象の粒度はキー範囲単位 (prefix) を MVP とすること
 
 ### FR-009: control-plane 管理
@@ -134,6 +136,6 @@
 
 ## 8. 未決事項 (次ラウンドで確定)
 
-- `majority_certificate` の署名方式と鍵配布モデル
+- Ed25519 鍵配布/ローテーション運用の詳細
 - CRDT 型ごとの API 形状と型システム
 - compaction 時の `digest_hash` 検証フロー詳細
