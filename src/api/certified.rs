@@ -37,6 +37,32 @@ pub struct PendingWrite {
     pub status: CertificationStatus,
 }
 
+/// Configuration for retention and cleanup of pending writes.
+///
+/// Controls how `CertifiedApi` bounds the growth of its internal
+/// `pending_writes` list. Cleanup can be triggered explicitly via
+/// `cleanup()` or automatically when `max_entries` is exceeded
+/// during `certified_write`.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    /// Maximum age in milliseconds for pending writes before they are
+    /// marked as `Timeout` and eligible for removal. Default: 60,000 ms.
+    pub max_age_ms: u64,
+    /// Maximum number of tracked writes. When exceeded during
+    /// `certified_write`, an automatic cleanup is triggered.
+    /// Default: 10,000.
+    pub max_entries: usize,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_age_ms: 60_000,
+            max_entries: 10_000,
+        }
+    }
+}
+
 /// Certified consistency API (FR-002, FR-004).
 ///
 /// Provides `get_certified` and `certified_write` operations that integrate
@@ -47,6 +73,7 @@ pub struct CertifiedApi {
     frontiers: AckFrontierSet,
     total_authorities: usize,
     pending_writes: Vec<PendingWrite>,
+    retention: RetentionPolicy,
 }
 
 impl CertifiedApi {
@@ -58,6 +85,23 @@ impl CertifiedApi {
             frontiers: AckFrontierSet::new(),
             total_authorities,
             pending_writes: Vec::new(),
+            retention: RetentionPolicy::default(),
+        }
+    }
+
+    /// Create a new `CertifiedApi` with a custom retention policy.
+    pub fn with_retention(
+        node_id: NodeId,
+        total_authorities: usize,
+        retention: RetentionPolicy,
+    ) -> Self {
+        Self {
+            store: Store::new(),
+            clock: Hlc::new(node_id.0),
+            frontiers: AckFrontierSet::new(),
+            total_authorities,
+            pending_writes: Vec::new(),
+            retention,
         }
     }
 
@@ -106,6 +150,11 @@ impl CertifiedApi {
         value: CrdtValue,
         on_timeout: OnTimeout,
     ) -> Result<CertificationStatus, CrdtError> {
+        // Auto-cleanup when capacity is exceeded.
+        if self.pending_writes.len() >= self.retention.max_entries {
+            self.cleanup_completed();
+        }
+
         let timestamp = self.clock.now();
 
         // Write to the local store (eventual consistency path).
@@ -174,7 +223,46 @@ impl CertifiedApi {
         }
     }
 
-    /// Return a slice of all pending writes.
+    /// Remove all writes whose status is not `Pending`.
+    ///
+    /// This removes `Certified`, `Rejected`, and `Timeout` entries,
+    /// keeping only writes that are still awaiting resolution.
+    pub fn cleanup_completed(&mut self) {
+        self.pending_writes
+            .retain(|pw| pw.status == CertificationStatus::Pending);
+    }
+
+    /// Mark pending writes older than `max_age_ms` as `Timeout`,
+    /// then remove all non-pending entries.
+    ///
+    /// `now_physical_ms` is the current wall-clock time in milliseconds.
+    pub fn cleanup_expired(&mut self, now_physical_ms: u64) {
+        for pw in &mut self.pending_writes {
+            if pw.status == CertificationStatus::Pending
+                && now_physical_ms.saturating_sub(pw.timestamp.physical)
+                    >= self.retention.max_age_ms
+            {
+                pw.status = CertificationStatus::Timeout;
+            }
+        }
+        self.cleanup_completed();
+    }
+
+    /// Full cleanup: expire old pending writes and remove all completed entries.
+    ///
+    /// This is the recommended periodic maintenance method. It:
+    /// 1. Marks stale `Pending` writes as `Timeout` based on `max_age_ms`.
+    /// 2. Removes all non-`Pending` entries (`Certified`, `Rejected`, `Timeout`).
+    pub fn cleanup(&mut self, now_physical_ms: u64) {
+        self.cleanup_expired(now_physical_ms);
+    }
+
+    /// Return a reference to the current retention policy.
+    pub fn retention_policy(&self) -> &RetentionPolicy {
+        &self.retention
+    }
+
+    /// Return a slice of all tracked writes.
     pub fn pending_writes(&self) -> &[PendingWrite] {
         &self.pending_writes
     }
@@ -428,5 +516,200 @@ mod tests {
             CrdtValue::Counter(c) => assert_eq!(c.value(), 3),
             other => panic!("expected Counter, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Retention policy defaults
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn retention_policy_defaults() {
+        let api = CertifiedApi::new(node("node-1"), 3);
+        let policy = api.retention_policy();
+        assert_eq!(policy.max_age_ms, 60_000);
+        assert_eq!(policy.max_entries, 10_000);
+    }
+
+    #[test]
+    fn with_retention_custom_policy() {
+        let policy = RetentionPolicy {
+            max_age_ms: 5_000,
+            max_entries: 100,
+        };
+        let api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        assert_eq!(api.retention_policy().max_age_ms, 5_000);
+        assert_eq!(api.retention_policy().max_entries, 100);
+    }
+
+    // ---------------------------------------------------------------
+    // cleanup_completed removes certified/rejected/timeout entries
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_completed_removes_non_pending() {
+        let mut api = CertifiedApi::new(node("node-1"), 3);
+
+        // Write 3 entries.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key3".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Certify key1 via frontier advancement.
+        api.update_frontier(make_frontier("auth-1", write_ts + 1, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 1, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(api.pending_writes().len(), 3);
+
+        api.cleanup_completed();
+
+        // Only pending entries remain.
+        assert!(
+            api.pending_writes()
+                .iter()
+                .all(|pw| pw.status == CertificationStatus::Pending)
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // cleanup_expired marks old pending as timeout and removes them
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_expired_marks_and_removes_old_entries() {
+        let policy = RetentionPolicy {
+            max_age_ms: 5_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        assert_eq!(api.pending_writes().len(), 1);
+
+        // Not yet expired.
+        api.cleanup_expired(write_ts + 4_999);
+        assert_eq!(api.pending_writes().len(), 1);
+
+        // Now expired.
+        api.cleanup_expired(write_ts + 5_000);
+        assert_eq!(api.pending_writes().len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // cleanup does full maintenance
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_removes_both_completed_and_expired() {
+        let policy = RetentionPolicy {
+            max_age_ms: 10_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+
+        // Write entries at different times.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+
+        api.certified_write("key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+
+        // Certify key1.
+        api.update_frontier(make_frontier("auth-1", ts1 + 1, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts1 + 1, 0, ""));
+        api.process_certifications();
+
+        let ts2 = api.pending_writes()[1].timestamp.physical;
+
+        // Cleanup at a time after TTL for key2 (and certainly key1).
+        api.cleanup(ts2 + 10_000);
+
+        // All entries should be removed: key1 was Certified, key2 was TTL-expired.
+        assert_eq!(api.pending_writes().len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Auto-cleanup when max_entries exceeded
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn auto_cleanup_on_capacity_exceeded() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 3,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+
+        // Write 3 entries (hits max_entries).
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+        api.certified_write("key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key3".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        // Certify key1 and key2.
+        api.update_frontier(make_frontier("auth-1", ts1 + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts1 + 100, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(api.pending_writes().len(), 3);
+
+        // Adding a 4th write triggers auto-cleanup (len >= max_entries).
+        api.certified_write("key4".into(), counter_value(4), OnTimeout::Pending)
+            .unwrap();
+
+        // Certified entries (key1, key2) were cleaned up.
+        // key3 (Pending) + key4 (new Pending) remain.
+        assert!(api.pending_writes().len() <= 3);
+        assert!(
+            api.pending_writes()
+                .iter()
+                .any(|pw| pw.key == "key3" || pw.key == "key4")
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Bounded growth under sustained writes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bounded_growth_under_sustained_writes() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 10,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+
+        // Simulate sustained writes with periodic certification.
+        for i in 0..50u64 {
+            api.certified_write(format!("key-{i}"), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+
+            // Certify every other write to make them eligible for cleanup.
+            if i % 2 == 0 {
+                let ts = api.pending_writes().last().unwrap().timestamp.physical;
+                api.update_frontier(make_frontier("auth-1", ts + 100, 0, ""));
+                api.update_frontier(make_frontier("auth-2", ts + 100, 0, ""));
+                api.process_certifications();
+            }
+        }
+
+        // The number of tracked writes must be bounded.
+        assert!(
+            api.pending_writes().len() <= 20,
+            "expected bounded growth, got {} entries",
+            api.pending_writes().len()
+        );
     }
 }

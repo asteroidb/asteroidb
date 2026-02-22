@@ -162,6 +162,31 @@ impl CertificationTracker {
         self.entries
             .retain(|_, e| e.status == CertificationStatus::Pending);
     }
+
+    /// Removes entries older than `ttl_ms` regardless of status.
+    ///
+    /// An entry is removed when `now.physical - entry.created_at.physical >= ttl_ms`.
+    pub fn remove_expired(&mut self, now: &HlcTimestamp, ttl_ms: u64) {
+        self.entries
+            .retain(|_, e| now.physical.saturating_sub(e.created_at.physical) < ttl_ms);
+    }
+
+    /// Full cleanup: check timeouts, then remove all completed and expired entries.
+    ///
+    /// This is the recommended periodic maintenance method. It:
+    /// 1. Marks stale `Pending` entries as `Timeout`.
+    /// 2. Removes all non-`Pending` entries.
+    /// 3. Removes any remaining entries older than `ttl_ms`.
+    pub fn cleanup(&mut self, now: &HlcTimestamp, ttl_ms: u64) {
+        self.check_timeouts(now);
+        self.remove_completed();
+        self.remove_expired(now, ttl_ms);
+    }
+
+    /// Returns the total number of tracked entries (all statuses).
+    pub fn total_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl Default for CertificationTracker {
@@ -430,5 +455,149 @@ mod tests {
         let json = serde_json::to_string(&wid).unwrap();
         let back: WriteId = serde_json::from_str(&json).unwrap();
         assert_eq!(wid, back);
+    }
+
+    // ---------------------------------------------------------------
+    // remove_expired tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn remove_expired_removes_old_entries() {
+        let mut tracker = CertificationTracker::new();
+        let wid_old = write_id("old-key", 1000);
+        let wid_new = write_id("new-key", 9000);
+
+        tracker.register_write(wid_old.clone(), 3, ts(1000, 0, "node-a"));
+        tracker.register_write(wid_new.clone(), 3, ts(9000, 0, "node-a"));
+
+        // TTL of 5000ms: old-key (created at 1000) should be expired at 10000.
+        tracker.remove_expired(&ts(10000, 0, "node-a"), 5000);
+
+        assert_eq!(tracker.get_status(&wid_old), None);
+        assert_eq!(
+            tracker.get_status(&wid_new),
+            Some(CertificationStatus::Pending)
+        );
+    }
+
+    #[test]
+    fn remove_expired_removes_completed_entries_too() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("key-1", 1000);
+        tracker.register_write(wid.clone(), 1, ts(1000, 0, "node-a"));
+        tracker.record_ack(&wid, ts(1001, 0, "auth-1"));
+
+        assert_eq!(
+            tracker.get_status(&wid),
+            Some(CertificationStatus::Certified)
+        );
+
+        tracker.remove_expired(&ts(10000, 0, "node-a"), 5000);
+        assert_eq!(tracker.get_status(&wid), None);
+    }
+
+    // ---------------------------------------------------------------
+    // cleanup tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cleanup_full_lifecycle() {
+        let mut tracker = CertificationTracker::with_timeout(5000);
+        let wid_pending = write_id("pending", 10000);
+        let wid_certified = write_id("certified", 2000);
+        let wid_old_pending = write_id("old-pending", 1000);
+
+        tracker.register_write(wid_pending.clone(), 3, ts(10000, 0, "node-a"));
+        tracker.register_write(wid_certified.clone(), 1, ts(2000, 0, "node-a"));
+        tracker.register_write(wid_old_pending.clone(), 3, ts(1000, 0, "node-a"));
+
+        // Certify one.
+        tracker.record_ack(&wid_certified, ts(2001, 0, "auth-1"));
+
+        // Full cleanup with ttl_ms=8000 at time 10000.
+        // old-pending (1000): pending → timeout (5000ms timeout), then removed (completed).
+        // certified (2000): already certified → removed (completed), also > 8000ms old.
+        // pending (10000): still pending, not old enough.
+        tracker.cleanup(&ts(10000, 0, "node-a"), 8000);
+
+        assert_eq!(
+            tracker.get_status(&wid_pending),
+            Some(CertificationStatus::Pending)
+        );
+        assert_eq!(tracker.get_status(&wid_certified), None);
+        assert_eq!(tracker.get_status(&wid_old_pending), None);
+    }
+
+    // ---------------------------------------------------------------
+    // total_count tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn total_count_tracks_all_entries() {
+        let mut tracker = CertificationTracker::new();
+        assert_eq!(tracker.total_count(), 0);
+
+        tracker.register_write(write_id("a", 1000), 2, ts(1000, 0, "node-a"));
+        tracker.register_write(write_id("b", 2000), 1, ts(2000, 0, "node-a"));
+        assert_eq!(tracker.total_count(), 2);
+
+        // Certify one — total_count still 2.
+        tracker.record_ack(&write_id("b", 2000), ts(2001, 0, "auth-1"));
+        assert_eq!(tracker.total_count(), 2);
+
+        // After remove_completed, only pending remains.
+        tracker.remove_completed();
+        assert_eq!(tracker.total_count(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Bounded growth under sustained writes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bounded_growth_with_cleanup() {
+        let mut tracker = CertificationTracker::with_timeout(100);
+
+        for i in 0..50u64 {
+            let wid = write_id(&format!("key-{i}"), i * 10);
+            tracker.register_write(wid.clone(), 1, ts(i * 10, 0, "node-a"));
+
+            // Certify each write immediately.
+            tracker.record_ack(&wid, ts(i * 10 + 1, 0, "auth-1"));
+        }
+
+        assert_eq!(tracker.total_count(), 50);
+
+        // Cleanup should remove all certified entries.
+        tracker.remove_completed();
+        assert_eq!(tracker.total_count(), 0);
+    }
+
+    #[test]
+    fn bounded_growth_with_ttl_cleanup() {
+        let mut tracker = CertificationTracker::with_timeout(100);
+
+        // Register writes at different times.
+        for i in 0..20u64 {
+            let wid = write_id(&format!("key-{i}"), i * 50);
+            tracker.register_write(wid, 3, ts(i * 50, 0, "node-a"));
+        }
+
+        assert_eq!(tracker.total_count(), 20);
+
+        // Full cleanup at time 2000 with TTL 500ms.
+        // Entries older than 1500 (created_at < 1500) will be:
+        // 1. Timeout-checked (entries created at < 1900 with 100ms timeout → all marked Timeout)
+        // 2. Removed as completed (Timeout status)
+        // 3. Remaining entries > 500ms old removed by TTL
+        tracker.cleanup(&ts(2000, 0, "node-a"), 500);
+
+        // Only entries created at >= 1500 (i.e., physical 1500, 1550, ..., 1950) survive.
+        // But they were all marked as Timeout by check_timeouts (2000 - 1500 = 500 >= 100).
+        // So remove_completed removes them too.
+        // Actually all entries will be timed out since timeout is 100ms.
+        // The only entries that survive TTL are those created at >= 1500 (2000 - 500).
+        // But those are also timed out. So total_count should be 0.
+        assert_eq!(tracker.total_count(), 0);
     }
 }
