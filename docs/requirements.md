@@ -1,4 +1,4 @@
-# AsteroidDB 要件定義 (Draft v0.3)
+# AsteroidDB 要件定義 (Draft v0.4)
 
 ## 1. この文書の目的
 
@@ -84,6 +84,9 @@
 - MVP の `majority_certificate` は Ed25519 個別署名集約方式を採用すること
 - Ed25519 鍵配布は `system namespace` の `keyset_version` 管理で行うこと
 - 鍵ローテーションは `epoch` ベースの自動切替をサポートすること
+- `keyset_version` の既定初期値は `1` とし、更新ごとに単調増加させること
+- `epoch` の既定長は `24h` とし、検証時は現在 epoch に加えて過去 7 epoch 分の鍵を許容すること
+- ローテーション手順は `publish(next keyset) -> epoch 切替 -> grace 終了後に旧鍵無効化` を標準とすること
 - 将来は Threshold 署名 (BLS 等) へ拡張可能とすること
 - 証明対象の粒度はキー範囲単位 (prefix) を MVP とすること
 
@@ -145,6 +148,5 @@
 
 ## 8. 未決事項 (次ラウンドで確定)
 
-- `keyset_version` / `epoch` の既定値とローテーション手順詳細
 - CRDT 共通エラーコードの最終一覧
 - `digest_hash` の既定時間閾値/件数閾値と再検証トリガー詳細
