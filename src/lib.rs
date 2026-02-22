@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod compaction;
 pub mod crdt;
 pub mod error;
 pub mod hlc;

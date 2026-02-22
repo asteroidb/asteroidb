@@ -1,0 +1,530 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::authority::ack_frontier::AckFrontierSet;
+use crate::hlc::HlcTimestamp;
+use crate::types::{KeyRange, PolicyVersion};
+
+/// Configuration for compaction triggers (FR-010).
+///
+/// Controls when checkpoints are created using a hybrid approach:
+/// either a time threshold or an operations count threshold, whichever
+/// is reached first.
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Time threshold in milliseconds before triggering a checkpoint (default: 30,000 ms = 30s).
+    pub time_threshold_ms: u64,
+    /// Number of operations before triggering a checkpoint (default: 10,000).
+    pub ops_threshold: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        }
+    }
+}
+
+/// A checkpoint snapshot for a key range.
+///
+/// Captures the state at a point in time for compaction verification
+/// and digest-based consistency checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Checkpoint {
+    /// The key range this checkpoint covers.
+    pub key_range: KeyRange,
+    /// The HLC timestamp when this checkpoint was created.
+    pub timestamp: HlcTimestamp,
+    /// Hex-encoded digest hash of the data at this checkpoint.
+    pub digest_hash: String,
+    /// The placement policy version in effect at checkpoint time.
+    pub policy_version: PolicyVersion,
+    /// Number of operations processed since the previous checkpoint.
+    pub ops_since_last: u64,
+}
+
+/// Reason why revalidation was triggered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevalidationTrigger {
+    /// Digest hash mismatch detected between expected and actual values.
+    DigestMismatch { expected: String, actual: String },
+    /// Policy version changed, requiring revalidation.
+    PolicyVersionChange {
+        old: PolicyVersion,
+        new: PolicyVersion,
+    },
+    /// Authority set composition changed.
+    AuthorityChange,
+    /// Manual revalidation requested via API.
+    Manual,
+}
+
+/// Compaction engine managing checkpoints and compaction eligibility (FR-010).
+///
+/// Tracks per-key-range operation counts, creates periodic checkpoints,
+/// determines compaction eligibility based on Authority ack_frontiers,
+/// and manages revalidation triggers.
+pub struct CompactionEngine {
+    config: CompactionConfig,
+    checkpoints: HashMap<String, Checkpoint>,
+    ops_count: HashMap<String, u64>,
+    revalidation_log: Vec<(HlcTimestamp, RevalidationTrigger)>,
+}
+
+impl CompactionEngine {
+    /// Create a new compaction engine with the given configuration.
+    pub fn new(config: CompactionConfig) -> Self {
+        Self {
+            config,
+            checkpoints: HashMap::new(),
+            ops_count: HashMap::new(),
+            revalidation_log: Vec::new(),
+        }
+    }
+
+    /// Create a new compaction engine with default configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(CompactionConfig::default())
+    }
+
+    /// Record an operation for the given key range, incrementing its ops counter.
+    pub fn record_op(&mut self, key_range: &KeyRange) {
+        *self.ops_count.entry(key_range.prefix.clone()).or_insert(0) += 1;
+    }
+
+    /// Check whether a checkpoint should be created for the given key range.
+    ///
+    /// Returns `true` if either the operations count threshold or the time
+    /// threshold has been reached since the last checkpoint.
+    pub fn should_checkpoint(&self, key_range: &KeyRange, now: &HlcTimestamp) -> bool {
+        let prefix = &key_range.prefix;
+
+        // Check ops threshold
+        let ops = self.ops_count.get(prefix).copied().unwrap_or(0);
+        if ops >= self.config.ops_threshold {
+            return true;
+        }
+
+        // Check time threshold
+        if let Some(cp) = self.checkpoints.get(prefix) {
+            let elapsed = now.physical.saturating_sub(cp.timestamp.physical);
+            if elapsed >= self.config.time_threshold_ms {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Create a checkpoint for the given key range.
+    ///
+    /// Records the current state and resets the operations counter for this range.
+    pub fn create_checkpoint(
+        &mut self,
+        key_range: KeyRange,
+        now: HlcTimestamp,
+        digest_hash: String,
+        policy_version: PolicyVersion,
+    ) -> Checkpoint {
+        let prefix = key_range.prefix.clone();
+        let ops_since_last = self.ops_count.get(&prefix).copied().unwrap_or(0);
+
+        let checkpoint = Checkpoint {
+            key_range,
+            timestamp: now,
+            digest_hash,
+            policy_version,
+            ops_since_last,
+        };
+
+        self.checkpoints.insert(prefix.clone(), checkpoint.clone());
+        self.ops_count.insert(prefix, 0);
+
+        checkpoint
+    }
+
+    /// Get the latest checkpoint for a key range prefix.
+    pub fn get_checkpoint(&self, prefix: &str) -> Option<&Checkpoint> {
+        self.checkpoints.get(prefix)
+    }
+
+    /// Check whether data for a key range can be compacted.
+    ///
+    /// Compaction is safe only when the majority of authorities have consumed
+    /// updates past the checkpoint's timestamp (FR-010).
+    pub fn is_compactable(
+        &self,
+        prefix: &str,
+        frontiers: &AckFrontierSet,
+        total_authorities: usize,
+    ) -> bool {
+        let checkpoint = match self.checkpoints.get(prefix) {
+            Some(cp) => cp,
+            None => return false,
+        };
+
+        frontiers.is_certified_at(&checkpoint.timestamp, total_authorities)
+    }
+
+    /// Verify the digest hash for a key range against the stored checkpoint.
+    ///
+    /// Returns `Ok(())` if the digests match, or `Err(RevalidationTrigger::DigestMismatch)`
+    /// if they differ.
+    pub fn verify_digest(
+        &self,
+        prefix: &str,
+        actual_hash: &str,
+    ) -> Result<(), RevalidationTrigger> {
+        match self.checkpoints.get(prefix) {
+            Some(cp) if cp.digest_hash == actual_hash => Ok(()),
+            Some(cp) => Err(RevalidationTrigger::DigestMismatch {
+                expected: cp.digest_hash.clone(),
+                actual: actual_hash.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Log a revalidation event with the given trigger and timestamp.
+    pub fn trigger_revalidation(&mut self, trigger: RevalidationTrigger, now: HlcTimestamp) {
+        self.revalidation_log.push((now, trigger));
+    }
+
+    /// Get the full revalidation log.
+    pub fn revalidation_log(&self) -> &[(HlcTimestamp, RevalidationTrigger)] {
+        &self.revalidation_log
+    }
+
+    /// Request a manual revalidation (FR-010 manual revalidation API).
+    pub fn request_manual_revalidation(&mut self, now: HlcTimestamp) {
+        self.trigger_revalidation(RevalidationTrigger::Manual, now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+    use crate::types::NodeId;
+
+    fn make_ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical,
+            node_id: node.into(),
+        }
+    }
+
+    fn make_key_range(prefix: &str) -> KeyRange {
+        KeyRange {
+            prefix: prefix.into(),
+        }
+    }
+
+    fn make_frontier(authority: &str, physical: u64, prefix: &str) -> AckFrontier {
+        AckFrontier {
+            authority_id: NodeId(authority.into()),
+            frontier_hlc: make_ts(physical, 0, authority),
+            key_range: make_key_range(prefix),
+            policy_version: PolicyVersion(1),
+            digest_hash: format!("{authority}-{physical}"),
+        }
+    }
+
+    #[test]
+    fn record_op_increments_count() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        engine.record_op(&kr);
+        engine.record_op(&kr);
+        engine.record_op(&kr);
+
+        assert_eq!(engine.ops_count.get("user/"), Some(&3));
+    }
+
+    #[test]
+    fn should_checkpoint_below_threshold_returns_false() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+        let now = make_ts(1000, 0, "node-a");
+
+        // Record a few ops, well below the 10,000 threshold
+        for _ in 0..100 {
+            engine.record_op(&kr);
+        }
+
+        assert!(!engine.should_checkpoint(&kr, &now));
+    }
+
+    #[test]
+    fn should_checkpoint_ops_threshold_reached() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 5,
+        });
+        let kr = make_key_range("user/");
+        let now = make_ts(1000, 0, "node-a");
+
+        for _ in 0..5 {
+            engine.record_op(&kr);
+        }
+
+        assert!(engine.should_checkpoint(&kr, &now));
+    }
+
+    #[test]
+    fn should_checkpoint_time_threshold_reached() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: 1_000,
+            ops_threshold: 10_000,
+        });
+        let kr = make_key_range("user/");
+
+        // Create an initial checkpoint at t=1000
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(1000, 0, "node-a"),
+            "hash1".into(),
+            PolicyVersion(1),
+        );
+
+        // Record 1 op (below ops threshold)
+        engine.record_op(&kr);
+
+        // Now is 2001ms later (past the 1000ms time threshold)
+        let now = make_ts(2001, 0, "node-a");
+        assert!(engine.should_checkpoint(&kr, &now));
+    }
+
+    #[test]
+    fn create_checkpoint_resets_ops_count() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        for _ in 0..50 {
+            engine.record_op(&kr);
+        }
+
+        let cp = engine.create_checkpoint(
+            kr.clone(),
+            make_ts(1000, 0, "node-a"),
+            "digest-abc".into(),
+            PolicyVersion(1),
+        );
+
+        assert_eq!(cp.ops_since_last, 50);
+        assert_eq!(engine.ops_count.get("user/"), Some(&0));
+    }
+
+    #[test]
+    fn get_checkpoint_returns_latest() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(1000, 0, "node-a"),
+            "hash1".into(),
+            PolicyVersion(1),
+        );
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(2000, 0, "node-a"),
+            "hash2".into(),
+            PolicyVersion(2),
+        );
+
+        let cp = engine.get_checkpoint("user/").unwrap();
+        assert_eq!(cp.digest_hash, "hash2");
+        assert_eq!(cp.policy_version, PolicyVersion(2));
+    }
+
+    #[test]
+    fn is_compactable_with_majority_ahead() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Checkpoint at t=100
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        // 3 authorities, all past the checkpoint
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 200, "user/"));
+        frontiers.update(make_frontier("auth-2", 300, "user/"));
+        frontiers.update(make_frontier("auth-3", 150, "user/"));
+
+        assert!(engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn is_compactable_with_frontiers_behind() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Checkpoint at t=500
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(500, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        // 3 authorities, most behind the checkpoint
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 100, "user/"));
+        frontiers.update(make_frontier("auth-2", 200, "user/"));
+        frontiers.update(make_frontier("auth-3", 600, "user/"));
+
+        // majority frontier with 3 authorities: sorted [100, 200, 600], majority=2, index=1 → 200
+        // 200 < 500, so not compactable
+        assert!(!engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn is_compactable_no_checkpoint() {
+        let engine = CompactionEngine::with_defaults();
+        let frontiers = AckFrontierSet::new();
+
+        assert!(!engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn verify_digest_match() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        engine.create_checkpoint(
+            kr,
+            make_ts(1000, 0, "node-a"),
+            "abc123".into(),
+            PolicyVersion(1),
+        );
+
+        assert!(engine.verify_digest("user/", "abc123").is_ok());
+    }
+
+    #[test]
+    fn verify_digest_mismatch() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        engine.create_checkpoint(
+            kr,
+            make_ts(1000, 0, "node-a"),
+            "abc123".into(),
+            PolicyVersion(1),
+        );
+
+        let result = engine.verify_digest("user/", "xyz789");
+        assert_eq!(
+            result,
+            Err(RevalidationTrigger::DigestMismatch {
+                expected: "abc123".into(),
+                actual: "xyz789".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn verify_digest_no_checkpoint() {
+        let engine = CompactionEngine::with_defaults();
+        assert!(engine.verify_digest("user/", "anything").is_ok());
+    }
+
+    #[test]
+    fn trigger_revalidation_logs_events() {
+        let mut engine = CompactionEngine::with_defaults();
+
+        engine.trigger_revalidation(
+            RevalidationTrigger::AuthorityChange,
+            make_ts(1000, 0, "node-a"),
+        );
+        engine.trigger_revalidation(
+            RevalidationTrigger::PolicyVersionChange {
+                old: PolicyVersion(1),
+                new: PolicyVersion(2),
+            },
+            make_ts(2000, 0, "node-a"),
+        );
+
+        let log = engine.revalidation_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].1, RevalidationTrigger::AuthorityChange);
+        assert_eq!(
+            log[1].1,
+            RevalidationTrigger::PolicyVersionChange {
+                old: PolicyVersion(1),
+                new: PolicyVersion(2),
+            }
+        );
+    }
+
+    #[test]
+    fn request_manual_revalidation() {
+        let mut engine = CompactionEngine::with_defaults();
+
+        engine.request_manual_revalidation(make_ts(5000, 0, "node-a"));
+
+        let log = engine.revalidation_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, RevalidationTrigger::Manual);
+        assert_eq!(log[0].0.physical, 5000);
+    }
+
+    #[test]
+    fn compaction_config_defaults() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.time_threshold_ms, 30_000);
+        assert_eq!(config.ops_threshold, 10_000);
+    }
+
+    #[test]
+    fn checkpoint_serde_roundtrip() {
+        let cp = Checkpoint {
+            key_range: make_key_range("order/"),
+            timestamp: make_ts(1_700_000_000_000, 42, "node-x"),
+            digest_hash: "deadbeef".into(),
+            policy_version: PolicyVersion(3),
+            ops_since_last: 1234,
+        };
+
+        let json = serde_json::to_string(&cp).expect("serialize");
+        let back: Checkpoint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cp, back);
+    }
+
+    #[test]
+    fn multiple_key_ranges_independent() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 3,
+        });
+
+        let kr_user = make_key_range("user/");
+        let kr_order = make_key_range("order/");
+
+        engine.record_op(&kr_user);
+        engine.record_op(&kr_user);
+        engine.record_op(&kr_order);
+
+        let now = make_ts(1000, 0, "node-a");
+
+        // user/ has 2 ops (below 3), order/ has 1 op (below 3)
+        assert!(!engine.should_checkpoint(&kr_user, &now));
+        assert!(!engine.should_checkpoint(&kr_order, &now));
+
+        // Push user/ over threshold
+        engine.record_op(&kr_user);
+        assert!(engine.should_checkpoint(&kr_user, &now));
+        assert!(!engine.should_checkpoint(&kr_order, &now));
+    }
+}
