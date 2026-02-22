@@ -562,7 +562,7 @@ fn mixed_duplicate_and_unique_acks_counted_correctly() {
 /// key_range and policy_version scope* have consumed past it.
 /// Frontiers from other key ranges must NOT contribute.
 #[test]
-fn compaction_eligibility_uses_global_frontier() {
+fn compaction_eligibility_uses_scoped_frontier() {
     let mut engine = CompactionEngine::new(CompactionConfig {
         time_threshold_ms: 30_000,
         ops_threshold: 10_000,
