@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::crdt::lww_register::LwwRegister;
@@ -20,7 +21,7 @@ struct Dot {
 /// add/remove) with LWW-Register for values. Each key tracks its causal
 /// dots so that concurrent `set` and `delete` operations resolve correctly:
 /// a `set` that is concurrent with a `delete` will re-add the key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrMap<K, V>
 where
     K: Eq + Hash + Clone,
@@ -37,8 +38,8 @@ where
 
 impl<K, V> OrMap<K, V>
 where
-    K: Eq + Hash + Clone,
-    V: Clone,
+    K: Eq + Hash + Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
 {
     /// Create an empty OR-Map.
     pub fn new() -> Self {
@@ -181,8 +182,8 @@ where
 
 impl<K, V> Default for OrMap<K, V>
 where
-    K: Eq + Hash + Clone,
-    V: Clone,
+    K: Eq + Hash + Clone + Serialize + DeserializeOwned,
+    V: Clone + Serialize + DeserializeOwned,
 {
     fn default() -> Self {
         Self::new()

@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::crdt::lww_register::LwwRegister;
 use crate::crdt::or_map::OrMap;
@@ -10,7 +14,7 @@ use crate::error::CrdtError;
 ///
 /// Wraps all supported CRDT types so the store can hold heterogeneous
 /// values while preserving type-safe merge semantics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CrdtValue {
     Counter(PnCounter),
     Set(OrSet<String>),
@@ -34,7 +38,7 @@ impl CrdtValue {
 ///
 /// Provides basic CRUD operations, prefix-based key space partitioning,
 /// and CRDT-aware value merging with type checking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     data: HashMap<String, CrdtValue>,
 }
@@ -90,6 +94,32 @@ impl Store {
     /// Check whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Save the store as a JSON snapshot to the given path.
+    pub fn save_snapshot(&self, path: &Path) -> io::Result<()> {
+        let json = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)
+    }
+
+    /// Load a store from a JSON snapshot at the given path.
+    ///
+    /// Returns an `io::Error` if the file cannot be read or parsed.
+    pub fn load_snapshot(path: &Path) -> io::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Load a store from a snapshot, falling back to an empty store on any error.
+    ///
+    /// This is the recommended way to load at startup: if the snapshot file
+    /// is missing or corrupted, the store starts fresh.
+    pub fn load_snapshot_or_default(path: &Path) -> Self {
+        Self::load_snapshot(path).unwrap_or_default()
     }
 
     /// Merge a CRDT value into an existing entry.
@@ -576,5 +606,163 @@ mod tests {
 
         store.delete("b");
         assert!(store.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Snapshot persistence
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_snapshot_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        let mut store = Store::new();
+
+        // Counter
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        counter.increment(&node("A"));
+        counter.decrement(&node("B"));
+        store.put("hits".into(), CrdtValue::Counter(counter));
+
+        // Set
+        let mut set = OrSet::new();
+        set.add("alice".to_string(), &node("A"));
+        set.add("bob".to_string(), &node("B"));
+        store.put("users".into(), CrdtValue::Set(set));
+
+        // Map
+        let mut map = OrMap::new();
+        map.set(
+            "name".to_string(),
+            "AsteroidDB".to_string(),
+            ts(100, 0, "A"),
+            &node("A"),
+        );
+        store.put("config".into(), CrdtValue::Map(map));
+
+        // Register
+        let mut reg = LwwRegister::new();
+        reg.set("hello".to_string(), ts(200, 0, "A"));
+        store.put("greeting".into(), CrdtValue::Register(reg));
+
+        // Save
+        store.save_snapshot(&path).unwrap();
+
+        // Load
+        let loaded = Store::load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.len(), 4);
+        assert!(loaded.contains_key("hits"));
+        assert!(loaded.contains_key("users"));
+        assert!(loaded.contains_key("config"));
+        assert!(loaded.contains_key("greeting"));
+
+        // Verify counter value
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1), // 2 inc - 1 dec
+            other => panic!("expected Counter, got {:?}", other),
+        }
+
+        // Verify set values
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert!(s.contains(&"bob".to_string()));
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+
+        // Verify map values
+        match loaded.get("config") {
+            Some(CrdtValue::Map(m)) => {
+                assert_eq!(m.get(&"name".to_string()), Some(&"AsteroidDB".to_string()));
+            }
+            other => panic!("expected Map, got {:?}", other),
+        }
+
+        // Verify register value
+        match loaded.get("greeting") {
+            Some(CrdtValue::Register(r)) => {
+                assert_eq!(r.get(), Some(&"hello".to_string()));
+            }
+            other => panic!("expected Register, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_snapshot_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+
+        let result = Store::load_snapshot(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_snapshot_or_default_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+
+        let store = Store::load_snapshot_or_default(&path);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn load_snapshot_or_default_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let store = Store::load_snapshot_or_default(&path);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn save_snapshot_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("dir").join("store.json");
+
+        let store = Store::new();
+        store.save_snapshot(&path).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn empty_store_snapshot_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+
+        let store = Store::new();
+        store.save_snapshot(&path).unwrap();
+
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn save_overwrite_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        // First save
+        let mut store = Store::new();
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.save_snapshot(&path).unwrap();
+
+        // Overwrite with different data
+        let mut store2 = Store::new();
+        let mut reg = LwwRegister::new();
+        reg.set("val".to_string(), ts(100, 0, "A"));
+        store2.put("b".into(), CrdtValue::Register(reg));
+        store2.save_snapshot(&path).unwrap();
+
+        // Should load the second version
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded.contains_key("a"));
+        assert!(loaded.contains_key("b"));
     }
 }
