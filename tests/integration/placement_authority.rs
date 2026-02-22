@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use asteroidb_poc::authority::{AckFrontier, AckFrontierSet};
+use asteroidb_poc::authority::{AckFrontier, AckFrontierSet, FrontierScope};
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::node::Node;
 use asteroidb_poc::placement::PlacementPolicy;
@@ -500,17 +500,33 @@ fn frontier_tracks_policy_version_correctly() {
     assert_eq!(f_v2.policy_version, PolicyVersion(2));
 
     // An AckFrontierSet can hold frontiers with different policy versions
-    // (though in practice, a reset would create a new set)
+    // scoped by {key_range, policy_version, authority_id}
     let mut frontier_set = AckFrontierSet::new();
     frontier_set.update(f_v1);
-    let tracked = frontier_set.get(&NodeId("auth-1".into())).unwrap();
+
+    let scope_v1 = FrontierScope::new(
+        KeyRange { prefix: "user/".into() },
+        PolicyVersion(1),
+        NodeId("auth-1".into()),
+    );
+    let tracked = frontier_set.get_scoped(&scope_v1).unwrap();
     assert_eq!(tracked.policy_version, PolicyVersion(1));
 
-    // Update with newer HLC advances and changes policy version
+    // Update with newer policy version creates a separate scoped entry
     frontier_set.update(f_v2);
-    let tracked = frontier_set.get(&NodeId("auth-1".into())).unwrap();
+    let scope_v2 = FrontierScope::new(
+        KeyRange { prefix: "user/".into() },
+        PolicyVersion(2),
+        NodeId("auth-1".into()),
+    );
+    let tracked = frontier_set.get_scoped(&scope_v2).unwrap();
     assert_eq!(tracked.policy_version, PolicyVersion(2));
     assert_eq!(tracked.frontier_hlc.physical, 6000);
+
+    // v1 entry is still independently accessible (no contamination)
+    let tracked_v1 = frontier_set.get_scoped(&scope_v1).unwrap();
+    assert_eq!(tracked_v1.policy_version, PolicyVersion(1));
+    assert_eq!(tracked_v1.frontier_hlc.physical, 5000);
 }
 
 // ---------------------------------------------------------------------------
