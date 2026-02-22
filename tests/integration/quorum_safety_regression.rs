@@ -557,9 +557,10 @@ fn mixed_duplicate_and_unique_acks_counted_correctly() {
 // 4. Compaction eligibility checks under scoped frontiers (#39, FR-010)
 // ===========================================================================
 
-/// Compaction eligibility must use global (unscoped) majority frontier,
-/// so a checkpoint is only compactable when authorities in the *same scope*
-/// have consumed past it.
+/// Compaction eligibility uses scoped majority frontier (#51),
+/// so a checkpoint is only compactable when authorities in the *same
+/// key_range and policy_version scope* have consumed past it.
+/// Frontiers from other key ranges must NOT contribute.
 #[test]
 fn compaction_eligibility_uses_global_frontier() {
     let mut engine = CompactionEngine::new(CompactionConfig {
@@ -575,14 +576,12 @@ fn compaction_eligibility_uses_global_frontier() {
     frontiers.update(make_frontier("auth-1", 500, 0, "order/"));
     frontiers.update(make_frontier("auth-2", 600, 0, "order/"));
 
-    // is_compactable uses global is_certified_at which counts all entries.
-    // With 2 entries total and total_authorities=3, majority=2 → frontier index=0 → 500.
-    // Checkpoint at 100 ≤ 500, so technically it could pass with global queries.
-    // BUT: this demonstrates the need for scoped compaction in production.
-    // The current engine uses is_certified_at (global), so this DOES pass:
-    assert!(engine.is_compactable("user/", &frontiers, 3));
+    // is_compactable uses scoped is_certified_at_for_scope which only counts
+    // entries matching the checkpoint's key_range + policy_version.
+    // No "user/" frontiers exist, so this must NOT be compactable:
+    assert!(!engine.is_compactable("user/", &frontiers, 3));
 
-    // With only 1 frontier entry (below majority): NOT compactable
+    // With only 1 frontier entry (also wrong scope): still NOT compactable
     let mut frontiers_insufficient = AckFrontierSet::new();
     frontiers_insufficient.update(make_frontier("auth-1", 500, 0, "order/"));
     assert!(!engine.is_compactable("user/", &frontiers_insufficient, 3));

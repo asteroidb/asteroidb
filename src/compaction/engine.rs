@@ -153,8 +153,10 @@ impl CompactionEngine {
 
     /// Check whether data for a key range can be compacted.
     ///
-    /// Compaction is safe only when the majority of authorities have consumed
-    /// updates past the checkpoint's timestamp (FR-010).
+    /// Compaction is safe only when the majority of authorities **within the
+    /// same key_range and policy_version scope** have consumed updates past
+    /// the checkpoint's timestamp (FR-010).  Frontiers from other key ranges
+    /// or policy versions are excluded to prevent cross-scope contamination.
     pub fn is_compactable(
         &self,
         prefix: &str,
@@ -166,7 +168,12 @@ impl CompactionEngine {
             None => return false,
         };
 
-        frontiers.is_certified_at(&checkpoint.timestamp, total_authorities)
+        frontiers.is_certified_at_for_scope(
+            &checkpoint.timestamp,
+            &checkpoint.key_range,
+            &checkpoint.policy_version,
+            total_authorities,
+        )
     }
 
     /// Verify the digest hash for a key range against the stored checkpoint.
@@ -478,6 +485,118 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].1, RevalidationTrigger::Manual);
         assert_eq!(log[0].0.physical, 5000);
+    }
+
+    #[test]
+    fn is_compactable_not_affected_by_other_key_range() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr_user = make_key_range("user/");
+
+        // Checkpoint at t=100 for user/
+        engine.create_checkpoint(
+            kr_user.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        // 3 authorities, but all frontiers are for order/ (different key range)
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 200, "order/"));
+        frontiers.update(make_frontier("auth-2", 300, "order/"));
+        frontiers.update(make_frontier("auth-3", 400, "order/"));
+
+        // Should NOT be compactable: no user/ frontiers exist
+        assert!(!engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn is_compactable_not_affected_by_other_policy_version() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Checkpoint at t=100 for user/ with policy_version=1
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        // 3 authorities, but all frontiers are for policy_version=2
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(AckFrontier {
+            authority_id: NodeId("auth-1".into()),
+            frontier_hlc: make_ts(200, 0, "auth-1"),
+            key_range: make_key_range("user/"),
+            policy_version: PolicyVersion(2),
+            digest_hash: "auth-1-200".into(),
+        });
+        frontiers.update(AckFrontier {
+            authority_id: NodeId("auth-2".into()),
+            frontier_hlc: make_ts(300, 0, "auth-2"),
+            key_range: make_key_range("user/"),
+            policy_version: PolicyVersion(2),
+            digest_hash: "auth-2-300".into(),
+        });
+        frontiers.update(AckFrontier {
+            authority_id: NodeId("auth-3".into()),
+            frontier_hlc: make_ts(400, 0, "auth-3"),
+            key_range: make_key_range("user/"),
+            policy_version: PolicyVersion(2),
+            digest_hash: "auth-3-400".into(),
+        });
+
+        // Should NOT be compactable: no policy_version=1 frontiers
+        assert!(!engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn is_compactable_scoped_majority_only() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Checkpoint at t=100 for user/
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        let mut frontiers = AckFrontierSet::new();
+        // 1 authority in user/ scope (insufficient for majority of 3)
+        frontiers.update(make_frontier("auth-1", 200, "user/"));
+        // 2 authorities in order/ scope (irrelevant)
+        frontiers.update(make_frontier("auth-2", 300, "order/"));
+        frontiers.update(make_frontier("auth-3", 400, "order/"));
+
+        // Should NOT be compactable: only 1 of 3 in user/ scope
+        assert!(!engine.is_compactable("user/", &frontiers, 3));
+    }
+
+    #[test]
+    fn is_compactable_with_matching_scope() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Checkpoint at t=100 for user/ with policy_version=1
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        let mut frontiers = AckFrontierSet::new();
+        // 2 of 3 authorities in correct scope (user/, policy_version=1)
+        frontiers.update(make_frontier("auth-1", 200, "user/"));
+        frontiers.update(make_frontier("auth-2", 300, "user/"));
+        // 1 authority in wrong scope
+        frontiers.update(make_frontier("auth-3", 400, "order/"));
+
+        // Should be compactable: 2 of 3 in user/ scope past t=100
+        assert!(engine.is_compactable("user/", &frontiers, 3));
     }
 
     #[test]
