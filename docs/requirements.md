@@ -56,6 +56,8 @@
 - Counter: PN-Counter
 - Set: OR-Set
 - Map: OR-Map + LWW-Register
+- MVP の公開 API は型ごと専用 API (`counter_inc`, `orset_add` など) を採用すること
+- 将来拡張として汎用 op-envelope API (`apply_op(type, op, payload)`) を追加可能にすること
 
 ### FR-006: 配置・ローカライゼーション
 
@@ -137,5 +139,5 @@
 ## 8. 未決事項 (次ラウンドで確定)
 
 - Ed25519 鍵配布/ローテーション運用の詳細
-- CRDT 型ごとの API 形状と型システム
+- CRDT 専用 API の命名規則とエラー体系
 - compaction 時の `digest_hash` 検証フロー詳細
