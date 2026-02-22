@@ -59,6 +59,15 @@
 - MVP の公開 API は型ごと専用 API (`counter_inc`, `orset_add` など) を採用すること
 - API 命名規則は `crdt.<type>.<op>` を正規形とすること
 - エラー体系は型共通のエラーコードセットを採用すること
+- CRDT 共通エラーコードは以下を MVP の最小セットとすること
+- `INVALID_ARGUMENT`: 引数不正
+- `INVALID_OP`: 型に対して無効な操作
+- `TYPE_MISMATCH`: 既存型と操作型の不一致
+- `KEY_NOT_FOUND`: 対象キー不存在
+- `STALE_VERSION`: 古い文脈/バージョンでの更新
+- `POLICY_DENIED`: ポリシー違反による拒否
+- `TIMEOUT`: 処理または認証待ちの時間超過
+- `INTERNAL`: 内部エラー
 - 将来拡張として汎用 op-envelope API (`apply_op(type, op, payload)`) を追加可能にすること
 
 ### FR-006: 配置・ローカライゼーション
@@ -148,5 +157,4 @@
 
 ## 8. 未決事項 (次ラウンドで確定)
 
-- CRDT 共通エラーコードの最終一覧
 - `digest_hash` の既定時間閾値/件数閾値と再検証トリガー詳細
