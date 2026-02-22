@@ -1,5 +1,6 @@
 pub mod api;
 pub mod authority;
+pub mod control_plane;
 pub mod crdt;
 pub mod error;
 pub mod hlc;
