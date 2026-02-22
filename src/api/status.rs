@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::hlc::HlcTimestamp;
-use crate::types::CertificationStatus;
+use crate::types::{CertificationStatus, NodeId};
 
 /// Identifies a specific write operation by its key and timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,8 +25,8 @@ pub struct StatusEntry {
     pub created_at: HlcTimestamp,
     /// When the status was last updated.
     pub updated_at: HlcTimestamp,
-    /// Number of authority acks received so far.
-    pub acks_received: usize,
+    /// Set of authority node IDs that have acknowledged this write.
+    pub acked_by: HashSet<NodeId>,
     /// Number of acks required for certification (majority threshold).
     pub acks_required: usize,
 }
@@ -69,7 +69,7 @@ impl CertificationTracker {
             status: CertificationStatus::Pending,
             created_at: now.clone(),
             updated_at: now,
-            acks_received: 0,
+            acked_by: HashSet::new(),
             acks_required,
         };
         self.entries.insert(write_id, entry);
@@ -87,14 +87,17 @@ impl CertificationTracker {
 
     /// Records an authority acknowledgement for a write.
     ///
-    /// If the ack count reaches the required threshold, the status is
-    /// automatically promoted to `Certified`. Only `Pending` writes
+    /// Duplicate acks from the same authority are ignored to prevent
+    /// a single authority from inflating the ack count.
+    /// If the unique ack count reaches the required threshold, the status
+    /// is automatically promoted to `Certified`. Only `Pending` writes
     /// can receive acks.
     ///
     /// Returns the updated status, or `None` if the write is not found.
     pub fn record_ack(
         &mut self,
         write_id: &WriteId,
+        authority_id: NodeId,
         now: HlcTimestamp,
     ) -> Option<CertificationStatus> {
         let entry = self.entries.get_mut(write_id)?;
@@ -103,10 +106,10 @@ impl CertificationTracker {
             return Some(entry.status);
         }
 
-        entry.acks_received += 1;
+        entry.acked_by.insert(authority_id);
         entry.updated_at = now;
 
-        if entry.acks_received >= entry.acks_required {
+        if entry.acked_by.len() >= entry.acks_required {
             entry.status = CertificationStatus::Certified;
         }
 
@@ -189,6 +192,10 @@ mod tests {
         }
     }
 
+    fn auth(name: &str) -> NodeId {
+        NodeId(name.into())
+    }
+
     #[test]
     fn register_write_status_is_pending() {
         let mut tracker = CertificationTracker::new();
@@ -204,10 +211,10 @@ mod tests {
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
 
-        let status = tracker.record_ack(&wid, ts(1001, 0, "auth-1"));
+        let status = tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
         assert_eq!(status, Some(CertificationStatus::Pending));
 
-        let status = tracker.record_ack(&wid, ts(1002, 0, "auth-2"));
+        let status = tracker.record_ack(&wid, auth("auth-2"), ts(1002, 0, "auth-2"));
         assert_eq!(status, Some(CertificationStatus::Pending));
 
         assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
@@ -219,9 +226,9 @@ mod tests {
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
 
-        tracker.record_ack(&wid, ts(1001, 0, "auth-1"));
-        tracker.record_ack(&wid, ts(1002, 0, "auth-2"));
-        let status = tracker.record_ack(&wid, ts(1003, 0, "auth-3"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-2"), ts(1002, 0, "auth-2"));
+        let status = tracker.record_ack(&wid, auth("auth-3"), ts(1003, 0, "auth-3"));
 
         assert_eq!(status, Some(CertificationStatus::Certified));
         assert_eq!(
@@ -292,7 +299,7 @@ mod tests {
         tracker.register_write(wid_timeout.clone(), 3, ts(100, 0, "node-a"));
 
         // Certify one
-        tracker.record_ack(&wid_certified, ts(2001, 0, "auth-1"));
+        tracker.record_ack(&wid_certified, auth("auth-1"), ts(2001, 0, "auth-1"));
         // Reject one
         tracker.reject(&wid_rejected, ts(3001, 0, "auth-1"));
         // Timeout one
@@ -339,7 +346,7 @@ mod tests {
         assert_eq!(tracker.pending_count(), 3);
 
         // Certify one
-        tracker.record_ack(&write_id("c", 3000), ts(3001, 0, "auth-1"));
+        tracker.record_ack(&write_id("c", 3000), auth("auth-1"), ts(3001, 0, "auth-1"));
         assert_eq!(tracker.pending_count(), 2);
 
         // Reject one
@@ -359,14 +366,15 @@ mod tests {
         assert_eq!(entry.status, CertificationStatus::Pending);
         assert_eq!(entry.created_at, created);
         assert_eq!(entry.updated_at, created);
-        assert_eq!(entry.acks_received, 0);
+        assert!(entry.acked_by.is_empty());
         assert_eq!(entry.acks_required, 3);
 
-        // After an ack, updated_at and acks_received should change
+        // After an ack, updated_at and acked_by should change
         let ack_time = ts(1001, 0, "auth-1");
-        tracker.record_ack(&wid, ack_time.clone());
+        tracker.record_ack(&wid, auth("auth-1"), ack_time.clone());
         let entry = tracker.get_entry(&wid).unwrap();
-        assert_eq!(entry.acks_received, 1);
+        assert_eq!(entry.acked_by.len(), 1);
+        assert!(entry.acked_by.contains(&auth("auth-1")));
         assert_eq!(entry.updated_at, ack_time);
     }
 
@@ -374,7 +382,10 @@ mod tests {
     fn record_ack_for_unknown_write_returns_none() {
         let mut tracker = CertificationTracker::new();
         let wid = write_id("unknown", 9999);
-        assert_eq!(tracker.record_ack(&wid, ts(10000, 0, "auth-1")), None);
+        assert_eq!(
+            tracker.record_ack(&wid, auth("auth-1"), ts(10000, 0, "auth-1")),
+            None
+        );
     }
 
     #[test]
@@ -391,14 +402,14 @@ mod tests {
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 1, ts(1000, 0, "node-a"));
 
-        tracker.record_ack(&wid, ts(1001, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
         assert_eq!(
             tracker.get_status(&wid),
             Some(CertificationStatus::Certified)
         );
 
         // Extra ack should not change anything
-        let status = tracker.record_ack(&wid, ts(1002, 0, "auth-2"));
+        let status = tracker.record_ack(&wid, auth("auth-2"), ts(1002, 0, "auth-2"));
         assert_eq!(status, Some(CertificationStatus::Certified));
     }
 
@@ -408,7 +419,7 @@ mod tests {
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 1, ts(1000, 0, "node-a"));
 
-        tracker.record_ack(&wid, ts(1001, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
         tracker.reject(&wid, ts(1002, 0, "auth-2"));
 
         // Should still be certified
@@ -430,5 +441,40 @@ mod tests {
         let json = serde_json::to_string(&wid).unwrap();
         let back: WriteId = serde_json::from_str(&json).unwrap();
         assert_eq!(wid, back);
+    }
+
+    #[test]
+    fn duplicate_ack_same_authority_does_not_inflate_count() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("key-1", 1000);
+        tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
+
+        // Same authority acks 5 times
+        for i in 0..5 {
+            tracker.record_ack(&wid, auth("auth-1"), ts(1001 + i, 0, "auth-1"));
+        }
+
+        // Should still be pending because only 1 unique authority acked
+        assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
+        let entry = tracker.get_entry(&wid).unwrap();
+        assert_eq!(entry.acked_by.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_acks_do_not_promote_pending_write() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("key-1", 1000);
+        // Require 2 unique acks for certification
+        tracker.register_write(wid.clone(), 2, ts(1000, 0, "node-a"));
+
+        // Same authority acks many times — should NOT promote
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1002, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1003, 0, "auth-1"));
+        assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
+
+        // A different authority acks → now reaches threshold
+        let status = tracker.record_ack(&wid, auth("auth-2"), ts(1004, 0, "auth-2"));
+        assert_eq!(status, Some(CertificationStatus::Certified));
     }
 }
