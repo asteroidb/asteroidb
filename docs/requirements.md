@@ -80,6 +80,8 @@
 - `ack_frontier` は最低限、`authority_id` / `frontier_hlc` / `key_range` / `policy_version` / `digest_hash` を含むこと
 - `majority_certificate` は data-plane の `get_certified` から実験導入し、検証後に control-plane へ横展開すること
 - MVP の `majority_certificate` は Ed25519 個別署名集約方式を採用すること
+- Ed25519 鍵配布は `system namespace` の `keyset_version` 管理で行うこと
+- 鍵ローテーションは `epoch` ベースの自動切替をサポートすること
 - 将来は Threshold 署名 (BLS 等) へ拡張可能とすること
 - 証明対象の粒度はキー範囲単位 (prefix) を MVP とすること
 
@@ -140,6 +142,6 @@
 
 ## 8. 未決事項 (次ラウンドで確定)
 
-- Ed25519 鍵配布/ローテーション運用の詳細
+- `keyset_version` / `epoch` の既定値とローテーション手順詳細
 - CRDT 専用 API の命名規則とエラー体系
 - `digest_hash` チェックポイント周期と再検証トリガー条件
