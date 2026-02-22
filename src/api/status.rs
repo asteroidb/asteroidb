@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +17,7 @@ pub struct WriteId {
 }
 
 /// Entry tracking a single write's certification progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusEntry {
     /// The write this entry tracks.
     pub write_id: WriteId,
@@ -37,9 +39,40 @@ pub struct StatusEntry {
 /// The tracker monitors acknowledgements from authority nodes and
 /// automatically promotes writes to `Certified` once the majority
 /// threshold is reached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificationTracker {
+    #[serde(with = "entries_map_serde")]
     entries: HashMap<WriteId, StatusEntry>,
     default_timeout_ms: u64,
+}
+
+/// Custom serde for `HashMap<WriteId, StatusEntry>`.
+///
+/// JSON only supports string keys, so we serialize the map as a
+/// `Vec<(WriteId, StatusEntry)>` instead.
+mod entries_map_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<WriteId, StatusEntry>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(&WriteId, &StatusEntry)> = map.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<WriteId, StatusEntry>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(WriteId, StatusEntry)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
 }
 
 impl CertificationTracker {
@@ -189,6 +222,60 @@ impl CertificationTracker {
     /// Returns the total number of tracked entries (all statuses).
     pub fn total_count(&self) -> usize {
         self.entries.len()
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence
+    // ---------------------------------------------------------------
+
+    /// Serialize the tracker to a JSON string.
+    pub fn to_json(&self) -> Result<String, io::Error> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Deserialize a tracker from a JSON string.
+    ///
+    /// After deserialization, entry consistency is validated: each
+    /// `WriteId` key must match the `StatusEntry`'s `write_id` field.
+    pub fn from_json(json: &str) -> Result<Self, io::Error> {
+        let tracker: Self = serde_json::from_str(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        tracker.validate_entry_consistency()?;
+        Ok(tracker)
+    }
+
+    /// Save the tracker to a file as JSON.
+    pub fn save(&self, path: &Path) -> Result<(), io::Error> {
+        let json = self.to_json()?;
+        std::fs::write(path, json)
+    }
+
+    /// Load a tracker from a JSON file.
+    ///
+    /// Performs entry consistency validation after loading.
+    pub fn load(path: &Path) -> Result<Self, io::Error> {
+        let json = std::fs::read_to_string(path)?;
+        Self::from_json(&json)
+    }
+
+    /// Validate that every `WriteId` key matches its `StatusEntry`'s `write_id`.
+    ///
+    /// Returns an error if any key is inconsistent with the entry it maps to
+    /// (e.g., due to manual editing or data corruption).
+    fn validate_entry_consistency(&self) -> Result<(), io::Error> {
+        for (key, entry) in &self.entries {
+            if *key != entry.write_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "entry key mismatch: key {:?} does not match entry write_id {:?}",
+                        key, entry.write_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -632,5 +719,189 @@ mod tests {
         tracker.cleanup(&ts(2000, 0, "node-a"), 500);
 
         assert_eq!(tracker.total_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn serde_roundtrip_status_entry() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("key-1", 1000);
+        tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
+
+        let entry = tracker.get_entry(&wid).unwrap();
+        let json = serde_json::to_string(entry).expect("serialize");
+        let back: StatusEntry = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.write_id, wid);
+        assert_eq!(back.status, CertificationStatus::Pending);
+        assert_eq!(back.acked_by.len(), 1);
+        assert!(back.acked_by.contains(&auth("auth-1")));
+        assert_eq!(back.acks_required, 3);
+    }
+
+    #[test]
+    fn serde_roundtrip_certification_tracker() {
+        let mut tracker = CertificationTracker::with_timeout(5000);
+        let wid1 = write_id("key-1", 1000);
+        let wid2 = write_id("key-2", 2000);
+        let wid3 = write_id("key-3", 3000);
+
+        tracker.register_write(wid1.clone(), 3, ts(1000, 0, "node-a"));
+        tracker.register_write(wid2.clone(), 1, ts(2000, 0, "node-a"));
+        tracker.register_write(wid3.clone(), 2, ts(3000, 0, "node-a"));
+
+        // Certify wid2
+        tracker.record_ack(&wid2, auth("auth-1"), ts(2001, 0, "auth-1"));
+        // Partially ack wid1
+        tracker.record_ack(&wid1, auth("auth-1"), ts(1001, 0, "auth-1"));
+
+        let json = tracker.to_json().expect("serialize");
+        let restored = CertificationTracker::from_json(&json).expect("deserialize");
+
+        assert_eq!(restored.total_count(), 3);
+        assert_eq!(
+            restored.get_status(&wid1),
+            Some(CertificationStatus::Pending)
+        );
+        assert_eq!(
+            restored.get_status(&wid2),
+            Some(CertificationStatus::Certified)
+        );
+        assert_eq!(
+            restored.get_status(&wid3),
+            Some(CertificationStatus::Pending)
+        );
+
+        // Verify acks are preserved
+        let entry1 = restored.get_entry(&wid1).unwrap();
+        assert_eq!(entry1.acked_by.len(), 1);
+        assert!(entry1.acked_by.contains(&auth("auth-1")));
+    }
+
+    #[test]
+    fn serde_roundtrip_empty_tracker() {
+        let tracker = CertificationTracker::new();
+        let json = tracker.to_json().expect("serialize");
+        let restored = CertificationTracker::from_json(&json).expect("deserialize");
+        assert_eq!(restored.total_count(), 0);
+    }
+
+    #[test]
+    fn save_and_load_tracker() {
+        let mut tracker = CertificationTracker::with_timeout(10_000);
+        let wid1 = write_id("key-1", 1000);
+        let wid2 = write_id("key-2", 2000);
+
+        tracker.register_write(wid1.clone(), 2, ts(1000, 0, "node-a"));
+        tracker.register_write(wid2.clone(), 1, ts(2000, 0, "node-a"));
+        tracker.record_ack(&wid2, auth("auth-1"), ts(2001, 0, "auth-1"));
+
+        let dir = std::env::temp_dir().join("asteroidb_test_tracker_save");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("tracker.json");
+
+        tracker.save(&path).expect("save");
+        let restored = CertificationTracker::load(&path).expect("load");
+
+        assert_eq!(restored.total_count(), 2);
+        assert_eq!(restored.pending_count(), 1);
+        assert_eq!(
+            restored.get_status(&wid1),
+            Some(CertificationStatus::Pending)
+        );
+        assert_eq!(
+            restored.get_status(&wid2),
+            Some(CertificationStatus::Certified)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restored_tracker_continues_certification() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("key-1", 1000);
+        tracker.register_write(wid.clone(), 2, ts(1000, 0, "node-a"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
+
+        // Save while partially acked
+        let json = tracker.to_json().expect("serialize");
+        let mut restored = CertificationTracker::from_json(&json).expect("deserialize");
+
+        // Continue certification on restored tracker
+        let status = restored.record_ack(&wid, auth("auth-2"), ts(1002, 0, "auth-2"));
+        assert_eq!(status, Some(CertificationStatus::Certified));
+    }
+
+    #[test]
+    fn restored_tracker_timeout_still_works() {
+        let mut tracker = CertificationTracker::with_timeout(5000);
+        let wid = write_id("key-1", 1000);
+        tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
+
+        let json = tracker.to_json().expect("serialize");
+        let mut restored = CertificationTracker::from_json(&json).expect("deserialize");
+
+        // Timeout should work on restored tracker
+        restored.check_timeouts(&ts(7000, 0, "node-a"));
+        assert_eq!(
+            restored.get_status(&wid),
+            Some(CertificationStatus::Timeout)
+        );
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_error() {
+        let path = std::path::PathBuf::from("/tmp/asteroidb_nonexistent_tracker.json");
+        let result = CertificationTracker::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_json_invalid_data_returns_error() {
+        let result = CertificationTracker::from_json("not valid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_and_load_preserves_all_statuses() {
+        let mut tracker = CertificationTracker::with_timeout(100);
+        let wid_pending = write_id("pending", 10000);
+        let wid_certified = write_id("certified", 2000);
+        let wid_rejected = write_id("rejected", 3000);
+        let wid_timeout = write_id("timeout", 4000);
+
+        tracker.register_write(wid_pending.clone(), 3, ts(10000, 0, "node-a"));
+        tracker.register_write(wid_certified.clone(), 1, ts(2000, 0, "node-a"));
+        tracker.register_write(wid_rejected.clone(), 3, ts(3000, 0, "node-a"));
+        tracker.register_write(wid_timeout.clone(), 3, ts(100, 0, "node-a"));
+
+        tracker.record_ack(&wid_certified, auth("auth-1"), ts(2001, 0, "auth-1"));
+        tracker.reject(&wid_rejected, ts(3001, 0, "auth-1"));
+        tracker.check_timeouts(&ts(10000, 0, "node-a"));
+
+        let json = tracker.to_json().expect("serialize");
+        let restored = CertificationTracker::from_json(&json).expect("deserialize");
+
+        assert_eq!(
+            restored.get_status(&wid_pending),
+            Some(CertificationStatus::Pending)
+        );
+        assert_eq!(
+            restored.get_status(&wid_certified),
+            Some(CertificationStatus::Certified)
+        );
+        assert_eq!(
+            restored.get_status(&wid_rejected),
+            Some(CertificationStatus::Rejected)
+        );
+        assert_eq!(
+            restored.get_status(&wid_timeout),
+            Some(CertificationStatus::Timeout)
+        );
     }
 }

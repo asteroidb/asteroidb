@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -66,9 +68,41 @@ impl FrontierScope {
 /// eligibility (`majority_frontier`, `is_certified_at`).  Both unscoped
 /// (all entries) and scoped (filtered by key_range + policy_version)
 /// query variants are available.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AckFrontierSet {
+    #[serde(with = "frontier_map_serde")]
     frontiers: HashMap<FrontierScope, AckFrontier>,
+}
+
+/// Custom serde for `HashMap<FrontierScope, AckFrontier>`.
+///
+/// JSON only supports string keys, so we serialize the map as a
+/// `Vec<(FrontierScope, AckFrontier)>` instead.
+mod frontier_map_serde {
+    use super::*;
+    use serde::de::Deserializer;
+    use serde::ser::Serializer;
+
+    pub fn serialize<S>(
+        map: &HashMap<FrontierScope, AckFrontier>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let vec: Vec<(&FrontierScope, &AckFrontier)> = map.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<FrontierScope, AckFrontier>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(FrontierScope, AckFrontier)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
 }
 
 impl AckFrontierSet {
@@ -223,6 +257,61 @@ impl AckFrontierSet {
             Some(ref mf) => timestamp <= mf,
             None => false,
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence
+    // ---------------------------------------------------------------
+
+    /// Serialize the frontier set to a JSON string.
+    pub fn to_json(&self) -> Result<String, io::Error> {
+        serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Deserialize a frontier set from a JSON string.
+    ///
+    /// After deserialization, scope consistency is validated: each entry's
+    /// `FrontierScope` key must match the `AckFrontier` value it maps to.
+    pub fn from_json(json: &str) -> Result<Self, io::Error> {
+        let set: Self = serde_json::from_str(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        set.validate_scope_consistency()?;
+        Ok(set)
+    }
+
+    /// Save the frontier set to a file as JSON.
+    pub fn save(&self, path: &Path) -> Result<(), io::Error> {
+        let json = self.to_json()?;
+        std::fs::write(path, json)
+    }
+
+    /// Load a frontier set from a JSON file.
+    ///
+    /// Performs scope consistency validation after loading.
+    pub fn load(path: &Path) -> Result<Self, io::Error> {
+        let json = std::fs::read_to_string(path)?;
+        Self::from_json(&json)
+    }
+
+    /// Validate that every `FrontierScope` key matches its `AckFrontier` value.
+    ///
+    /// Returns an error if any scope key is inconsistent with the frontier
+    /// it maps to (e.g., due to manual editing or data corruption).
+    fn validate_scope_consistency(&self) -> Result<(), io::Error> {
+        for (scope, frontier) in &self.frontiers {
+            let expected = FrontierScope::from_frontier(frontier);
+            if *scope != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "scope mismatch: key {:?} does not match frontier {:?}",
+                        scope, expected
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -751,5 +840,159 @@ mod tests {
         // v1 entries not contaminated by v2
         assert!(set.is_certified_at_for_scope(&make_ts(100, 0, "c"), &kr("user/"), &pv(1), 3));
         assert!(!set.is_certified_at_for_scope(&make_ts(100, 0, "c"), &kr("user/"), &pv(2), 3));
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn serde_roundtrip_ack_frontier_set() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+        set.update(make_frontier("auth-2", 200, 0, "user/"));
+        set.update(make_frontier("auth-1", 300, 0, "order/"));
+
+        let json = set.to_json().expect("serialize");
+        let restored = AckFrontierSet::from_json(&json).expect("deserialize");
+
+        assert_eq!(restored.all().len(), 3);
+
+        let scope_user_1 = FrontierScope::new(kr("user/"), pv(1), NodeId("auth-1".into()));
+        let scope_user_2 = FrontierScope::new(kr("user/"), pv(1), NodeId("auth-2".into()));
+        let scope_order = FrontierScope::new(kr("order/"), pv(1), NodeId("auth-1".into()));
+
+        assert_eq!(
+            restored
+                .get_scoped(&scope_user_1)
+                .unwrap()
+                .frontier_hlc
+                .physical,
+            100
+        );
+        assert_eq!(
+            restored
+                .get_scoped(&scope_user_2)
+                .unwrap()
+                .frontier_hlc
+                .physical,
+            200
+        );
+        assert_eq!(
+            restored
+                .get_scoped(&scope_order)
+                .unwrap()
+                .frontier_hlc
+                .physical,
+            300
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip_empty_frontier_set() {
+        let set = AckFrontierSet::new();
+        let json = set.to_json().expect("serialize");
+        let restored = AckFrontierSet::from_json(&json).expect("deserialize");
+        assert!(restored.all().is_empty());
+    }
+
+    #[test]
+    fn save_and_load_frontier_set() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+        set.update(make_frontier("auth-2", 200, 0, "user/"));
+        set.update(make_frontier_v("auth-1", 50, 0, "user/", 2));
+
+        let dir = std::env::temp_dir().join("asteroidb_test_frontier_save");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("frontier_set.json");
+
+        set.save(&path).expect("save");
+        let restored = AckFrontierSet::load(&path).expect("load");
+
+        assert_eq!(restored.all().len(), 3);
+
+        // Verify scoped queries work on restored data
+        let mf = restored
+            .majority_frontier_for_scope(&kr("user/"), &pv(1), 3)
+            .unwrap();
+        assert_eq!(mf.physical, 100);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_and_load_preserves_scope_info() {
+        let mut set = AckFrontierSet::new();
+
+        // Multiple scopes: different key ranges and policy versions
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.update(make_frontier_v("auth-2", 200, 0, "user/", 1));
+        set.update(make_frontier_v("auth-1", 50, 0, "order/", 1));
+        set.update(make_frontier_v("auth-1", 10, 0, "user/", 2));
+
+        let dir = std::env::temp_dir().join("asteroidb_test_frontier_scope");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("frontier_scoped.json");
+
+        set.save(&path).expect("save");
+        let restored = AckFrontierSet::load(&path).expect("load");
+
+        assert_eq!(restored.all().len(), 4);
+
+        // Verify each scope independently
+        assert_eq!(restored.all_for_scope(&kr("user/"), &pv(1)).len(), 2);
+        assert_eq!(restored.all_for_scope(&kr("order/"), &pv(1)).len(), 1);
+        assert_eq!(restored.all_for_scope(&kr("user/"), &pv(2)).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_error() {
+        let path = std::path::PathBuf::from("/tmp/asteroidb_nonexistent_frontier.json");
+        let result = AckFrontierSet::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_json_invalid_data_returns_error() {
+        let result = AckFrontierSet::from_json("not valid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scope_consistency_validated_on_load() {
+        // Build valid JSON then corrupt the scope key to create a mismatch.
+        // The serialized format is a Vec of (FrontierScope, AckFrontier) tuples.
+        // We corrupt the scope's authority_id so it no longer matches the frontier's.
+        let corrupted_json = r#"{
+            "frontiers": [
+                [
+                    {
+                        "key_range": {"prefix": "user/"},
+                        "policy_version": 1,
+                        "authority_id": "auth-WRONG"
+                    },
+                    {
+                        "authority_id": "auth-1",
+                        "frontier_hlc": {"physical": 100, "logical": 0, "node_id": "auth-1"},
+                        "key_range": {"prefix": "user/"},
+                        "policy_version": 1,
+                        "digest_hash": "auth-1-100-0"
+                    }
+                ]
+            ]
+        }"#;
+
+        let result = AckFrontierSet::from_json(corrupted_json);
+        assert!(result.is_err());
+
+        // Verify the error message mentions scope mismatch
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("scope mismatch"),
+            "expected scope mismatch error, got: {err_msg}"
+        );
     }
 }
