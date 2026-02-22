@@ -1,3 +1,4 @@
+pub mod api;
 pub mod authority;
 pub mod crdt;
 pub mod error;
