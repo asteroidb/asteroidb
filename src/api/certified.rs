@@ -83,6 +83,8 @@ pub struct CertifiedApi {
     namespace: SystemNamespace,
     pending_writes: Vec<PendingWrite>,
     retention: RetentionPolicy,
+    /// Cumulative count of pending writes evicted due to `max_entries` pressure.
+    evicted_count: u64,
 }
 
 impl CertifiedApi {
@@ -98,6 +100,7 @@ impl CertifiedApi {
             namespace,
             pending_writes: Vec::new(),
             retention: RetentionPolicy::default(),
+            evicted_count: 0,
         }
     }
 
@@ -114,6 +117,7 @@ impl CertifiedApi {
             namespace,
             pending_writes: Vec::new(),
             retention,
+            evicted_count: 0,
         }
     }
 
@@ -176,6 +180,16 @@ impl CertifiedApi {
     /// Returns `Err(CrdtError::PolicyDenied)` if no authority definition
     /// covers the key.
     ///
+    /// ## Capacity enforcement
+    ///
+    /// `max_entries` is enforced as a hard limit. When the pending list
+    /// reaches capacity:
+    /// 1. Completed (non-`Pending`) entries are removed first.
+    /// 2. If still at capacity, the **oldest** `Pending` entries are evicted
+    ///    (marked `Timeout` and removed) to make room for the new write.
+    ///
+    /// Evictions are tracked via [`evicted_count`](Self::evicted_count).
+    ///
     /// If the write is already certified at the current scoped frontier,
     /// returns `Ok(CertificationStatus::Certified)`. Otherwise, behaviour
     /// depends on `on_timeout`:
@@ -195,6 +209,25 @@ impl CertifiedApi {
         // Auto-cleanup when capacity is exceeded.
         if self.pending_writes.len() >= self.retention.max_entries {
             self.cleanup_completed();
+        }
+
+        // Hard eviction: if still at capacity after removing completed entries,
+        // evict oldest pending writes (mark as Timeout then remove) to make room.
+        if self.pending_writes.len() >= self.retention.max_entries {
+            let evict_count = self.pending_writes.len() - self.retention.max_entries + 1;
+            let mut evicted = 0;
+            for pw in &mut self.pending_writes {
+                if evicted >= evict_count {
+                    break;
+                }
+                if pw.status == CertificationStatus::Pending {
+                    pw.status = CertificationStatus::Timeout;
+                    evicted += 1;
+                }
+            }
+            self.evicted_count += evicted as u64;
+            self.pending_writes
+                .retain(|pw| pw.status != CertificationStatus::Timeout);
         }
 
         let timestamp = self.clock.now();
@@ -317,6 +350,16 @@ impl CertifiedApi {
     /// Return a slice of all tracked writes.
     pub fn pending_writes(&self) -> &[PendingWrite] {
         &self.pending_writes
+    }
+
+    /// Return the cumulative count of pending writes evicted due to
+    /// `max_entries` pressure.
+    ///
+    /// This counter increments each time `certified_write` must forcibly
+    /// mark oldest `Pending` entries as `Timeout` and remove them because
+    /// `cleanup_completed` alone could not bring the size below `max_entries`.
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted_count
     }
 
     /// Return a reference to the system namespace.
@@ -808,12 +851,117 @@ mod tests {
             }
         }
 
-        // The number of tracked writes must be bounded.
+        // The number of tracked writes must never exceed max_entries.
         assert!(
-            api.pending_writes().len() <= 20,
-            "expected bounded growth, got {} entries",
+            api.pending_writes().len() <= 10,
+            "expected bounded growth <= max_entries(10), got {} entries",
             api.pending_writes().len()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Hard limit: all-pending eviction
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn all_pending_eviction_enforces_hard_limit() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 3,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        // Fill to capacity with all-pending writes (no certification).
+        for i in 0..3u64 {
+            api.certified_write(format!("key-{i}"), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+        }
+        assert_eq!(api.pending_writes().len(), 3);
+        assert_eq!(api.evicted_count(), 0);
+
+        // Writing a 4th entry must evict the oldest pending to stay <= max_entries.
+        api.certified_write("key-3".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+
+        assert!(
+            api.pending_writes().len() <= 3,
+            "expected <= 3, got {}",
+            api.pending_writes().len()
+        );
+        assert!(api.evicted_count() > 0, "expected evictions to be tracked");
+
+        // The evicted entry should be the oldest one (key-0).
+        assert!(
+            !api.pending_writes().iter().any(|pw| pw.key == "key-0"),
+            "oldest pending write should have been evicted"
+        );
+        // The newest write should be present.
+        assert!(
+            api.pending_writes().iter().any(|pw| pw.key == "key-3"),
+            "newest write should be present"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Eviction counter tracks cumulative evictions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn evicted_count_tracks_cumulative_evictions() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 2,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        // Fill to capacity.
+        api.certified_write("a".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("b".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(api.evicted_count(), 0);
+
+        // Each additional write evicts 1 oldest pending.
+        api.certified_write("c".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(api.evicted_count(), 1);
+
+        api.certified_write("d".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(api.evicted_count(), 2);
+
+        // Size never exceeds max_entries.
+        assert!(api.pending_writes().len() <= 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Hard limit under sustained all-pending writes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn hard_limit_under_sustained_all_pending_writes() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 5,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        // 100 writes, none ever certified — pure backpressure scenario.
+        for i in 0..100u64 {
+            api.certified_write(format!("key-{i}"), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+
+            assert!(
+                api.pending_writes().len() <= 5,
+                "iteration {i}: expected <= 5, got {}",
+                api.pending_writes().len()
+            );
+        }
+
+        // Exactly max_entries entries remain.
+        assert_eq!(api.pending_writes().len(), 5);
+        // 95 entries were evicted (100 writes - 5 retained).
+        assert_eq!(api.evicted_count(), 95);
     }
 
     // ---------------------------------------------------------------
