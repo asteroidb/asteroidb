@@ -60,15 +60,16 @@ impl ControlPlaneConsensus {
     }
 
     /// Returns `true` if the given approvals constitute a majority of the
-    /// authority nodes.
+    /// authority nodes. Duplicate approvals from the same node are counted
+    /// only once, and approvals from non-authority nodes are ignored.
     pub fn has_majority(&self, approvals: &[NodeId]) -> bool {
         let authority_set: HashSet<&NodeId> = self.authority_nodes.iter().collect();
-        let valid_approvals = approvals
+        let unique_valid: HashSet<&NodeId> = approvals
             .iter()
             .filter(|a| authority_set.contains(a))
-            .count();
+            .collect();
         let majority = self.authority_nodes.len() / 2 + 1;
-        valid_approvals >= majority
+        unique_valid.len() >= majority
     }
 }
 
@@ -133,6 +134,49 @@ mod tests {
         let c = three_node_consensus();
         // "n4" is not an authority node, so only "n1" counts
         assert!(!c.has_majority(&[node_id("n1"), node_id("n4")]));
+    }
+
+    #[test]
+    fn duplicate_approvals_counted_once() {
+        let c = three_node_consensus();
+        // "n1" appears three times but should count as only one unique approval
+        assert!(!c.has_majority(&[node_id("n1"), node_id("n1"), node_id("n1")]));
+    }
+
+    #[test]
+    fn duplicate_approvals_do_not_inflate_quorum() {
+        let c = three_node_consensus();
+        // Two unique authority nodes (n1, n2) = majority, even with duplicates
+        assert!(c.has_majority(&[node_id("n1"), node_id("n2"), node_id("n1"), node_id("n2")]));
+        // One unique authority node (n1) repeated != majority
+        assert!(!c.has_majority(&[node_id("n1"), node_id("n1")]));
+    }
+
+    #[test]
+    fn duplicate_non_authority_approvals_ignored() {
+        let c = three_node_consensus();
+        // "n4" is not authority; even duplicated many times, only n1 counts
+        assert!(!c.has_majority(&[node_id("n1"), node_id("n4"), node_id("n4"), node_id("n4")]));
+    }
+
+    #[test]
+    fn duplicate_approvals_policy_update_rejected() {
+        let mut c = three_node_consensus();
+        // Same node duplicated should not reach majority
+        let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1"), node_id("n1")]);
+        assert!(result.is_err());
+        assert!(c.namespace().get_placement_policy("user/").is_none());
+    }
+
+    #[test]
+    fn duplicate_approvals_authority_update_rejected() {
+        let mut c = three_node_consensus();
+        let result = c.propose_authority_update(
+            make_authority_def("user/", &["a1"]),
+            &[node_id("n1"), node_id("n1")],
+        );
+        assert!(result.is_err());
+        assert!(c.namespace().get_authority_definition("user/").is_none());
     }
 
     #[test]
