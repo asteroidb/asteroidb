@@ -57,6 +57,8 @@
 - Set: OR-Set
 - Map: OR-Map + LWW-Register
 - MVP の公開 API は型ごと専用 API (`counter_inc`, `orset_add` など) を採用すること
+- API 命名規則は `crdt.<type>.<op>` を正規形とすること
+- エラー体系は型共通のエラーコードセットを採用すること
 - 将来拡張として汎用 op-envelope API (`apply_op(type, op, payload)`) を追加可能にすること
 
 ### FR-006: 配置・ローカライゼーション
@@ -143,5 +145,5 @@
 ## 8. 未決事項 (次ラウンドで確定)
 
 - `keyset_version` / `epoch` の既定値とローテーション手順詳細
-- CRDT 専用 API の命名規則とエラー体系
+- CRDT 共通エラーコードの最終一覧
 - `digest_hash` チェックポイント周期と再検証トリガー条件
