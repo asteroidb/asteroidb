@@ -297,13 +297,13 @@ fn five_node_concurrent_register_write_lww_wins() {
 
     // Each node writes to the same register with increasing timestamps.
     // Node 4 has the highest timestamp, so its value should win.
-    for i in 0..5 {
+    for (i, store) in stores.iter_mut().enumerate() {
         let mut reg = LwwRegister::new();
         reg.set(
             format!("value-{}", i),
             ts((i as u64 + 1) * 100, 0, &format!("node-{}", i)),
         );
-        stores[i].put("shared-reg".into(), CrdtValue::Register(reg));
+        store.put("shared-reg".into(), CrdtValue::Register(reg));
     }
 
     full_mesh_merge(&mut stores);
