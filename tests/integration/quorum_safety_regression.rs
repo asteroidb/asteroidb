@@ -15,7 +15,7 @@ use asteroidb_poc::authority::certificate::{
 };
 use asteroidb_poc::compaction::{CompactionConfig, CompactionEngine};
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
-use asteroidb_poc::control_plane::system_namespace::AuthorityDefinition;
+use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::placement::PlacementPolicy;
@@ -84,6 +84,17 @@ fn counter_value(n: i64) -> CrdtValue {
         counter.increment(&writer);
     }
     CrdtValue::Counter(counter)
+}
+
+/// Create a default SystemNamespace with a single authority definition
+/// covering the empty prefix (all keys), with 3 authority nodes.
+fn default_namespace() -> SystemNamespace {
+    let mut ns = SystemNamespace::new();
+    ns.set_authority_definition(AuthorityDefinition {
+        key_range: key_range(""),
+        authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+    });
+    ns
 }
 
 fn make_key_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
@@ -679,7 +690,7 @@ fn retention_auto_cleanup_removes_completed_entries() {
         max_age_ms: 60_000,
         max_entries: 5,
     };
-    let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+    let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
     // Write 5 entries (hitting capacity)
     for i in 0..5 {
@@ -730,7 +741,7 @@ fn retention_expired_writes_marked_timeout_and_removed() {
         max_age_ms: 1_000,
         max_entries: 10_000,
     };
-    let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+    let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
     api.certified_write("ephemeral".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
@@ -756,7 +767,7 @@ fn retention_full_cleanup_lifecycle() {
         max_age_ms: 5_000,
         max_entries: 100,
     };
-    let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+    let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
     // Write entry A (will be certified)
     api.certified_write("cert-me".into(), counter_value(1), OnTimeout::Pending)
@@ -791,7 +802,7 @@ fn retention_bounded_growth_under_sustained_writes() {
         max_age_ms: 60_000,
         max_entries: 10,
     };
-    let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+    let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
     for i in 0..100u64 {
         api.certified_write(format!("key-{i}"), counter_value(1), OnTimeout::Pending)
