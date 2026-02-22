@@ -90,21 +90,38 @@ impl MajorityCertificate {
     }
 
     /// Add a signature from an authority node.
+    ///
+    /// Duplicate signatures from the same authority are silently ignored
+    /// to prevent a single authority from inflating the majority count.
     pub fn add_signature(&mut self, sig: AuthoritySignature) {
+        if self
+            .signatures
+            .iter()
+            .any(|s| s.authority_id == sig.authority_id)
+        {
+            return;
+        }
         self.signatures.push(sig);
     }
 
-    /// Return the number of collected signatures.
+    /// Return the number of unique signers.
     pub fn signature_count(&self) -> usize {
-        self.signatures.len()
+        self.unique_signer_count()
     }
 
-    /// Check whether a strict majority of authorities have signed.
+    /// Check whether a strict majority of unique authorities have signed.
     ///
     /// Majority threshold is `total_authorities / 2 + 1`.
     pub fn has_majority(&self, total_authorities: usize) -> bool {
         let needed = majority_threshold(total_authorities);
-        self.signatures.len() >= needed
+        self.unique_signer_count() >= needed
+    }
+
+    /// Count unique authority IDs among collected signatures.
+    fn unique_signer_count(&self) -> usize {
+        let unique: std::collections::HashSet<&NodeId> =
+            self.signatures.iter().map(|s| &s.authority_id).collect();
+        unique.len()
     }
 
     /// Verify all signatures against the given message bytes.
@@ -397,5 +414,81 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let back: KeysetVersion = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn duplicate_signature_same_authority_ignored() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_signature(AuthoritySignature {
+            authority_id: NodeId("auth-1".into()),
+            public_key: vk,
+            signature: sig,
+        });
+
+        // Add a second signature from the same authority (should be ignored)
+        let (sk2, vk2) = make_key_pair();
+        let sig2 = sign_message(&sk2, &message);
+        cert.add_signature(AuthoritySignature {
+            authority_id: NodeId("auth-1".into()),
+            public_key: vk2,
+            signature: sig2,
+        });
+
+        assert_eq!(cert.signature_count(), 1);
+        assert!(!cert.has_majority(3)); // 1 < 2 needed
+    }
+
+    #[test]
+    fn duplicate_signatures_do_not_inflate_majority() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+
+        // Add one legitimate signature
+        let (sk1, vk1) = make_key_pair();
+        let sig1 = sign_message(&sk1, &message);
+        cert.add_signature(AuthoritySignature {
+            authority_id: NodeId("auth-1".into()),
+            public_key: vk1,
+            signature: sig1,
+        });
+
+        // Try to add the same authority 4 more times (all should be ignored)
+        for _ in 0..4 {
+            let (sk, vk) = make_key_pair();
+            let sig = sign_message(&sk, &message);
+            cert.add_signature(AuthoritySignature {
+                authority_id: NodeId("auth-1".into()),
+                public_key: vk,
+                signature: sig,
+            });
+        }
+
+        // Still only 1 unique signer, cannot reach majority of 3
+        assert_eq!(cert.signature_count(), 1);
+        assert!(!cert.has_majority(3));
+
+        // Now add a genuinely different authority
+        let (sk2, vk2) = make_key_pair();
+        let sig2 = sign_message(&sk2, &message);
+        cert.add_signature(AuthoritySignature {
+            authority_id: NodeId("auth-2".into()),
+            public_key: vk2,
+            signature: sig2,
+        });
+
+        assert_eq!(cert.signature_count(), 2);
+        assert!(cert.has_majority(3)); // 2 >= 3/2+1 = 2
     }
 }

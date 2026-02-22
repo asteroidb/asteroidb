@@ -554,7 +554,7 @@ fn certification_tracker_with_frontier_set() {
         logical: 0,
         node_id: "auth-1".into(),
     };
-    tracker.record_ack(&write_id, ack1_ts);
+    tracker.record_ack(&write_id, node("auth-1"), ack1_ts);
 
     // Check: 1 ack, not enough
     assert_eq!(
@@ -570,7 +570,7 @@ fn certification_tracker_with_frontier_set() {
         logical: 0,
         node_id: "auth-2".into(),
     };
-    let status = tracker.record_ack(&write_id, ack2_ts);
+    let status = tracker.record_ack(&write_id, node("auth-2"), ack2_ts);
 
     // Now both tracker and frontier_set agree: certified
     assert_eq!(status, Some(CertificationStatus::Certified));
