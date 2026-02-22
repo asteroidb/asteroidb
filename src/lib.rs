@@ -5,6 +5,7 @@ pub mod control_plane;
 pub mod crdt;
 pub mod error;
 pub mod hlc;
+pub mod http;
 pub mod node;
 pub mod ops;
 pub mod placement;
