@@ -1,9 +1,20 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::placement::PlacementPolicy;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+/// Error type for system namespace persistence operations.
+#[derive(Debug, Error)]
+pub enum PersistError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
 
 /// Defines which nodes are authorities for a key range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,7 +25,7 @@ pub struct AuthorityDefinition {
 
 /// The system namespace stores all control-plane configuration.
 /// Updates require control-plane Authority consensus (FR-009).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemNamespace {
     version: PolicyVersion,
     placement_policies: HashMap<String, PlacementPolicy>,
@@ -99,6 +110,34 @@ impl SystemNamespace {
             .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, def)| def)
+    }
+
+    /// Saves the system namespace to a JSON file at the given path.
+    ///
+    /// Writes to a temporary file first, then atomically renames to ensure
+    /// crash safety. If the parent directory does not exist, it is created.
+    pub fn save(&self, path: &Path) -> Result<(), PersistError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Loads a system namespace from a JSON file.
+    ///
+    /// Returns `Ok(None)` if the file does not exist, allowing callers to
+    /// fall back to a fresh namespace via [`SystemNamespace::new`].
+    pub fn load(path: &Path) -> Result<Option<Self>, PersistError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(path)?;
+        let ns: Self = serde_json::from_str(&data)?;
+        Ok(Some(ns))
     }
 
     fn bump_version(&mut self) {
@@ -363,5 +402,120 @@ mod tests {
         let back: AuthorityDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(back.key_range.prefix, "user/");
         assert_eq!(back.authority_nodes.len(), 3);
+    }
+
+    // --- Serde for SystemNamespace ---
+
+    #[test]
+    fn serde_system_namespace_round_trip() {
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/"));
+        ns.set_authority_definition(make_authority_def("user/", &["n1", "n2", "n3"]));
+
+        let json = serde_json::to_string(&ns).unwrap();
+        let back: SystemNamespace = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(*back.version(), *ns.version());
+        assert!(back.get_placement_policy("user/").is_some());
+        assert!(back.get_authority_definition("user/").is_some());
+        assert_eq!(back.version_history(), ns.version_history());
+    }
+
+    // --- Persistence (save / load) ---
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.json");
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("order/"));
+        ns.set_authority_definition(make_authority_def("user/", &["n1", "n2", "n3"]));
+
+        ns.save(&path).unwrap();
+        let loaded = SystemNamespace::load(&path).unwrap().unwrap();
+
+        assert_eq!(*loaded.version(), *ns.version());
+        assert_eq!(loaded.version_history(), ns.version_history());
+        assert_eq!(loaded.all_placement_policies().len(), 2);
+        assert!(loaded.get_placement_policy("user/").is_some());
+        assert!(loaded.get_placement_policy("order/").is_some());
+        assert!(loaded.get_authority_definition("user/").is_some());
+        assert_eq!(
+            loaded
+                .get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn load_nonexistent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.json");
+        let result = SystemNamespace::load(&path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn save_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("dir").join("ns.json");
+
+        let ns = SystemNamespace::new();
+        ns.save(&path).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn version_continues_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.json");
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/"));
+        // version is now 2
+        ns.save(&path).unwrap();
+
+        let mut loaded = SystemNamespace::load(&path).unwrap().unwrap();
+        assert_eq!(*loaded.version(), PolicyVersion(2));
+
+        loaded.set_placement_policy(make_policy("order/"));
+        assert_eq!(*loaded.version(), PolicyVersion(3));
+        assert_eq!(
+            loaded.version_history(),
+            &[PolicyVersion(1), PolicyVersion(2), PolicyVersion(3)]
+        );
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.json");
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/"));
+        ns.save(&path).unwrap();
+
+        ns.set_placement_policy(make_policy("order/"));
+        ns.save(&path).unwrap();
+
+        let loaded = SystemNamespace::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.all_placement_policies().len(), 2);
+        assert_eq!(*loaded.version(), *ns.version());
+    }
+
+    #[test]
+    fn load_corrupt_json_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let result = SystemNamespace::load(&path);
+        assert!(result.is_err());
     }
 }
