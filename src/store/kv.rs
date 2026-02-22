@@ -20,7 +20,7 @@ pub enum CrdtValue {
 
 impl CrdtValue {
     /// Returns a human-readable type name for error reporting.
-    fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &'static str {
         match self {
             CrdtValue::Counter(_) => "Counter",
             CrdtValue::Set(_) => "Set",
@@ -50,6 +50,11 @@ impl Store {
     /// Get a reference to the value associated with `key`.
     pub fn get(&self, key: &str) -> Option<&CrdtValue> {
         self.data.get(key)
+    }
+
+    /// Get a mutable reference to the value associated with `key`.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut CrdtValue> {
+        self.data.get_mut(key)
     }
 
     /// Insert or replace a value for the given key.
