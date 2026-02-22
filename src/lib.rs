@@ -8,5 +8,6 @@ pub mod hlc;
 pub mod node;
 pub mod ops;
 pub mod placement;
+pub mod runtime;
 pub mod store;
 pub mod types;
