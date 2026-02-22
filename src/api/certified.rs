@@ -1,8 +1,9 @@
 use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::store::kv::{CrdtValue, Store};
-use crate::types::{CertificationStatus, NodeId};
+use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// What to do when `certified_write` cannot achieve consensus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,12 @@ pub struct PendingWrite {
     pub timestamp: HlcTimestamp,
     /// Current certification status.
     pub status: CertificationStatus,
+    /// The resolved key range for this write's authority scope.
+    pub key_range: KeyRange,
+    /// The policy version in effect when this write was issued.
+    pub policy_version: PolicyVersion,
+    /// The total number of authorities for this write's key range.
+    pub total_authorities: usize,
 }
 
 /// Configuration for retention and cleanup of pending writes.
@@ -67,23 +74,28 @@ impl Default for RetentionPolicy {
 ///
 /// Provides `get_certified` and `certified_write` operations that integrate
 /// with the Authority ack_frontier to track and report certification status.
+/// Authority resolution uses longest-prefix match via `SystemNamespace` to
+/// ensure certification decisions are scoped to the correct key range.
 pub struct CertifiedApi {
     store: Store,
     clock: Hlc,
     frontiers: AckFrontierSet,
-    total_authorities: usize,
+    namespace: SystemNamespace,
     pending_writes: Vec<PendingWrite>,
     retention: RetentionPolicy,
 }
 
 impl CertifiedApi {
     /// Create a new `CertifiedApi` for the given node.
-    pub fn new(node_id: NodeId, total_authorities: usize) -> Self {
+    ///
+    /// The `namespace` provides authority definitions for key-range-scoped
+    /// certification decisions via longest-prefix match.
+    pub fn new(node_id: NodeId, namespace: SystemNamespace) -> Self {
         Self {
             store: Store::new(),
             clock: Hlc::new(node_id.0),
             frontiers: AckFrontierSet::new(),
-            total_authorities,
+            namespace,
             pending_writes: Vec::new(),
             retention: RetentionPolicy::default(),
         }
@@ -92,29 +104,52 @@ impl CertifiedApi {
     /// Create a new `CertifiedApi` with a custom retention policy.
     pub fn with_retention(
         node_id: NodeId,
-        total_authorities: usize,
+        namespace: SystemNamespace,
         retention: RetentionPolicy,
     ) -> Self {
         Self {
             store: Store::new(),
             clock: Hlc::new(node_id.0),
             frontiers: AckFrontierSet::new(),
-            total_authorities,
+            namespace,
             pending_writes: Vec::new(),
             retention,
         }
     }
 
+    /// Resolve the authority scope for a given key.
+    ///
+    /// Uses longest-prefix match against authority definitions in the system
+    /// namespace. Returns the key range, current policy version, and total
+    /// authority count for that range.
+    fn resolve_scope(&self, key: &str) -> Result<(KeyRange, PolicyVersion, usize), CrdtError> {
+        let auth_def = self.namespace.get_authorities_for_key(key).ok_or_else(|| {
+            CrdtError::PolicyDenied(format!("no authority definition for key: {key}"))
+        })?;
+
+        let key_range = auth_def.key_range.clone();
+        let total = auth_def.authority_nodes.len();
+
+        let policy_version = self
+            .namespace
+            .get_placement_policy(&key_range.prefix)
+            .map(|p| p.version)
+            .unwrap_or(PolicyVersion(1));
+
+        Ok((key_range, policy_version, total))
+    }
+
     /// Read a key with certification status (FR-002).
     ///
     /// Returns the value (if present), its certification status based on
-    /// the latest pending write for that key, and the current majority frontier.
+    /// the latest pending write for that key, and the scoped majority frontier
+    /// for the key's authority range.
     pub fn get_certified(&self, key: &str) -> CertifiedRead<'_> {
         let value = self.store.get(key);
-        let frontier = self
-            .frontiers
-            .majority_frontier(self.total_authorities)
-            .cloned();
+
+        let frontier = self.resolve_scope(key).ok().and_then(|(kr, pv, total)| {
+            self.frontiers.majority_frontier_for_scope(&kr, &pv, total)
+        });
 
         let status = self
             .pending_writes
@@ -133,12 +168,17 @@ impl CertifiedApi {
 
     /// Write a value that requires Authority majority certification (FR-004).
     ///
-    /// The value is written to the local store immediately (eventual path).
-    /// A `PendingWrite` entry is created to track certification progress.
+    /// The key is resolved to an authority scope via longest-prefix match
+    /// in the system namespace. The value is written to the local store
+    /// immediately (eventual path). A `PendingWrite` entry is created to
+    /// track certification progress.
     ///
-    /// If the write is already certified at the current frontier, returns
-    /// `Ok(CertificationStatus::Certified)`. Otherwise, behaviour depends
-    /// on `on_timeout`:
+    /// Returns `Err(CrdtError::PolicyDenied)` if no authority definition
+    /// covers the key.
+    ///
+    /// If the write is already certified at the current scoped frontier,
+    /// returns `Ok(CertificationStatus::Certified)`. Otherwise, behaviour
+    /// depends on `on_timeout`:
     /// - `OnTimeout::Error` — returns `Err(CrdtError::Timeout)`.
     /// - `OnTimeout::Pending` — returns `Ok(CertificationStatus::Pending)`.
     ///
@@ -150,6 +190,8 @@ impl CertifiedApi {
         value: CrdtValue,
         on_timeout: OnTimeout,
     ) -> Result<CertificationStatus, CrdtError> {
+        let (key_range, policy_version, total_authorities) = self.resolve_scope(&key)?;
+
         // Auto-cleanup when capacity is exceeded.
         if self.pending_writes.len() >= self.retention.max_entries {
             self.cleanup_completed();
@@ -160,10 +202,13 @@ impl CertifiedApi {
         // Write to the local store (eventual consistency path).
         self.store.put(key.clone(), value.clone());
 
-        // Check if already certified at the current frontier.
-        let already_certified = self
-            .frontiers
-            .is_certified_at(&timestamp, self.total_authorities);
+        // Check if already certified at the current scoped frontier.
+        let already_certified = self.frontiers.is_certified_at_for_scope(
+            &timestamp,
+            &key_range,
+            &policy_version,
+            total_authorities,
+        );
 
         let status = if already_certified {
             CertificationStatus::Certified
@@ -176,6 +221,9 @@ impl CertifiedApi {
             value,
             timestamp,
             status,
+            key_range,
+            policy_version,
+            total_authorities,
         });
 
         if already_certified {
@@ -209,14 +257,18 @@ impl CertifiedApi {
 
     /// Re-evaluate all pending writes against the current frontiers.
     ///
-    /// Writes whose timestamps are at or below the majority frontier
-    /// are promoted to `Certified`.
+    /// Each write is checked against the scoped majority frontier for its
+    /// resolved key range. Writes whose timestamps are at or below the
+    /// scoped majority frontier are promoted to `Certified`.
     pub fn process_certifications(&mut self) {
         for pw in &mut self.pending_writes {
             if pw.status == CertificationStatus::Pending
-                && self
-                    .frontiers
-                    .is_certified_at(&pw.timestamp, self.total_authorities)
+                && self.frontiers.is_certified_at_for_scope(
+                    &pw.timestamp,
+                    &pw.key_range,
+                    &pw.policy_version,
+                    pw.total_authorities,
+                )
             {
                 pw.status = CertificationStatus::Certified;
             }
@@ -266,18 +318,31 @@ impl CertifiedApi {
     pub fn pending_writes(&self) -> &[PendingWrite] {
         &self.pending_writes
     }
+
+    /// Return a reference to the system namespace.
+    pub fn namespace(&self) -> &SystemNamespace {
+        &self.namespace
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::authority::ack_frontier::AckFrontier;
+    use crate::control_plane::system_namespace::AuthorityDefinition;
     use crate::crdt::pn_counter::PnCounter;
     use crate::hlc::HlcTimestamp;
+    use crate::placement::PlacementPolicy;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
 
     fn node(name: &str) -> NodeId {
         NodeId(name.into())
+    }
+
+    fn kr(prefix: &str) -> KeyRange {
+        KeyRange {
+            prefix: prefix.into(),
+        }
     }
 
     fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> AckFrontier {
@@ -296,6 +361,28 @@ mod tests {
         }
     }
 
+    fn make_frontier_v(
+        authority: &str,
+        physical: u64,
+        logical: u32,
+        prefix: &str,
+        version: u64,
+    ) -> AckFrontier {
+        AckFrontier {
+            authority_id: NodeId(authority.into()),
+            frontier_hlc: HlcTimestamp {
+                physical,
+                logical,
+                node_id: authority.into(),
+            },
+            key_range: KeyRange {
+                prefix: prefix.into(),
+            },
+            policy_version: PolicyVersion(version),
+            digest_hash: format!("{authority}-{physical}-{logical}"),
+        }
+    }
+
     fn counter_value(n: i64) -> CrdtValue {
         let mut counter = PnCounter::new();
         for _ in 0..n {
@@ -304,13 +391,29 @@ mod tests {
         CrdtValue::Counter(counter)
     }
 
+    /// Create a namespace with a single catch-all authority definition (prefix "")
+    /// with 3 authorities. This preserves backward-compatible behaviour for
+    /// existing tests.
+    fn default_namespace() -> SystemNamespace {
+        make_namespace("", &["auth-1", "auth-2", "auth-3"])
+    }
+
+    fn make_namespace(prefix: &str, authorities: &[&str]) -> SystemNamespace {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(prefix),
+            authority_nodes: authorities.iter().map(|a| node(a)).collect(),
+        });
+        ns
+    }
+
     // ---------------------------------------------------------------
     // get_certified with no data
     // ---------------------------------------------------------------
 
     #[test]
     fn get_certified_no_data() {
-        let api = CertifiedApi::new(node("node-1"), 3);
+        let api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.get_certified("missing");
 
         assert!(result.value.is_none());
@@ -324,7 +427,7 @@ mod tests {
 
     #[test]
     fn certified_write_creates_pending_entry() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending);
 
         assert_eq!(result.unwrap(), CertificationStatus::Pending);
@@ -339,7 +442,7 @@ mod tests {
 
     #[test]
     fn get_certification_status_pending_for_new_write() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
 
@@ -351,7 +454,7 @@ mod tests {
 
     #[test]
     fn get_certification_status_no_write_returns_pending() {
-        let api = CertifiedApi::new(node("node-1"), 3);
+        let api = CertifiedApi::new(node("node-1"), default_namespace());
         assert_eq!(
             api.get_certification_status("nonexistent"),
             CertificationStatus::Pending
@@ -364,7 +467,7 @@ mod tests {
 
     #[test]
     fn process_certifications_promotes_to_certified() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
 
@@ -384,7 +487,7 @@ mod tests {
 
     #[test]
     fn process_certifications_not_enough_authorities() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
 
@@ -404,7 +507,7 @@ mod tests {
 
     #[test]
     fn certified_write_on_timeout_error() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.certified_write("key1".into(), counter_value(1), OnTimeout::Error);
 
         assert_eq!(result.unwrap_err(), CrdtError::Timeout);
@@ -419,7 +522,7 @@ mod tests {
 
     #[test]
     fn certified_write_on_timeout_pending() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending);
 
         assert_eq!(result.unwrap(), CertificationStatus::Pending);
@@ -431,7 +534,7 @@ mod tests {
 
     #[test]
     fn get_certified_after_certification() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         api.certified_write("key1".into(), counter_value(5), OnTimeout::Pending)
             .unwrap();
 
@@ -455,7 +558,7 @@ mod tests {
 
     #[test]
     fn multiple_writes_selective_certification() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
 
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
@@ -489,7 +592,7 @@ mod tests {
 
     #[test]
     fn update_frontier_updates_tracking() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
 
         api.update_frontier(make_frontier("auth-1", 100, 0, ""));
         api.update_frontier(make_frontier("auth-2", 200, 0, ""));
@@ -506,7 +609,7 @@ mod tests {
 
     #[test]
     fn certified_write_stores_value_locally() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         api.certified_write("key1".into(), counter_value(3), OnTimeout::Pending)
             .unwrap();
 
@@ -524,7 +627,7 @@ mod tests {
 
     #[test]
     fn retention_policy_defaults() {
-        let api = CertifiedApi::new(node("node-1"), 3);
+        let api = CertifiedApi::new(node("node-1"), default_namespace());
         let policy = api.retention_policy();
         assert_eq!(policy.max_age_ms, 60_000);
         assert_eq!(policy.max_entries, 10_000);
@@ -536,7 +639,7 @@ mod tests {
             max_age_ms: 5_000,
             max_entries: 100,
         };
-        let api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        let api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
         assert_eq!(api.retention_policy().max_age_ms, 5_000);
         assert_eq!(api.retention_policy().max_entries, 100);
     }
@@ -547,7 +650,7 @@ mod tests {
 
     #[test]
     fn cleanup_completed_removes_non_pending() {
-        let mut api = CertifiedApi::new(node("node-1"), 3);
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
 
         // Write 3 entries.
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -586,7 +689,7 @@ mod tests {
             max_age_ms: 5_000,
             max_entries: 10_000,
         };
-        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
@@ -613,7 +716,7 @@ mod tests {
             max_age_ms: 10_000,
             max_entries: 10_000,
         };
-        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
         // Write entries at different times.
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -647,7 +750,7 @@ mod tests {
             max_age_ms: 60_000,
             max_entries: 3,
         };
-        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
         // Write 3 entries (hits max_entries).
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -689,7 +792,7 @@ mod tests {
             max_age_ms: 60_000,
             max_entries: 10,
         };
-        let mut api = CertifiedApi::with_retention(node("node-1"), 3, policy);
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
 
         // Simulate sustained writes with periodic certification.
         for i in 0..50u64 {
@@ -711,5 +814,220 @@ mod tests {
             "expected bounded growth, got {} entries",
             api.pending_writes().len()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware certification: cross-range contamination prevented
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cross_range_certification_does_not_contaminate() {
+        // Two separate key ranges with distinct authority sets.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node("auth-u1"), node("auth-u2"), node("auth-u3")],
+        });
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("order/"),
+            authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
+        });
+
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        // Write to both ranges.
+        api.certified_write("user/alice".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let user_ts = api.pending_writes()[0].timestamp.physical;
+
+        api.certified_write("order/123".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+        let order_ts = api.pending_writes()[1].timestamp.physical;
+
+        // Advance only order/ authorities past both timestamps.
+        api.update_frontier(make_frontier("auth-o1", order_ts + 100, 0, "order/"));
+        api.update_frontier(make_frontier("auth-o2", order_ts + 200, 0, "order/"));
+
+        api.process_certifications();
+
+        // order/123 should be certified (its authorities reached majority).
+        assert_eq!(
+            api.get_certification_status("order/123"),
+            CertificationStatus::Certified
+        );
+
+        // user/alice must NOT be certified — user/ authorities haven't reported.
+        assert_eq!(
+            api.get_certification_status("user/alice"),
+            CertificationStatus::Pending
+        );
+
+        // Now advance user/ authorities.
+        api.update_frontier(make_frontier("auth-u1", user_ts + 100, 0, "user/"));
+        api.update_frontier(make_frontier("auth-u2", user_ts + 200, 0, "user/"));
+
+        api.process_certifications();
+
+        // Now user/alice should be certified.
+        assert_eq!(
+            api.get_certification_status("user/alice"),
+            CertificationStatus::Certified
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware: scoped majority frontier in get_certified
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_certified_returns_scoped_frontier() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node("auth-u1"), node("auth-u2"), node("auth-u3")],
+        });
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("order/"),
+            authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
+        });
+
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        // Set different frontier levels for each range.
+        api.update_frontier(make_frontier("auth-u1", 100, 0, "user/"));
+        api.update_frontier(make_frontier("auth-u2", 200, 0, "user/"));
+        api.update_frontier(make_frontier("auth-u3", 150, 0, "user/"));
+
+        api.update_frontier(make_frontier("auth-o1", 1000, 0, "order/"));
+        api.update_frontier(make_frontier("auth-o2", 2000, 0, "order/"));
+        api.update_frontier(make_frontier("auth-o3", 1500, 0, "order/"));
+
+        // user/ majority frontier should be 150.
+        let user_read = api.get_certified("user/alice");
+        assert_eq!(user_read.frontier.unwrap().physical, 150);
+
+        // order/ majority frontier should be 1500.
+        let order_read = api.get_certified("order/123");
+        assert_eq!(order_read.frontier.unwrap().physical, 1500);
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware: policy version transition
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn policy_version_transition_independent_certification() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("data/"),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        });
+        // Set placement policy at version 2.
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3).with_certified(true),
+        );
+
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        // Write a key — should resolve to data/ with policy version 2.
+        api.certified_write("data/sensor".into(), counter_value(42), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+        assert_eq!(api.pending_writes()[0].policy_version, PolicyVersion(2));
+
+        // Frontiers at version 1 should NOT certify a write resolved at version 2.
+        api.update_frontier(make_frontier_v("auth-1", write_ts + 100, 0, "data/", 1));
+        api.update_frontier(make_frontier_v("auth-2", write_ts + 200, 0, "data/", 1));
+        api.process_certifications();
+
+        assert_eq!(
+            api.get_certification_status("data/sensor"),
+            CertificationStatus::Pending,
+            "v1 frontiers must not certify a v2 write"
+        );
+
+        // Frontiers at version 2 should certify the write.
+        api.update_frontier(make_frontier_v("auth-1", write_ts + 100, 0, "data/", 2));
+        api.update_frontier(make_frontier_v("auth-2", write_ts + 200, 0, "data/", 2));
+        api.process_certifications();
+
+        assert_eq!(
+            api.get_certification_status("data/sensor"),
+            CertificationStatus::Certified
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware: longest-prefix authority resolution
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn longest_prefix_authority_resolution() {
+        let mut ns = SystemNamespace::new();
+        // Broader authority set for user/
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        });
+        // Narrower (higher-priority) authority set for user/vip/
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/vip/"),
+            authority_nodes: vec![node("auth-v1"), node("auth-v2")],
+        });
+
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        // Write to user/vip/alice — should resolve to user/vip/ (2 authorities).
+        api.certified_write(
+            "user/vip/alice".into(),
+            counter_value(1),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        assert_eq!(api.pending_writes()[0].key_range, kr("user/vip/"));
+        assert_eq!(api.pending_writes()[0].total_authorities, 2);
+
+        // Write to user/regular/bob — should resolve to user/ (3 authorities).
+        api.certified_write(
+            "user/regular/bob".into(),
+            counter_value(2),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        assert_eq!(api.pending_writes()[1].key_range, kr("user/"));
+        assert_eq!(api.pending_writes()[1].total_authorities, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware: certified_write rejects key with no authority
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn certified_write_rejects_key_without_authority() {
+        // Namespace with only user/ defined.
+        let ns = make_namespace("user/", &["auth-1", "auth-2", "auth-3"]);
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        // order/ has no authority definition — should be PolicyDenied.
+        let result = api.certified_write("order/123".into(), counter_value(1), OnTimeout::Pending);
+        assert!(matches!(result, Err(CrdtError::PolicyDenied(_))));
+    }
+
+    // ---------------------------------------------------------------
+    // Range-aware: pending write stores resolved scope
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn pending_write_stores_resolved_scope() {
+        let ns = make_namespace("data/", &["auth-1", "auth-2", "auth-3"]);
+        let mut api = CertifiedApi::new(node("node-1"), ns);
+
+        api.certified_write("data/key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+
+        let pw = &api.pending_writes()[0];
+        assert_eq!(pw.key_range, kr("data/"));
+        assert_eq!(pw.policy_version, PolicyVersion(1));
+        assert_eq!(pw.total_authorities, 3);
     }
 }

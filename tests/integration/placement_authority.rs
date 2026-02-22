@@ -505,7 +505,9 @@ fn frontier_tracks_policy_version_correctly() {
     frontier_set.update(f_v1);
 
     let scope_v1 = FrontierScope::new(
-        KeyRange { prefix: "user/".into() },
+        KeyRange {
+            prefix: "user/".into(),
+        },
         PolicyVersion(1),
         NodeId("auth-1".into()),
     );
@@ -515,7 +517,9 @@ fn frontier_tracks_policy_version_correctly() {
     // Update with newer policy version creates a separate scoped entry
     frontier_set.update(f_v2);
     let scope_v2 = FrontierScope::new(
-        KeyRange { prefix: "user/".into() },
+        KeyRange {
+            prefix: "user/".into(),
+        },
         PolicyVersion(2),
         NodeId("auth-1".into()),
     );

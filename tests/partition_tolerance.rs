@@ -12,6 +12,7 @@ use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use asteroidb_poc::compaction::{CompactionConfig, CompactionEngine};
+use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::error::CrdtError;
 use asteroidb_poc::hlc::HlcTimestamp;
@@ -48,6 +49,16 @@ fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> 
         policy_version: PolicyVersion(1),
         digest_hash: format!("{authority}-{physical}-{logical}"),
     }
+}
+
+/// Create a namespace with a catch-all authority definition (prefix "").
+fn default_namespace() -> SystemNamespace {
+    let mut ns = SystemNamespace::new();
+    ns.set_authority_definition(AuthorityDefinition {
+        key_range: KeyRange { prefix: "".into() },
+        authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+    });
+    ns
 }
 
 /// Bidirectional merge between two EventualApi nodes for a single key.
@@ -152,7 +163,7 @@ fn partition_eventual_write_succeeds_in_both_partitions() {
 fn partition_certified_write_fails_without_majority() {
     // During partition, {C} alone cannot reach majority (needs 2 of 3 authorities).
     // Auth-1 and Auth-2 are in partition {A,B}; Auth-3 is with {C}.
-    let mut cert_c = CertifiedApi::new(node("node-c"), 3);
+    let mut cert_c = CertifiedApi::new(node("node-c"), default_namespace());
 
     // Only auth-3 reports a frontier (1 of 3 — no majority).
     cert_c.update_frontier(make_frontier("auth-3", 1000, 0, ""));
@@ -166,7 +177,7 @@ fn partition_certified_write_fails_without_majority() {
 #[test]
 fn partition_certified_write_pending_without_majority() {
     // Same scenario with OnTimeout::Pending — should return Pending.
-    let mut cert_c = CertifiedApi::new(node("node-c"), 3);
+    let mut cert_c = CertifiedApi::new(node("node-c"), default_namespace());
     cert_c.update_frontier(make_frontier("auth-3", 1000, 0, ""));
 
     let counter = CrdtValue::Counter(PnCounter::new());
@@ -437,7 +448,7 @@ fn convergence_multiple_keys_across_partitions() {
 fn authority_majority_loss_and_recovery() {
     // With 3 authorities, losing 2 means no majority.
     // When they recover (report updated frontiers), certification resumes.
-    let mut cert = CertifiedApi::new(node("node-a"), 3);
+    let mut cert = CertifiedApi::new(node("node-a"), default_namespace());
 
     // Write while no authorities have reported.
     let counter = CrdtValue::Counter(PnCounter::new());
@@ -504,8 +515,8 @@ fn authority_ack_frontier_handoff_after_replacement() {
 fn authority_partition_different_certified_values() {
     // During partition, authorities in different partitions may advance their
     // frontiers at different rates, producing "split" certification states.
-    let mut cert_ab = CertifiedApi::new(node("node-a"), 3);
-    let mut cert_c = CertifiedApi::new(node("node-c"), 3);
+    let mut cert_ab = CertifiedApi::new(node("node-a"), default_namespace());
+    let mut cert_c = CertifiedApi::new(node("node-c"), default_namespace());
 
     // Partition {A,B} has auth-1 and auth-2.
     // Partition {C} has auth-3.
@@ -779,7 +790,7 @@ fn partition_map_concurrent_set_and_delete_add_wins() {
 fn certified_write_succeeds_with_full_authority_set() {
     // Baseline: when all 3 authorities report frontiers past the write,
     // writes are certified.
-    let mut cert = CertifiedApi::new(node("node-a"), 3);
+    let mut cert = CertifiedApi::new(node("node-a"), default_namespace());
 
     // First write (will be Pending since no authorities have reported).
     let counter = CrdtValue::Counter(PnCounter::new());
@@ -849,7 +860,7 @@ fn partition_asymmetric_load_convergence() {
 fn partition_certified_api_multiple_pending_writes_resolve_after_heal() {
     // Multiple pending writes should all be certified once authorities
     // catch up after partition heal.
-    let mut cert = CertifiedApi::new(node("node-a"), 3);
+    let mut cert = CertifiedApi::new(node("node-a"), default_namespace());
 
     // Write 3 values while no authorities are available.
     for i in 0..3 {
