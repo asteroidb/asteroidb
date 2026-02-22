@@ -1,0 +1,332 @@
+use std::collections::HashMap;
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
+
+use crate::error::CrdtError;
+use crate::store::kv::CrdtValue;
+use crate::types::CertificationStatus;
+
+/// JSON-friendly representation of a CRDT value for API responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum CrdtValueJson {
+    #[serde(rename = "counter")]
+    Counter { value: i64 },
+    #[serde(rename = "set")]
+    Set { elements: Vec<String> },
+    #[serde(rename = "map")]
+    Map { entries: HashMap<String, String> },
+    #[serde(rename = "register")]
+    Register { value: Option<String> },
+}
+
+impl CrdtValueJson {
+    /// Convert an internal `CrdtValue` to its JSON representation.
+    pub fn from_crdt_value(value: &CrdtValue) -> Self {
+        match value {
+            CrdtValue::Counter(c) => CrdtValueJson::Counter { value: c.value() },
+            CrdtValue::Set(s) => {
+                let mut elements: Vec<String> = s.elements().into_iter().cloned().collect();
+                elements.sort();
+                CrdtValueJson::Set { elements }
+            }
+            CrdtValue::Map(m) => {
+                let mut entries = HashMap::new();
+                for key in m.keys() {
+                    if let Some(val) = m.get(key) {
+                        entries.insert(key.clone(), val.clone());
+                    }
+                }
+                CrdtValueJson::Map { entries }
+            }
+            CrdtValue::Register(r) => CrdtValueJson::Register {
+                value: r.get().cloned(),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// Request types
+// ---------------------------------------------------------------
+
+/// Request body for `POST /api/eventual/write`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum EventualWriteRequest {
+    #[serde(rename = "counter_inc")]
+    CounterInc { key: String },
+    #[serde(rename = "counter_dec")]
+    CounterDec { key: String },
+    #[serde(rename = "set_add")]
+    SetAdd { key: String, element: String },
+    #[serde(rename = "set_remove")]
+    SetRemove { key: String, element: String },
+    #[serde(rename = "map_set")]
+    MapSet {
+        key: String,
+        map_key: String,
+        map_value: String,
+    },
+    #[serde(rename = "map_delete")]
+    MapDelete { key: String, map_key: String },
+    #[serde(rename = "register_set")]
+    RegisterSet { key: String, value: String },
+}
+
+/// Request body for `POST /api/certified/write`.
+#[derive(Debug, Deserialize)]
+pub struct CertifiedWriteRequest {
+    pub key: String,
+    pub value: CrdtValueJson,
+    #[serde(default = "default_on_timeout")]
+    pub on_timeout: String,
+}
+
+fn default_on_timeout() -> String {
+    "pending".to_string()
+}
+
+// ---------------------------------------------------------------
+// Response types
+// ---------------------------------------------------------------
+
+/// Response for `GET /api/eventual/:key`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventualReadResponse {
+    pub key: String,
+    pub value: Option<CrdtValueJson>,
+}
+
+/// Response for a successful write.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WriteResponse {
+    pub ok: bool,
+}
+
+/// Response for `GET /api/certified/:key`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CertifiedReadResponse {
+    pub key: String,
+    pub value: Option<CrdtValueJson>,
+    pub status: CertificationStatus,
+    pub frontier: Option<FrontierJson>,
+}
+
+/// JSON-friendly frontier representation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FrontierJson {
+    pub physical: u64,
+    pub logical: u32,
+    pub node_id: String,
+}
+
+/// Response for `POST /api/certified/write`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CertifiedWriteResponse {
+    pub status: CertificationStatus,
+}
+
+/// Response for `GET /api/status/:key`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub key: String,
+    pub status: CertificationStatus,
+}
+
+// ---------------------------------------------------------------
+// Error response
+// ---------------------------------------------------------------
+
+/// Structured error body returned as JSON.
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error_code: String,
+    pub message: String,
+}
+
+/// Map `CrdtError` to HTTP status code + JSON body.
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match &self.0 {
+            CrdtError::InvalidArgument(msg) => {
+                (StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", msg.clone())
+            }
+            CrdtError::InvalidOp => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_OP",
+                "invalid operation for this CRDT type".to_string(),
+            ),
+            CrdtError::TypeMismatch { expected, actual } => (
+                StatusCode::CONFLICT,
+                "TYPE_MISMATCH",
+                format!("expected {expected}, got {actual}"),
+            ),
+            CrdtError::KeyNotFound(key) => (
+                StatusCode::NOT_FOUND,
+                "KEY_NOT_FOUND",
+                format!("key not found: {key}"),
+            ),
+            CrdtError::StaleVersion => (
+                StatusCode::CONFLICT,
+                "STALE_VERSION",
+                "stale version".to_string(),
+            ),
+            CrdtError::PolicyDenied(msg) => (StatusCode::FORBIDDEN, "POLICY_DENIED", msg.clone()),
+            CrdtError::Timeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "TIMEOUT",
+                "timeout".to_string(),
+            ),
+            CrdtError::Internal(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", msg.clone())
+            }
+        };
+
+        let body = ErrorResponse {
+            error_code: code.to_string(),
+            message,
+        };
+
+        (status, axum::Json(body)).into_response()
+    }
+}
+
+/// Newtype wrapper for `CrdtError` to implement `IntoResponse`.
+#[derive(Debug)]
+pub struct ApiError(pub CrdtError);
+
+impl From<CrdtError> for ApiError {
+    fn from(err: CrdtError) -> Self {
+        ApiError(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crdt::lww_register::LwwRegister;
+    use crate::crdt::or_map::OrMap;
+    use crate::crdt::or_set::OrSet;
+    use crate::crdt::pn_counter::PnCounter;
+    use crate::hlc::HlcTimestamp;
+    use crate::types::NodeId;
+
+    fn node(name: &str) -> NodeId {
+        NodeId(name.into())
+    }
+
+    fn ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical,
+            node_id: node.into(),
+        }
+    }
+
+    #[test]
+    fn counter_to_json() {
+        let mut c = PnCounter::new();
+        c.increment(&node("a"));
+        c.increment(&node("a"));
+        c.decrement(&node("a"));
+
+        let json = CrdtValueJson::from_crdt_value(&CrdtValue::Counter(c));
+        assert_eq!(json, CrdtValueJson::Counter { value: 1 });
+    }
+
+    #[test]
+    fn set_to_json() {
+        let mut s = OrSet::new();
+        s.add("bob".to_string(), &node("a"));
+        s.add("alice".to_string(), &node("a"));
+
+        let json = CrdtValueJson::from_crdt_value(&CrdtValue::Set(s));
+        match json {
+            CrdtValueJson::Set { elements } => {
+                assert_eq!(elements, vec!["alice", "bob"]);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_to_json() {
+        let mut m = OrMap::new();
+        m.set(
+            "name".to_string(),
+            "AsteroidDB".to_string(),
+            ts(100, 0, "a"),
+            &node("a"),
+        );
+
+        let json = CrdtValueJson::from_crdt_value(&CrdtValue::Map(m));
+        match json {
+            CrdtValueJson::Map { entries } => {
+                assert_eq!(entries.get("name"), Some(&"AsteroidDB".to_string()));
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_to_json() {
+        let mut r = LwwRegister::new();
+        r.set("hello".to_string(), ts(100, 0, "a"));
+
+        let json = CrdtValueJson::from_crdt_value(&CrdtValue::Register(r));
+        assert_eq!(
+            json,
+            CrdtValueJson::Register {
+                value: Some("hello".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn empty_register_to_json() {
+        let r = LwwRegister::<String>::new();
+        let json = CrdtValueJson::from_crdt_value(&CrdtValue::Register(r));
+        assert_eq!(json, CrdtValueJson::Register { value: None });
+    }
+
+    #[test]
+    fn deserialize_eventual_write_counter_inc() {
+        let json = r#"{"type":"counter_inc","key":"hits"}"#;
+        let req: EventualWriteRequest = serde_json::from_str(json).unwrap();
+        match req {
+            EventualWriteRequest::CounterInc { key } => assert_eq!(key, "hits"),
+            other => panic!("expected CounterInc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_eventual_write_set_add() {
+        let json = r#"{"type":"set_add","key":"users","element":"alice"}"#;
+        let req: EventualWriteRequest = serde_json::from_str(json).unwrap();
+        match req {
+            EventualWriteRequest::SetAdd { key, element } => {
+                assert_eq!(key, "users");
+                assert_eq!(element, "alice");
+            }
+            other => panic!("expected SetAdd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_certified_write_request() {
+        let json = r#"{"key":"sensor","value":{"type":"counter","value":42},"on_timeout":"error"}"#;
+        let req: CertifiedWriteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.key, "sensor");
+        assert_eq!(req.on_timeout, "error");
+    }
+
+    #[test]
+    fn deserialize_certified_write_request_default_timeout() {
+        let json = r#"{"key":"sensor","value":{"type":"counter","value":42}}"#;
+        let req: CertifiedWriteRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.on_timeout, "pending");
+    }
+}
