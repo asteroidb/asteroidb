@@ -54,7 +54,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
     let namespace = Arc::new(RwLock::new(default_namespace()));
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(nid.clone())),
-        certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),
     });

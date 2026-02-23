@@ -87,7 +87,10 @@ mod tests {
 
         Arc::new(AppState {
             eventual: Mutex::new(EventualApi::new(node_id.clone())),
-            certified: Mutex::new(CertifiedApi::new(node_id, Arc::clone(&namespace))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(
+                node_id,
+                Arc::clone(&namespace),
+            ))),
             namespace,
             metrics: Arc::new(RuntimeMetrics::default()),
         })

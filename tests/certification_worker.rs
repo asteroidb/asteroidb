@@ -27,6 +27,7 @@ use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+use tokio::sync::Mutex;
 
 fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
     Arc::new(RwLock::new(ns))
@@ -182,14 +183,16 @@ async fn three_authority_node_runner_certification() {
     api.update_frontier(make_frontier("auth-3", write_ts + 600, ""));
 
     // auth-1's own frontier will be auto-reported by the NodeRunner.
+    let shared_api = Arc::new(Mutex::new(api));
     let engine = CompactionEngine::with_defaults();
     let mut runner = NodeRunner::new(
         node_id("auth-1"),
-        api,
+        shared_api.clone(),
         engine,
         fast_config(),
         Arc::new(RuntimeMetrics::default()),
-    );
+    )
+    .await;
     assert!(runner.is_authority());
 
     let handle = runner.shutdown_handle();
@@ -203,8 +206,9 @@ async fn three_authority_node_runner_certification() {
 
     // auth-1 frontier should have been auto-reported, giving 3/3 authorities.
     // But only 2/3 are needed for majority. The write should be certified.
+    let api = shared_api.lock().await;
     assert_eq!(
-        runner.certified_api().pending_writes()[0].status,
+        api.pending_writes()[0].status,
         CertificationStatus::Certified,
         "write should auto-certify in 3-authority NodeRunner setup"
     );
@@ -233,14 +237,16 @@ async fn single_authority_self_certification() {
         CertificationStatus::Pending
     );
 
+    let shared_api = Arc::new(Mutex::new(api));
     let engine = CompactionEngine::with_defaults();
     let mut runner = NodeRunner::new(
         node_id("auth-1"),
-        api,
+        shared_api.clone(),
         engine,
         fast_config(),
         Arc::new(RuntimeMetrics::default()),
-    );
+    )
+    .await;
     let handle = runner.shutdown_handle();
 
     tokio::spawn(async move {
@@ -259,8 +265,9 @@ async fn single_authority_self_certification() {
         "certification ticks should have fired"
     );
 
+    let api = shared_api.lock().await;
     assert_eq!(
-        runner.certified_api().pending_writes()[0].status,
+        api.pending_writes()[0].status,
         CertificationStatus::Certified,
         "write should auto-certify on authority node"
     );
@@ -288,6 +295,7 @@ async fn timeout_auto_detection() {
         CertificationStatus::Pending
     );
 
+    let shared_api = Arc::new(Mutex::new(api));
     let engine = CompactionEngine::with_defaults();
     let config = NodeRunnerConfig {
         certification_interval: Duration::from_millis(10),
@@ -299,11 +307,12 @@ async fn timeout_auto_detection() {
 
     let mut runner = NodeRunner::new(
         node_id("node-1"),
-        api,
+        shared_api.clone(),
         engine,
         config,
         Arc::new(RuntimeMetrics::default()),
-    );
+    )
+    .await;
     let handle = runner.shutdown_handle();
 
     // Run long enough for the write to age past max_age_ms (10ms).
@@ -316,8 +325,9 @@ async fn timeout_auto_detection() {
 
     // The write should be marked as Timeout because the certification tick
     // detected that it exceeded max_age_ms.
+    let api = shared_api.lock().await;
     assert_eq!(
-        runner.certified_api().pending_writes()[0].status,
+        api.pending_writes()[0].status,
         CertificationStatus::Timeout,
         "stale write should auto-transition to Timeout"
     );

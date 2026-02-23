@@ -55,7 +55,7 @@ impl Default for NodeRunnerConfig {
 /// Supports graceful shutdown via a watch channel.
 pub struct NodeRunner {
     node_id: NodeId,
-    certified_api: CertifiedApi,
+    certified_api: Arc<Mutex<CertifiedApi>>,
     compaction_engine: CompactionEngine,
     clock: Hlc,
     config: NodeRunnerConfig,
@@ -90,15 +90,16 @@ impl NodeRunner {
     ///
     /// Automatically discovers whether this node is an authority and
     /// configures the frontier reporter accordingly.
-    pub fn new(
+    pub async fn new(
         node_id: NodeId,
-        certified_api: CertifiedApi,
+        certified_api: Arc<Mutex<CertifiedApi>>,
         compaction_engine: CompactionEngine,
         config: NodeRunnerConfig,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let reporter = {
-            let ns = certified_api.namespace().read().unwrap();
+            let api = certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
             FrontierReporter::new(node_id.clone(), &ns)
         };
         let frontier_reporter = if reporter.is_authority() {
@@ -127,9 +128,9 @@ impl NodeRunner {
     ///
     /// The `eventual_api` must be the same `Arc<Mutex<EventualApi>>` shared
     /// with the HTTP handlers so that sync reads the latest store state.
-    pub fn with_sync(
+    pub async fn with_sync(
         node_id: NodeId,
-        certified_api: CertifiedApi,
+        certified_api: Arc<Mutex<CertifiedApi>>,
         compaction_engine: CompactionEngine,
         config: NodeRunnerConfig,
         sync_client: SyncClient,
@@ -137,7 +138,8 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let reporter = {
-            let ns = certified_api.namespace().read().unwrap();
+            let api = certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
             FrontierReporter::new(node_id.clone(), &ns)
         };
         let frontier_reporter = if reporter.is_authority() {
@@ -175,14 +177,9 @@ impl NodeRunner {
         &self.node_id
     }
 
-    /// Return a reference to the `CertifiedApi`.
-    pub fn certified_api(&self) -> &CertifiedApi {
+    /// Return a shared reference to the `CertifiedApi` wrapped in `Arc<Mutex<..>>`.
+    pub fn certified_api(&self) -> &Arc<Mutex<CertifiedApi>> {
         &self.certified_api
-    }
-
-    /// Return a mutable reference to the `CertifiedApi`.
-    pub fn certified_api_mut(&mut self) -> &mut CertifiedApi {
-        &mut self.certified_api
     }
 
     /// Return a reference to the `CompactionEngine`.
@@ -268,19 +265,19 @@ impl NodeRunner {
                     }
                 }
                 _ = cert_interval.tick() => {
-                    self.process_certifications();
+                    self.process_certifications().await;
                     stats.certification_ticks += 1;
                 }
                 _ = cleanup_interval.tick() => {
-                    self.run_cleanup();
+                    self.run_cleanup().await;
                     stats.cleanup_ticks += 1;
                 }
                 _ = compaction_interval.tick() => {
-                    self.check_compaction();
+                    self.check_compaction().await;
                     stats.compaction_check_ticks += 1;
                 }
                 _ = frontier_interval.tick(), if self.frontier_reporter.is_some() => {
-                    self.report_frontiers();
+                    self.report_frontiers().await;
                     stats.frontier_report_ticks += 1;
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
@@ -309,23 +306,23 @@ impl NodeRunner {
         self.run().await
     }
 
-    fn process_certifications(&mut self) {
+    async fn process_certifications(&mut self) {
         let now = self.clock.now();
         let now_ms = now.physical;
 
+        let mut api = self.certified_api.lock().await;
+
         // Snapshot pending write timestamps before processing.
-        let pre_statuses: Vec<(CertificationStatus, u64)> = self
-            .certified_api
+        let pre_statuses: Vec<(CertificationStatus, u64)> = api
             .pending_writes()
             .iter()
             .map(|pw| (pw.status, pw.timestamp.physical))
             .collect();
 
-        self.certified_api
-            .process_certifications_with_timeout(now_ms);
+        api.process_certifications_with_timeout(now_ms);
 
         // Compute metrics after processing.
-        let writes = self.certified_api.pending_writes();
+        let writes = api.pending_writes();
         let mut pending = 0u64;
         let mut newly_certified = 0u64;
         let mut latency_sum = 0u64;
@@ -346,6 +343,8 @@ impl NodeRunner {
             }
         }
 
+        drop(api);
+
         self.metrics.pending_count.store(pending, Ordering::Relaxed);
 
         if newly_certified > 0 {
@@ -361,30 +360,33 @@ impl NodeRunner {
         }
     }
 
-    fn run_cleanup(&mut self) {
+    async fn run_cleanup(&mut self) {
         let now_ms = self.clock.now().physical;
-        self.certified_api.cleanup(now_ms);
+        let mut api = self.certified_api.lock().await;
+        api.cleanup(now_ms);
     }
 
     /// Generate and apply frontier reports for this authority node.
-    fn report_frontiers(&mut self) {
+    async fn report_frontiers(&mut self) {
         if let Some(reporter) = &self.frontier_reporter {
             let frontiers = reporter.report_frontiers(&mut self.clock);
+            let mut api = self.certified_api.lock().await;
             for f in frontiers {
-                self.certified_api.update_frontier(f);
+                api.update_frontier(f);
             }
         }
 
         // Compute frontier skew: for each scope, find max and min frontier
         // HLC among authorities, and report the maximum skew across all scopes.
-        self.update_frontier_skew();
+        self.update_frontier_skew().await;
     }
 
     /// Compute and store the maximum frontier skew across all authority scopes.
-    fn update_frontier_skew(&self) {
+    async fn update_frontier_skew(&self) {
         use std::collections::HashMap;
 
-        let all_frontiers = self.certified_api.all_frontiers();
+        let api = self.certified_api.lock().await;
+        let all_frontiers = api.all_frontiers();
         if all_frontiers.is_empty() {
             return;
         }
@@ -404,6 +406,8 @@ impl NodeRunner {
             .map(|(min_p, max_p)| max_p.saturating_sub(*min_p))
             .max()
             .unwrap_or(0);
+
+        drop(api);
 
         self.metrics
             .frontier_skew_ms
@@ -446,10 +450,11 @@ impl NodeRunner {
         );
     }
 
-    fn check_compaction(&mut self) {
+    async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
-        let ns = self.certified_api.namespace().read().unwrap();
+        let api = self.certified_api.lock().await;
+        let ns = api.namespace().read().unwrap();
 
         // Iterate over all authority definitions to check each key range.
         let defs: Vec<_> = ns
@@ -545,9 +550,13 @@ mod tests {
         }
     }
 
+    fn wrap_api(api: CertifiedApi) -> Arc<Mutex<CertifiedApi>> {
+        Arc::new(Mutex::new(api))
+    }
+
     #[tokio::test]
     async fn node_runner_starts_and_stops() {
-        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_millis(10),
@@ -557,7 +566,8 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
         let handle = runner.shutdown_handle();
 
         // Shut down after a brief delay.
@@ -594,6 +604,7 @@ mod tests {
         api.update_frontier(make_frontier("auth-1", write_ts + 100, ""));
         api.update_frontier(make_frontier("auth-2", write_ts + 200, ""));
 
+        let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_millis(10),
@@ -603,7 +614,14 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            shared_api.clone(),
+            engine,
+            config,
+            default_metrics(),
+        )
+        .await;
         let handle = runner.shutdown_handle();
 
         // Run long enough for at least one certification tick.
@@ -615,8 +633,9 @@ mod tests {
         runner.run().await;
 
         // The pending write should now be certified.
+        let api = shared_api.lock().await;
         assert_eq!(
-            runner.certified_api().pending_writes()[0].status,
+            api.pending_writes()[0].status,
             CertificationStatus::Certified
         );
     }
@@ -636,6 +655,7 @@ mod tests {
 
         assert_eq!(api.pending_writes().len(), 1);
 
+        let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_secs(60),
@@ -645,7 +665,14 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            shared_api.clone(),
+            engine,
+            config,
+            default_metrics(),
+        )
+        .await;
         let handle = runner.shutdown_handle();
 
         // Run long enough for cleanup to expire the 10ms-TTL write.
@@ -657,8 +684,9 @@ mod tests {
         runner.run().await;
 
         // The expired write should have been cleaned up.
+        let api = shared_api.lock().await;
         assert_eq!(
-            runner.certified_api().pending_writes().len(),
+            api.pending_writes().len(),
             0,
             "expired writes should be cleaned up"
         );
@@ -672,7 +700,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         });
 
-        let api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
 
         let compaction_config = CompactionConfig {
             time_threshold_ms: 10,
@@ -690,7 +718,8 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
@@ -709,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_handle_is_cloneable() {
-        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let runner = NodeRunner::new(
             node_id("node-1"),
@@ -717,7 +746,8 @@ mod tests {
             engine,
             NodeRunnerConfig::default(),
             default_metrics(),
-        );
+        )
+        .await;
 
         let handle1 = runner.shutdown_handle();
         let handle2 = runner.shutdown_handle();
@@ -739,31 +769,34 @@ mod tests {
 
     #[tokio::test]
     async fn node_runner_accessors() {
-        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let mut runner = NodeRunner::new(
             node_id("node-1"),
-            api,
+            api.clone(),
             engine,
             NodeRunnerConfig::default(),
             default_metrics(),
-        );
+        )
+        .await;
 
         assert_eq!(runner.node_id(), &node_id("node-1"));
 
-        // Mutable access.
-        runner
-            .certified_api_mut()
-            .certified_write("test".into(), counter_value(1), OnTimeout::Pending)
-            .unwrap();
-        assert_eq!(runner.certified_api().pending_writes().len(), 1);
+        // Access through lock.
+        {
+            let mut locked_api = api.lock().await;
+            locked_api
+                .certified_write("test".into(), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+            assert_eq!(locked_api.pending_writes().len(), 1);
+        }
 
         runner.compaction_engine_mut().record_op(&kr("test/"));
     }
 
     #[tokio::test]
     async fn immediate_shutdown() {
-        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_secs(60),
@@ -773,7 +806,8 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
 
         // Signal shutdown before run starts.
         let _ = runner.shutdown_handle().send(true);
@@ -795,8 +829,8 @@ mod tests {
 
     #[tokio::test]
     async fn authority_node_has_frontier_reporter() {
-        // node-1 is NOT in the authority set → no reporter
-        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        // node-1 is NOT in the authority set -> no reporter
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let runner = NodeRunner::new(
             node_id("node-1"),
@@ -804,12 +838,13 @@ mod tests {
             engine,
             NodeRunnerConfig::default(),
             default_metrics(),
-        );
+        )
+        .await;
         assert!(!runner.is_authority());
         assert!(runner.frontier_reporter().is_none());
 
-        // auth-1 IS in the authority set → has reporter
-        let api = CertifiedApi::new(node_id("auth-1"), default_namespace());
+        // auth-1 IS in the authority set -> has reporter
+        let api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
         let engine = CompactionEngine::with_defaults();
         let runner = NodeRunner::new(
             node_id("auth-1"),
@@ -817,7 +852,8 @@ mod tests {
             engine,
             NodeRunnerConfig::default(),
             default_metrics(),
-        );
+        )
+        .await;
         assert!(runner.is_authority());
         assert!(runner.frontier_reporter().is_some());
     }
@@ -826,7 +862,7 @@ mod tests {
     async fn frontier_auto_report_advances_local_frontier() {
         // Create a namespace where auth-1 is an authority.
         let ns = default_namespace();
-        let api = CertifiedApi::new(node_id("auth-1"), ns);
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), ns));
         let engine = CompactionEngine::with_defaults();
 
         let config = NodeRunnerConfig {
@@ -837,7 +873,14 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            engine,
+            config,
+            default_metrics(),
+        )
+        .await;
         assert!(runner.is_authority());
 
         let handle = runner.shutdown_handle();
@@ -857,7 +900,8 @@ mod tests {
         );
 
         // The frontier should have been applied locally.
-        let frontiers = runner.certified_api().all_frontiers();
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
         assert!(
             !frontiers.is_empty(),
             "authority node should have auto-reported frontiers"
@@ -875,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn non_authority_does_not_report_frontiers() {
         let ns = default_namespace();
-        let api = CertifiedApi::new(node_id("store-node"), ns);
+        let shared_api = wrap_api(CertifiedApi::new(node_id("store-node"), ns));
         let engine = CompactionEngine::with_defaults();
 
         let config = NodeRunnerConfig {
@@ -888,11 +932,12 @@ mod tests {
 
         let mut runner = NodeRunner::new(
             node_id("store-node"),
-            api,
+            shared_api.clone(),
             engine,
             config,
             default_metrics(),
-        );
+        )
+        .await;
         assert!(!runner.is_authority());
 
         let handle = runner.shutdown_handle();
@@ -911,7 +956,8 @@ mod tests {
         );
 
         // No frontiers should have been applied.
-        let frontiers = runner.certified_api().all_frontiers();
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
         assert!(
             frontiers.is_empty(),
             "non-authority node should have no frontiers"
@@ -936,6 +982,7 @@ mod tests {
             .unwrap();
         assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
 
+        let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_millis(10),
@@ -945,7 +992,14 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            engine,
+            config,
+            default_metrics(),
+        )
+        .await;
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
@@ -956,8 +1010,9 @@ mod tests {
         runner.run().await;
 
         // The pending write should have been auto-certified.
+        let api = shared_api.lock().await;
         assert_eq!(
-            runner.certified_api().pending_writes()[0].status,
+            api.pending_writes()[0].status,
             CertificationStatus::Certified,
             "pending write should be auto-certified by frontier pipeline"
         );
@@ -989,6 +1044,7 @@ mod tests {
             digest_hash: "high-frontier".into(),
         });
 
+        let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
         let config = NodeRunnerConfig {
             certification_interval: Duration::from_secs(60),
@@ -998,7 +1054,14 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            engine,
+            config,
+            default_metrics(),
+        )
+        .await;
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
@@ -1009,7 +1072,8 @@ mod tests {
         runner.run().await;
 
         // The frontier should still be at the high value (not regressed).
-        let frontiers = runner.certified_api().all_frontiers();
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
         assert!(!frontiers.is_empty());
         assert!(
             frontiers[0].frontier_hlc.physical >= u64::MAX - 1000,

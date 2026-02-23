@@ -55,7 +55,10 @@ async fn two_node_anti_entropy_convergence() {
     let ns1 = wrap_ns(default_namespace());
     let state1 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns1))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("node-1"),
+            Arc::clone(&ns1),
+        ))),
         namespace: ns1,
         metrics: Arc::new(RuntimeMetrics::default()),
     });
@@ -64,7 +67,10 @@ async fn two_node_anti_entropy_convergence() {
     let ns2 = wrap_ns(default_namespace());
     let state2 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-2"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-2"), Arc::clone(&ns2))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("node-2"),
+            Arc::clone(&ns2),
+        ))),
         namespace: ns2,
         metrics: Arc::new(RuntimeMetrics::default()),
     });
@@ -239,7 +245,10 @@ async fn pull_based_sync() {
     let ns_source = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("source"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("source"), Arc::clone(&ns_source))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("source"),
+            Arc::clone(&ns_source),
+        ))),
         namespace: ns_source,
         metrics: Arc::new(RuntimeMetrics::default()),
     });
@@ -289,7 +298,10 @@ async fn sync_endpoint_partial_failure() {
     let ns_target = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("target"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("target"), Arc::clone(&ns_target))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("target"),
+            Arc::clone(&ns_target),
+        ))),
         namespace: ns_target,
         metrics: Arc::new(RuntimeMetrics::default()),
     });
@@ -379,7 +391,7 @@ async fn three_node_convergence_via_sync() {
         let ns_i = wrap_ns(default_namespace());
         let state = Arc::new(AppState {
             eventual: Mutex::new(EventualApi::new(nid.clone())),
-            certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i)))),
             namespace: ns_i,
             metrics: Arc::new(RuntimeMetrics::default()),
         });
@@ -482,7 +494,10 @@ async fn internal_keys_endpoint() {
     let ns_keys = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns_keys))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("node-1"),
+            Arc::clone(&ns_keys),
+        ))),
         namespace: ns_keys,
         metrics: Arc::new(RuntimeMetrics::default()),
     });

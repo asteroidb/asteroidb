@@ -40,26 +40,33 @@ async fn main() {
     // Build shared runtime metrics.
     let metrics = Arc::new(RuntimeMetrics::default());
 
+    // Share a single CertifiedApi between HTTP handlers and NodeRunner
+    // so that certification status updates are visible to both.
+    let certified_api = Arc::new(Mutex::new(CertifiedApi::new(
+        node_id.clone(),
+        Arc::clone(&namespace),
+    )));
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
-        certified: Mutex::new(CertifiedApi::new(node_id.clone(), Arc::clone(&namespace))),
+        certified: Arc::clone(&certified_api),
         namespace: Arc::clone(&namespace),
         metrics: Arc::clone(&metrics),
     });
 
     let app = router(state);
 
-    // Build NodeRunner with its own CertifiedApi for background processing.
-    let runner_api = CertifiedApi::new(node_id.clone(), Arc::clone(&namespace));
+    // NodeRunner uses the same CertifiedApi instance for background processing.
     let engine = CompactionEngine::with_defaults();
     let mut runner = NodeRunner::new(
         node_id,
-        runner_api,
+        Arc::clone(&certified_api),
         engine,
         NodeRunnerConfig::default(),
         Arc::clone(&metrics),
-    );
+    )
+    .await;
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.
