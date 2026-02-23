@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn collect_multiple_durations() {
-        let durations: Vec<Duration> = (1..=100).map(|i| Duration::from_micros(i)).collect();
+        let durations: Vec<Duration> = (1..=100).map(Duration::from_micros).collect();
         let result = collect_latencies("range", &durations);
         assert_eq!(result.iterations, 100);
         assert!((result.mean_us - 50.5).abs() < 1.0);

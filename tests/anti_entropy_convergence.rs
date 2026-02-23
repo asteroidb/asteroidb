@@ -404,7 +404,7 @@ async fn three_node_convergence_via_sync() {
 
     // Run 2 rounds of full-mesh sync (push from each node to all others).
     for _round in 0..2 {
-        for i in 0..3 {
+        for (i, state) in states.iter().enumerate() {
             let self_id = node_id(&format!("node-{}", i + 1));
             let peers: Vec<PeerConfig> = (0..3)
                 .filter(|&j| j != i)
@@ -418,7 +418,7 @@ async fn three_node_convergence_via_sync() {
             let sync_client = SyncClient::new(registry);
 
             let entries: HashMap<String, CrdtValue> = {
-                let api = states[i].eventual.lock().await;
+                let api = state.eventual.lock().await;
                 api.store()
                     .all_entries()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -432,8 +432,8 @@ async fn three_node_convergence_via_sync() {
     }
 
     // Verify all nodes converge to score = 2 + 3 + 1 = 6.
-    for i in 0..3 {
-        let api = states[i].eventual.lock().await;
+    for (i, state) in states.iter().enumerate() {
+        let api = state.eventual.lock().await;
         match api.get_eventual("score") {
             Some(CrdtValue::Counter(c)) => {
                 assert_eq!(
