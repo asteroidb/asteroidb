@@ -27,6 +27,18 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+### CI (GitHub Actions)
+
+- ワークフロー定義: `.github/workflows/ci.yml`
+- トリガ: `pull_request (main)`, `push (main)`, `workflow_dispatch`
+- 必須ジョブ:
+  - `Format Check` (`cargo fmt --all -- --check`)
+  - `Clippy Lint` (`cargo clippy --all-targets --all-features -- -D warnings`)
+  - `Test` (`cargo test`)
+  - `Release Build` (`cargo build --release`)
+
+`main` ブランチでは、上記4ジョブを必須ステータスチェックとして設定してからマージする運用を前提にします。
+
 ### ノード実行 (ランループ)
 
 ```bash
