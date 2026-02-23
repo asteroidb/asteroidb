@@ -147,3 +147,104 @@ async fn server_graceful_shutdown_via_abort() {
         .await;
     assert!(result.is_err(), "expected connection error after shutdown");
 }
+
+#[tokio::test]
+async fn certified_write_rejects_invalid_on_timeout() {
+    let state = test_state();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // "bogus" should be rejected.
+    let resp = client
+        .post(format!("http://{addr}/api/certified/write"))
+        .header("content-type", "application/json")
+        .body(r#"{"key":"k","value":{"type":"counter","value":1},"on_timeout":"bogus"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error_code"], "INVALID_ARGUMENT");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid on_timeout value"),
+        "expected descriptive error message, got: {}",
+        body["message"]
+    );
+
+    // "ERROR" (wrong case) should also be rejected.
+    let resp = client
+        .post(format!("http://{addr}/api/certified/write"))
+        .header("content-type", "application/json")
+        .body(r#"{"key":"k","value":{"type":"counter","value":1},"on_timeout":"ERROR"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error_code"], "INVALID_ARGUMENT");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn certified_write_accepts_valid_on_timeout_values() {
+    let state = test_state();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // "error" should be accepted (returns 504 because certification is not
+    // immediately available, which is the correct OnTimeout::Error behaviour).
+    let resp = client
+        .post(format!("http://{addr}/api/certified/write"))
+        .header("content-type", "application/json")
+        .body(r#"{"key":"k1","value":{"type":"counter","value":1},"on_timeout":"error"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 504);
+
+    // "pending" should be accepted.
+    let resp = client
+        .post(format!("http://{addr}/api/certified/write"))
+        .header("content-type", "application/json")
+        .body(r#"{"key":"k2","value":{"type":"counter","value":1},"on_timeout":"pending"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Omitted on_timeout should default to "pending" and succeed.
+    let resp = client
+        .post(format!("http://{addr}/api/certified/write"))
+        .header("content-type", "application/json")
+        .body(r#"{"key":"k3","value":{"type":"counter","value":1}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    server.abort();
+}
