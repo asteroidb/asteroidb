@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::hlc::Hlc;
 use crate::network::sync::SyncClient;
+use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
@@ -77,6 +79,16 @@ pub struct NodeRunner {
     /// When a version change is detected, the old version is fenced
     /// and the frontier reporter is refreshed.
     tracked_policy_versions: HashMap<String, PolicyVersion>,
+    /// Known cluster nodes for authority auto-reconfiguration.
+    ///
+    /// When this list changes (node join/leave), the runner triggers
+    /// `recalculate_authorities()` on the system namespace, updating
+    /// authority definitions based on placement policy tag criteria.
+    cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
+    /// Hash-based fingerprint for detecting cluster membership changes.
+    /// Computed from sorted node IDs so that same-size replacements
+    /// (e.g. 1 leave + 1 join) are detected correctly.
+    tracked_cluster_generation: u64,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -106,6 +118,31 @@ impl NodeRunner {
         config: NodeRunnerConfig,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::new()));
+        Self::with_cluster_nodes(
+            node_id,
+            certified_api,
+            compaction_engine,
+            config,
+            metrics,
+            cluster_nodes,
+        )
+        .await
+    }
+
+    /// Create a new `NodeRunner` with a shared cluster node list.
+    ///
+    /// The `cluster_nodes` list is monitored for changes. When nodes
+    /// join or leave, authority definitions are automatically
+    /// recalculated based on placement policies.
+    pub async fn with_cluster_nodes(
+        node_id: NodeId,
+        certified_api: Arc<Mutex<CertifiedApi>>,
+        compaction_engine: CompactionEngine,
+        config: NodeRunnerConfig,
+        metrics: Arc<RuntimeMetrics>,
+        cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
+    ) -> Self {
         let (reporter, tracked_versions) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
@@ -118,7 +155,6 @@ impl NodeRunner {
         } else {
             None
         };
-
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -133,6 +169,9 @@ impl NodeRunner {
             eventual_api: None,
             metrics,
             tracked_policy_versions: tracked_versions,
+            cluster_nodes,
+            // Use sentinel value to force initial recalculation on first tick.
+            tracked_cluster_generation: u64::MAX,
         }
     }
 
@@ -149,6 +188,7 @@ impl NodeRunner {
         eventual_api: Arc<Mutex<EventualApi>>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::new()));
         let (reporter, tracked_versions) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
@@ -176,6 +216,8 @@ impl NodeRunner {
             eventual_api: Some(eventual_api),
             metrics,
             tracked_policy_versions: tracked_versions,
+            cluster_nodes,
+            tracked_cluster_generation: 0,
         }
     }
 
@@ -222,6 +264,11 @@ impl NodeRunner {
         &self.metrics
     }
 
+    /// Return a shared reference to the cluster node list.
+    pub fn cluster_nodes(&self) -> &Arc<std::sync::RwLock<Vec<Node>>> {
+        &self.cluster_nodes
+    }
+
     /// Snapshot the current policy version for each placement policy
     /// in the system namespace.
     fn snapshot_policy_versions(ns: &SystemNamespace) -> HashMap<String, PolicyVersion> {
@@ -231,14 +278,20 @@ impl NodeRunner {
             .collect()
     }
 
-    /// Detect policy version changes and fence old versions.
+    /// Detect policy version changes, membership changes, and fence old versions.
     ///
     /// Compares the current namespace policy versions against the tracked
     /// snapshot. When a version change is detected:
     /// 1. The old version is fenced in the `AckFrontierSet` (via `CertifiedApi`)
     /// 2. The `FrontierReporter` is refreshed to pick up the new scopes
     /// 3. The tracked versions are updated
+    ///
+    /// Also detects cluster membership changes (node join/leave) and triggers
+    /// authority recalculation when the node list changes.
     async fn detect_version_changes(&mut self) {
+        // Check for cluster membership changes first.
+        self.detect_membership_changes().await;
+
         // Snapshot current versions while briefly holding the locks.
         let current_versions: HashMap<String, PolicyVersion> = {
             let api = self.certified_api.lock().await;
@@ -279,6 +332,58 @@ impl NodeRunner {
 
         // Update tracked versions.
         self.tracked_policy_versions = current_versions;
+    }
+
+    /// Detect cluster membership changes and recalculate authorities.
+    ///
+    /// Compares the current cluster node list against the tracked generation.
+    /// When a change is detected, calls `recalculate_authorities()` on the
+    /// system namespace and refreshes the frontier reporter.
+    /// Compute a fingerprint of the cluster node list.
+    ///
+    /// Sorts node IDs and feeds them into a deterministic hasher so that
+    /// any structural change (including same-size replacements) produces
+    /// a different value.
+    fn cluster_fingerprint(nodes: &[Node]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
+        ids.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        ids.len().hash(&mut hasher);
+        for id in ids {
+            id.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    async fn detect_membership_changes(&mut self) {
+        let current_generation = {
+            let nodes = self.cluster_nodes.read().unwrap();
+            Self::cluster_fingerprint(&nodes)
+        };
+        if current_generation == self.tracked_cluster_generation {
+            return;
+        }
+        self.tracked_cluster_generation = current_generation;
+
+        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+
+        let api = self.certified_api.lock().await;
+        let changed = {
+            let mut ns = api.namespace().write().unwrap();
+            ns.recalculate_authorities(&nodes)
+        };
+
+        if changed > 0 {
+            // Refresh the frontier reporter to pick up new authority scopes.
+            let ns = api.namespace().read().unwrap();
+            let reporter = FrontierReporter::new(self.node_id.clone(), &ns);
+            if reporter.is_authority() {
+                self.frontier_reporter = Some(reporter);
+            } else {
+                self.frontier_reporter = None;
+            }
+        }
     }
 
     /// Run the node event loop until shutdown is signalled.
@@ -1153,6 +1258,217 @@ mod tests {
         assert!(
             frontiers[0].frontier_hlc.physical >= u64::MAX - 1000,
             "frontier must not regress below the manually-set high value"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Authority auto-reconfiguration tests (#118)
+    // ---------------------------------------------------------------
+
+    fn make_node(id: &str, mode: crate::types::NodeMode, tags: &[&str]) -> crate::node::Node {
+        use crate::types::Tag;
+        let mut n = crate::node::Node::new(node_id(id), mode);
+        for t in tags {
+            n.add_tag(Tag((*t).into()));
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn membership_change_triggers_authority_recalculation() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Create a namespace with a certified policy requiring dc:tokyo tag.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        // Shared cluster node list (initially empty).
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+
+        // Initially no authority definition for user/.
+        {
+            let api_lock = api.lock().await;
+            let ns = api_lock.namespace().read().unwrap();
+            assert!(ns.get_authority_definition("user/").is_none());
+        }
+
+        // Simulate nodes joining the cluster.
+        {
+            let mut nodes = cluster_nodes.write().unwrap();
+            nodes.push(make_node("n1", NodeMode::Store, &["dc:tokyo"]));
+            nodes.push(make_node("n2", NodeMode::Store, &["dc:tokyo"]));
+            nodes.push(make_node("n3", NodeMode::Store, &["dc:tokyo"]));
+        }
+
+        // Run for a bit to let detection fire.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+
+        runner.run().await;
+
+        // After detection, authority definition should be auto-created.
+        let api_lock = api.lock().await;
+        let ns = api_lock.namespace().read().unwrap();
+        let def = ns.get_authority_definition("user/");
+        assert!(
+            def.is_some(),
+            "authority definition should be auto-created from certified policy"
+        );
+        assert_eq!(def.unwrap().authority_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cluster_nodes_accessor_returns_shared_ref() {
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![make_node(
+            "n1",
+            crate::types::NodeMode::Store,
+            &["dc:tokyo"],
+        )]));
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
+        let runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api,
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        assert_eq!(runner.cluster_nodes().read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_size_replacement_triggers_authority_recalculation() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Create a namespace with a certified policy requiring dc:tokyo tag.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        // Start with 3 nodes.
+        let initial_nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(initial_nodes));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config.clone(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+
+        // Run briefly to let the initial membership detection fire.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        // Verify initial authority definition: n1, n2, n3.
+        {
+            let api_lock = api.lock().await;
+            let ns = api_lock.namespace().read().unwrap();
+            let def = ns.get_authority_definition("user/").unwrap();
+            assert_eq!(def.authority_nodes.len(), 3);
+            assert!(def.authority_nodes.contains(&node_id("n1")));
+            assert!(def.authority_nodes.contains(&node_id("n2")));
+            assert!(def.authority_nodes.contains(&node_id("n3")));
+        }
+
+        // Same-size replacement: n3 leaves, n4 joins (still 3 nodes).
+        {
+            let mut nodes = cluster_nodes.write().unwrap();
+            nodes.retain(|n| n.id != node_id("n3"));
+            nodes.push(make_node("n4", NodeMode::Store, &["dc:tokyo"]));
+            assert_eq!(nodes.len(), 3, "node count must remain unchanged");
+        }
+
+        // Run again with the same runner state (tracked generation is from
+        // the first run). A new runner picks up the same tracked state.
+        let mut runner2 = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle2 = runner2.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle2.send(true);
+        });
+        runner2.run().await;
+
+        // After detection, the authority definition should reflect the
+        // replacement: n4 replaces n3.
+        let api_lock = api.lock().await;
+        let ns = api_lock.namespace().read().unwrap();
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(def.authority_nodes.len(), 3);
+        assert!(
+            def.authority_nodes.contains(&node_id("n4")),
+            "n4 should be in authority set after same-size replacement"
+        );
+        assert!(
+            !def.authority_nodes.contains(&node_id("n3")),
+            "n3 should no longer be in authority set after leaving"
         );
     }
 }

@@ -51,6 +51,11 @@ pub struct PeerConfig {
 pub struct PeerRegistry {
     self_id: NodeId,
     peers: HashMap<NodeId, PeerConfig>,
+    /// Monotonically increasing counter that increments on every structural
+    /// change (add/remove). Consumers can poll this to detect membership
+    /// changes without diffing the full peer list.
+    #[serde(default)]
+    generation: u64,
 }
 
 impl PeerRegistry {
@@ -76,6 +81,7 @@ impl PeerRegistry {
         Ok(Self {
             self_id,
             peers: map,
+            generation: 0,
         })
     }
 
@@ -114,6 +120,7 @@ impl PeerRegistry {
             return Err(PeerError::DuplicateNodeId(peer.node_id.0.clone()));
         }
         self.peers.insert(peer.node_id.clone(), peer);
+        self.generation += 1;
         Ok(())
     }
 
@@ -130,12 +137,24 @@ impl PeerRegistry {
         if *node_id == self.self_id {
             return Err(PeerError::SelfInPeerList(self.self_id.0.clone()));
         }
-        Ok(self.peers.remove(node_id))
+        let removed = self.peers.remove(node_id);
+        if removed.is_some() {
+            self.generation += 1;
+        }
+        Ok(removed)
     }
 
     /// Return all registered peers as owned `PeerConfig` values.
     pub fn all_peers_owned(&self) -> Vec<PeerConfig> {
         self.peers.values().cloned().collect()
+    }
+
+    /// Return the current generation counter.
+    ///
+    /// Increments on every structural change (add/remove). Consumers can
+    /// compare successive values to detect membership changes.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -565,6 +584,39 @@ mod tests {
         let mut ids: Vec<String> = owned.iter().map(|p| p.node_id.0.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["node-2", "node-3"]);
+    }
+
+    // ---- generation counter ----
+
+    #[test]
+    fn generation_starts_at_zero() {
+        let reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        assert_eq!(reg.generation(), 0);
+    }
+
+    #[test]
+    fn generation_increments_on_add() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        reg.add_peer(peer("node-2", "127.0.0.1:8001")).unwrap();
+        assert_eq!(reg.generation(), 1);
+        reg.add_peer(peer("node-3", "127.0.0.1:8002")).unwrap();
+        assert_eq!(reg.generation(), 2);
+    }
+
+    #[test]
+    fn generation_increments_on_remove() {
+        let mut reg =
+            PeerRegistry::new(nid("node-1"), vec![peer("node-2", "127.0.0.1:8001")]).unwrap();
+        assert_eq!(reg.generation(), 0);
+        reg.remove_peer(&nid("node-2")).unwrap();
+        assert_eq!(reg.generation(), 1);
+    }
+
+    #[test]
+    fn generation_does_not_increment_on_noop_remove() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        reg.remove_peer(&nid("node-99")).unwrap();
+        assert_eq!(reg.generation(), 0);
     }
 
     // ---- PeerError Display ----
