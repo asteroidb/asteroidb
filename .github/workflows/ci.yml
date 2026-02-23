@@ -83,7 +83,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tests
-        run: cargo test 2>&1 | tee test-output.txt
+        run: set -o pipefail; cargo test 2>&1 | tee test-output.txt
 
       - name: Generate test summary
         if: always()
@@ -125,12 +125,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release
-        run: cargo build --release
+        run: set -o pipefail; cargo build --release 2>&1 | tee build-output.txt
 
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: target/release/.cargo-lock
+          path: build-output.txt
           retention-days: 7
