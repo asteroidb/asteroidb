@@ -23,6 +23,7 @@ use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
@@ -182,7 +183,13 @@ async fn three_authority_node_runner_certification() {
 
     // auth-1's own frontier will be auto-reported by the NodeRunner.
     let engine = CompactionEngine::with_defaults();
-    let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, fast_config());
+    let mut runner = NodeRunner::new(
+        node_id("auth-1"),
+        api,
+        engine,
+        fast_config(),
+        Arc::new(RuntimeMetrics::default()),
+    );
     assert!(runner.is_authority());
 
     let handle = runner.shutdown_handle();
@@ -227,7 +234,13 @@ async fn single_authority_self_certification() {
     );
 
     let engine = CompactionEngine::with_defaults();
-    let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, fast_config());
+    let mut runner = NodeRunner::new(
+        node_id("auth-1"),
+        api,
+        engine,
+        fast_config(),
+        Arc::new(RuntimeMetrics::default()),
+    );
     let handle = runner.shutdown_handle();
 
     tokio::spawn(async move {
@@ -284,7 +297,13 @@ async fn timeout_auto_detection() {
         sync_interval: None,
     };
 
-    let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+    let mut runner = NodeRunner::new(
+        node_id("node-1"),
+        api,
+        engine,
+        config,
+        Arc::new(RuntimeMetrics::default()),
+    );
     let handle = runner.shutdown_handle();
 
     // Run long enough for the write to age past max_age_ms (10ms).
