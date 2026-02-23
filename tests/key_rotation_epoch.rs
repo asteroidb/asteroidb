@@ -65,8 +65,8 @@ fn key_rotation_old_and_new_keys_coexist_during_grace() {
 
     // Rotate to version 1 at epoch 0.
     let (sk_a1, vk_a1) = make_key_pair();
-    let (sk_b1, vk_b1) = make_key_pair();
-    let (sk_c1, vk_c1) = make_key_pair();
+    let (_sk_b1, vk_b1) = make_key_pair();
+    let (_sk_c1, vk_c1) = make_key_pair();
     let id_a = NodeId("auth-a".into());
     let id_b = NodeId("auth-b".into());
     let id_c = NodeId("auth-c".into());
@@ -84,7 +84,7 @@ fn key_rotation_old_and_new_keys_coexist_during_grace() {
 
     // Rotate to version 2 at epoch 3 (3 days later).
     let epoch3_secs = base_secs + 86400 * 3;
-    let (sk_a2, vk_a2) = make_key_pair();
+    let (_sk_a2, vk_a2) = make_key_pair();
     let (sk_b2, vk_b2) = make_key_pair();
     let (sk_c2, vk_c2) = make_key_pair();
 
@@ -245,7 +245,7 @@ fn tampered_signature_detected_with_registry() {
 
     let (sk_a, vk_a) = make_key_pair();
     let (sk_b, vk_b) = make_key_pair();
-    let (sk_c, vk_c) = make_key_pair();
+    let (_sk_c, vk_c) = make_key_pair();
     let id_a = NodeId("auth-a".into());
     let id_b = NodeId("auth-b".into());
     let id_c = NodeId("auth-c".into());

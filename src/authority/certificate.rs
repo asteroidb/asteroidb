@@ -110,6 +110,9 @@ pub enum CertError {
         keyset_epoch: u64,
         current_epoch: u64,
     },
+
+    #[error("authority {0} not found in keyset registry")]
+    AuthorityNotInRegistry(String),
 }
 
 /// Keyset version for key rotation management.
@@ -485,12 +488,11 @@ impl MajorityCertificate {
             }
 
             // Look up the expected public key from the registry.
-            let expected_key =
-                registry.get_key_for_authority(&sig.keyset_version, &sig.authority_id);
-
-            // If the registry has a key for this authority, verify against it;
-            // otherwise fall back to the embedded public key.
-            let verify_key = expected_key.unwrap_or(&sig.public_key);
+            // Registry-aware verification trusts only registry keys;
+            // if the authority is missing from the registry, reject it.
+            let verify_key = registry
+                .get_key_for_authority(&sig.keyset_version, &sig.authority_id)
+                .ok_or_else(|| CertError::AuthorityNotInRegistry(sig.authority_id.0.clone()))?;
             verify_key
                 .verify(message, &sig.signature)
                 .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
@@ -1257,7 +1259,7 @@ mod tests {
         let message = create_certificate_message(&kr, &hlc, &pv);
 
         let mut registry = KeysetRegistry::new();
-        let (sk1, vk1) = make_key_pair();
+        let (_sk1, vk1) = make_key_pair();
         let (sk2, _vk2) = make_key_pair(); // different key
         let id = NodeId("auth-1".into());
 
@@ -1276,5 +1278,44 @@ mod tests {
             result,
             Err(CertError::InvalidSignature(ref id)) if id == "auth-1"
         ));
+    }
+
+    #[test]
+    fn verify_with_registry_rejects_authority_not_in_registry() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut registry = KeysetRegistry::new();
+
+        // Register keyset version 1 with only auth-1.
+        let (sk1, vk1) = make_key_pair();
+        let id1 = NodeId("auth-1".into());
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(id1.clone(), vk1)])
+            .unwrap();
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+
+        // Valid signature from auth-1 (in registry).
+        let sig1 = sign_message(&sk1, &message);
+        cert.add_signature(make_auth_sig(id1, vk1, sig1));
+
+        // Signature from auth-unknown (NOT in registry).
+        let (sk_unknown, vk_unknown) = make_key_pair();
+        let id_unknown = NodeId("auth-unknown".into());
+        let sig_unknown = sign_message(&sk_unknown, &message);
+        cert.add_signature(make_auth_sig(id_unknown, vk_unknown, sig_unknown));
+
+        let config = EpochConfig::default();
+        let result = cert.verify_signatures_with_registry(&message, &registry, 0, &config);
+        assert!(
+            matches!(
+                result,
+                Err(CertError::AuthorityNotInRegistry(ref id)) if id == "auth-unknown"
+            ),
+            "expected AuthorityNotInRegistry, got: {result:?}"
+        );
     }
 }
