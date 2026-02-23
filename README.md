@@ -48,8 +48,8 @@ cargo run --example demo_partition_recovery
 HTTP ルーター/ハンドラーは `src/http/` に実装済みです。  
 エンドポイント仕様は `docs/getting-started.md` を参照してください。
 
-現状の `src/main.rs` は HTTP サーバーを bind せず、NodeRunner を実行する構成です。  
-HTTP 層はテスト内でルーターを直接起動して検証しています。
+`cargo run` を実行すると HTTP サーバーが `127.0.0.1:3000` で起動し、NodeRunner のバックグラウンド処理も同時に開始します。
+バインドアドレスは環境変数 `ASTEROIDB_BIND_ADDR` で、ノード ID は `ASTEROIDB_NODE_ID` で変更可能です。
 
 ## ドキュメント
 
