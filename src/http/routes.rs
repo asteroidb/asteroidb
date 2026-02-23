@@ -5,8 +5,7 @@ use axum::routing::{get, post};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_certification_status, get_certified,
-    get_eventual, get_internal_frontiers, internal_keys, internal_sync,
-    post_internal_frontiers,
+    get_eventual, get_internal_frontiers, internal_keys, internal_sync, post_internal_frontiers,
 };
 
 /// Build the HTTP API router with all endpoints.
