@@ -241,6 +241,61 @@ pub struct VersionHistoryResponse {
 }
 
 // ---------------------------------------------------------------
+// Internal join/leave request/response types
+// ---------------------------------------------------------------
+
+/// Request body for `POST /api/internal/join`.
+///
+/// A new node sends this to a seed node to join the cluster.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// Unique identifier of the joining node.
+    pub node_id: String,
+    /// Socket address (ip:port) the joining node is listening on.
+    pub address: String,
+    /// Tags associated with the joining node.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Response for `POST /api/internal/join`.
+///
+/// Returned by the seed node to the joining node. Contains the current
+/// peer list and a snapshot of the system namespace for bootstrap.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JoinResponse {
+    /// All peers currently known to the seed node (including the seed itself).
+    pub peers: Vec<PeerInfo>,
+    /// Serialised snapshot of the system namespace.
+    pub namespace: serde_json::Value,
+}
+
+/// Minimal peer information returned in the join response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    /// Unique identifier of the peer node.
+    pub node_id: String,
+    /// Socket address (ip:port) the peer is listening on.
+    pub address: String,
+}
+
+/// Request body for `POST /api/internal/leave`.
+///
+/// Sent by a node that is gracefully departing the cluster.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LeaveRequest {
+    /// Unique identifier of the departing node.
+    pub node_id: String,
+}
+
+/// Response for `POST /api/internal/leave`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LeaveResponse {
+    /// Whether the leave operation was successful.
+    pub success: bool,
+}
+
+// ---------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------
 

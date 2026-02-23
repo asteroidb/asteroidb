@@ -57,6 +57,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     let app = router(state.clone());

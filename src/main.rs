@@ -47,12 +47,22 @@ async fn main() {
         Arc::clone(&namespace),
     )));
 
+    // Build a peer registry for the node (initially empty; nodes join
+    // dynamically via POST /api/internal/join).
+    let peer_registry = {
+        use asteroidb_poc::network::PeerRegistry;
+        Arc::new(Mutex::new(
+            PeerRegistry::new(node_id.clone(), vec![]).expect("empty peer list is always valid"),
+        ))
+    };
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
         certified: Arc::clone(&certified_api),
         namespace: Arc::clone(&namespace),
         metrics: Arc::clone(&metrics),
+        peers: Some(peer_registry),
     });
 
     let app = router(state);

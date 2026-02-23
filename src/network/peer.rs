@@ -98,6 +98,45 @@ impl PeerRegistry {
     pub fn self_id(&self) -> &NodeId {
         &self.self_id
     }
+
+    /// Add a new peer to the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerError::DuplicateNodeId`] if a peer with the same ID
+    /// already exists, or [`PeerError::SelfInPeerList`] if the peer's ID
+    /// matches the local node's own ID.
+    pub fn add_peer(&mut self, peer: PeerConfig) -> Result<(), PeerError> {
+        if peer.node_id == self.self_id {
+            return Err(PeerError::SelfInPeerList(self.self_id.0.clone()));
+        }
+        if self.peers.contains_key(&peer.node_id) {
+            return Err(PeerError::DuplicateNodeId(peer.node_id.0.clone()));
+        }
+        self.peers.insert(peer.node_id.clone(), peer);
+        Ok(())
+    }
+
+    /// Remove a peer from the registry by its node ID.
+    ///
+    /// Returns the removed [`PeerConfig`] if it existed, or `None` if it
+    /// was not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerError::SelfInPeerList`] if the given ID matches the
+    /// local node's own ID (cannot remove self).
+    pub fn remove_peer(&mut self, node_id: &NodeId) -> Result<Option<PeerConfig>, PeerError> {
+        if *node_id == self.self_id {
+            return Err(PeerError::SelfInPeerList(self.self_id.0.clone()));
+        }
+        Ok(self.peers.remove(node_id))
+    }
+
+    /// Return all registered peers as owned `PeerConfig` values.
+    pub fn all_peers_owned(&self) -> Vec<PeerConfig> {
+        self.peers.values().cloned().collect()
+    }
 }
 
 /// Top-level configuration for a node, combining the node definition, its
@@ -441,6 +480,91 @@ mod tests {
             assert_eq!(loaded.bind_addr, original.bind_addr);
             assert_eq!(loaded.peers.peer_count(), original.peers.peer_count());
         }
+    }
+
+    // ---- add_peer / remove_peer ----
+
+    #[test]
+    fn add_peer_success() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        assert_eq!(reg.peer_count(), 0);
+
+        reg.add_peer(peer("node-2", "127.0.0.1:8001")).unwrap();
+        assert_eq!(reg.peer_count(), 1);
+        assert!(reg.get_peer(&nid("node-2")).is_some());
+    }
+
+    #[test]
+    fn add_peer_rejects_duplicate() {
+        let mut reg =
+            PeerRegistry::new(nid("node-1"), vec![peer("node-2", "127.0.0.1:8001")]).unwrap();
+
+        let result = reg.add_peer(peer("node-2", "127.0.0.1:8099"));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PeerError::DuplicateNodeId(id) => assert_eq!(id, "node-2"),
+            other => panic!("expected DuplicateNodeId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_peer_rejects_self() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+
+        let result = reg.add_peer(peer("node-1", "127.0.0.1:8000"));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PeerError::SelfInPeerList(id) => assert_eq!(id, "node-1"),
+            other => panic!("expected SelfInPeerList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_peer_success() {
+        let mut reg =
+            PeerRegistry::new(nid("node-1"), vec![peer("node-2", "127.0.0.1:8001")]).unwrap();
+        assert_eq!(reg.peer_count(), 1);
+
+        let removed = reg.remove_peer(&nid("node-2")).unwrap();
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().node_id, nid("node-2"));
+        assert_eq!(reg.peer_count(), 0);
+    }
+
+    #[test]
+    fn remove_peer_nonexistent_returns_none() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        let removed = reg.remove_peer(&nid("node-99")).unwrap();
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn remove_peer_rejects_self() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        let result = reg.remove_peer(&nid("node-1"));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PeerError::SelfInPeerList(id) => assert_eq!(id, "node-1"),
+            other => panic!("expected SelfInPeerList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_peers_owned_returns_clones() {
+        let reg = PeerRegistry::new(
+            nid("node-1"),
+            vec![
+                peer("node-2", "127.0.0.1:8001"),
+                peer("node-3", "127.0.0.1:8002"),
+            ],
+        )
+        .unwrap();
+
+        let owned = reg.all_peers_owned();
+        assert_eq!(owned.len(), 2);
+        let mut ids: Vec<String> = owned.iter().map(|p| p.node_id.0.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["node-2", "node-3"]);
     }
 
     // ---- PeerError Display ----
