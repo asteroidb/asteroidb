@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::api::certified::CertifiedApi;
+use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::hlc::Hlc;
 use crate::types::NodeId;
@@ -16,6 +17,9 @@ pub struct NodeRunnerConfig {
     pub cleanup_interval: Duration,
     /// How often to check compaction eligibility and create checkpoints.
     pub compaction_check_interval: Duration,
+    /// How often Authority nodes report their frontier and push to peers.
+    /// Default: 1 second. Only effective when this node is an authority.
+    pub frontier_report_interval: Duration,
 }
 
 impl Default for NodeRunnerConfig {
@@ -24,6 +28,7 @@ impl Default for NodeRunnerConfig {
             certification_interval: Duration::from_secs(1),
             cleanup_interval: Duration::from_secs(5),
             compaction_check_interval: Duration::from_secs(10),
+            frontier_report_interval: Duration::from_secs(1),
         }
     }
 }
@@ -34,6 +39,9 @@ impl Default for NodeRunnerConfig {
 /// - `process_certifications`: re-evaluates pending writes against frontiers
 /// - `cleanup`: expires old pending writes and removes completed entries
 /// - compaction checkpoint checks
+/// - **frontier reporting**: if this node is an Authority, automatically
+///   generates and applies frontier updates (removing the need for manual
+///   `update_frontier` calls)
 ///
 /// Supports graceful shutdown via a watch channel.
 pub struct NodeRunner {
@@ -42,6 +50,7 @@ pub struct NodeRunner {
     compaction_engine: CompactionEngine,
     clock: Hlc,
     config: NodeRunnerConfig,
+    frontier_reporter: Option<FrontierReporter>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -55,16 +64,28 @@ pub struct RunLoopStats {
     pub cleanup_ticks: u64,
     /// Number of compaction check ticks executed.
     pub compaction_check_ticks: u64,
+    /// Number of frontier report ticks executed.
+    pub frontier_report_ticks: u64,
 }
 
 impl NodeRunner {
     /// Create a new `NodeRunner`.
+    ///
+    /// Automatically discovers whether this node is an authority and
+    /// configures the frontier reporter accordingly.
     pub fn new(
         node_id: NodeId,
         certified_api: CertifiedApi,
         compaction_engine: CompactionEngine,
         config: NodeRunnerConfig,
     ) -> Self {
+        let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
+        let frontier_reporter = if reporter.is_authority() {
+            Some(reporter)
+        } else {
+            None
+        };
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -72,6 +93,7 @@ impl NodeRunner {
             certified_api,
             compaction_engine,
             config,
+            frontier_reporter,
             shutdown_tx,
             shutdown_rx,
         }
@@ -110,15 +132,29 @@ impl NodeRunner {
         &mut self.compaction_engine
     }
 
+    /// Return whether this node has an active frontier reporter (is an authority).
+    pub fn is_authority(&self) -> bool {
+        self.frontier_reporter.is_some()
+    }
+
+    /// Return a reference to the frontier reporter, if this node is an authority.
+    pub fn frontier_reporter(&self) -> Option<&FrontierReporter> {
+        self.frontier_reporter.as_ref()
+    }
+
     /// Run the node event loop until shutdown is signalled.
     ///
-    /// This drives three periodic tasks using `tokio::time::interval`:
-    /// 1. **Certification processing** — calls `process_certifications()` on the
+    /// This drives four periodic tasks using `tokio::time::interval`:
+    /// 1. **Certification processing** -- calls `process_certifications()` on the
     ///    `CertifiedApi` to promote pending writes whose frontiers have advanced.
-    /// 2. **Cleanup** — calls `cleanup()` to expire old pending writes and
+    /// 2. **Cleanup** -- calls `cleanup()` to expire old pending writes and
     ///    remove completed entries.
-    /// 3. **Compaction check** — evaluates whether checkpoints should be created
+    /// 3. **Compaction check** -- evaluates whether checkpoints should be created
     ///    for tracked key ranges.
+    /// 4. **Frontier reporting** -- if this node is an authority, generates
+    ///    frontier updates from the current HLC time and applies them locally.
+    ///    This drives the automatic frontier pipeline so callers never need
+    ///    to call `update_frontier` manually.
     ///
     /// Returns [`RunLoopStats`] with tick counters after shutdown completes.
     pub async fn run(&mut self) -> RunLoopStats {
@@ -137,6 +173,10 @@ impl NodeRunner {
         let mut compaction_interval = tokio::time::interval_at(
             start + self.config.compaction_check_interval,
             self.config.compaction_check_interval,
+        );
+        let mut frontier_interval = tokio::time::interval_at(
+            start + self.config.frontier_report_interval,
+            self.config.frontier_report_interval,
         );
 
         let mut stats = RunLoopStats::default();
@@ -160,6 +200,10 @@ impl NodeRunner {
                 _ = compaction_interval.tick() => {
                     self.check_compaction();
                     stats.compaction_check_ticks += 1;
+                }
+                _ = frontier_interval.tick(), if self.frontier_reporter.is_some() => {
+                    self.report_frontiers();
+                    stats.frontier_report_ticks += 1;
                 }
             }
         }
@@ -190,6 +234,21 @@ impl NodeRunner {
     fn run_cleanup(&mut self) {
         let now_ms = self.clock.now().physical;
         self.certified_api.cleanup(now_ms);
+    }
+
+    /// Generate and apply frontier reports for this authority node.
+    ///
+    /// Uses `FrontierReporter` to produce frontiers at the current HLC time,
+    /// then applies them to the local `CertifiedApi` via `update_frontier`.
+    /// This ensures the frontier advances automatically without manual
+    /// intervention.
+    fn report_frontiers(&mut self) {
+        if let Some(reporter) = &self.frontier_reporter {
+            let frontiers = reporter.report_frontiers(&mut self.clock);
+            for f in frontiers {
+                self.certified_api.update_frontier(f);
+            }
+        }
     }
 
     fn check_compaction(&mut self) {
@@ -291,6 +350,7 @@ mod tests {
             certification_interval: Duration::from_millis(10),
             cleanup_interval: Duration::from_millis(50),
             compaction_check_interval: Duration::from_millis(100),
+            frontier_report_interval: Duration::from_millis(100),
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -335,6 +395,7 @@ mod tests {
             certification_interval: Duration::from_millis(10),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -375,6 +436,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_millis(10),
             compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -418,6 +480,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_millis(10),
+            frontier_report_interval: Duration::from_secs(60),
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -457,6 +520,7 @@ mod tests {
         assert_eq!(config.certification_interval, Duration::from_secs(1));
         assert_eq!(config.cleanup_interval, Duration::from_secs(5));
         assert_eq!(config.compaction_check_interval, Duration::from_secs(10));
+        assert_eq!(config.frontier_report_interval, Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -486,6 +550,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -501,6 +566,212 @@ mod tests {
         assert!(
             stats.certification_ticks <= 1,
             "expected at most 1 cert tick on immediate shutdown"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Frontier auto-report tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn authority_node_has_frontier_reporter() {
+        // node-1 is NOT in the authority set → no reporter
+        let api = CertifiedApi::new(node_id("node-1"), default_namespace());
+        let engine = CompactionEngine::with_defaults();
+        let runner = NodeRunner::new(node_id("node-1"), api, engine, NodeRunnerConfig::default());
+        assert!(!runner.is_authority());
+        assert!(runner.frontier_reporter().is_none());
+
+        // auth-1 IS in the authority set → has reporter
+        let api = CertifiedApi::new(node_id("auth-1"), default_namespace());
+        let engine = CompactionEngine::with_defaults();
+        let runner = NodeRunner::new(node_id("auth-1"), api, engine, NodeRunnerConfig::default());
+        assert!(runner.is_authority());
+        assert!(runner.frontier_reporter().is_some());
+    }
+
+    #[tokio::test]
+    async fn frontier_auto_report_advances_local_frontier() {
+        // Create a namespace where auth-1 is an authority.
+        let ns = default_namespace();
+        let api = CertifiedApi::new(node_id("auth-1"), ns);
+        let engine = CompactionEngine::with_defaults();
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_secs(60),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_millis(10),
+        };
+
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        assert!(runner.is_authority());
+
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+
+        let stats = runner.run().await;
+
+        // Frontier report ticks should have fired.
+        assert!(
+            stats.frontier_report_ticks >= 1,
+            "expected at least 1 frontier report tick, got {}",
+            stats.frontier_report_ticks
+        );
+
+        // The frontier should have been applied locally.
+        let frontiers = runner.certified_api().all_frontiers();
+        assert!(
+            !frontiers.is_empty(),
+            "authority node should have auto-reported frontiers"
+        );
+
+        // Verify the frontier is from auth-1.
+        assert!(
+            frontiers
+                .iter()
+                .any(|f| f.authority_id == node_id("auth-1")),
+            "frontier should be from auth-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_authority_does_not_report_frontiers() {
+        let ns = default_namespace();
+        let api = CertifiedApi::new(node_id("store-node"), ns);
+        let engine = CompactionEngine::with_defaults();
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_secs(60),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_millis(10),
+        };
+
+        let mut runner = NodeRunner::new(node_id("store-node"), api, engine, config);
+        assert!(!runner.is_authority());
+
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+
+        let stats = runner.run().await;
+
+        // Non-authority should not have any frontier report ticks.
+        assert_eq!(
+            stats.frontier_report_ticks, 0,
+            "non-authority node should not report frontiers"
+        );
+
+        // No frontiers should have been applied.
+        let frontiers = runner.certified_api().all_frontiers();
+        assert!(
+            frontiers.is_empty(),
+            "non-authority node should have no frontiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_frontier_certifies_pending_write() {
+        // This is the key integration test: a pending write on an authority
+        // node should eventually be certified by the auto-frontier pipeline,
+        // without any manual update_frontier calls.
+        //
+        // Setup: 1-authority system where auth-1 is the only authority.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node_id("auth-1")],
+        });
+
+        let mut api = CertifiedApi::new(node_id("auth-1"), ns);
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
+
+        let engine = CompactionEngine::with_defaults();
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_millis(10),
+        };
+
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = handle.send(true);
+        });
+
+        runner.run().await;
+
+        // The pending write should have been auto-certified.
+        assert_eq!(
+            runner.certified_api().pending_writes()[0].status,
+            CertificationStatus::Certified,
+            "pending write should be auto-certified by frontier pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_frontier_regression_prevented() {
+        // Verify that the auto-frontier pipeline never regresses.
+        // We'll manually insert a high frontier, then let the auto-reporter
+        // run. The frontier should not go backwards.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node_id("auth-1")],
+        });
+
+        let mut api = CertifiedApi::new(node_id("auth-1"), ns);
+
+        // Set a very high initial frontier manually.
+        api.update_frontier(AckFrontier {
+            authority_id: node_id("auth-1"),
+            frontier_hlc: HlcTimestamp {
+                physical: u64::MAX - 1000,
+                logical: 0,
+                node_id: "auth-1".into(),
+            },
+            key_range: kr(""),
+            policy_version: PolicyVersion(1),
+            digest_hash: "high-frontier".into(),
+        });
+
+        let engine = CompactionEngine::with_defaults();
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_secs(60),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_millis(10),
+        };
+
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+
+        runner.run().await;
+
+        // The frontier should still be at the high value (not regressed).
+        let frontiers = runner.certified_api().all_frontiers();
+        assert!(!frontiers.is_empty());
+        assert!(
+            frontiers[0].frontier_hlc.physical >= u64::MAX - 1000,
+            "frontier must not regress below the manually-set high value"
         );
     }
 }
