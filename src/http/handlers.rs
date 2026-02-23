@@ -511,11 +511,18 @@ pub async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsSnap
 // Helpers
 // ---------------------------------------------------------------
 
+/// Maximum allowed absolute value for counter initialization via HTTP API.
+///
+/// Values exceeding this limit are rejected with `InvalidArgument` to prevent
+/// resource exhaustion. This is a defense-in-depth measure; the O(1) constructor
+/// already prevents CPU-based DoS.
+const MAX_COUNTER_MAGNITUDE: i64 = 1_000_000_000;
+
 /// Convert a JSON CRDT value representation into an internal `CrdtValue`.
 ///
-/// For Counter, creates a PnCounter with the specified value by incrementing
-/// a synthetic writer node. For Set/Map/Register, constructs the appropriate
-/// CRDT type from the provided data.
+/// For Counter, creates a PnCounter with the specified value using O(1)
+/// `PnCounter::from_value` (not by looping). For Set/Map/Register,
+/// constructs the appropriate CRDT type from the provided data.
 fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
     use crate::crdt::lww_register::LwwRegister;
     use crate::crdt::or_map::OrMap;
@@ -527,16 +534,13 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
 
     match json {
         CrdtValueJson::Counter { value } => {
-            let mut counter = PnCounter::new();
-            if *value >= 0 {
-                for _ in 0..*value {
-                    counter.increment(&writer);
-                }
-            } else {
-                for _ in 0..value.unsigned_abs() {
-                    counter.decrement(&writer);
-                }
+            if value.unsigned_abs() > MAX_COUNTER_MAGNITUDE as u64 {
+                return Err(CrdtError::InvalidArgument(format!(
+                    "counter magnitude {} exceeds maximum allowed value {MAX_COUNTER_MAGNITUDE}",
+                    value.unsigned_abs()
+                )));
             }
+            let counter = PnCounter::from_value(&writer, *value);
             Ok(CrdtValue::Counter(counter))
         }
         CrdtValueJson::Set { elements } => {
@@ -654,6 +658,71 @@ mod tests {
                 assert_eq!(r.get(), None);
             }
             other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_crdt_counter_large_value_is_o1() {
+        // This would take O(999_999_999) iterations with the old loop-based
+        // approach. With from_value it completes instantly.
+        let json = CrdtValueJson::Counter { value: 999_999_999 };
+        let val = json_to_crdt_value(&json).unwrap();
+        match val {
+            CrdtValue::Counter(c) => assert_eq!(c.value(), 999_999_999),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_crdt_counter_large_negative_is_o1() {
+        let json = CrdtValueJson::Counter {
+            value: -999_999_999,
+        };
+        let val = json_to_crdt_value(&json).unwrap();
+        match val {
+            CrdtValue::Counter(c) => assert_eq!(c.value(), -999_999_999),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_crdt_counter_exceeds_max_magnitude() {
+        let json = CrdtValueJson::Counter {
+            value: 1_000_000_001,
+        };
+        let err = json_to_crdt_value(&json).unwrap_err();
+        match err {
+            CrdtError::InvalidArgument(msg) => {
+                assert!(msg.contains("exceeds maximum"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_crdt_counter_negative_exceeds_max_magnitude() {
+        let json = CrdtValueJson::Counter {
+            value: -1_000_000_001,
+        };
+        let err = json_to_crdt_value(&json).unwrap_err();
+        match err {
+            CrdtError::InvalidArgument(msg) => {
+                assert!(msg.contains("exceeds maximum"), "unexpected message: {msg}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_crdt_counter_at_max_magnitude_is_ok() {
+        // Exactly at the boundary should succeed.
+        let json = CrdtValueJson::Counter {
+            value: 1_000_000_000,
+        };
+        let val = json_to_crdt_value(&json).unwrap();
+        match val {
+            CrdtValue::Counter(c) => assert_eq!(c.value(), 1_000_000_000),
+            other => panic!("expected Counter, got {other:?}"),
         }
     }
 }
