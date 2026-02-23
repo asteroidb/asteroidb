@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -8,10 +9,11 @@ use crate::api::certified::CertifiedApi;
 use crate::api::eventual::EventualApi;
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
+use crate::control_plane::system_namespace::SystemNamespace;
 use crate::hlc::Hlc;
 use crate::network::sync::SyncClient;
 use crate::ops::metrics::RuntimeMetrics;
-use crate::types::{CertificationStatus, NodeId};
+use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
 #[derive(Debug, Clone)]
@@ -68,6 +70,13 @@ pub struct NodeRunner {
     eventual_api: Option<Arc<Mutex<EventualApi>>>,
     /// Runtime metrics for operational monitoring.
     metrics: Arc<RuntimeMetrics>,
+    /// Tracked policy versions per key range prefix.
+    ///
+    /// On each certification tick the runner snapshots the current
+    /// namespace versions and compares with these tracked values.
+    /// When a version change is detected, the old version is fenced
+    /// and the frontier reporter is refreshed.
+    tracked_policy_versions: HashMap<String, PolicyVersion>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -97,10 +106,12 @@ impl NodeRunner {
         config: NodeRunnerConfig,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
-        let reporter = {
+        let (reporter, tracked_versions) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
-            FrontierReporter::new(node_id.clone(), &ns)
+            let reporter = FrontierReporter::new(node_id.clone(), &ns);
+            let versions = Self::snapshot_policy_versions(&ns);
+            (reporter, versions)
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -121,6 +132,7 @@ impl NodeRunner {
             sync_client: None,
             eventual_api: None,
             metrics,
+            tracked_policy_versions: tracked_versions,
         }
     }
 
@@ -137,10 +149,12 @@ impl NodeRunner {
         eventual_api: Arc<Mutex<EventualApi>>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
-        let reporter = {
+        let (reporter, tracked_versions) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
-            FrontierReporter::new(node_id.clone(), &ns)
+            let reporter = FrontierReporter::new(node_id.clone(), &ns);
+            let versions = Self::snapshot_policy_versions(&ns);
+            (reporter, versions)
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -161,6 +175,7 @@ impl NodeRunner {
             sync_client: Some(sync_client),
             eventual_api: Some(eventual_api),
             metrics,
+            tracked_policy_versions: tracked_versions,
         }
     }
 
@@ -205,6 +220,65 @@ impl NodeRunner {
     /// Return a reference to the runtime metrics.
     pub fn metrics(&self) -> &Arc<RuntimeMetrics> {
         &self.metrics
+    }
+
+    /// Snapshot the current policy version for each placement policy
+    /// in the system namespace.
+    fn snapshot_policy_versions(ns: &SystemNamespace) -> HashMap<String, PolicyVersion> {
+        ns.all_placement_policies()
+            .into_iter()
+            .map(|p| (p.key_range.prefix.clone(), p.version))
+            .collect()
+    }
+
+    /// Detect policy version changes and fence old versions.
+    ///
+    /// Compares the current namespace policy versions against the tracked
+    /// snapshot. When a version change is detected:
+    /// 1. The old version is fenced in the `AckFrontierSet` (via `CertifiedApi`)
+    /// 2. The `FrontierReporter` is refreshed to pick up the new scopes
+    /// 3. The tracked versions are updated
+    async fn detect_version_changes(&mut self) {
+        // Snapshot current versions while briefly holding the locks.
+        let current_versions: HashMap<String, PolicyVersion> = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
+            Self::snapshot_policy_versions(&ns)
+        };
+
+        // Collect version changes: (prefix, old_version, new_version).
+        let mut changes: Vec<(String, PolicyVersion, PolicyVersion)> = Vec::new();
+        for (prefix, new_version) in &current_versions {
+            if let Some(old_version) = self.tracked_policy_versions.get(prefix)
+                && old_version != new_version
+            {
+                changes.push((prefix.clone(), *old_version, *new_version));
+            }
+        }
+
+        if changes.is_empty() {
+            return;
+        }
+
+        // Apply fencing and refresh reporter.
+        {
+            let mut api = self.certified_api.lock().await;
+            for (prefix, old_version, _new_version) in &changes {
+                let key_range = KeyRange {
+                    prefix: prefix.clone(),
+                };
+                api.fence_version(&key_range, *old_version);
+            }
+
+            // Refresh the frontier reporter scopes.
+            if let Some(reporter) = &mut self.frontier_reporter {
+                let ns = api.namespace().read().unwrap();
+                reporter.refresh_scopes(&ns);
+            }
+        }
+
+        // Update tracked versions.
+        self.tracked_policy_versions = current_versions;
     }
 
     /// Run the node event loop until shutdown is signalled.
@@ -265,6 +339,7 @@ impl NodeRunner {
                     }
                 }
                 _ = cert_interval.tick() => {
+                    self.detect_version_changes().await;
                     self.process_certifications().await;
                     stats.certification_ticks += 1;
                 }

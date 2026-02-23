@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+/// A fenced (key_range, policy_version) pair.
+///
+/// Once a version is fenced for a key range, no new frontier updates for that
+/// combination are accepted. This prevents "frontier pollution" where stale
+/// updates from an old policy version contaminate the new version's frontier
+/// tracking (FR-009 safe transition).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FencedVersion {
+    /// The key range that is fenced.
+    pub key_range: KeyRange,
+    /// The policy version that is fenced.
+    pub policy_version: PolicyVersion,
+}
 
 /// Tracks how far an Authority node has consumed updates for a key range.
 ///
@@ -72,6 +86,10 @@ impl FrontierScope {
 pub struct AckFrontierSet {
     #[serde(with = "frontier_map_serde")]
     frontiers: HashMap<FrontierScope, AckFrontier>,
+    /// Fenced (key_range, policy_version) pairs. Updates targeting a fenced
+    /// combination are silently rejected by `update()`.
+    #[serde(default)]
+    fenced_versions: HashSet<FencedVersion>,
 }
 
 /// Custom serde for `HashMap<FrontierScope, AckFrontier>`.
@@ -110,6 +128,7 @@ impl AckFrontierSet {
     pub fn new() -> Self {
         Self {
             frontiers: HashMap::new(),
+            fenced_versions: HashSet::new(),
         }
     }
 
@@ -122,6 +141,11 @@ impl AckFrontierSet {
     /// Returns `true` if the frontier was actually advanced (inserted or
     /// updated), `false` if the update was stale or duplicate.
     pub fn update(&mut self, frontier: AckFrontier) -> bool {
+        // Reject updates targeting a fenced (key_range, policy_version) pair.
+        if self.is_version_fenced(&frontier.key_range, &frontier.policy_version) {
+            return false;
+        }
+
         let scope = FrontierScope::from_frontier(&frontier);
         match self.frontiers.get(&scope) {
             Some(existing) if existing.frontier_hlc >= frontier.frontier_hlc => {
@@ -133,6 +157,27 @@ impl AckFrontierSet {
                 true
             }
         }
+    }
+
+    /// Fence a (key_range, policy_version) pair.
+    ///
+    /// After fencing, all subsequent `update()` calls targeting this
+    /// combination are silently rejected. Existing frontier entries for
+    /// the fenced pair are preserved (they remain readable via `get_scoped`
+    /// and scoped query methods).
+    pub fn fence_version(&mut self, range: &KeyRange, version: PolicyVersion) {
+        self.fenced_versions.insert(FencedVersion {
+            key_range: range.clone(),
+            policy_version: version,
+        });
+    }
+
+    /// Check whether a (key_range, policy_version) pair has been fenced.
+    pub fn is_version_fenced(&self, range: &KeyRange, version: &PolicyVersion) -> bool {
+        self.fenced_versions.contains(&FencedVersion {
+            key_range: range.clone(),
+            policy_version: *version,
+        })
     }
 
     /// Get the frontier for a specific authority by `NodeId`.
@@ -1040,5 +1085,123 @@ mod tests {
         // Submitting a newer frontier should return true.
         let newer = make_frontier("auth-1", 200, 0, "user/");
         assert!(set.update(newer), "advancing frontier should return true");
+    }
+
+    // ---------------------------------------------------------------
+    // Version fencing tests (#98)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fence_version_blocks_new_updates() {
+        let mut set = AckFrontierSet::new();
+
+        // Insert a frontier at v1.
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+
+        // Fence v1 for user/.
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        // New update at v1 should be rejected.
+        let blocked = set.update(make_frontier_v("auth-1", 200, 0, "user/", 1));
+        assert!(!blocked, "fenced version should block new updates");
+
+        // Existing entry should remain unchanged.
+        let scope = FrontierScope::new(kr("user/"), pv(1), NodeId("auth-1".into()));
+        assert_eq!(set.get_scoped(&scope).unwrap().frontier_hlc.physical, 100);
+    }
+
+    #[test]
+    fn fence_version_does_not_affect_other_versions() {
+        let mut set = AckFrontierSet::new();
+
+        // Fence v1 for user/.
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        // v2 for the same key range should still be accepted.
+        let accepted = set.update(make_frontier_v("auth-1", 500, 0, "user/", 2));
+        assert!(accepted, "unfenced version should be accepted");
+
+        let scope_v2 = FrontierScope::new(kr("user/"), pv(2), NodeId("auth-1".into()));
+        assert_eq!(
+            set.get_scoped(&scope_v2).unwrap().frontier_hlc.physical,
+            500
+        );
+    }
+
+    #[test]
+    fn fence_version_does_not_affect_other_key_ranges() {
+        let mut set = AckFrontierSet::new();
+
+        // Fence v1 for user/.
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        // v1 for order/ should still be accepted.
+        let accepted = set.update(make_frontier_v("auth-1", 300, 0, "order/", 1));
+        assert!(accepted, "different key range should not be fenced");
+    }
+
+    #[test]
+    fn is_version_fenced_returns_correct_state() {
+        let mut set = AckFrontierSet::new();
+
+        assert!(!set.is_version_fenced(&kr("user/"), &PolicyVersion(1)));
+
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+        assert!(set.is_version_fenced(&kr("user/"), &PolicyVersion(1)));
+        assert!(!set.is_version_fenced(&kr("user/"), &PolicyVersion(2)));
+        assert!(!set.is_version_fenced(&kr("order/"), &PolicyVersion(1)));
+    }
+
+    #[test]
+    fn fenced_version_preserves_existing_entries() {
+        let mut set = AckFrontierSet::new();
+
+        // Insert entries at v1 and v2.
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.update(make_frontier_v("auth-2", 200, 0, "user/", 1));
+        set.update(make_frontier_v("auth-1", 50, 0, "user/", 2));
+
+        // Fence v1.
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        // All existing entries are still readable.
+        assert_eq!(set.all_for_scope(&kr("user/"), &pv(1)).len(), 2);
+        assert_eq!(set.all_for_scope(&kr("user/"), &pv(2)).len(), 1);
+
+        // Scoped queries still work.
+        let mf = set
+            .majority_frontier_for_scope(&kr("user/"), &pv(1), 3)
+            .unwrap();
+        assert_eq!(mf.physical, 100);
+    }
+
+    #[test]
+    fn fence_new_insert_also_blocked() {
+        let mut set = AckFrontierSet::new();
+
+        // Fence v1 before any data exists.
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        // First-time insert should also be blocked.
+        let blocked = set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        assert!(!blocked, "fenced version should block first-time inserts");
+        assert!(set.all().is_empty());
+    }
+
+    #[test]
+    fn fenced_versions_serde_roundtrip() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.fence_version(&kr("user/"), PolicyVersion(1));
+
+        let json = set.to_json().expect("serialize");
+        let mut restored = AckFrontierSet::from_json(&json).expect("deserialize");
+
+        // Fencing state should survive serialization.
+        assert!(restored.is_version_fenced(&kr("user/"), &PolicyVersion(1)));
+
+        // Updates should still be blocked after deserialization.
+        let blocked = restored.update(make_frontier_v("auth-1", 200, 0, "user/", 1));
+        assert!(!blocked, "fenced version should survive serde roundtrip");
     }
 }
