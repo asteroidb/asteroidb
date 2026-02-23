@@ -2,6 +2,8 @@ services:
   node-1:
     build: .
     container_name: asteroidb-node-1
+    cap_add:
+      - NET_ADMIN
     ports:
       - "3001:3000"
     environment:
@@ -13,6 +15,8 @@ services:
   node-2:
     build: .
     container_name: asteroidb-node-2
+    cap_add:
+      - NET_ADMIN
     ports:
       - "3002:3000"
     environment:
@@ -24,6 +28,8 @@ services:
   node-3:
     build: .
     container_name: asteroidb-node-3
+    cap_add:
+      - NET_ADMIN
     ports:
       - "3003:3000"
     environment:
