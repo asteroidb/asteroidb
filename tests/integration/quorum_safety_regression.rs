@@ -398,6 +398,7 @@ fn duplicate_signature_does_not_inflate_certificate_majority() {
             authority_id: node("auth-1"),
             public_key: vk,
             signature: sig,
+            keyset_version: KeysetVersion(1),
         });
     }
 
@@ -430,11 +431,13 @@ fn duplicate_signature_different_keys_same_authority_deduplicated() {
         authority_id: node("auth-A"),
         public_key: vk1,
         signature: sign_message(&sk1, &message),
+        keyset_version: KeysetVersion(1),
     });
     cert.add_signature(AuthoritySignature {
         authority_id: node("auth-A"),
         public_key: vk2,
         signature: sign_message(&sk2, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     assert_eq!(cert.signature_count(), 1);
@@ -459,6 +462,7 @@ fn certificate_majority_requires_unique_authorities() {
             authority_id: node("auth-1"),
             public_key: vk,
             signature: sign_message(&sk, &message),
+            keyset_version: KeysetVersion(1),
         });
     }
     assert!(!cert.has_majority(3));
@@ -469,6 +473,7 @@ fn certificate_majority_requires_unique_authorities() {
         authority_id: node("auth-2"),
         public_key: vk2,
         signature: sign_message(&sk2, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     assert_eq!(cert.signature_count(), 2);
@@ -918,6 +923,7 @@ fn end_to_end_scoped_frontier_with_duplicate_safety() {
         authority_id: node("auth-1"),
         public_key: vk1,
         signature: sign_message(&sk1, &message),
+        keyset_version: KeysetVersion(1),
     });
     // Duplicate from auth-1
     let (sk1b, vk1b) = make_key_pair();
@@ -925,6 +931,7 @@ fn end_to_end_scoped_frontier_with_duplicate_safety() {
         authority_id: node("auth-1"),
         public_key: vk1b,
         signature: sign_message(&sk1b, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     assert_eq!(
@@ -938,6 +945,7 @@ fn end_to_end_scoped_frontier_with_duplicate_safety() {
         authority_id: node("auth-2"),
         public_key: vk2,
         signature: sign_message(&sk2, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     assert!(cert.has_majority(3));
