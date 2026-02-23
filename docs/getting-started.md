@@ -355,7 +355,105 @@ cargo test eventual_counter_inc
 - **統合テスト**: Authority 認証フロー、配置連携、CRDT 収束、クォーラム安全性
 - **分断耐性テスト**: ネットワーク分断後の収束、Certified write の挙動
 
-## 5. デモシナリオ
+## 5. Docker Compose による 3 ノードクラスタ
+
+Docker Compose を使って、ローカル環境で 3 ノードのクラスタを起動できます。
+
+### 前提条件
+
+| 項目 | 要件 |
+|------|------|
+| **Docker** | 20.10 以降 |
+| **Docker Compose** | V2 (docker compose コマンド) |
+
+### クラスタの起動
+
+```bash
+# 補助スクリプトで起動 (ビルド + バックグラウンド起動)
+./scripts/cluster-up.sh
+
+# または直接 docker compose を実行
+docker compose up -d --build
+```
+
+起動後、各ノードは以下のポートで HTTP API を公開します:
+
+| ノード | ホスト側ポート | コンテナ内ポート |
+|--------|--------------|----------------|
+| node-1 | `localhost:3001` | `0.0.0.0:3000` |
+| node-2 | `localhost:3002` | `0.0.0.0:3000` |
+| node-3 | `localhost:3003` | `0.0.0.0:3000` |
+
+### ヘルスチェック
+
+```bash
+./scripts/cluster-status.sh
+```
+
+出力例:
+
+```
+AsteroidDB Cluster Status
+=========================
+
+  node-1 (localhost:3001): UP
+  node-2 (localhost:3002): UP
+  node-3 (localhost:3003): UP
+
+All nodes are healthy.
+```
+
+### クラスタへの操作
+
+各ノードに対して個別に HTTP API を呼び出せます:
+
+```bash
+# node-1 に書き込み
+curl -X POST http://localhost:3001/api/eventual/write \
+  -H "Content-Type: application/json" \
+  -d '{"type":"counter_inc","key":"hits"}'
+
+# node-2 から読み取り
+curl http://localhost:3002/api/eventual/hits
+
+# node-3 に書き込み
+curl -X POST http://localhost:3003/api/eventual/write \
+  -H "Content-Type: application/json" \
+  -d '{"type":"set_add","key":"users","element":"alice"}'
+```
+
+> **注**: 現時点ではノード間のデータ同期 (レプリケーション) は docker compose 構成では未接続です。各ノードは独立した HTTP API サーバとして動作します。ノード間通信の統合は今後の Issue で対応予定です。
+
+### クラスタの停止
+
+```bash
+./scripts/cluster-down.sh
+
+# または直接
+docker compose down
+```
+
+### ログの確認
+
+```bash
+# 全ノードのログを表示
+docker compose logs
+
+# 特定ノードのログをフォロー
+docker compose logs -f node-1
+```
+
+### 設定ファイル
+
+各ノードの設定例は `configs/` ディレクトリに格納されています:
+
+- `configs/node-1.json` - node-1 の NodeConfig
+- `configs/node-2.json` - node-2 の NodeConfig
+- `configs/node-3.json` - node-3 の NodeConfig
+
+これらは `NodeConfig::load()` で読み込み可能な JSON 形式です。将来的にノード起動時に設定ファイルを指定する機能が追加される予定です。
+
+## 6. デモシナリオ
 
 ### ノード起動とバックグラウンド処理
 
@@ -397,7 +495,7 @@ cargo test --test partition_tolerance -- --nocapture
 
 > 注: `demo_partition_recovery` example は今後追加予定です。現時点では上記のテストスイートで分断耐性を検証できます。
 
-## 6. トラブルシューティング
+## 7. トラブルシューティング
 
 ### ビルドエラー
 

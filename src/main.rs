@@ -16,9 +16,11 @@ async fn main() {
     let bind_addr =
         std::env::var("ASTEROIDB_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
 
-    println!("AsteroidDB starting...");
+    let node_id_str = std::env::var("ASTEROIDB_NODE_ID").unwrap_or_else(|_| "node-1".into());
 
-    let node_id = NodeId("node-1".into());
+    println!("AsteroidDB starting... (node_id={node_id_str})");
+
+    let node_id = NodeId(node_id_str);
 
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
