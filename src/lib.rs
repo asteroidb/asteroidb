@@ -6,6 +6,7 @@ pub mod crdt;
 pub mod error;
 pub mod hlc;
 pub mod http;
+pub mod network;
 pub mod node;
 pub mod ops;
 pub mod placement;
