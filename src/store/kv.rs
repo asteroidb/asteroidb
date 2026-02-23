@@ -9,6 +9,7 @@ use crate::crdt::or_map::OrMap;
 use crate::crdt::or_set::OrSet;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
+use crate::hlc::HlcTimestamp;
 
 /// A CRDT value stored in the KVS.
 ///
@@ -37,10 +38,14 @@ impl CrdtValue {
 /// Key-value store backed by CRDT values (FR-001).
 ///
 /// Provides basic CRUD operations, prefix-based key space partitioning,
-/// and CRDT-aware value merging with type checking.
+/// and CRDT-aware value merging with type checking. Supports HLC-based
+/// change tracking for delta sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     data: HashMap<String, CrdtValue>,
+    /// Per-key HLC timestamp of the last modification, used for delta sync.
+    #[serde(default)]
+    timestamps: HashMap<String, HlcTimestamp>,
 }
 
 impl Store {
@@ -48,6 +53,7 @@ impl Store {
     pub fn new() -> Self {
         Self {
             data: HashMap::new(),
+            timestamps: HashMap::new(),
         }
     }
 
@@ -157,6 +163,47 @@ impl Store {
             self.data.insert(key, value.clone());
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // HLC-tracked operations for delta sync
+    // ---------------------------------------------------------------
+
+    /// Record a change timestamp for the given key.
+    ///
+    /// Called after any mutation to enable delta sync tracking.
+    pub fn record_change(&mut self, key: &str, hlc: HlcTimestamp) {
+        self.timestamps.insert(key.to_string(), hlc);
+    }
+
+    /// Return entries modified strictly after the given frontier timestamp.
+    ///
+    /// Returns `(key, value, last_modified)` triples sorted by HLC timestamp.
+    pub fn entries_since(&self, frontier: &HlcTimestamp) -> Vec<(String, CrdtValue, HlcTimestamp)> {
+        let mut result: Vec<(String, CrdtValue, HlcTimestamp)> = self
+            .timestamps
+            .iter()
+            .filter(|(_, ts)| *ts > frontier)
+            .filter_map(|(key, ts)| {
+                self.data
+                    .get(key)
+                    .map(|v| (key.clone(), v.clone(), ts.clone()))
+            })
+            .collect();
+        result.sort_by(|a, b| a.2.cmp(&b.2));
+        result
+    }
+
+    /// Return the highest HLC timestamp across all tracked entries.
+    ///
+    /// Returns `None` if no entries have been tracked yet.
+    pub fn current_frontier(&self) -> Option<HlcTimestamp> {
+        self.timestamps.values().max().cloned()
+    }
+
+    /// Return the HLC timestamp for a specific key, if tracked.
+    pub fn timestamp_for(&self, key: &str) -> Option<&HlcTimestamp> {
+        self.timestamps.get(key)
     }
 }
 
@@ -769,5 +816,130 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(!loaded.contains_key("a"));
         assert!(loaded.contains_key("b"));
+    }
+
+    // ---------------------------------------------------------------
+    // Delta sync: record_change, entries_since, current_frontier
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn record_change_and_current_frontier() {
+        let mut store = Store::new();
+        assert!(store.current_frontier().is_none());
+
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("a", ts(100, 0, "N1"));
+
+        assert_eq!(store.current_frontier(), Some(ts(100, 0, "N1")));
+
+        store.put("b".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("b", ts(200, 0, "N1"));
+
+        assert_eq!(store.current_frontier(), Some(ts(200, 0, "N1")));
+    }
+
+    #[test]
+    fn entries_since_returns_only_newer() {
+        let mut store = Store::new();
+
+        store.put("old".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("old", ts(100, 0, "N1"));
+
+        store.put("mid".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("mid", ts(200, 0, "N1"));
+
+        store.put("new".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("new", ts(300, 0, "N1"));
+
+        // Everything after ts(150, 0, "N1")
+        let frontier = ts(150, 0, "N1");
+        let entries = store.entries_since(&frontier);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "mid");
+        assert_eq!(entries[1].0, "new");
+    }
+
+    #[test]
+    fn entries_since_returns_empty_when_nothing_newer() {
+        let mut store = Store::new();
+
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("a", ts(100, 0, "N1"));
+
+        let frontier = ts(200, 0, "N1");
+        let entries = store.entries_since(&frontier);
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn entries_since_empty_store() {
+        let store = Store::new();
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn entries_since_sorted_by_hlc() {
+        let mut store = Store::new();
+
+        store.put("c".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("c", ts(300, 0, "N1"));
+
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("a", ts(100, 0, "N1"));
+
+        store.put("b".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("b", ts(200, 0, "N1"));
+
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, "a");
+        assert_eq!(entries[1].0, "b");
+        assert_eq!(entries[2].0, "c");
+    }
+
+    #[test]
+    fn timestamp_for_returns_correct_value() {
+        let mut store = Store::new();
+
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 5, "N1"));
+
+        assert_eq!(store.timestamp_for("k"), Some(&ts(100, 5, "N1")));
+        assert_eq!(store.timestamp_for("missing"), None);
+    }
+
+    #[test]
+    fn record_change_updates_timestamp() {
+        let mut store = Store::new();
+
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "N1"));
+        assert_eq!(store.timestamp_for("k"), Some(&ts(100, 0, "N1")));
+
+        store.record_change("k", ts(200, 0, "N1"));
+        assert_eq!(store.timestamp_for("k"), Some(&ts(200, 0, "N1")));
+    }
+
+    #[test]
+    fn snapshot_preserves_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "N1"));
+
+        store.save_snapshot(&path).unwrap();
+        let loaded = Store::load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.timestamp_for("k"), Some(&ts(100, 0, "N1")));
+        assert_eq!(loaded.current_frontier(), Some(ts(100, 0, "N1")));
     }
 }

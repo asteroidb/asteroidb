@@ -15,7 +15,10 @@ use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use crate::network::PeerRegistry;
-use crate::network::sync::{KeyDumpResponse, SyncError, SyncRequest, SyncResponse};
+use crate::network::sync::{
+    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
+    SyncResponse,
+};
 
 use super::types::{
     ApiError, AuthorityDefinitionResponse, CertifiedReadResponse, CertifiedWriteRequest,
@@ -504,6 +507,32 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
         .collect();
 
     Json(KeyDumpResponse { entries })
+}
+
+/// `POST /api/internal/sync/delta`
+///
+/// Receives a delta sync request with a frontier timestamp and returns
+/// all entries modified after that frontier. Used for incremental
+/// anti-entropy sync.
+pub async fn internal_delta_sync(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DeltaSyncRequest>,
+) -> Json<DeltaSyncResponse> {
+    let api = state.eventual.lock().await;
+    let store = api.store();
+
+    let entries: Vec<DeltaEntry> = store
+        .entries_since(&req.frontier)
+        .into_iter()
+        .map(|(key, value, hlc)| DeltaEntry { key, value, hlc })
+        .collect();
+
+    let sender_frontier = store.current_frontier();
+
+    Json(DeltaSyncResponse {
+        entries,
+        sender_frontier,
+    })
 }
 
 // ---------------------------------------------------------------

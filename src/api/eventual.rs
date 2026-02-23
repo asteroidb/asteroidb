@@ -1,5 +1,5 @@
 use crate::error::CrdtError;
-use crate::hlc::Hlc;
+use crate::hlc::{Hlc, HlcTimestamp};
 use crate::store::kv::{CrdtValue, Store};
 use crate::types::NodeId;
 
@@ -40,9 +40,12 @@ impl EventualApi {
     /// Write a CRDT value locally (FR-004).
     ///
     /// The value is accepted immediately and will be propagated
-    /// to other nodes asynchronously.
+    /// to other nodes asynchronously. Records the HLC timestamp
+    /// for delta sync tracking.
     pub fn eventual_write(&mut self, key: String, value: CrdtValue) {
-        self.store.put(key, value);
+        let ts = self.clock.now();
+        self.store.put(key.clone(), value);
+        self.store.record_change(&key, ts);
     }
 
     /// Increment a PN-Counter at the given key.
@@ -67,6 +70,8 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.increment(&self.node_id);
         }
+        let ts = self.clock.now();
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -91,6 +96,8 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.decrement(&self.node_id);
         }
+        let ts = self.clock.now();
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -115,6 +122,8 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.add(element, &self.node_id);
         }
+        let ts = self.clock.now();
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -138,6 +147,8 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.remove(&element.to_string());
         }
+        let ts = self.clock.now();
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -168,6 +179,8 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.set(map_key, map_value, ts, &self.node_id);
         }
+        let change_ts = self.clock.now();
+        self.store.record_change(key, change_ts);
         Ok(())
     }
 
@@ -191,6 +204,8 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.delete(&map_key.to_string());
         }
+        let ts = self.clock.now();
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -216,15 +231,36 @@ impl EventualApi {
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
             r.set(value, ts);
         }
+        let change_ts = self.clock.now();
+        self.store.record_change(key, change_ts);
         Ok(())
     }
 
     /// Merge a CRDT value received from a remote node.
     ///
     /// Delegates to `Store::merge_value`, which handles type checking
-    /// and CRDT-specific merge semantics.
+    /// and CRDT-specific merge semantics. Records the HLC timestamp
+    /// for delta sync tracking.
     pub fn merge_remote(&mut self, key: String, remote_value: &CrdtValue) -> Result<(), CrdtError> {
-        self.store.merge_value(key, remote_value)
+        self.store.merge_value(key.clone(), remote_value)?;
+        let ts = self.clock.now();
+        self.store.record_change(&key, ts);
+        Ok(())
+    }
+
+    /// Merge a CRDT value received from a remote node with a pre-assigned HLC.
+    ///
+    /// Used by delta sync to preserve the original modification timestamp.
+    pub fn merge_remote_with_hlc(
+        &mut self,
+        key: String,
+        remote_value: &CrdtValue,
+        hlc: HlcTimestamp,
+    ) -> Result<(), CrdtError> {
+        self.clock.update(&hlc);
+        self.store.merge_value(key.clone(), remote_value)?;
+        self.store.record_change(&key, hlc);
+        Ok(())
     }
 
     /// Return all keys in the store.

@@ -10,7 +10,7 @@ use crate::api::eventual::EventualApi;
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
-use crate::hlc::Hlc;
+use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::sync::SyncClient;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
@@ -77,6 +77,9 @@ pub struct NodeRunner {
     /// When a version change is detected, the old version is fenced
     /// and the frontier reporter is refreshed.
     tracked_policy_versions: HashMap<String, PolicyVersion>,
+    /// Per-peer last known frontier for delta sync.
+    /// Maps peer address string to its last known frontier.
+    peer_frontiers: HashMap<String, HlcTimestamp>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -133,6 +136,7 @@ impl NodeRunner {
             eventual_api: None,
             metrics,
             tracked_policy_versions: tracked_versions,
+            peer_frontiers: HashMap::new(),
         }
     }
 
@@ -176,6 +180,7 @@ impl NodeRunner {
             eventual_api: Some(eventual_api),
             metrics,
             tracked_policy_versions: tracked_versions,
+            peer_frontiers: HashMap::new(),
         }
     }
 
@@ -489,8 +494,13 @@ impl NodeRunner {
             .store(max_skew_ms, Ordering::Relaxed);
     }
 
-    /// Run one cycle of anti-entropy push sync.
-    async fn run_sync(&self) {
+    /// Run one cycle of delta-based anti-entropy sync.
+    ///
+    /// For each peer:
+    /// 1. If we have a known frontier for the peer, try delta pull.
+    /// 2. Apply received entries and update the peer's frontier.
+    /// 3. On failure, fall back to full sync.
+    async fn run_sync(&mut self) {
         let Some(sync_client) = &self.sync_client else {
             return;
         };
@@ -502,17 +512,102 @@ impl NodeRunner {
             .sync_attempt_total
             .fetch_add(1, Ordering::Relaxed);
 
-        let entries = {
-            let api = eventual_api.lock().await;
-            api.store()
-                .all_entries()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
+        let peers: Vec<_> = sync_client.peer_registry().all_peers().to_vec();
+        let mut any_success = false;
 
-        let synced = sync_client.push_all_keys(entries, &self.node_id.0).await;
+        for peer in &peers {
+            let peer_key = peer.addr.to_string();
 
-        if synced == 0 && sync_client.peer_registry().peer_count() > 0 {
+            // Try delta sync if we have a frontier for this peer.
+            if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
+                let delta_result = sync_client
+                    .pull_delta(&peer.addr, &self.node_id.0, frontier)
+                    .await;
+
+                if let Some(delta_resp) = delta_result {
+                    // Apply delta entries.
+                    let mut api = eventual_api.lock().await;
+                    for entry in &delta_resp.entries {
+                        let _ = api.merge_remote_with_hlc(
+                            entry.key.clone(),
+                            &entry.value,
+                            entry.hlc.clone(),
+                        );
+                    }
+                    drop(api);
+
+                    // Update peer frontier.
+                    if let Some(new_frontier) = delta_resp.sender_frontier {
+                        self.peer_frontiers.insert(peer_key.clone(), new_frontier);
+                    }
+
+                    any_success = true;
+                    tracing::debug!(
+                        peer = %peer.node_id.0,
+                        delta_entries = delta_resp.entries.len(),
+                        "delta sync pull succeeded"
+                    );
+                    continue;
+                }
+
+                // Delta sync failed; retry once.
+                let retry_result = sync_client
+                    .pull_delta(&peer.addr, &self.node_id.0, frontier)
+                    .await;
+
+                if let Some(delta_resp) = retry_result {
+                    let mut api = eventual_api.lock().await;
+                    for entry in &delta_resp.entries {
+                        let _ = api.merge_remote_with_hlc(
+                            entry.key.clone(),
+                            &entry.value,
+                            entry.hlc.clone(),
+                        );
+                    }
+                    drop(api);
+
+                    if let Some(new_frontier) = delta_resp.sender_frontier {
+                        self.peer_frontiers.insert(peer_key.clone(), new_frontier);
+                    }
+
+                    any_success = true;
+                    tracing::debug!(
+                        peer = %peer.node_id.0,
+                        "delta sync retry succeeded"
+                    );
+                    continue;
+                }
+
+                // Both delta attempts failed; fall through to full sync.
+                tracing::warn!(
+                    peer = %peer.node_id.0,
+                    "delta sync failed, falling back to full sync"
+                );
+            }
+
+            // Full sync fallback: pull all keys from peer.
+            if let Some(remote_entries) = sync_client.pull_all_keys(&peer.addr).await {
+                let mut api = eventual_api.lock().await;
+                for (key, value) in &remote_entries {
+                    let _ = api.merge_remote(key.clone(), value);
+                }
+                drop(api);
+
+                // After full sync, set the peer's frontier to our current store frontier.
+                let api = eventual_api.lock().await;
+                if let Some(frontier) = api.store().current_frontier() {
+                    self.peer_frontiers.insert(peer_key, frontier);
+                }
+
+                any_success = true;
+                tracing::debug!(
+                    peer = %peer.node_id.0,
+                    "full sync fallback succeeded"
+                );
+            }
+        }
+
+        if !any_success && !peers.is_empty() {
             self.metrics
                 .sync_failure_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -520,8 +615,7 @@ impl NodeRunner {
 
         tracing::debug!(
             node = %self.node_id.0,
-            peers_synced = synced,
-            "anti-entropy sync cycle completed"
+            "anti-entropy sync cycle completed (delta-based)"
         );
     }
 
