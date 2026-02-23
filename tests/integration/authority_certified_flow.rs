@@ -258,6 +258,7 @@ fn end_to_end_certificate_signing_to_certified_api() {
         authority_id: node("auth-1"),
         public_key: vk1,
         signature: sig1,
+        keyset_version: KeysetVersion(1),
     });
 
     let sig2 = sign_message(&sk2, &message);
@@ -265,6 +266,7 @@ fn end_to_end_certificate_signing_to_certified_api() {
         authority_id: node("auth-2"),
         public_key: vk2,
         signature: sig2,
+        keyset_version: KeysetVersion(1),
     });
 
     // Step 3: Verify the certificate has majority and signatures are valid
@@ -360,11 +362,13 @@ fn full_flow_write_frontier_certificate_read() {
         authority_id: node("auth-1"),
         public_key: vk1,
         signature: sign_message(&sk1, &message),
+        keyset_version: KeysetVersion(1),
     });
     cert.add_signature(AuthoritySignature {
         authority_id: node("auth-2"),
         public_key: vk2,
         signature: sign_message(&sk2, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     // Verify certificate
@@ -444,6 +448,7 @@ fn certification_across_epoch_boundary() {
         authority_id: node("auth-1"),
         public_key: vk_epoch1,
         signature: sign_message(&sk_epoch1, &msg1),
+        keyset_version: KeysetVersion(1),
     });
 
     // Certificate from epoch 2 with new keyset version
@@ -459,6 +464,7 @@ fn certification_across_epoch_boundary() {
         authority_id: node("auth-2"),
         public_key: vk_epoch2,
         signature: sign_message(&sk_epoch2, &msg2),
+        keyset_version: KeysetVersion(2),
     });
 
     // Both certificates should be independently verifiable
@@ -704,6 +710,7 @@ fn invalid_signature_detected_in_certificate() {
         authority_id: node("auth-1"),
         public_key: vk1,
         signature: sign_message(&sk1, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     // Invalid signature: signed by sk2 but presented with vk3
@@ -711,6 +718,7 @@ fn invalid_signature_detected_in_certificate() {
         authority_id: node("auth-2"),
         public_key: vk3,
         signature: sign_message(&sk2, &message),
+        keyset_version: KeysetVersion(1),
     });
 
     // Has 2 signatures (majority) but verification should fail
