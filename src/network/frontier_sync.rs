@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +42,10 @@ impl FrontierSyncClient {
     /// Create a new sync client with default HTTP settings.
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -66,6 +70,7 @@ impl FrontierSyncClient {
             .json(&body)
             .send()
             .await?
+            .error_for_status()?
             .json::<FrontierPushResponse>()
             .await
     }
@@ -84,6 +89,7 @@ impl FrontierSyncClient {
             .get(&url)
             .send()
             .await?
+            .error_for_status()?
             .json::<FrontierPullResponse>()
             .await
     }
