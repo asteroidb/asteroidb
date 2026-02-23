@@ -19,6 +19,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/lib.sh"
 
 # --- Configuration ---
 NODE1_URL="http://localhost:3001"
@@ -33,86 +34,16 @@ SYNC_WAIT=3
 CONVERGENCE_RETRIES=10
 CONVERGENCE_INTERVAL=2
 
-separator() {
-    echo "======================================================================"
-}
-
-sub_separator() {
-    echo "----------------------------------------------------------------------"
-}
-
-check_node() {
-    local url="$1"
-    local name="$2"
-    local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "${url}/api/eventual/__health_check" 2>/dev/null || echo "000")
-    if [ "$status" = "200" ]; then
-        echo "  ${name}: UP"
-        return 0
-    else
-        echo "  ${name}: DOWN (HTTP ${status})"
-        return 1
-    fi
-}
-
-read_counter() {
-    local url="$1"
-    curl -sf --max-time 5 "${url}/api/eventual/${KEY}" 2>/dev/null || echo '{"value":null}'
-}
-
-extract_value() {
-    local json="$1"
-    # Extract counter value. Handles {"key":"...","value":{"type":"counter","value":N}}.
-    echo "$json" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    v = d.get('value')
-    if v is None:
-        print('null')
-    elif isinstance(v, dict):
-        print(v.get('value', 'null'))
-    else:
-        print(v)
-except Exception:
-    print('null')
-" 2>/dev/null || echo "null"
-}
-
 # === STEP 1: Cluster health check ===
-separator
-echo "STEP 1: Verify cluster health"
-sub_separator
+log_step 1 "Verify cluster health"
 
-all_up=true
-for pair in "${NODE1_URL}:node-1" "${NODE2_URL}:node-2" "${NODE3_URL}:node-3"; do
-    url="${pair%%:*}:${pair#*:}"
-    # Re-split correctly
-    url_part="${pair%:node-*}"
-    name_part="${pair##*:}"
-    # Fix: pair format is "http://localhost:3001:node-1", need to handle the URL correctly
-    true
-done
-
-# Simpler approach
-if ! check_node "$NODE1_URL" "node-1"; then all_up=false; fi
-if ! check_node "$NODE2_URL" "node-2"; then all_up=false; fi
-if ! check_node "$NODE3_URL" "node-3"; then all_up=false; fi
-
-if ! $all_up; then
-    echo ""
-    echo "[ERROR] Not all nodes are up. Start the cluster first:"
-    echo "  ./scripts/cluster-up.sh"
+if ! check_cluster "$NODE1_URL" "$NODE2_URL" "$NODE3_URL"; then
     exit 1
 fi
 echo ""
-echo "All nodes healthy."
-echo ""
 
 # === STEP 2: Initial eventual write to node-1 ===
-separator
-echo "STEP 2: Write counter to node-1 (3 increments)"
-sub_separator
+log_step 2 "Write counter to node-1 (3 increments)"
 
 for i in 1 2 3; do
     curl -sf -X POST "${NODE1_URL}/api/eventual/write" \
@@ -123,32 +54,26 @@ done
 echo ""
 
 # === STEP 3: Wait and verify sync ===
-separator
-echo "STEP 3: Wait ${SYNC_WAIT}s for replication, then verify sync"
-sub_separator
+log_step 3 "Wait ${SYNC_WAIT}s for replication, then verify sync"
 sleep "$SYNC_WAIT"
 
 for pair in "node-1:${NODE1_URL}" "node-2:${NODE2_URL}" "node-3:${NODE3_URL}"; do
     name="${pair%%:*}"
     url="${pair#*:}"
-    json=$(read_counter "$url")
+    json=$(read_counter "$url" "$KEY")
     val=$(extract_value "$json")
     echo "  ${name}: counter = ${val}"
 done
 echo ""
 
 # === STEP 4: Partition node-3 ===
-separator
-echo "STEP 4: Partition node-3 (100% packet loss)"
-sub_separator
+log_step 4 "Partition node-3 (100% packet loss)"
 
 "${SCRIPT_DIR}/add-partition.sh" "$NODE3_CONTAINER"
 echo ""
 
 # === STEP 5: Additional writes during partition ===
-separator
-echo "STEP 5: Write 5 more increments to node-1 (node-3 is partitioned)"
-sub_separator
+log_step 5 "Write 5 more increments to node-1 (node-3 is partitioned)"
 
 for i in 1 2 3 4 5; do
     curl -sf -X POST "${NODE1_URL}/api/eventual/write" \
@@ -161,19 +86,17 @@ echo ""
 sleep "$SYNC_WAIT"
 
 # === STEP 6: Verify divergence ===
-separator
-echo "STEP 6: Verify state divergence"
-sub_separator
+log_step 6 "Verify state divergence"
 
 for pair in "node-1:${NODE1_URL}" "node-2:${NODE2_URL}"; do
     name="${pair%%:*}"
     url="${pair#*:}"
-    json=$(read_counter "$url")
+    json=$(read_counter "$url" "$KEY")
     val=$(extract_value "$json")
     echo "  ${name} (connected): counter = ${val}"
 done
 
-json3=$(read_counter "$NODE3_URL")
+json3=$(read_counter "$NODE3_URL" "$KEY")
 val3=$(extract_value "$json3")
 echo "  node-3 (partitioned): counter = ${val3}"
 echo ""
@@ -181,42 +104,26 @@ echo "  [Expected] node-1, node-2 have newer data; node-3 is behind."
 echo ""
 
 # === STEP 7: Recover node-3 ===
-separator
-echo "STEP 7: Recover node-3 (remove netem rules)"
-sub_separator
+log_step 7 "Recover node-3 (remove netem rules)"
 
 "${SCRIPT_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
 echo ""
 
 # === STEP 8: Wait for convergence ===
-separator
-echo "STEP 8: Wait for CRDT convergence after recovery"
-sub_separator
+log_step 8 "Wait for CRDT convergence after recovery"
 
 # Read expected value from node-1.
-json1=$(read_counter "$NODE1_URL")
+json1=$(read_counter "$NODE1_URL" "$KEY")
 expected=$(extract_value "$json1")
 echo "  Expected converged value (from node-1): ${expected}"
 
 converged=false
-for attempt in $(seq 1 "$CONVERGENCE_RETRIES"); do
-    sleep "$CONVERGENCE_INTERVAL"
-    json3=$(read_counter "$NODE3_URL")
-    val3=$(extract_value "$json3")
-    echo "  Attempt ${attempt}/${CONVERGENCE_RETRIES}: node-3 counter = ${val3}"
-
-    if [ "$val3" = "$expected" ]; then
-        converged=true
-        break
-    fi
-done
+if wait_for_convergence "$expected" "$NODE3_URL" "node-3" "$CONVERGENCE_RETRIES" "$CONVERGENCE_INTERVAL" "$KEY"; then
+    converged=true
+fi
 
 echo ""
-if $converged; then
-    echo "  [OK] node-3 converged to ${expected}."
-else
-    echo "  [WARN] node-3 did not converge within the retry window."
-    echo "  Current node-3 value: ${val3}, expected: ${expected}"
+if ! $converged; then
     echo "  This may be expected if inter-node replication is not yet wired."
 fi
 
@@ -229,7 +136,7 @@ echo "Final state:"
 for pair in "node-1:${NODE1_URL}" "node-2:${NODE2_URL}" "node-3:${NODE3_URL}"; do
     name="${pair%%:*}"
     url="${pair#*:}"
-    json=$(read_counter "$url")
+    json=$(read_counter "$url" "$KEY")
     val=$(extract_value "$json")
     echo "  ${name}: counter = ${val}"
 done
