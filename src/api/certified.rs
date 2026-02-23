@@ -479,6 +479,20 @@ impl CertifiedApi {
     pub fn all_frontiers(&self) -> Vec<&AckFrontier> {
         self.frontiers.all()
     }
+
+    /// Fence a (key_range, policy_version) pair in the frontier set.
+    ///
+    /// After fencing, all subsequent frontier updates for this combination
+    /// are silently rejected. This isolates frontier judgment at version
+    /// boundaries during policy transitions (FR-009).
+    pub fn fence_version(&mut self, range: &KeyRange, version: PolicyVersion) {
+        self.frontiers.fence_version(range, version);
+    }
+
+    /// Check whether a (key_range, policy_version) pair has been fenced.
+    pub fn is_version_fenced(&self, range: &KeyRange, version: &PolicyVersion) -> bool {
+        self.frontiers.is_version_fenced(range, version)
+    }
 }
 
 #[cfg(test)]
