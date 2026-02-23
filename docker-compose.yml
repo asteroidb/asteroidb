@@ -1,0 +1,37 @@
+services:
+  node-1:
+    build: .
+    container_name: asteroidb-node-1
+    ports:
+      - "3001:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-1"
+    networks:
+      - asteroidb
+
+  node-2:
+    build: .
+    container_name: asteroidb-node-2
+    ports:
+      - "3002:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-2"
+    networks:
+      - asteroidb
+
+  node-3:
+    build: .
+    container_name: asteroidb-node-3
+    ports:
+      - "3003:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-3"
+    networks:
+      - asteroidb
+
+networks:
+  asteroidb:
+    driver: bridge

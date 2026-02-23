@@ -1,0 +1,21 @@
+{
+  "node": {
+    "id": "node-1",
+    "mode": "Both",
+    "tags": []
+  },
+  "bind_addr": "0.0.0.0:3000",
+  "peers": {
+    "self_id": "node-1",
+    "peers": {
+      "node-2": {
+        "node_id": "node-2",
+        "addr": "asteroidb-node-2:3000"
+      },
+      "node-3": {
+        "node_id": "node-3",
+        "addr": "asteroidb-node-3:3000"
+      }
+    }
+  }
+}
