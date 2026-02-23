@@ -8,6 +8,7 @@ use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
 
@@ -34,10 +35,14 @@ async fn main() {
         ],
     });
 
+    // Build shared runtime metrics.
+    let metrics = Arc::new(RuntimeMetrics::default());
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
         certified: Mutex::new(CertifiedApi::new(node_id.clone(), ns.clone())),
+        metrics: Arc::clone(&metrics),
     });
 
     let app = router(state);
@@ -45,7 +50,13 @@ async fn main() {
     // Build NodeRunner with its own CertifiedApi for background processing.
     let runner_api = CertifiedApi::new(node_id.clone(), ns);
     let engine = CompactionEngine::with_defaults();
-    let mut runner = NodeRunner::new(node_id, runner_api, engine, NodeRunnerConfig::default());
+    let mut runner = NodeRunner::new(
+        node_id,
+        runner_api,
+        engine,
+        NodeRunnerConfig::default(),
+        Arc::clone(&metrics),
+    );
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.

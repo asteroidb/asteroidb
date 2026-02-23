@@ -15,6 +15,7 @@ use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId};
 
@@ -50,12 +51,14 @@ async fn two_node_anti_entropy_convergence() {
     let state1 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-1"), default_namespace())),
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Build state for node 2.
     let state2 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-2"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-2"), default_namespace())),
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Write some data to node 1.
@@ -228,6 +231,7 @@ async fn pull_based_sync() {
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("source"))),
         certified: Mutex::new(CertifiedApi::new(node_id("source"), default_namespace())),
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     {
@@ -275,6 +279,7 @@ async fn sync_endpoint_partial_failure() {
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("target"))),
         certified: Mutex::new(CertifiedApi::new(node_id("target"), default_namespace())),
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Pre-populate with a counter at "k".
@@ -362,6 +367,7 @@ async fn three_node_convergence_via_sync() {
         let state = Arc::new(AppState {
             eventual: Mutex::new(EventualApi::new(nid.clone())),
             certified: Mutex::new(CertifiedApi::new(nid, default_namespace())),
+            metrics: Arc::new(RuntimeMetrics::default()),
         });
         states.push(state);
     }
@@ -462,6 +468,7 @@ async fn internal_keys_endpoint() {
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-1"), default_namespace())),
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     {

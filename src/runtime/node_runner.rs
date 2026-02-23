@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
@@ -9,7 +10,8 @@ use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::hlc::Hlc;
 use crate::network::sync::SyncClient;
-use crate::types::NodeId;
+use crate::ops::metrics::RuntimeMetrics;
+use crate::types::{CertificationStatus, NodeId};
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
 #[derive(Debug, Clone)]
@@ -64,6 +66,8 @@ pub struct NodeRunner {
     sync_client: Option<SyncClient>,
     /// Shared reference to the eventual API for reading store state during sync.
     eventual_api: Option<Arc<Mutex<EventualApi>>>,
+    /// Runtime metrics for operational monitoring.
+    metrics: Arc<RuntimeMetrics>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -91,6 +95,7 @@ impl NodeRunner {
         certified_api: CertifiedApi,
         compaction_engine: CompactionEngine,
         config: NodeRunnerConfig,
+        metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
         let frontier_reporter = if reporter.is_authority() {
@@ -111,6 +116,7 @@ impl NodeRunner {
             shutdown_rx,
             sync_client: None,
             eventual_api: None,
+            metrics,
         }
     }
 
@@ -125,6 +131,7 @@ impl NodeRunner {
         config: NodeRunnerConfig,
         sync_client: SyncClient,
         eventual_api: Arc<Mutex<EventualApi>>,
+        metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
         let frontier_reporter = if reporter.is_authority() {
@@ -145,6 +152,7 @@ impl NodeRunner {
             shutdown_rx,
             sync_client: Some(sync_client),
             eventual_api: Some(eventual_api),
+            metrics,
         }
     }
 
@@ -189,6 +197,11 @@ impl NodeRunner {
     /// Return a reference to the frontier reporter, if this node is an authority.
     pub fn frontier_reporter(&self) -> Option<&FrontierReporter> {
         self.frontier_reporter.as_ref()
+    }
+
+    /// Return a reference to the runtime metrics.
+    pub fn metrics(&self) -> &Arc<RuntimeMetrics> {
+        &self.metrics
     }
 
     /// Run the node event loop until shutdown is signalled.
@@ -291,9 +304,55 @@ impl NodeRunner {
     }
 
     fn process_certifications(&mut self) {
-        let now_ms = self.clock.now().physical;
+        let now = self.clock.now();
+        let now_ms = now.physical;
+
+        // Snapshot pending write timestamps before processing.
+        let pre_statuses: Vec<(CertificationStatus, u64)> = self
+            .certified_api
+            .pending_writes()
+            .iter()
+            .map(|pw| (pw.status, pw.timestamp.physical))
+            .collect();
+
         self.certified_api
             .process_certifications_with_timeout(now_ms);
+
+        // Compute metrics after processing.
+        let writes = self.certified_api.pending_writes();
+        let mut pending = 0u64;
+        let mut newly_certified = 0u64;
+        let mut latency_sum = 0u64;
+
+        for (i, pw) in writes.iter().enumerate() {
+            if pw.status == CertificationStatus::Pending {
+                pending += 1;
+            }
+            // Detect newly certified writes by comparing pre/post status.
+            if pw.status == CertificationStatus::Certified {
+                let was_pending = pre_statuses
+                    .get(i)
+                    .is_some_and(|(s, _)| *s == CertificationStatus::Pending);
+                if was_pending {
+                    newly_certified += 1;
+                    latency_sum += now_ms.saturating_sub(pw.timestamp.physical) * 1000;
+                }
+            }
+        }
+
+        self.metrics.pending_count.store(pending, Ordering::Relaxed);
+
+        if newly_certified > 0 {
+            self.metrics
+                .certified_total
+                .fetch_add(newly_certified, Ordering::Relaxed);
+            self.metrics
+                .certification_latency_sum_us
+                .fetch_add(latency_sum, Ordering::Relaxed);
+            self.metrics
+                .certification_latency_count
+                .fetch_add(newly_certified, Ordering::Relaxed);
+        }
     }
 
     fn run_cleanup(&mut self) {
@@ -309,6 +368,40 @@ impl NodeRunner {
                 self.certified_api.update_frontier(f);
             }
         }
+
+        // Compute frontier skew: for each scope, find max and min frontier
+        // HLC among authorities, and report the maximum skew across all scopes.
+        self.update_frontier_skew();
+    }
+
+    /// Compute and store the maximum frontier skew across all authority scopes.
+    fn update_frontier_skew(&self) {
+        use std::collections::HashMap;
+
+        let all_frontiers = self.certified_api.all_frontiers();
+        if all_frontiers.is_empty() {
+            return;
+        }
+
+        // Group frontiers by key range prefix.
+        let mut by_scope: HashMap<&str, (u64, u64)> = HashMap::new();
+        for f in &all_frontiers {
+            let entry = by_scope
+                .entry(f.key_range.prefix.as_str())
+                .or_insert((u64::MAX, 0));
+            entry.0 = entry.0.min(f.frontier_hlc.physical);
+            entry.1 = entry.1.max(f.frontier_hlc.physical);
+        }
+
+        let max_skew_ms = by_scope
+            .values()
+            .map(|(min_p, max_p)| max_p.saturating_sub(*min_p))
+            .max()
+            .unwrap_or(0);
+
+        self.metrics
+            .frontier_skew_ms
+            .store(max_skew_ms, Ordering::Relaxed);
     }
 
     /// Run one cycle of anti-entropy push sync.
@@ -320,6 +413,10 @@ impl NodeRunner {
             return;
         };
 
+        self.metrics
+            .sync_attempt_total
+            .fetch_add(1, Ordering::Relaxed);
+
         let entries = {
             let api = eventual_api.lock().await;
             api.store()
@@ -329,6 +426,12 @@ impl NodeRunner {
         };
 
         let synced = sync_client.push_all_keys(entries, &self.node_id.0).await;
+
+        if synced == 0 && sync_client.peer_registry().peer_count() > 0 {
+            self.metrics
+                .sync_failure_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         tracing::debug!(
             node = %self.node_id.0,
@@ -382,8 +485,13 @@ mod tests {
     use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
     use crate::crdt::pn_counter::PnCounter;
     use crate::hlc::HlcTimestamp;
+    use crate::ops::metrics::RuntimeMetrics;
     use crate::store::kv::CrdtValue;
-    use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+    use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+    fn default_metrics() -> Arc<RuntimeMetrics> {
+        Arc::new(RuntimeMetrics::default())
+    }
 
     fn node_id(s: &str) -> NodeId {
         NodeId(s.into())
@@ -440,7 +548,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         // Shut down after a brief delay.
@@ -486,7 +594,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         // Run long enough for at least one certification tick.
@@ -528,7 +636,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         // Run long enough for cleanup to expire the 10ms-TTL write.
@@ -573,7 +681,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
@@ -594,7 +702,13 @@ mod tests {
     async fn shutdown_handle_is_cloneable() {
         let api = CertifiedApi::new(node_id("node-1"), default_namespace());
         let engine = CompactionEngine::with_defaults();
-        let runner = NodeRunner::new(node_id("node-1"), api, engine, NodeRunnerConfig::default());
+        let runner = NodeRunner::new(
+            node_id("node-1"),
+            api,
+            engine,
+            NodeRunnerConfig::default(),
+            default_metrics(),
+        );
 
         let handle1 = runner.shutdown_handle();
         let handle2 = runner.shutdown_handle();
@@ -618,8 +732,13 @@ mod tests {
     async fn node_runner_accessors() {
         let api = CertifiedApi::new(node_id("node-1"), default_namespace());
         let engine = CompactionEngine::with_defaults();
-        let mut runner =
-            NodeRunner::new(node_id("node-1"), api, engine, NodeRunnerConfig::default());
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            api,
+            engine,
+            NodeRunnerConfig::default(),
+            default_metrics(),
+        );
 
         assert_eq!(runner.node_id(), &node_id("node-1"));
 
@@ -645,7 +764,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics());
 
         // Signal shutdown before run starts.
         let _ = runner.shutdown_handle().send(true);
@@ -670,14 +789,26 @@ mod tests {
         // node-1 is NOT in the authority set → no reporter
         let api = CertifiedApi::new(node_id("node-1"), default_namespace());
         let engine = CompactionEngine::with_defaults();
-        let runner = NodeRunner::new(node_id("node-1"), api, engine, NodeRunnerConfig::default());
+        let runner = NodeRunner::new(
+            node_id("node-1"),
+            api,
+            engine,
+            NodeRunnerConfig::default(),
+            default_metrics(),
+        );
         assert!(!runner.is_authority());
         assert!(runner.frontier_reporter().is_none());
 
         // auth-1 IS in the authority set → has reporter
         let api = CertifiedApi::new(node_id("auth-1"), default_namespace());
         let engine = CompactionEngine::with_defaults();
-        let runner = NodeRunner::new(node_id("auth-1"), api, engine, NodeRunnerConfig::default());
+        let runner = NodeRunner::new(
+            node_id("auth-1"),
+            api,
+            engine,
+            NodeRunnerConfig::default(),
+            default_metrics(),
+        );
         assert!(runner.is_authority());
         assert!(runner.frontier_reporter().is_some());
     }
@@ -697,7 +828,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
         assert!(runner.is_authority());
 
         let handle = runner.shutdown_handle();
@@ -746,7 +877,13 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("store-node"), api, engine, config);
+        let mut runner = NodeRunner::new(
+            node_id("store-node"),
+            api,
+            engine,
+            config,
+            default_metrics(),
+        );
         assert!(!runner.is_authority());
 
         let handle = runner.shutdown_handle();
@@ -799,7 +936,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
@@ -852,7 +989,7 @@ mod tests {
             sync_interval: None,
         };
 
-        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
+        let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config, default_metrics());
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {

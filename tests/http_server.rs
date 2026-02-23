@@ -8,6 +8,7 @@ use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::types::{KeyRange, NodeId};
 use tokio::sync::Mutex;
 
@@ -29,6 +30,7 @@ fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
         certified: Mutex::new(CertifiedApi::new(node_id, ns)),
+        metrics: Arc::new(RuntimeMetrics::default()),
     })
 }
 
