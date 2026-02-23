@@ -61,6 +61,7 @@ async fn two_node_anti_entropy_convergence() {
         ))),
         namespace: ns1,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     // Build state for node 2.
@@ -73,6 +74,7 @@ async fn two_node_anti_entropy_convergence() {
         ))),
         namespace: ns2,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     // Write some data to node 1.
@@ -251,6 +253,7 @@ async fn pull_based_sync() {
         ))),
         namespace: ns_source,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     {
@@ -304,6 +307,7 @@ async fn sync_endpoint_partial_failure() {
         ))),
         namespace: ns_target,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     // Pre-populate with a counter at "k".
@@ -394,6 +398,7 @@ async fn three_node_convergence_via_sync() {
             certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i)))),
             namespace: ns_i,
             metrics: Arc::new(RuntimeMetrics::default()),
+            peers: None,
         });
         states.push(state);
     }
@@ -500,6 +505,7 @@ async fn internal_keys_endpoint() {
         ))),
         namespace: ns_keys,
         metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
     });
 
     {

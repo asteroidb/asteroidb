@@ -14,12 +14,14 @@ use crate::placement::PlacementPolicy;
 use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
+use crate::network::PeerRegistry;
 use crate::network::sync::{KeyDumpResponse, SyncError, SyncRequest, SyncResponse};
 
 use super::types::{
     ApiError, AuthorityDefinitionResponse, CertifiedReadResponse, CertifiedWriteRequest,
     CertifiedWriteResponse, CrdtValueJson, EventualReadResponse, EventualWriteRequest,
-    FrontierJson, PlacementPolicyResponse, ProofBundleJson, SetAuthorityDefinitionRequest,
+    FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, PeerInfo,
+    PlacementPolicyResponse, ProofBundleJson, SetAuthorityDefinitionRequest,
     SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
     VersionHistoryResponse, WriteResponse,
 };
@@ -30,6 +32,9 @@ pub struct AppState {
     pub certified: Arc<Mutex<CertifiedApi>>,
     pub namespace: Arc<RwLock<SystemNamespace>>,
     pub metrics: Arc<RuntimeMetrics>,
+    /// Peer registry for node join/leave bootstrap.
+    /// `None` when peer tracking is not needed (e.g. unit tests).
+    pub peers: Option<Arc<Mutex<PeerRegistry>>>,
 }
 
 // ---------------------------------------------------------------
@@ -499,6 +504,106 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
         .collect();
 
     Json(KeyDumpResponse { entries })
+}
+
+// ---------------------------------------------------------------
+// Internal join/leave handlers
+// ---------------------------------------------------------------
+
+/// `POST /api/internal/join`
+///
+/// A new node sends its configuration to this (seed) node to join the
+/// cluster. The seed node adds the joining node to its peer registry
+/// and returns the current peer list plus a system namespace snapshot.
+pub async fn internal_join(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JoinRequest>,
+) -> Result<Json<JoinResponse>, ApiError> {
+    use crate::network::PeerConfig;
+    use std::net::SocketAddr;
+
+    let peers_registry = state.peers.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "peer registry not configured".to_string(),
+        ))
+    })?;
+
+    let addr: SocketAddr = req
+        .address
+        .parse()
+        .map_err(|e| ApiError(CrdtError::InvalidArgument(format!("invalid address: {e}"))))?;
+
+    let joining_node_id = NodeId(req.node_id.clone());
+
+    // Add the joining node to our peer registry.
+    {
+        let mut registry = peers_registry.lock().await;
+        registry
+            .add_peer(PeerConfig {
+                node_id: joining_node_id.clone(),
+                addr,
+            })
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    }
+
+    // Build the response: current peer list + namespace snapshot.
+    let peer_list: Vec<PeerInfo> = {
+        let registry = peers_registry.lock().await;
+
+        // Include all known peers (including the seed node itself).
+        let mut list: Vec<PeerInfo> = registry
+            .all_peers_owned()
+            .into_iter()
+            .map(|p| PeerInfo {
+                node_id: p.node_id.0,
+                address: p.addr.to_string(),
+            })
+            .collect();
+
+        // Also include the seed node (self) in the list so the joiner
+        // knows about everyone.
+        // We cannot get the seed's own address from the registry, so
+        // we omit it here -- the joiner already knows the seed's address
+        // since it sent this request to it.
+        list.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        list
+    };
+
+    let ns_snapshot = {
+        let ns = state.namespace.read().unwrap();
+        serde_json::to_value(&*ns).unwrap_or(serde_json::Value::Null)
+    };
+
+    Ok(Json(JoinResponse {
+        peers: peer_list,
+        namespace: ns_snapshot,
+    }))
+}
+
+/// `POST /api/internal/leave`
+///
+/// A node sends its ID to gracefully depart the cluster. The receiving
+/// node removes the departing node from its peer registry.
+pub async fn internal_leave(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LeaveRequest>,
+) -> Result<Json<LeaveResponse>, ApiError> {
+    let peers_registry = state.peers.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "peer registry not configured".to_string(),
+        ))
+    })?;
+
+    let leaving_node_id = NodeId(req.node_id);
+
+    let mut registry = peers_registry.lock().await;
+    let removed = registry
+        .remove_peer(&leaving_node_id)
+        .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+
+    Ok(Json(LeaveResponse {
+        success: removed.is_some(),
+    }))
 }
 
 // ---------------------------------------------------------------
