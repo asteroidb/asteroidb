@@ -113,6 +113,7 @@ pub struct CertifiedReadResponse {
     pub value: Option<CrdtValueJson>,
     pub status: CertificationStatus,
     pub frontier: Option<FrontierJson>,
+    pub proof: Option<ProofBundleJson>,
 }
 
 /// JSON-friendly frontier representation.
@@ -123,10 +124,57 @@ pub struct FrontierJson {
     pub node_id: String,
 }
 
+/// JSON-friendly representation of a verifiable proof bundle.
+///
+/// Included in certified read responses so that external clients can
+/// independently verify that a majority of authorities acknowledged
+/// the frontier.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProofBundleJson {
+    /// Key range prefix this proof covers.
+    pub key_range_prefix: String,
+    /// The majority frontier at certification time.
+    pub frontier: FrontierJson,
+    /// The policy version in effect.
+    pub policy_version: u64,
+    /// Authority node IDs that contributed to this proof.
+    pub contributing_authorities: Vec<String>,
+    /// Total number of authorities in the set.
+    pub total_authorities: usize,
+}
+
 /// Response for `POST /api/certified/write`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CertifiedWriteResponse {
     pub status: CertificationStatus,
+}
+
+/// Request body for `POST /api/certified/verify`.
+#[derive(Debug, Deserialize)]
+pub struct VerifyProofRequest {
+    /// Key range prefix this proof covers.
+    pub key_range_prefix: String,
+    /// The majority frontier at certification time.
+    pub frontier: FrontierJson,
+    /// The policy version in effect.
+    pub policy_version: u64,
+    /// Authority node IDs that contributed to this proof.
+    pub contributing_authorities: Vec<String>,
+    /// Total number of authorities in the set.
+    pub total_authorities: usize,
+}
+
+/// Response for `POST /api/certified/verify`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerifyProofResponse {
+    /// Overall validity of the proof.
+    pub valid: bool,
+    /// Whether a strict majority is present.
+    pub has_majority: bool,
+    /// Number of contributing authorities.
+    pub contributing_count: usize,
+    /// Number of authorities required for majority.
+    pub required_count: usize,
 }
 
 /// Response for `GET /api/status/:key`.

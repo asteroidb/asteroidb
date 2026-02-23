@@ -8,6 +8,7 @@ use super::handlers::{
     get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy,
     get_version_history, internal_keys, internal_sync, list_authorities, list_policies,
     post_internal_frontiers, remove_policy, set_authority_definition, set_placement_policy,
+    verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -16,6 +17,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/eventual/write", post(eventual_write))
         .route("/api/eventual/{key}", get(get_eventual))
         .route("/api/certified/write", post(certified_write))
+        .route("/api/certified/verify", post(verify_proof))
         .route("/api/certified/{key}", get(get_certified))
         .route("/api/status/{key}", get(get_certification_status))
         .route(
@@ -761,7 +763,7 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Initial version history (namespace had 1 authority set → version 2)
+        // Initial version history (namespace had 1 authority set -> version 2)
         let req = Request::builder()
             .uri("/api/control-plane/versions")
             .body(Body::empty())
@@ -775,7 +777,7 @@ mod tests {
         assert_eq!(versions.current_version, 2);
         assert_eq!(versions.history, vec![1, 2]);
 
-        // Set a policy → version should increment
+        // Set a policy -> version should increment
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
@@ -804,7 +806,7 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Set policy twice → version should increment each time
+        // Set policy twice -> version should increment each time
         for i in 0..2 {
             let req = Request::builder()
                 .method("PUT")
@@ -912,5 +914,201 @@ mod tests {
         assert!((json["certification_latency_mean_us"].as_f64().unwrap() - 500.0).abs() < 0.01);
         // Failure rate: 3 / 20 = 0.15
         assert!((json["sync_failure_rate"].as_f64().unwrap() - 0.15).abs() < 0.01);
+    }
+
+    // ---------------------------------------------------------------
+    // Proof bundle in certified read (pending -> no proof)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn certified_read_pending_has_no_proof() {
+        let state = test_state();
+        let app = router(state);
+
+        // Write a certified value (stays pending since no frontiers).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/write")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key":"k1","value":{"type":"counter","value":1}}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // Read it back -- should be pending with no proof.
+        let req = Request::builder()
+            .uri("/api/certified/k1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let read_resp: CertifiedReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.status, CertificationStatus::Pending);
+        assert!(
+            read_resp.proof.is_none(),
+            "proof should be None for pending"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Proof bundle in certified read (certified -> has proof)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn certified_read_certified_has_proof() {
+        use crate::authority::ack_frontier::AckFrontier;
+        use crate::hlc::HlcTimestamp;
+        use crate::types::PolicyVersion;
+
+        let state = test_state();
+
+        // Write a certified value and advance frontiers to certify it.
+        {
+            let mut api = state.certified.lock().await;
+            let val = {
+                use crate::crdt::pn_counter::PnCounter;
+                use crate::store::kv::CrdtValue;
+                let mut c = PnCounter::new();
+                c.increment(&NodeId("writer".into()));
+                CrdtValue::Counter(c)
+            };
+            api.certified_write("k2".into(), val, crate::api::certified::OnTimeout::Pending)
+                .unwrap();
+
+            let write_ts = api.pending_writes()[0].timestamp.physical;
+
+            // Advance 2 of 3 authorities.
+            api.update_frontier(AckFrontier {
+                authority_id: NodeId("auth-1".into()),
+                frontier_hlc: HlcTimestamp {
+                    physical: write_ts + 100,
+                    logical: 0,
+                    node_id: "auth-1".into(),
+                },
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                policy_version: PolicyVersion(1),
+                digest_hash: "h1".into(),
+            });
+            api.update_frontier(AckFrontier {
+                authority_id: NodeId("auth-2".into()),
+                frontier_hlc: HlcTimestamp {
+                    physical: write_ts + 200,
+                    logical: 0,
+                    node_id: "auth-2".into(),
+                },
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                policy_version: PolicyVersion(1),
+                digest_hash: "h2".into(),
+            });
+            api.process_certifications();
+        }
+
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/certified/k2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: CertifiedReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.status, CertificationStatus::Certified);
+        assert!(
+            read_resp.proof.is_some(),
+            "proof should be present when certified"
+        );
+
+        let proof = read_resp.proof.unwrap();
+        assert_eq!(proof.total_authorities, 3);
+        assert_eq!(proof.contributing_authorities.len(), 2);
+        assert!(
+            proof
+                .contributing_authorities
+                .contains(&"auth-1".to_string())
+        );
+        assert!(
+            proof
+                .contributing_authorities
+                .contains(&"auth-2".to_string())
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Verify proof endpoint
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_proof_valid() {
+        use crate::http::types::VerifyProofResponse;
+
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "key_range_prefix": "user/",
+                    "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+                    "policy_version": 1,
+                    "contributing_authorities": ["auth-1", "auth-2", "auth-3"],
+                    "total_authorities": 5
+                }"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert!(result.valid);
+        assert!(result.has_majority);
+        assert_eq!(result.contributing_count, 3);
+        assert_eq!(result.required_count, 3); // 5/2+1 = 3
+    }
+
+    #[tokio::test]
+    async fn verify_proof_insufficient_authorities() {
+        use crate::http::types::VerifyProofResponse;
+
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "key_range_prefix": "user/",
+                    "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+                    "policy_version": 1,
+                    "contributing_authorities": ["auth-1"],
+                    "total_authorities": 5
+                }"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert!(!result.valid);
+        assert!(!result.has_majority);
+        assert_eq!(result.contributing_count, 1);
+        assert_eq!(result.required_count, 3);
     }
 }
