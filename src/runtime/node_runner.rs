@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -84,9 +85,10 @@ pub struct NodeRunner {
     /// `recalculate_authorities()` on the system namespace, updating
     /// authority definitions based on placement policy tag criteria.
     cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
-    /// Generation counter for detecting cluster membership changes.
-    /// Compared against `cluster_nodes` length + a hash to detect changes.
-    tracked_cluster_generation: usize,
+    /// Hash-based fingerprint for detecting cluster membership changes.
+    /// Computed from sorted node IDs so that same-size replacements
+    /// (e.g. 1 leave + 1 join) are detected correctly.
+    tracked_cluster_generation: u64,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -169,7 +171,7 @@ impl NodeRunner {
             tracked_policy_versions: tracked_versions,
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
-            tracked_cluster_generation: usize::MAX,
+            tracked_cluster_generation: u64::MAX,
         }
     }
 
@@ -337,8 +339,28 @@ impl NodeRunner {
     /// Compares the current cluster node list against the tracked generation.
     /// When a change is detected, calls `recalculate_authorities()` on the
     /// system namespace and refreshes the frontier reporter.
+    /// Compute a fingerprint of the cluster node list.
+    ///
+    /// Sorts node IDs and feeds them into a deterministic hasher so that
+    /// any structural change (including same-size replacements) produces
+    /// a different value.
+    fn cluster_fingerprint(nodes: &[Node]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
+        ids.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        ids.len().hash(&mut hasher);
+        for id in ids {
+            id.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     async fn detect_membership_changes(&mut self) {
-        let current_generation = self.cluster_nodes.read().unwrap().len();
+        let current_generation = {
+            let nodes = self.cluster_nodes.read().unwrap();
+            Self::cluster_fingerprint(&nodes)
+        };
         if current_generation == self.tracked_cluster_generation {
             return;
         }
@@ -1344,5 +1366,109 @@ mod tests {
         .await;
 
         assert_eq!(runner.cluster_nodes().read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_size_replacement_triggers_authority_recalculation() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Create a namespace with a certified policy requiring dc:tokyo tag.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        // Start with 3 nodes.
+        let initial_nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(initial_nodes));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config.clone(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+
+        // Run briefly to let the initial membership detection fire.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        // Verify initial authority definition: n1, n2, n3.
+        {
+            let api_lock = api.lock().await;
+            let ns = api_lock.namespace().read().unwrap();
+            let def = ns.get_authority_definition("user/").unwrap();
+            assert_eq!(def.authority_nodes.len(), 3);
+            assert!(def.authority_nodes.contains(&node_id("n1")));
+            assert!(def.authority_nodes.contains(&node_id("n2")));
+            assert!(def.authority_nodes.contains(&node_id("n3")));
+        }
+
+        // Same-size replacement: n3 leaves, n4 joins (still 3 nodes).
+        {
+            let mut nodes = cluster_nodes.write().unwrap();
+            nodes.retain(|n| n.id != node_id("n3"));
+            nodes.push(make_node("n4", NodeMode::Store, &["dc:tokyo"]));
+            assert_eq!(nodes.len(), 3, "node count must remain unchanged");
+        }
+
+        // Run again with the same runner state (tracked generation is from
+        // the first run). A new runner picks up the same tracked state.
+        let mut runner2 = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle2 = runner2.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle2.send(true);
+        });
+        runner2.run().await;
+
+        // After detection, the authority definition should reflect the
+        // replacement: n4 replaces n3.
+        let api_lock = api.lock().await;
+        let ns = api_lock.namespace().read().unwrap();
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(def.authority_nodes.len(), 3);
+        assert!(
+            def.authority_nodes.contains(&node_id("n4")),
+            "n4 should be in authority set after same-size replacement"
+        );
+        assert!(
+            !def.authority_nodes.contains(&node_id("n3")),
+            "n3 should no longer be in authority set after leaving"
+        );
     }
 }

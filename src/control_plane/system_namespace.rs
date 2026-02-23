@@ -765,7 +765,6 @@ mod tests {
     fn recalculate_authorities_respects_forbidden_tags() {
         use crate::types::NodeMode;
         use crate::types::Tag;
-        use std::collections::HashSet;
 
         let mut ns = SystemNamespace::new();
         let policy = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 3)
