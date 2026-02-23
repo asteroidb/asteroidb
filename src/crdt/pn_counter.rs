@@ -28,6 +28,20 @@ impl PnCounter {
         }
     }
 
+    /// Create a counter pre-initialized with the given value for the specified node.
+    ///
+    /// This is O(1) unlike repeated `increment`/`decrement` calls, which would
+    /// be O(|value|) and susceptible to DoS for large magnitudes.
+    pub fn from_value(node: &NodeId, value: i64) -> Self {
+        let mut counter = PnCounter::new();
+        if value >= 0 {
+            counter.p.insert(node.clone(), value as u64);
+        } else {
+            counter.n.insert(node.clone(), value.unsigned_abs());
+        }
+        counter
+    }
+
     /// Increment the counter for the given node.
     pub fn increment(&mut self, node_id: &NodeId) {
         *self.p.entry(node_id.clone()).or_insert(0) += 1;
@@ -283,5 +297,64 @@ mod tests {
     fn default_is_zero() {
         let counter = PnCounter::default();
         assert_eq!(counter.value(), 0);
+    }
+
+    #[test]
+    fn from_value_positive() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, 42);
+        assert_eq!(counter.value(), 42);
+    }
+
+    #[test]
+    fn from_value_negative() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, -7);
+        assert_eq!(counter.value(), -7);
+    }
+
+    #[test]
+    fn from_value_zero() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, 0);
+        assert_eq!(counter.value(), 0);
+    }
+
+    #[test]
+    fn from_value_large_positive() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, 999_999_999);
+        assert_eq!(counter.value(), 999_999_999);
+    }
+
+    #[test]
+    fn from_value_large_negative() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, -999_999_999);
+        assert_eq!(counter.value(), -999_999_999);
+    }
+
+    #[test]
+    fn from_value_merges_with_incremented() {
+        let na = node("node-a");
+        let nb = node("node-b");
+
+        // Build one counter via from_value, another via increment.
+        let counter_a = PnCounter::from_value(&na, 100);
+
+        let mut counter_b = PnCounter::new();
+        for _ in 0..5 {
+            counter_b.increment(&nb);
+        }
+        counter_b.decrement(&nb); // net +4
+
+        let mut merged = counter_a.clone();
+        merged.merge(&counter_b);
+        assert_eq!(merged.value(), 104);
+
+        // Commutativity: merge the other direction.
+        let mut merged_rev = counter_b.clone();
+        merged_rev.merge(&counter_a);
+        assert_eq!(merged_rev.value(), 104);
     }
 }
