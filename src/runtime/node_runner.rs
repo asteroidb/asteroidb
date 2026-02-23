@@ -92,7 +92,10 @@ impl NodeRunner {
         compaction_engine: CompactionEngine,
         config: NodeRunnerConfig,
     ) -> Self {
-        let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
+        let reporter = {
+            let ns = certified_api.namespace().read().unwrap();
+            FrontierReporter::new(node_id.clone(), &ns)
+        };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
         } else {
@@ -126,7 +129,10 @@ impl NodeRunner {
         sync_client: SyncClient,
         eventual_api: Arc<Mutex<EventualApi>>,
     ) -> Self {
-        let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
+        let reporter = {
+            let ns = certified_api.namespace().read().unwrap();
+            FrontierReporter::new(node_id.clone(), &ns)
+        };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
         } else {
@@ -340,10 +346,10 @@ impl NodeRunner {
     fn check_compaction(&mut self) {
         let now = self.clock.now();
 
+        let ns = self.certified_api.namespace().read().unwrap();
+
         // Iterate over all authority definitions to check each key range.
-        let defs: Vec<_> = self
-            .certified_api
-            .namespace()
+        let defs: Vec<_> = ns
             .all_authority_definitions()
             .into_iter()
             .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
@@ -354,9 +360,7 @@ impl NodeRunner {
                 // Create a checkpoint with a placeholder digest.
                 // In a full implementation this would compute an actual digest
                 // over the store data for this key range.
-                let policy_version = self
-                    .certified_api
-                    .namespace()
+                let policy_version = ns
                     .get_placement_policy(&key_range.prefix)
                     .map(|p| p.version)
                     .unwrap_or(crate::types::PolicyVersion(1));
@@ -384,6 +388,7 @@ mod tests {
     use crate::hlc::HlcTimestamp;
     use crate::store::kv::CrdtValue;
     use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+    use std::sync::{Arc, RwLock};
 
     fn node_id(s: &str) -> NodeId {
         NodeId(s.into())
@@ -395,13 +400,17 @@ mod tests {
         }
     }
 
-    fn default_namespace() -> SystemNamespace {
+    fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+        Arc::new(RwLock::new(ns))
+    }
+
+    fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         let mut ns = SystemNamespace::new();
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(""),
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         });
-        ns
+        wrap_ns(ns)
     }
 
     fn counter_value(n: i64) -> CrdtValue {
@@ -555,7 +564,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         });
 
-        let api = CertifiedApi::new(node_id("node-1"), ns);
+        let api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));
 
         let compaction_config = CompactionConfig {
             time_threshold_ms: 10,
@@ -785,7 +794,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
         });
 
-        let mut api = CertifiedApi::new(node_id("auth-1"), ns);
+        let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
         assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
@@ -828,7 +837,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
         });
 
-        let mut api = CertifiedApi::new(node_id("auth-1"), ns);
+        let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
 
         // Set a very high initial frontier manually.
         api.update_frontier(AckFrontier {

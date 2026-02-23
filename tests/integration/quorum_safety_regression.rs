@@ -6,6 +6,8 @@
 //! - #42: MajorityCertificate and CertificationTracker unique-authority quorum
 //! - #43: CertifiedApi pending_writes retention/cleanup
 
+use std::sync::{Arc, RwLock};
+
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout, RetentionPolicy};
 use asteroidb_poc::api::status::{CertificationTracker, WriteId};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet, FrontierScope};
@@ -86,15 +88,19 @@ fn counter_value(n: i64) -> CrdtValue {
     CrdtValue::Counter(counter)
 }
 
+fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+    Arc::new(RwLock::new(ns))
+}
+
 /// Create a default SystemNamespace with a single authority definition
 /// covering the empty prefix (all keys), with 3 authority nodes.
-fn default_namespace() -> SystemNamespace {
+fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range(""),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
     });
-    ns
+    wrap_ns(ns)
 }
 
 fn make_key_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {

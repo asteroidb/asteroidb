@@ -4,7 +4,7 @@
 //! using the anti-entropy sync loop (push-based replication via HTTP).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
@@ -19,6 +19,10 @@ use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId};
 
 use tokio::sync::Mutex;
+
+fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+    Arc::new(RwLock::new(ns))
+}
 
 fn node_id(s: &str) -> NodeId {
     NodeId(s.into())
@@ -47,15 +51,19 @@ async fn two_node_anti_entropy_convergence() {
     let addr2 = listener2.local_addr().unwrap();
 
     // Build state for node 1.
+    let ns1 = wrap_ns(default_namespace());
     let state1 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns1))),
+        namespace: ns1,
     });
 
     // Build state for node 2.
+    let ns2 = wrap_ns(default_namespace());
     let state2 = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-2"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-2"), default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(node_id("node-2"), Arc::clone(&ns2))),
+        namespace: ns2,
     });
 
     // Write some data to node 1.
@@ -225,9 +233,11 @@ async fn pull_based_sync() {
     let addr = listener.local_addr().unwrap();
 
     // Build state with some data.
+    let ns_source = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("source"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("source"), default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(node_id("source"), Arc::clone(&ns_source))),
+        namespace: ns_source,
     });
 
     {
@@ -272,9 +282,11 @@ async fn sync_endpoint_partial_failure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let ns_target = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("target"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("target"), default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(node_id("target"), Arc::clone(&ns_target))),
+        namespace: ns_target,
     });
 
     // Pre-populate with a counter at "k".
@@ -359,9 +371,11 @@ async fn three_node_convergence_via_sync() {
     let mut states = Vec::new();
     for i in 0..3 {
         let nid = node_id(&format!("node-{}", i + 1));
+        let ns_i = wrap_ns(default_namespace());
         let state = Arc::new(AppState {
             eventual: Mutex::new(EventualApi::new(nid.clone())),
-            certified: Mutex::new(CertifiedApi::new(nid, default_namespace())),
+            certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i))),
+            namespace: ns_i,
         });
         states.push(state);
     }
@@ -459,9 +473,11 @@ async fn internal_keys_endpoint() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let ns_keys = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
-        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns_keys))),
+        namespace: ns_keys,
     });
 
     {

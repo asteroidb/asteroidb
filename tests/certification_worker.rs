@@ -12,6 +12,7 @@
 //! 4. **Status tracking**: certification status transitions are observable
 //!    through the `CertifiedApi` and `CertificationTracker` APIs.
 
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout, RetentionPolicy};
@@ -25,6 +26,10 @@ use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+
+fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+    Arc::new(RwLock::new(ns))
+}
 
 fn node_id(s: &str) -> NodeId {
     NodeId(s.into())
@@ -70,6 +75,10 @@ fn three_authority_namespace() -> SystemNamespace {
     ns
 }
 
+fn three_authority_namespace_shared() -> Arc<RwLock<SystemNamespace>> {
+    wrap_ns(three_authority_namespace())
+}
+
 /// Fast runner config with short intervals for testing.
 fn fast_config() -> NodeRunnerConfig {
     NodeRunnerConfig {
@@ -104,7 +113,7 @@ async fn three_authority_auto_certification() {
     assert!(reporter3.is_authority());
 
     // Client node: writes a pending entry.
-    let mut client_api = CertifiedApi::new(node_id("client"), ns);
+    let mut client_api = CertifiedApi::new(node_id("client"), wrap_ns(ns));
     client_api
         .certified_write("sensor/temp".into(), counter_value(42), OnTimeout::Pending)
         .unwrap();
@@ -158,7 +167,7 @@ async fn three_authority_auto_certification() {
 /// the network sync that would deliver them.
 #[tokio::test]
 async fn three_authority_node_runner_certification() {
-    let ns = three_authority_namespace();
+    let ns = three_authority_namespace_shared();
 
     // auth-1 is an authority node that also has the pending write.
     let mut api = CertifiedApi::new(node_id("auth-1"), ns);
@@ -209,7 +218,7 @@ async fn single_authority_self_certification() {
         authority_nodes: vec![node_id("auth-1")],
     });
 
-    let mut api = CertifiedApi::new(node_id("auth-1"), ns);
+    let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
     api.certified_write("key1".into(), counter_value(10), OnTimeout::Pending)
         .unwrap();
     assert_eq!(
@@ -256,7 +265,7 @@ async fn timeout_auto_detection() {
         max_age_ms: 10, // Very short TTL for test.
         max_entries: 10_000,
     };
-    let ns = three_authority_namespace();
+    let ns = three_authority_namespace_shared();
     let mut api = CertifiedApi::with_retention(node_id("node-1"), ns, retention);
 
     api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -303,8 +312,8 @@ async fn timeout_auto_detection() {
 /// status is observable through the API.
 #[tokio::test]
 async fn rejected_transition_observable() {
-    let ns = three_authority_namespace();
-    let mut api = CertifiedApi::new(node_id("node-1"), ns);
+    let ns = three_authority_namespace_shared();
+    let mut api = CertifiedApi::new(node_id("node-1"), Arc::clone(&ns));
 
     api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
@@ -452,7 +461,7 @@ async fn status_tracker_mirrors_certification_flow() {
 /// Verifies the majority condition precisely.
 #[tokio::test]
 async fn majority_certification_requires_two_of_three() {
-    let ns = three_authority_namespace();
+    let ns = three_authority_namespace_shared();
     let mut api = CertifiedApi::new(node_id("node-1"), ns);
 
     api.certified_write("data/x".into(), counter_value(1), OnTimeout::Pending)
@@ -506,7 +515,7 @@ async fn mixed_outcomes_all_observable() {
         max_age_ms: 5_000,
         max_entries: 10_000,
     };
-    let mut api = CertifiedApi::with_retention(node_id("node-1"), ns, retention);
+    let mut api = CertifiedApi::with_retention(node_id("node-1"), wrap_ns(ns), retention);
 
     // Write 3 keys to different ranges.
     api.certified_write("cert/key".into(), counter_value(1), OnTimeout::Pending)
@@ -563,7 +572,7 @@ async fn cleanup_after_auto_certification() {
         authority_nodes: vec![node_id("auth-b1"), node_id("auth-b2"), node_id("auth-b3")],
     });
 
-    let mut api = CertifiedApi::new(node_id("node-1"), ns);
+    let mut api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));
 
     api.certified_write("a/key1".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();

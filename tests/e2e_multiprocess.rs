@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
@@ -50,9 +50,11 @@ fn default_namespace() -> SystemNamespace {
 async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
     let nid = node_id(name);
 
+    let namespace = Arc::new(RwLock::new(default_namespace()));
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(nid.clone())),
-        certified: Mutex::new(CertifiedApi::new(nid, default_namespace())),
+        certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace))),
+        namespace,
     });
 
     let app = router(state.clone());

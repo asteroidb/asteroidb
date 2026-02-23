@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::status::{CertificationTracker, WriteId};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
@@ -78,21 +80,25 @@ fn make_key_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
     (sk, vk)
 }
 
+fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+    Arc::new(RwLock::new(ns))
+}
+
 /// Create a namespace with a catch-all authority definition (prefix "").
-fn default_namespace() -> SystemNamespace {
+fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
     make_namespace("", &["auth-1", "auth-2", "auth-3"])
 }
 
-fn make_namespace(prefix: &str, authorities: &[&str]) -> SystemNamespace {
+fn make_namespace(prefix: &str, authorities: &[&str]) -> Arc<RwLock<SystemNamespace>> {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range(prefix),
         authority_nodes: authorities.iter().map(|a| node(a)).collect(),
     });
-    ns
+    wrap_ns(ns)
 }
 
-fn five_auth_namespace() -> SystemNamespace {
+fn five_auth_namespace() -> Arc<RwLock<SystemNamespace>> {
     make_namespace("", &["auth-1", "auth-2", "auth-3", "auth-4", "auth-5"])
 }
 
@@ -887,7 +893,7 @@ fn cross_range_certification_contamination_prevented() {
         authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
     });
 
-    let mut api = CertifiedApi::new(node("node-1"), ns);
+    let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
     // Write to both ranges.
     api.certified_write("user/alice".into(), counter_value(10), OnTimeout::Pending)
@@ -960,7 +966,7 @@ fn policy_version_transition_certification() {
         PlacementPolicy::new(PolicyVersion(2), key_range("data/"), 3).with_certified(true),
     );
 
-    let mut api = CertifiedApi::new(node("node-1"), ns);
+    let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
     // Write resolves to data/ with policy version 2.
     api.certified_write("data/sensor".into(), counter_value(42), OnTimeout::Pending)
@@ -1005,7 +1011,7 @@ fn longest_prefix_authority_resolution_in_integration() {
         authority_nodes: vec![node("auth-v1"), node("auth-v2")],
     });
 
-    let mut api = CertifiedApi::new(node("node-1"), ns);
+    let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
     // VIP key — resolves to user/vip/ with 2 authorities (majority = 2).
     api.certified_write(

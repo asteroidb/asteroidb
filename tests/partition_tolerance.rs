@@ -8,6 +8,8 @@
 //! Node topology: 3 nodes {A, B, C} with 3 Authority nodes {auth-1, auth-2, auth-3}.
 //! Partition: {A, B} vs {C}.
 
+use std::sync::{Arc, RwLock};
+
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
@@ -51,14 +53,18 @@ fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> 
     }
 }
 
+fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+    Arc::new(RwLock::new(ns))
+}
+
 /// Create a namespace with a catch-all authority definition (prefix "").
-fn default_namespace() -> SystemNamespace {
+fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: KeyRange { prefix: "".into() },
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
     });
-    ns
+    wrap_ns(ns)
 }
 
 /// Bidirectional merge between two EventualApi nodes for a single key.

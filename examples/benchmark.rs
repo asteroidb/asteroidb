@@ -9,6 +9,8 @@
 /// JSON output: `cargo run --example benchmark 2>/dev/null`
 use std::time::Instant;
 
+use std::sync::{Arc, RwLock};
+
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
@@ -49,13 +51,13 @@ fn make_frontier(authority: &str, physical: u64, prefix: &str) -> AckFrontier {
     }
 }
 
-fn default_namespace() -> SystemNamespace {
+fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
     });
-    ns
+    Arc::new(RwLock::new(ns))
 }
 
 fn counter_value(n: i64) -> CrdtValue {
