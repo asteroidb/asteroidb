@@ -49,7 +49,7 @@ fn test_state() -> Arc<AppState> {
     let namespace = Arc::new(RwLock::new(ns));
 
     Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(nid.clone())),
+        eventual: Arc::new(Mutex::new(EventualApi::new(nid.clone()))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),

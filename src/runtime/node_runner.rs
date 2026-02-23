@@ -234,6 +234,15 @@ impl NodeRunner {
         self.shutdown_tx.clone()
     }
 
+    /// Set the shared `EventualApi` reference.
+    ///
+    /// This allows the `NodeRunner` to access the same eventual store
+    /// used by HTTP handlers, ensuring that HTTP writes are visible
+    /// to the anti-entropy sync loop.
+    pub fn set_eventual_api(&mut self, api: Arc<Mutex<EventualApi>>) {
+        self.eventual_api = Some(api);
+    }
+
     /// Return a reference to the node ID.
     pub fn node_id(&self) -> &NodeId {
         &self.node_id

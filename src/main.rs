@@ -56,9 +56,13 @@ async fn main() {
         ))
     };
 
+    // Share a single EventualApi between HTTP handlers and NodeRunner
+    // so that HTTP writes are visible to the anti-entropy sync loop.
+    let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id.clone())));
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id.clone())),
+        eventual: Arc::clone(&eventual_api),
         certified: Arc::clone(&certified_api),
         namespace: Arc::clone(&namespace),
         metrics: Arc::clone(&metrics),
@@ -67,7 +71,8 @@ async fn main() {
 
     let app = router(state);
 
-    // NodeRunner uses the same CertifiedApi instance for background processing.
+    // NodeRunner uses the same CertifiedApi and EventualApi instances
+    // for background processing, ensuring sync sees HTTP writes.
     let engine = CompactionEngine::with_defaults();
     let mut runner = NodeRunner::new(
         node_id,
@@ -77,6 +82,7 @@ async fn main() {
         Arc::clone(&metrics),
     )
     .await;
+    runner.set_eventual_api(eventual_api);
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.

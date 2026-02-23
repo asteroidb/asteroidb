@@ -31,7 +31,7 @@ use super::types::{
 
 /// Shared application state for HTTP handlers.
 pub struct AppState {
-    pub eventual: Mutex<EventualApi>,
+    pub eventual: Arc<Mutex<EventualApi>>,
     pub certified: Arc<Mutex<CertifiedApi>>,
     pub namespace: Arc<RwLock<SystemNamespace>>,
     pub metrics: Arc<RuntimeMetrics>,

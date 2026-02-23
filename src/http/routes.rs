@@ -89,7 +89,7 @@ mod tests {
         let namespace = Arc::new(RwLock::new(ns));
 
         Arc::new(AppState {
-            eventual: Mutex::new(EventualApi::new(node_id.clone())),
+            eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
             certified: Arc::new(Mutex::new(CertifiedApi::new(
                 node_id,
                 Arc::clone(&namespace),
