@@ -1111,4 +1111,88 @@ mod tests {
         assert_eq!(result.contributing_count, 1);
         assert_eq!(result.required_count, 3);
     }
+
+    // ---------------------------------------------------------------
+    // Internal frontier push: accepted count reflects actual changes (#105)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_internal_frontiers_accepted_counts_actual_changes() {
+        use crate::network::frontier_sync::FrontierPushResponse;
+
+        let state = test_state();
+        let app = router(state);
+
+        let frontier_json = r#"{
+            "frontiers": [
+                {
+                    "authority_id": "auth-1",
+                    "frontier_hlc": {"physical": 100, "logical": 0, "node_id": "auth-1"},
+                    "key_range": {"prefix": ""},
+                    "policy_version": 1,
+                    "digest_hash": "h1"
+                }
+            ]
+        }"#;
+
+        // First push: frontier is new, accepted should be 1.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/frontiers")
+            .header("content-type", "application/json")
+            .body(Body::from(frontier_json))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: FrontierPushResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(result.accepted, 1, "new frontier should be accepted");
+
+        // Second push: same frontier (stale/duplicate), accepted should be 0.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/frontiers")
+            .header("content-type", "application/json")
+            .body(Body::from(frontier_json))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: FrontierPushResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result.accepted, 0,
+            "duplicate frontier should not be accepted"
+        );
+
+        // Third push: newer frontier, accepted should be 1.
+        let newer_json = r#"{
+            "frontiers": [
+                {
+                    "authority_id": "auth-1",
+                    "frontier_hlc": {"physical": 200, "logical": 0, "node_id": "auth-1"},
+                    "key_range": {"prefix": ""},
+                    "policy_version": 1,
+                    "digest_hash": "h2"
+                }
+            ]
+        }"#;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/frontiers")
+            .header("content-type", "application/json")
+            .body(Body::from(newer_json))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: FrontierPushResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(result.accepted, 1, "newer frontier should be accepted");
+    }
 }

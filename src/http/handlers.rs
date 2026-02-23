@@ -183,8 +183,9 @@ pub async fn post_internal_frontiers(
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for frontier in req.frontiers {
-        api.update_frontier(frontier);
-        accepted += 1;
+        if api.update_frontier(frontier) {
+            accepted += 1;
+        }
     }
     Json(crate::network::frontier_sync::FrontierPushResponse { accepted })
 }

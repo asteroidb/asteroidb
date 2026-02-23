@@ -118,14 +118,19 @@ impl AckFrontierSet {
     /// The scope key `{key_range, policy_version, authority_id}` is derived
     /// from the frontier itself. Only advances the frontier forward within
     /// its scope; an older `frontier_hlc` is ignored to prevent regression.
-    pub fn update(&mut self, frontier: AckFrontier) {
+    ///
+    /// Returns `true` if the frontier was actually advanced (inserted or
+    /// updated), `false` if the update was stale or duplicate.
+    pub fn update(&mut self, frontier: AckFrontier) -> bool {
         let scope = FrontierScope::from_frontier(&frontier);
         match self.frontiers.get(&scope) {
             Some(existing) if existing.frontier_hlc >= frontier.frontier_hlc => {
                 // Existing frontier is same or newer; ignore the update.
+                false
             }
             _ => {
                 self.frontiers.insert(scope, frontier);
+                true
             }
         }
     }
@@ -994,5 +999,46 @@ mod tests {
             err_msg.contains("scope mismatch"),
             "expected scope mismatch error, got: {err_msg}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // update() return value tests (#105)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn update_new_frontier_returns_true() {
+        let mut set = AckFrontierSet::new();
+        let f = make_frontier("auth-1", 100, 0, "user/");
+        assert!(set.update(f), "inserting a new frontier should return true");
+    }
+
+    #[test]
+    fn update_stale_frontier_returns_false() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 200, 0, "user/"));
+
+        // Submitting an older frontier should return false.
+        let stale = make_frontier("auth-1", 100, 0, "user/");
+        assert!(!set.update(stale), "stale frontier should return false");
+    }
+
+    #[test]
+    fn update_duplicate_frontier_returns_false() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+
+        // Submitting the same frontier again should return false.
+        let dup = make_frontier("auth-1", 100, 0, "user/");
+        assert!(!set.update(dup), "duplicate frontier should return false");
+    }
+
+    #[test]
+    fn update_newer_frontier_returns_true() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+
+        // Submitting a newer frontier should return true.
+        let newer = make_frontier("auth-1", 200, 0, "user/");
+        assert!(set.update(newer), "advancing frontier should return true");
     }
 }
