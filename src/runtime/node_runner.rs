@@ -291,7 +291,9 @@ impl NodeRunner {
     }
 
     fn process_certifications(&mut self) {
-        self.certified_api.process_certifications();
+        let now_ms = self.clock.now().physical;
+        self.certified_api
+            .process_certifications_with_timeout(now_ms);
     }
 
     fn run_cleanup(&mut self) {

@@ -308,6 +308,54 @@ impl CertifiedApi {
         }
     }
 
+    /// Re-evaluate pending writes and detect timeouts in a single pass.
+    ///
+    /// Combines the logic of [`process_certifications`](Self::process_certifications)
+    /// and timeout detection: pending writes whose timestamps are at or below
+    /// the scoped majority frontier are promoted to `Certified`, while those
+    /// older than `max_age_ms` are marked as `Timeout`.
+    ///
+    /// Returns the number of writes that transitioned (certified + timed out).
+    pub fn process_certifications_with_timeout(&mut self, now_physical_ms: u64) -> usize {
+        let mut transitions = 0;
+        for pw in &mut self.pending_writes {
+            if pw.status != CertificationStatus::Pending {
+                continue;
+            }
+            if self.frontiers.is_certified_at_for_scope(
+                &pw.timestamp,
+                &pw.key_range,
+                &pw.policy_version,
+                pw.total_authorities,
+            ) {
+                pw.status = CertificationStatus::Certified;
+                transitions += 1;
+            } else if now_physical_ms.saturating_sub(pw.timestamp.physical)
+                >= self.retention.max_age_ms
+            {
+                pw.status = CertificationStatus::Timeout;
+                transitions += 1;
+            }
+        }
+        transitions
+    }
+
+    /// Reject a pending write by key.
+    ///
+    /// Marks the most recent `Pending` write for the given key as `Rejected`.
+    /// Returns `true` if a write was found and rejected, `false` otherwise.
+    /// Only `Pending` writes can be rejected; already-resolved writes are
+    /// left unchanged.
+    pub fn reject_write(&mut self, key: &str) -> bool {
+        for pw in self.pending_writes.iter_mut().rev() {
+            if pw.key == key && pw.status == CertificationStatus::Pending {
+                pw.status = CertificationStatus::Rejected;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove all writes whose status is not `Pending`.
     ///
     /// This removes `Certified`, `Rejected`, and `Timeout` entries,
@@ -1185,5 +1233,181 @@ mod tests {
         assert_eq!(pw.key_range, kr("data/"));
         assert_eq!(pw.policy_version, PolicyVersion(1));
         assert_eq!(pw.total_authorities, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // process_certifications_with_timeout tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn process_with_timeout_certifies_and_detects_timeout() {
+        // Use two separate key ranges so we can certify one without the other.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("cert/"),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        });
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("stale/"),
+            authority_nodes: vec![node("auth-s1"), node("auth-s2"), node("auth-s3")],
+        });
+
+        let policy = RetentionPolicy {
+            max_age_ms: 5_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), ns, policy);
+
+        // Write to cert/ range (will be certified).
+        api.certified_write("cert/key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+
+        // Write to stale/ range (will time out because its authorities never report).
+        api.certified_write("stale/key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+
+        // Advance cert/ authorities past the write timestamp.
+        api.update_frontier(make_frontier_v("auth-1", ts1 + 100, 0, "cert/", 1));
+        api.update_frontier(make_frontier_v("auth-2", ts1 + 200, 0, "cert/", 1));
+
+        // Process with a time far in the future to trigger timeout on stale/key2.
+        let transitions = api.process_certifications_with_timeout(ts1 + 10_000);
+
+        // cert/key1 should be certified (its authorities reached majority).
+        assert_eq!(
+            api.get_certification_status("cert/key1"),
+            CertificationStatus::Certified
+        );
+        // stale/key2 should time out (its authorities never reported).
+        assert_eq!(
+            api.get_certification_status("stale/key2"),
+            CertificationStatus::Timeout
+        );
+        assert_eq!(transitions, 2);
+    }
+
+    #[test]
+    fn process_with_timeout_no_timeout_when_young() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+
+        // Process with a time only slightly ahead (below max_age_ms).
+        let transitions = api.process_certifications_with_timeout(ts1 + 1_000);
+
+        // Still pending — no timeout.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Pending
+        );
+        assert_eq!(transitions, 0);
+    }
+
+    #[test]
+    fn process_with_timeout_returns_transition_count() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+
+        let ts = api.pending_writes()[1].timestamp.physical;
+
+        // Certify both.
+        api.update_frontier(make_frontier("auth-1", ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts + 200, 0, ""));
+
+        let transitions = api.process_certifications_with_timeout(ts + 100);
+        assert_eq!(transitions, 2);
+
+        // Calling again should yield 0 (already certified).
+        let transitions2 = api.process_certifications_with_timeout(ts + 200);
+        assert_eq!(transitions2, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // reject_write tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn reject_write_marks_pending_as_rejected() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Pending
+        );
+
+        assert!(api.reject_write("key1"));
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn reject_write_returns_false_for_nonexistent_key() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        assert!(!api.reject_write("no-such-key"));
+    }
+
+    #[test]
+    fn reject_write_does_not_affect_certified() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts = api.pending_writes()[0].timestamp.physical;
+
+        // Certify it.
+        api.update_frontier(make_frontier("auth-1", ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts + 200, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+
+        // Reject should be a no-op on certified writes.
+        assert!(!api.reject_write("key1"));
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+    }
+
+    #[test]
+    fn reject_write_targets_latest_pending() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        // Write same key twice.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key1".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+
+        // Reject targets the latest (most recent) pending write.
+        assert!(api.reject_write("key1"));
+
+        // The latest should be rejected.
+        let writes: Vec<_> = api
+            .pending_writes()
+            .iter()
+            .filter(|pw| pw.key == "key1")
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].status, CertificationStatus::Pending);
+        assert_eq!(writes[1].status, CertificationStatus::Rejected);
     }
 }
