@@ -586,18 +586,25 @@ impl NodeRunner {
             }
 
             // Full sync fallback: pull all keys from peer.
-            if let Some(remote_entries) = sync_client.pull_all_keys(&peer.addr).await {
+            if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
                 let mut api = eventual_api.lock().await;
-                for (key, value) in &remote_entries {
+                for (key, value) in &dump.entries {
                     let _ = api.merge_remote(key.clone(), value);
                 }
                 drop(api);
 
-                // After full sync, set the peer's frontier to our current store frontier.
-                let api = eventual_api.lock().await;
-                if let Some(frontier) = api.store().current_frontier() {
-                    self.peer_frontiers.insert(peer_key, frontier);
+                // Update the peer frontier from the *remote* peer's frontier.
+                // We must NOT use our local store frontier here because the local
+                // store may be ahead of the remote; using it would cause subsequent
+                // delta pulls to miss remote updates between the remote's true
+                // frontier and our local frontier.
+                if let Some(remote_frontier) = dump.frontier {
+                    self.peer_frontiers.insert(peer_key, remote_frontier);
                 }
+                // If the remote did not report a frontier (e.g. empty store or
+                // older peer that doesn't support the field), we intentionally
+                // leave peer_frontiers without an entry. This means the next
+                // sync cycle will fall back to full sync again, which is safe.
 
                 any_success = true;
                 tracing::debug!(

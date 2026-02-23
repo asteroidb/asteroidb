@@ -277,13 +277,15 @@ async fn pull_based_sync() {
     let pulled = sync_client.pull_all_keys(&addr).await;
     assert!(pulled.is_some(), "pull should succeed");
 
-    let entries = pulled.unwrap();
-    assert_eq!(entries.len(), 2, "should have 2 keys");
-    assert!(entries.contains_key("counter1"));
-    assert!(entries.contains_key("set1"));
+    let dump = pulled.unwrap();
+    assert_eq!(dump.entries.len(), 2, "should have 2 keys");
+    assert!(dump.entries.contains_key("counter1"));
+    assert!(dump.entries.contains_key("set1"));
+    // The response should include the remote's frontier.
+    assert!(dump.frontier.is_some(), "full sync should include frontier");
 
     // Verify the pulled counter value.
-    match entries.get("counter1") {
+    match dump.entries.get("counter1") {
         Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
         other => panic!("expected Counter, got {:?}", other),
     }
@@ -536,6 +538,85 @@ async fn internal_keys_endpoint() {
     assert!(dump.entries.contains_key("a"));
     assert!(dump.entries.contains_key("b"));
     assert!(dump.entries.contains_key("c"));
+    // The response should include the store's frontier.
+    assert!(
+        dump.frontier.is_some(),
+        "key dump response should include frontier"
+    );
+
+    server.abort();
+}
+
+/// Test that full-sync fallback records the *remote* peer frontier, not the local one.
+///
+/// Regression test for PR #123 review: after full sync, the peer frontier
+/// must be set to the remote's frontier so that subsequent delta pulls
+/// correctly request only entries the remote has produced since then.
+#[tokio::test]
+async fn full_sync_records_remote_frontier_not_local() {
+    // Set up two nodes: "local" and "remote".
+    // The remote has some data with specific HLC timestamps.
+    // The local node also has data with *higher* HLC timestamps.
+    // After full sync (pull all keys from remote), the peer frontier
+    // should be the remote's frontier, not the local's.
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+
+    let ns_remote = wrap_ns(default_namespace());
+    let remote_state = Arc::new(AppState {
+        eventual: Mutex::new(EventualApi::new(node_id("remote"))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("remote"),
+            Arc::clone(&ns_remote),
+        ))),
+        namespace: ns_remote,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
+    });
+
+    // Write data to the remote node.
+    {
+        let mut api = remote_state.eventual.lock().await;
+        api.eventual_counter_inc("shared-key").unwrap();
+    }
+
+    // Capture the remote store's frontier.
+    let remote_frontier = {
+        let api = remote_state.eventual.lock().await;
+        api.store()
+            .current_frontier()
+            .expect("remote should have a frontier")
+    };
+
+    let app = router(remote_state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Pull all keys from the remote.
+    let registry = PeerRegistry::new(node_id("local"), vec![]).unwrap();
+    let sync_client = SyncClient::new(registry);
+
+    let dump = sync_client.pull_all_keys(&remote_addr).await;
+    assert!(dump.is_some(), "pull should succeed");
+
+    let dump = dump.unwrap();
+    assert!(dump.frontier.is_some(), "response should include frontier");
+
+    let received_frontier = dump.frontier.unwrap();
+
+    // The frontier in the response must match the remote's actual frontier.
+    assert_eq!(
+        received_frontier, remote_frontier,
+        "full sync response frontier should be the remote's frontier"
+    );
+
+    // Importantly, if a local node had a higher frontier, using the remote
+    // frontier (not local) ensures subsequent delta pulls don't skip remote
+    // updates.
 
     server.abort();
 }

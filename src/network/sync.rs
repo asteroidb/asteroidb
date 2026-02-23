@@ -40,6 +40,13 @@ pub struct SyncError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyDumpResponse {
     pub entries: HashMap<String, CrdtValue>,
+    /// The responder's current frontier (highest tracked HLC).
+    ///
+    /// Used by the requester to correctly initialise its peer frontier
+    /// tracking after a full sync, avoiding the bug where a local-only
+    /// frontier would cause subsequent delta pulls to miss remote updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier: Option<HlcTimestamp>,
 }
 
 // ---------------------------------------------------------------
@@ -164,18 +171,16 @@ impl SyncClient {
     /// Pull all key-value pairs from a specific peer.
     ///
     /// Sends `GET /api/internal/keys` to the peer and returns the
-    /// entries map. Returns `None` on failure.
-    pub async fn pull_all_keys(
-        &self,
-        peer_addr: &std::net::SocketAddr,
-    ) -> Option<HashMap<String, CrdtValue>> {
+    /// full [`KeyDumpResponse`] including entries and the remote
+    /// peer's frontier. Returns `None` on failure.
+    pub async fn pull_all_keys(&self, peer_addr: &std::net::SocketAddr) -> Option<KeyDumpResponse> {
         let url = format!("http://{}/api/internal/keys", peer_addr);
 
         match self.http_client.get(&url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.json::<KeyDumpResponse>().await {
-                        Ok(dump) => Some(dump.entries),
+                        Ok(dump) => Some(dump),
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
@@ -346,11 +351,24 @@ mod tests {
         counter.increment(&nid("node-1"));
         entries.insert("hits".to_string(), CrdtValue::Counter(counter));
 
-        let resp = KeyDumpResponse { entries };
+        let resp = KeyDumpResponse {
+            entries,
+            frontier: Some(hlc(500, 0, "node-1")),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: KeyDumpResponse = serde_json::from_str(&json).unwrap();
 
         assert!(deserialized.entries.contains_key("hits"));
+        assert_eq!(deserialized.frontier.unwrap().physical, 500);
+    }
+
+    #[test]
+    fn key_dump_response_without_frontier_deserialises() {
+        // Backwards-compatibility: older peers may omit the frontier field.
+        let json = r#"{"entries":{}}"#;
+        let resp: KeyDumpResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.entries.is_empty());
+        assert!(resp.frontier.is_none());
     }
 
     #[test]

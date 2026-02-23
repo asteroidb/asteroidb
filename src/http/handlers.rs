@@ -496,17 +496,20 @@ pub async fn internal_sync(
 
 /// `GET /api/internal/keys`
 ///
-/// Returns all key-value pairs from the eventual store. Used by
-/// remote peers for pull-based anti-entropy sync.
+/// Returns all key-value pairs from the eventual store together with the
+/// store's current frontier HLC. Used by remote peers for pull-based
+/// anti-entropy sync. The frontier allows the requester to correctly
+/// initialise its peer frontier tracking after a full sync.
 pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpResponse> {
     let api = state.eventual.lock().await;
-    let entries = api
-        .store()
+    let store = api.store();
+    let entries = store
         .all_entries()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let frontier = store.current_frontier();
 
-    Json(KeyDumpResponse { entries })
+    Json(KeyDumpResponse { entries, frontier })
 }
 
 /// `POST /api/internal/sync/delta`
