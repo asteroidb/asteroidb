@@ -5,7 +5,7 @@ use axum::routing::{get, post};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_certification_status, get_certified,
-    get_eventual,
+    get_eventual, internal_keys, internal_sync,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -16,6 +16,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/certified/write", post(certified_write))
         .route("/api/certified/{key}", get(get_certified))
         .route("/api/status/{key}", get(get_certification_status))
+        .route("/api/internal/sync", post(internal_sync))
+        .route("/api/internal/keys", get(internal_keys))
         .with_state(state)
 }
 

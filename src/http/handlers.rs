@@ -10,6 +10,8 @@ use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::store::kv::CrdtValue;
 
+use crate::network::sync::{KeyDumpResponse, SyncError, SyncRequest, SyncResponse};
+
 use super::types::{
     ApiError, CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
     EventualReadResponse, EventualWriteRequest, FrontierJson, StatusResponse, WriteResponse,
@@ -138,6 +140,56 @@ pub async fn get_certification_status(
     let status = api.get_certification_status(&key);
 
     Json(StatusResponse { key, status })
+}
+
+// ---------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// Internal sync handlers
+// ---------------------------------------------------------------
+
+/// `POST /api/internal/sync`
+///
+/// Receives CRDT values from a remote peer and merges them into the
+/// local eventual store using `merge_remote`.
+pub async fn internal_sync(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SyncRequest>,
+) -> Json<SyncResponse> {
+    let mut api = state.eventual.lock().await;
+    let mut merged = 0;
+    let mut errors = Vec::new();
+
+    for (key, value) in &req.entries {
+        match api.merge_remote(key.clone(), value) {
+            Ok(()) => merged += 1,
+            Err(e) => {
+                errors.push(SyncError {
+                    key: key.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    Json(SyncResponse { merged, errors })
+}
+
+/// `GET /api/internal/keys`
+///
+/// Returns all key-value pairs from the eventual store. Used by
+/// remote peers for pull-based anti-entropy sync.
+pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpResponse> {
+    let api = state.eventual.lock().await;
+    let entries = api
+        .store()
+        .all_entries()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    Json(KeyDumpResponse { entries })
 }
 
 // ---------------------------------------------------------------

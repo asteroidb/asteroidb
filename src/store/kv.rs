@@ -96,6 +96,11 @@ impl Store {
         self.data.is_empty()
     }
 
+    /// Return all key-value pairs as an iterator.
+    pub fn all_entries(&self) -> impl Iterator<Item = (&String, &CrdtValue)> {
+        self.data.iter()
+    }
+
     /// Save the store as a JSON snapshot to the given path.
     pub fn save_snapshot(&self, path: &Path) -> io::Result<()> {
         let json = serde_json::to_string(self)

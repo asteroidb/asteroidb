@@ -1,10 +1,13 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use crate::api::certified::CertifiedApi;
+use crate::api::eventual::EventualApi;
 use crate::compaction::CompactionEngine;
 use crate::hlc::Hlc;
+use crate::network::sync::SyncClient;
 use crate::types::NodeId;
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -16,6 +19,9 @@ pub struct NodeRunnerConfig {
     pub cleanup_interval: Duration,
     /// How often to check compaction eligibility and create checkpoints.
     pub compaction_check_interval: Duration,
+    /// How often to run anti-entropy sync with peers.
+    /// Set to `None` to disable sync (e.g. when no peers are configured).
+    pub sync_interval: Option<Duration>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -24,6 +30,7 @@ impl Default for NodeRunnerConfig {
             certification_interval: Duration::from_secs(1),
             cleanup_interval: Duration::from_secs(5),
             compaction_check_interval: Duration::from_secs(10),
+            sync_interval: Some(Duration::from_secs(2)),
         }
     }
 }
@@ -44,6 +51,10 @@ pub struct NodeRunner {
     config: NodeRunnerConfig,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Optional sync client for anti-entropy replication.
+    sync_client: Option<SyncClient>,
+    /// Shared reference to the eventual API for reading store state during sync.
+    eventual_api: Option<Arc<Mutex<EventualApi>>>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -55,10 +66,12 @@ pub struct RunLoopStats {
     pub cleanup_ticks: u64,
     /// Number of compaction check ticks executed.
     pub compaction_check_ticks: u64,
+    /// Number of anti-entropy sync ticks executed.
+    pub sync_ticks: u64,
 }
 
 impl NodeRunner {
-    /// Create a new `NodeRunner`.
+    /// Create a new `NodeRunner` without anti-entropy sync.
     pub fn new(
         node_id: NodeId,
         certified_api: CertifiedApi,
@@ -74,6 +87,34 @@ impl NodeRunner {
             config,
             shutdown_tx,
             shutdown_rx,
+            sync_client: None,
+            eventual_api: None,
+        }
+    }
+
+    /// Create a new `NodeRunner` with anti-entropy sync enabled.
+    ///
+    /// The `eventual_api` must be the same `Arc<Mutex<EventualApi>>` shared
+    /// with the HTTP handlers so that sync reads the latest store state.
+    pub fn with_sync(
+        node_id: NodeId,
+        certified_api: CertifiedApi,
+        compaction_engine: CompactionEngine,
+        config: NodeRunnerConfig,
+        sync_client: SyncClient,
+        eventual_api: Arc<Mutex<EventualApi>>,
+    ) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            clock: Hlc::new(node_id.0.clone()),
+            node_id,
+            certified_api,
+            compaction_engine,
+            config,
+            shutdown_tx,
+            shutdown_rx,
+            sync_client: Some(sync_client),
+            eventual_api: Some(eventual_api),
         }
     }
 
@@ -139,6 +180,16 @@ impl NodeRunner {
             self.config.compaction_check_interval,
         );
 
+        // Sync interval: only create if sync is configured.
+        let sync_duration = self
+            .config
+            .sync_interval
+            .unwrap_or(Duration::from_secs(3600));
+        let sync_enabled = self.config.sync_interval.is_some()
+            && self.sync_client.is_some()
+            && self.eventual_api.is_some();
+        let mut sync_interval = tokio::time::interval_at(start + sync_duration, sync_duration);
+
         let mut stats = RunLoopStats::default();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -160,6 +211,10 @@ impl NodeRunner {
                 _ = compaction_interval.tick() => {
                     self.check_compaction();
                     stats.compaction_check_ticks += 1;
+                }
+                _ = sync_interval.tick(), if sync_enabled => {
+                    self.run_sync().await;
+                    stats.sync_ticks += 1;
                 }
             }
         }
@@ -190,6 +245,36 @@ impl NodeRunner {
     fn run_cleanup(&mut self) {
         let now_ms = self.clock.now().physical;
         self.certified_api.cleanup(now_ms);
+    }
+
+    /// Run one cycle of anti-entropy push sync.
+    ///
+    /// Reads all entries from the eventual store and pushes them
+    /// to every known peer. Failures are logged and skipped.
+    async fn run_sync(&self) {
+        let Some(sync_client) = &self.sync_client else {
+            return;
+        };
+        let Some(eventual_api) = &self.eventual_api else {
+            return;
+        };
+
+        // Snapshot the current store state while holding the lock briefly.
+        let entries = {
+            let api = eventual_api.lock().await;
+            api.store()
+                .all_entries()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let synced = sync_client.push_all_keys(entries, &self.node_id.0).await;
+
+        tracing::debug!(
+            node = %self.node_id.0,
+            peers_synced = synced,
+            "anti-entropy sync cycle completed"
+        );
     }
 
     fn check_compaction(&mut self) {
@@ -291,6 +376,7 @@ mod tests {
             certification_interval: Duration::from_millis(10),
             cleanup_interval: Duration::from_millis(50),
             compaction_check_interval: Duration::from_millis(100),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -335,6 +421,7 @@ mod tests {
             certification_interval: Duration::from_millis(10),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -375,6 +462,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_millis(10),
             compaction_check_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -418,6 +506,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_millis(10),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -457,6 +546,7 @@ mod tests {
         assert_eq!(config.certification_interval, Duration::from_secs(1));
         assert_eq!(config.cleanup_interval, Duration::from_secs(5));
         assert_eq!(config.compaction_check_interval, Duration::from_secs(10));
+        assert_eq!(config.sync_interval, Some(Duration::from_secs(2)));
     }
 
     #[tokio::test]
@@ -486,6 +576,7 @@ mod tests {
             certification_interval: Duration::from_secs(60),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);

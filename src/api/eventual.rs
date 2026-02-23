@@ -236,6 +236,14 @@ impl EventualApi {
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<&String> {
         self.store.keys_with_prefix(prefix)
     }
+
+    /// Return a reference to the underlying store.
+    ///
+    /// Used by the anti-entropy sync layer to read all entries for
+    /// push-based replication.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
 }
 
 #[cfg(test)]
