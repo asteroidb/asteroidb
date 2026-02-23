@@ -338,9 +338,11 @@ impl CertifiedApi {
 
     /// Update an Authority's ack frontier.
     ///
-    /// Simulates receiving an ack from an Authority node.
-    pub fn update_frontier(&mut self, frontier: AckFrontier) {
-        self.frontiers.update(frontier);
+    /// Simulates receiving an ack from an Authority node. Returns `true` if
+    /// the frontier was actually advanced, `false` if the update was
+    /// stale or duplicate.
+    pub fn update_frontier(&mut self, frontier: AckFrontier) -> bool {
+        self.frontiers.update(frontier)
     }
 
     /// Re-evaluate all pending writes against the current frontiers.
