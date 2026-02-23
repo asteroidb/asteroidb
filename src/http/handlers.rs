@@ -19,8 +19,9 @@ use crate::network::sync::{KeyDumpResponse, SyncError, SyncRequest, SyncResponse
 use super::types::{
     ApiError, AuthorityDefinitionResponse, CertifiedReadResponse, CertifiedWriteRequest,
     CertifiedWriteResponse, CrdtValueJson, EventualReadResponse, EventualWriteRequest,
-    FrontierJson, PlacementPolicyResponse, SetAuthorityDefinitionRequest,
-    SetPlacementPolicyRequest, StatusResponse, VersionHistoryResponse, WriteResponse,
+    FrontierJson, PlacementPolicyResponse, ProofBundleJson, SetAuthorityDefinitionRequest,
+    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
+    VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -114,7 +115,7 @@ pub async fn certified_write(
 
 /// `GET /api/certified/:key`
 ///
-/// Returns the value with certification status and frontier.
+/// Returns the value with certification status, frontier, and proof bundle.
 pub async fn get_certified(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
@@ -129,11 +130,28 @@ pub async fn get_certified(
         node_id: f.node_id,
     });
 
+    let proof = read.proof.map(|p| ProofBundleJson {
+        key_range_prefix: p.key_range.prefix,
+        frontier: FrontierJson {
+            physical: p.frontier_hlc.physical,
+            logical: p.frontier_hlc.logical,
+            node_id: p.frontier_hlc.node_id,
+        },
+        policy_version: p.policy_version.0,
+        contributing_authorities: p
+            .contributing_authorities
+            .into_iter()
+            .map(|n| n.0)
+            .collect(),
+        total_authorities: p.total_authorities,
+    });
+
     Json(CertifiedReadResponse {
         key,
         value,
         status: read.status,
         frontier,
+        proof,
     })
 }
 
@@ -380,6 +398,50 @@ pub async fn get_version_history(
     Json(VersionHistoryResponse {
         current_version: ns.version().0,
         history: ns.version_history().iter().map(|v| v.0).collect(),
+    })
+}
+
+// ---------------------------------------------------------------
+// Verification handler
+// ---------------------------------------------------------------
+
+/// `POST /api/certified/verify`
+///
+/// Accepts a proof bundle and returns the verification result.
+/// External clients can use this to independently verify that a
+/// proof bundle represents genuine Authority consensus.
+pub async fn verify_proof(Json(req): Json<VerifyProofRequest>) -> Json<VerifyProofResponse> {
+    use crate::api::certified::ProofBundle;
+    use crate::authority::verifier;
+    use crate::hlc::HlcTimestamp;
+    use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+    let bundle = ProofBundle {
+        key_range: KeyRange {
+            prefix: req.key_range_prefix,
+        },
+        frontier_hlc: HlcTimestamp {
+            physical: req.frontier.physical,
+            logical: req.frontier.logical,
+            node_id: req.frontier.node_id,
+        },
+        policy_version: PolicyVersion(req.policy_version),
+        contributing_authorities: req
+            .contributing_authorities
+            .into_iter()
+            .map(NodeId)
+            .collect(),
+        total_authorities: req.total_authorities,
+        certificate: None,
+    };
+
+    let result = verifier::verify_proof(&bundle);
+
+    Json(VerifyProofResponse {
+        valid: result.valid,
+        has_majority: result.has_majority,
+        contributing_count: result.contributing_count,
+        required_count: result.required_count,
     })
 }
 

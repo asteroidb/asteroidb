@@ -1,6 +1,9 @@
 use std::sync::{Arc, RwLock};
 
+use serde::Serialize;
+
 use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+use crate::authority::certificate::MajorityCertificate;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
@@ -16,6 +19,28 @@ pub enum OnTimeout {
     Pending,
 }
 
+/// A verifiable proof bundle attached to a certified read response.
+///
+/// Contains the metadata needed for an external client to independently
+/// verify that a majority of authorities have acknowledged a given frontier.
+/// The `certificate` field will carry cryptographic signatures once the
+/// full signing pipeline is implemented.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofBundle {
+    /// The key range this proof covers.
+    pub key_range: KeyRange,
+    /// The majority frontier HLC at the time of certification.
+    pub frontier_hlc: HlcTimestamp,
+    /// The policy version in effect when the proof was generated.
+    pub policy_version: PolicyVersion,
+    /// The authority node IDs that have reported frontiers for this scope.
+    pub contributing_authorities: Vec<NodeId>,
+    /// The total number of authorities in the authority set for this key range.
+    pub total_authorities: usize,
+    /// The majority certificate, if available (future: full signing pipeline).
+    pub certificate: Option<MajorityCertificate>,
+}
+
 /// Result of a certified read (FR-002).
 #[derive(Debug)]
 pub struct CertifiedRead<'a> {
@@ -25,6 +50,8 @@ pub struct CertifiedRead<'a> {
     pub status: CertificationStatus,
     /// The majority frontier at query time, if available.
     pub frontier: Option<HlcTimestamp>,
+    /// Verifiable proof bundle, present when status is `Certified`.
+    pub proof: Option<ProofBundle>,
 }
 
 /// A write awaiting Authority majority certification.
@@ -148,14 +175,17 @@ impl CertifiedApi {
     /// Read a key with certification status (FR-002).
     ///
     /// Returns the value (if present), its certification status based on
-    /// the latest pending write for that key, and the scoped majority frontier
-    /// for the key's authority range.
+    /// the latest pending write for that key, the scoped majority frontier
+    /// for the key's authority range, and a verifiable proof bundle when
+    /// the status is `Certified`.
     pub fn get_certified(&self, key: &str) -> CertifiedRead<'_> {
         let value = self.store.get(key);
 
-        let frontier = self.resolve_scope(key).ok().and_then(|(kr, pv, total)| {
-            self.frontiers.majority_frontier_for_scope(&kr, &pv, total)
-        });
+        let scope_info = self.resolve_scope(key).ok();
+
+        let frontier = scope_info
+            .as_ref()
+            .and_then(|(kr, pv, total)| self.frontiers.majority_frontier_for_scope(kr, pv, *total));
 
         let status = self
             .pending_writes
@@ -165,10 +195,33 @@ impl CertifiedApi {
             .map(|pw| pw.status)
             .unwrap_or(CertificationStatus::Pending);
 
+        let proof = if status == CertificationStatus::Certified {
+            scope_info.as_ref().and_then(|(kr, pv, total)| {
+                let frontier_hlc = frontier.clone()?;
+                let scoped_frontiers = self.frontiers.all_for_scope(kr, pv);
+                let contributing_authorities: Vec<NodeId> = scoped_frontiers
+                    .iter()
+                    .map(|f| f.authority_id.clone())
+                    .collect();
+
+                Some(ProofBundle {
+                    key_range: kr.clone(),
+                    frontier_hlc,
+                    policy_version: *pv,
+                    contributing_authorities,
+                    total_authorities: *total,
+                    certificate: None,
+                })
+            })
+        } else {
+            None
+        };
+
         CertifiedRead {
             value,
             status,
             frontier,
+            proof,
         }
     }
 
@@ -1415,5 +1468,121 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].status, CertificationStatus::Pending);
         assert_eq!(writes[1].status, CertificationStatus::Rejected);
+    }
+
+    // ---------------------------------------------------------------
+    // ProofBundle tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_certified_returns_proof_when_certified() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(5), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Advance majority of authorities.
+        api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+
+        api.process_certifications();
+
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(
+            result.proof.is_some(),
+            "proof should be present when certified"
+        );
+
+        let proof = result.proof.unwrap();
+        assert_eq!(proof.key_range, kr(""));
+        assert!(proof.frontier_hlc.physical > 0);
+        assert_eq!(proof.policy_version, PolicyVersion(1));
+        assert_eq!(proof.contributing_authorities.len(), 2);
+        assert_eq!(proof.total_authorities, 3);
+        assert!(
+            proof.certificate.is_none(),
+            "certificate not yet implemented"
+        );
+    }
+
+    #[test]
+    fn get_certified_proof_is_none_when_pending() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Pending);
+        assert!(
+            result.proof.is_none(),
+            "proof should be None when status is Pending"
+        );
+    }
+
+    #[test]
+    fn get_certified_proof_is_none_when_no_data() {
+        let api = CertifiedApi::new(node("node-1"), default_namespace());
+        let result = api.get_certified("nonexistent");
+        assert!(result.proof.is_none(), "proof should be None when no data");
+    }
+
+    #[test]
+    fn proof_bundle_has_correct_authority_ids() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("data/"),
+            authority_nodes: vec![node("auth-a"), node("auth-b"), node("auth-c")],
+        });
+
+        let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
+        api.certified_write("data/x".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Advance 2 of 3 authorities.
+        api.update_frontier(make_frontier("auth-a", write_ts + 100, 0, "data/"));
+        api.update_frontier(make_frontier("auth-b", write_ts + 200, 0, "data/"));
+
+        api.process_certifications();
+
+        let result = api.get_certified("data/x");
+        assert_eq!(result.status, CertificationStatus::Certified);
+
+        let proof = result.proof.unwrap();
+        let mut auth_ids: Vec<String> = proof
+            .contributing_authorities
+            .iter()
+            .map(|n| n.0.clone())
+            .collect();
+        auth_ids.sort();
+        assert_eq!(auth_ids, vec!["auth-a", "auth-b"]);
+    }
+
+    #[test]
+    fn proof_bundle_verifiable_with_verifier() {
+        use crate::authority::verifier;
+
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+
+        api.process_certifications();
+
+        let result = api.get_certified("key1");
+        let proof = result.proof.unwrap();
+
+        let verification = verifier::verify_proof(&proof);
+        assert!(verification.valid);
+        assert!(verification.has_majority);
+        assert_eq!(verification.contributing_count, 2);
+        assert_eq!(verification.required_count, 2); // 3/2+1 = 2
     }
 }

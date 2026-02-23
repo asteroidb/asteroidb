@@ -5,6 +5,86 @@ use thiserror::Error;
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
+/// Custom serde for `VerifyingKey` using hex encoding.
+mod hex_verifying_key {
+    use ed25519_dalek::VerifyingKey;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(key: &VerifyingKey, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bytes = key.as_bytes();
+        let hex_string: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        serializer.serialize_str(&hex_string)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<VerifyingKey, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_string = String::deserialize(deserializer)?;
+        let bytes = hex_to_bytes(&hex_string).map_err(serde::de::Error::custom)?;
+        let byte_array: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes for VerifyingKey"))?;
+        VerifyingKey::from_bytes(&byte_array).map_err(serde::de::Error::custom)
+    }
+
+    fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+        if !hex.len().is_multiple_of(2) {
+            return Err("odd-length hex string".to_string());
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&hex[i..i + 2], 16)
+                    .map_err(|e| format!("invalid hex character: {e}"))
+            })
+            .collect()
+    }
+}
+
+/// Custom serde for `Signature` using hex encoding.
+mod hex_signature {
+    use ed25519_dalek::Signature;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(sig: &Signature, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let bytes = sig.to_bytes();
+        let hex_string: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        serializer.serialize_str(&hex_string)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Signature, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_string = String::deserialize(deserializer)?;
+        let bytes = hex_to_bytes(&hex_string).map_err(serde::de::Error::custom)?;
+        let byte_array: [u8; 64] = bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64 bytes for Signature"))?;
+        Ok(Signature::from_bytes(&byte_array))
+    }
+
+    fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
+        if !hex.len().is_multiple_of(2) {
+            return Err("odd-length hex string".to_string());
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&hex[i..i + 2], 16)
+                    .map_err(|e| format!("invalid hex character: {e}"))
+            })
+            .collect()
+    }
+}
+
 /// Error type for certificate operations.
 #[derive(Debug, Error)]
 pub enum CertError {
@@ -43,13 +123,15 @@ impl Default for EpochConfig {
 }
 
 /// A single authority's signature over a certified data range.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthoritySignature {
     /// The authority node that produced this signature.
     pub authority_id: NodeId,
     /// The public key used for verification.
+    #[serde(with = "hex_verifying_key")]
     pub public_key: VerifyingKey,
     /// The Ed25519 signature.
+    #[serde(with = "hex_signature")]
     pub signature: Signature,
 }
 
@@ -58,7 +140,7 @@ pub struct AuthoritySignature {
 /// Aggregates individual Ed25519 signatures from authority nodes.
 /// A certificate is considered valid when it holds signatures from
 /// a strict majority of the authority set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MajorityCertificate {
     /// The key range this certificate covers.
     pub key_range: KeyRange,
@@ -490,5 +572,63 @@ mod tests {
 
         assert_eq!(cert.signature_count(), 2);
         assert!(cert.has_majority(3)); // 2 >= 3/2+1 = 2
+    }
+
+    #[test]
+    fn certificate_serde_roundtrip() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+
+        for i in 0..3 {
+            let (sk, vk) = make_key_pair();
+            let sig = sign_message(&sk, &message);
+            cert.add_signature(AuthoritySignature {
+                authority_id: NodeId(format!("auth-{i}")),
+                public_key: vk,
+                signature: sig,
+            });
+        }
+
+        // Serialize to JSON.
+        let json = serde_json::to_string(&cert).expect("serialize certificate");
+
+        // Deserialize back.
+        let restored: MajorityCertificate =
+            serde_json::from_str(&json).expect("deserialize certificate");
+
+        // Verify structural equality.
+        assert_eq!(restored.key_range, cert.key_range);
+        assert_eq!(restored.frontier_hlc, cert.frontier_hlc);
+        assert_eq!(restored.policy_version, cert.policy_version);
+        assert_eq!(restored.keyset_version, cert.keyset_version);
+        assert_eq!(restored.signatures.len(), cert.signatures.len());
+
+        // Verify the restored certificate can still verify signatures.
+        let valid = restored.verify_signatures(&message).unwrap();
+        assert_eq!(valid.len(), 3);
+    }
+
+    #[test]
+    fn authority_signature_serde_roundtrip() {
+        let (sk, vk) = make_key_pair();
+        let message = b"test message";
+        let sig = sign_message(&sk, message);
+
+        let auth_sig = AuthoritySignature {
+            authority_id: NodeId("auth-1".into()),
+            public_key: vk,
+            signature: sig,
+        };
+
+        let json = serde_json::to_string(&auth_sig).expect("serialize");
+        let restored: AuthoritySignature = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.authority_id, auth_sig.authority_id);
+        assert_eq!(restored.public_key, auth_sig.public_key);
+        assert_eq!(restored.signature, auth_sig.signature);
     }
 }
