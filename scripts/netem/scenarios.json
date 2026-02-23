@@ -1,0 +1,20 @@
+{
+  "scenarios": [
+    {
+      "name": "partition-recovery",
+      "description": "Network partition and CRDT convergence after recovery",
+      "script": "scenario-partition-recovery.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["partition", "convergence"]
+    },
+    {
+      "name": "delay-convergence",
+      "description": "High latency impact on CRDT convergence time",
+      "script": "scenario-delay-convergence.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["delay", "convergence"]
+    }
+  ]
+}
