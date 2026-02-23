@@ -5,7 +5,8 @@ use axum::routing::{get, post};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_certification_status, get_certified,
-    get_eventual, get_internal_frontiers, post_internal_frontiers,
+    get_eventual, get_internal_frontiers, internal_keys, internal_sync,
+    post_internal_frontiers,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -20,6 +21,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/internal/frontiers",
             post(post_internal_frontiers).get(get_internal_frontiers),
         )
+        .route("/api/internal/sync", post(internal_sync))
+        .route("/api/internal/keys", get(internal_keys))
         .with_state(state)
 }
 

@@ -1,11 +1,14 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 use crate::api::certified::CertifiedApi;
+use crate::api::eventual::EventualApi;
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::hlc::Hlc;
+use crate::network::sync::SyncClient;
 use crate::types::NodeId;
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -20,6 +23,9 @@ pub struct NodeRunnerConfig {
     /// How often Authority nodes report their frontier and push to peers.
     /// Default: 1 second. Only effective when this node is an authority.
     pub frontier_report_interval: Duration,
+    /// How often to run anti-entropy sync with peers.
+    /// Set to `None` to disable sync (e.g. when no peers are configured).
+    pub sync_interval: Option<Duration>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -29,6 +35,7 @@ impl Default for NodeRunnerConfig {
             cleanup_interval: Duration::from_secs(5),
             compaction_check_interval: Duration::from_secs(10),
             frontier_report_interval: Duration::from_secs(1),
+            sync_interval: Some(Duration::from_secs(2)),
         }
     }
 }
@@ -53,6 +60,10 @@ pub struct NodeRunner {
     frontier_reporter: Option<FrontierReporter>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Optional sync client for anti-entropy replication.
+    sync_client: Option<SyncClient>,
+    /// Shared reference to the eventual API for reading store state during sync.
+    eventual_api: Option<Arc<Mutex<EventualApi>>>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -66,10 +77,12 @@ pub struct RunLoopStats {
     pub compaction_check_ticks: u64,
     /// Number of frontier report ticks executed.
     pub frontier_report_ticks: u64,
+    /// Number of anti-entropy sync ticks executed.
+    pub sync_ticks: u64,
 }
 
 impl NodeRunner {
-    /// Create a new `NodeRunner`.
+    /// Create a new `NodeRunner` without anti-entropy sync.
     ///
     /// Automatically discovers whether this node is an authority and
     /// configures the frontier reporter accordingly.
@@ -96,6 +109,42 @@ impl NodeRunner {
             frontier_reporter,
             shutdown_tx,
             shutdown_rx,
+            sync_client: None,
+            eventual_api: None,
+        }
+    }
+
+    /// Create a new `NodeRunner` with anti-entropy sync enabled.
+    ///
+    /// The `eventual_api` must be the same `Arc<Mutex<EventualApi>>` shared
+    /// with the HTTP handlers so that sync reads the latest store state.
+    pub fn with_sync(
+        node_id: NodeId,
+        certified_api: CertifiedApi,
+        compaction_engine: CompactionEngine,
+        config: NodeRunnerConfig,
+        sync_client: SyncClient,
+        eventual_api: Arc<Mutex<EventualApi>>,
+    ) -> Self {
+        let reporter = FrontierReporter::new(node_id.clone(), certified_api.namespace());
+        let frontier_reporter = if reporter.is_authority() {
+            Some(reporter)
+        } else {
+            None
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self {
+            clock: Hlc::new(node_id.0.clone()),
+            node_id,
+            certified_api,
+            compaction_engine,
+            config,
+            frontier_reporter,
+            shutdown_tx,
+            shutdown_rx,
+            sync_client: Some(sync_client),
+            eventual_api: Some(eventual_api),
         }
     }
 
@@ -179,6 +228,16 @@ impl NodeRunner {
             self.config.frontier_report_interval,
         );
 
+        // Sync interval: only create if sync is configured.
+        let sync_duration = self
+            .config
+            .sync_interval
+            .unwrap_or(Duration::from_secs(3600));
+        let sync_enabled = self.config.sync_interval.is_some()
+            && self.sync_client.is_some()
+            && self.eventual_api.is_some();
+        let mut sync_interval = tokio::time::interval_at(start + sync_duration, sync_duration);
+
         let mut stats = RunLoopStats::default();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -204,6 +263,10 @@ impl NodeRunner {
                 _ = frontier_interval.tick(), if self.frontier_reporter.is_some() => {
                     self.report_frontiers();
                     stats.frontier_report_ticks += 1;
+                }
+                _ = sync_interval.tick(), if sync_enabled => {
+                    self.run_sync().await;
+                    stats.sync_ticks += 1;
                 }
             }
         }
@@ -237,11 +300,6 @@ impl NodeRunner {
     }
 
     /// Generate and apply frontier reports for this authority node.
-    ///
-    /// Uses `FrontierReporter` to produce frontiers at the current HLC time,
-    /// then applies them to the local `CertifiedApi` via `update_frontier`.
-    /// This ensures the frontier advances automatically without manual
-    /// intervention.
     fn report_frontiers(&mut self) {
         if let Some(reporter) = &self.frontier_reporter {
             let frontiers = reporter.report_frontiers(&mut self.clock);
@@ -249,6 +307,32 @@ impl NodeRunner {
                 self.certified_api.update_frontier(f);
             }
         }
+    }
+
+    /// Run one cycle of anti-entropy push sync.
+    async fn run_sync(&self) {
+        let Some(sync_client) = &self.sync_client else {
+            return;
+        };
+        let Some(eventual_api) = &self.eventual_api else {
+            return;
+        };
+
+        let entries = {
+            let api = eventual_api.lock().await;
+            api.store()
+                .all_entries()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        let synced = sync_client.push_all_keys(entries, &self.node_id.0).await;
+
+        tracing::debug!(
+            node = %self.node_id.0,
+            peers_synced = synced,
+            "anti-entropy sync cycle completed"
+        );
     }
 
     fn check_compaction(&mut self) {
@@ -351,6 +435,7 @@ mod tests {
             cleanup_interval: Duration::from_millis(50),
             compaction_check_interval: Duration::from_millis(100),
             frontier_report_interval: Duration::from_millis(100),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -396,6 +481,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -437,6 +523,7 @@ mod tests {
             cleanup_interval: Duration::from_millis(10),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -481,6 +568,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_millis(10),
             frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -521,6 +609,7 @@ mod tests {
         assert_eq!(config.cleanup_interval, Duration::from_secs(5));
         assert_eq!(config.compaction_check_interval, Duration::from_secs(10));
         assert_eq!(config.frontier_report_interval, Duration::from_secs(1));
+        assert_eq!(config.sync_interval, Some(Duration::from_secs(2)));
     }
 
     #[tokio::test]
@@ -551,6 +640,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("node-1"), api, engine, config);
@@ -602,6 +692,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
@@ -650,6 +741,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("store-node"), api, engine, config);
@@ -702,6 +794,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
@@ -754,6 +847,7 @@ mod tests {
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
+            sync_interval: None,
         };
 
         let mut runner = NodeRunner::new(node_id("auth-1"), api, engine, config);
