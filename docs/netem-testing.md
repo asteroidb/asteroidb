@@ -194,6 +194,130 @@ curl -s http://localhost:3001/api/status/partition-test
 > **Note**: 現時点ではノード間レプリケーションが docker compose 構成で未接続のため、
 > 自動収束は確認できない場合があります。レプリケーション統合後に完全なシナリオが動作します。
 
+## 自動テストランナー
+
+### 概要
+
+`runner.sh` は `scenarios.json` に定義されたシナリオを自動実行し、
+構造化された JSON 形式で結果を出力するテストランナーです。
+
+### 前提条件
+
+上記の前提条件に加えて:
+
+| 項目 | 要件 |
+|------|------|
+| **jq** | JSON パース用。`brew install jq` (macOS) / `apt-get install jq` (Linux) |
+
+### 使い方
+
+```bash
+# シナリオ一覧を表示
+./scripts/netem/runner.sh --list
+
+# 特定のシナリオを実行
+./scripts/netem/runner.sh --scenario partition-recovery
+
+# 全シナリオを実行
+./scripts/netem/runner.sh --all
+
+# JSON 出力付きで全シナリオを実行
+./scripts/netem/runner.sh --all --json-output
+
+# 結果の保存先を指定
+./scripts/netem/runner.sh --all --results-dir /tmp/netem-results
+```
+
+### オプション一覧
+
+| オプション | 説明 |
+|-----------|------|
+| `--scenario <name>` | 指定した名前のシナリオのみ実行 |
+| `--all` | 全シナリオを順次実行 |
+| `--list` | 利用可能なシナリオの一覧を表示 |
+| `--json-output` | 結果を JSON 形式で stdout に出力 |
+| `--results-dir <dir>` | 結果ファイルの保存先ディレクトリ (デフォルト: `./netem-results`) |
+| `--help` | ヘルプメッセージを表示 |
+
+### シナリオ定義 (`scenarios.json`)
+
+シナリオは `scripts/netem/scenarios.json` に JSON 形式で定義されています:
+
+```json
+{
+  "scenarios": [
+    {
+      "name": "partition-recovery",
+      "description": "Network partition and CRDT convergence after recovery",
+      "script": "scenario-partition-recovery.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["partition", "convergence"]
+    }
+  ]
+}
+```
+
+新しいシナリオを追加するには:
+1. `scripts/netem/scenario-<name>.sh` スクリプトを作成
+2. `scenarios.json` にエントリを追加
+3. スクリプトに実行権限を付与: `chmod +x scripts/netem/scenario-<name>.sh`
+
+### 結果の JSON フォーマット
+
+各シナリオの結果は以下の形式で保存されます:
+
+```json
+{
+  "timestamp": "2026-02-23T12:00:00Z",
+  "scenario": "partition-recovery",
+  "status": "pass",
+  "duration_seconds": 45,
+  "output": "..."
+}
+```
+
+| フィールド | 説明 |
+|-----------|------|
+| `timestamp` | 結果生成時の UTC タイムスタンプ (ISO 8601) |
+| `scenario` | シナリオ名 |
+| `status` | `pass` / `fail` / `timeout` / `error` |
+| `duration_seconds` | 実行時間 (秒) |
+| `output` | スクリプトの stdout/stderr 出力 |
+
+### 共有ライブラリ (`lib.sh`)
+
+シナリオスクリプト間で共有される関数群が `scripts/netem/lib.sh` に定義されています。
+新しいシナリオスクリプトでは先頭で source してください:
+
+```bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/lib.sh"
+```
+
+提供される関数:
+
+| 関数 | 説明 |
+|------|------|
+| `separator` / `sub_separator` | 視覚的な区切り線を出力 |
+| `log_step <n> <msg>` | 番号付きステップヘッダーを出力 |
+| `check_node <url> <name>` | ノードの health check |
+| `check_cluster <url1> <url2> <url3>` | 3 ノード全体の health check |
+| `read_counter <url> <key>` | カウンタの JSON レスポンスを取得 |
+| `extract_value <json>` | JSON からカウンタ値を抽出 |
+| `wait_for_convergence <expected> <url> <name> <retries> <interval> <key>` | 収束をポーリング |
+| `now_epoch_ms` / `elapsed_ms <start>` | タイミング計測 |
+
+### CI (GitHub Actions)
+
+netem テストは GitHub Actions で自動実行できます:
+
+- **手動トリガー**: Actions タブから `Netem Integration Tests` を手動実行
+- **夜間スケジュール**: 毎日 UTC 3:00 (JST 12:00) に自動実行
+- **結果**: Artifacts として `netem-results` がダウンロード可能
+
+ワークフロー定義: `.github/workflows/netem.yml`
+
 ## トラブルシューティング
 
 ### tc コマンドが見つからない
