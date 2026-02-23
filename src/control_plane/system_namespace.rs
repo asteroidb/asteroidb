@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::node::Node;
 use crate::placement::PlacementPolicy;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -110,6 +111,63 @@ impl SystemNamespace {
             .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, def)| def)
+    }
+
+    /// Recalculate authority definitions from placement policies and available nodes.
+    ///
+    /// For each placement policy with `certified == true`, selects candidate
+    /// nodes via the policy's tag-based criteria and updates the authority
+    /// definition for that key range. Authority definitions for non-certified
+    /// policies are left unchanged.
+    ///
+    /// Only bumps the namespace version if at least one authority definition
+    /// was actually created or modified.
+    ///
+    /// Returns the number of authority definitions that changed.
+    pub fn recalculate_authorities(&mut self, nodes: &[Node]) -> usize {
+        let policies: Vec<PlacementPolicy> = self.placement_policies.values().cloned().collect();
+        let mut changed = 0;
+
+        for policy in &policies {
+            if !policy.certified {
+                continue;
+            }
+
+            let mut candidates: Vec<NodeId> = policy
+                .select_nodes(nodes)
+                .iter()
+                .map(|n| n.id.clone())
+                .collect();
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let prefix = &policy.key_range.prefix;
+
+            let needs_update = match self.authority_definitions.get(prefix) {
+                Some(existing) => {
+                    let mut existing_sorted = existing.authority_nodes.clone();
+                    existing_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    existing_sorted != candidates
+                }
+                None => !candidates.is_empty(),
+            };
+
+            if needs_update {
+                self.authority_definitions.insert(
+                    prefix.clone(),
+                    AuthorityDefinition {
+                        key_range: policy.key_range.clone(),
+                        authority_nodes: candidates,
+                    },
+                );
+                changed += 1;
+            }
+        }
+
+        if changed > 0 {
+            self.bump_version();
+        }
+
+        changed
     }
 
     /// Saves the system namespace to a JSON file at the given path.
@@ -517,5 +575,262 @@ mod tests {
 
         let result = SystemNamespace::load(&path);
         assert!(result.is_err());
+    }
+
+    // --- recalculate_authorities ---
+
+    fn make_certified_policy(prefix: &str, tags: &[&str]) -> PlacementPolicy {
+        use crate::types::Tag;
+        use std::collections::HashSet;
+        let tag_set: HashSet<Tag> = tags.iter().map(|t| Tag((*t).into())).collect();
+        PlacementPolicy::new(PolicyVersion(1), key_range(prefix), 3)
+            .with_certified(true)
+            .with_required_tags(tag_set)
+    }
+
+    fn make_node(id: &str, mode: crate::types::NodeMode, tags: &[&str]) -> crate::node::Node {
+        use crate::types::Tag;
+        let mut n = crate::node::Node::new(NodeId(id.into()), mode);
+        for t in tags {
+            n.add_tag(Tag((*t).into()));
+        }
+        n
+    }
+
+    #[test]
+    fn recalculate_authorities_creates_from_certified_policy() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:osaka"]),
+        ];
+
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 1);
+
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(def.authority_nodes.len(), 2);
+        assert!(def.authority_nodes.contains(&NodeId("n1".into())));
+        assert!(def.authority_nodes.contains(&NodeId("n2".into())));
+    }
+
+    #[test]
+    fn recalculate_authorities_ignores_non_certified_policy() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        let policy = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 3);
+        // certified is false by default
+        ns.set_placement_policy(policy);
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Store, &[]),
+        ];
+
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 0);
+        assert!(ns.get_authority_definition("data/").is_none());
+    }
+
+    #[test]
+    fn recalculate_authorities_updates_on_membership_change() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+
+        // Initial: 2 matching nodes
+        let nodes_v1 = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        ns.recalculate_authorities(&nodes_v1);
+        assert_eq!(
+            ns.get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .len(),
+            2
+        );
+
+        // After join: 3 matching nodes
+        let nodes_v2 = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        let changed = ns.recalculate_authorities(&nodes_v2);
+        assert_eq!(changed, 1);
+        assert_eq!(
+            ns.get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn recalculate_authorities_updates_on_node_leave() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+
+        let nodes_v1 = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        ns.recalculate_authorities(&nodes_v1);
+        assert_eq!(
+            ns.get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .len(),
+            3
+        );
+
+        // After leave: n3 is gone
+        let nodes_v2 = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+        ];
+        let changed = ns.recalculate_authorities(&nodes_v2);
+        assert_eq!(changed, 1);
+        assert_eq!(
+            ns.get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .len(),
+            2
+        );
+        assert!(
+            !ns.get_authority_definition("user/")
+                .unwrap()
+                .authority_nodes
+                .contains(&NodeId("n3".into()))
+        );
+    }
+
+    #[test]
+    fn recalculate_authorities_no_change_returns_zero() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+        ];
+
+        ns.recalculate_authorities(&nodes);
+        let version_before = *ns.version();
+
+        // Same nodes → no change
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 0);
+        assert_eq!(*ns.version(), version_before);
+    }
+
+    #[test]
+    fn recalculate_authorities_excludes_subscribe_mode() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &[]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Subscribe, &[]),
+            make_node("n3", NodeMode::Both, &[]),
+        ];
+
+        ns.recalculate_authorities(&nodes);
+        let def = ns.get_authority_definition("user/").unwrap();
+        // Subscribe-only nodes should not be authority candidates
+        assert_eq!(def.authority_nodes.len(), 2);
+        assert!(def.authority_nodes.contains(&NodeId("n1".into())));
+        assert!(def.authority_nodes.contains(&NodeId("n3".into())));
+    }
+
+    #[test]
+    fn recalculate_authorities_respects_forbidden_tags() {
+        use crate::types::NodeMode;
+        use crate::types::Tag;
+        use std::collections::HashSet;
+
+        let mut ns = SystemNamespace::new();
+        let policy = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 3)
+            .with_certified(true)
+            .with_required_tags([Tag("dc:tokyo".into())].into())
+            .with_forbidden_tags([Tag("decommissioned".into())].into());
+        ns.set_placement_policy(policy);
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo", "decommissioned"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ];
+
+        ns.recalculate_authorities(&nodes);
+        let def = ns.get_authority_definition("data/").unwrap();
+        assert_eq!(def.authority_nodes.len(), 2);
+        assert!(!def.authority_nodes.contains(&NodeId("n2".into())));
+    }
+
+    #[test]
+    fn recalculate_authorities_multiple_policies() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+        ns.set_placement_policy(make_certified_policy("order/", &["dc:osaka"]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:osaka"]),
+            make_node("n3", NodeMode::Both, &["dc:tokyo", "dc:osaka"]),
+        ];
+
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 2);
+
+        let user_def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(user_def.authority_nodes.len(), 2); // n1, n3
+        assert!(user_def.authority_nodes.contains(&NodeId("n1".into())));
+        assert!(user_def.authority_nodes.contains(&NodeId("n3".into())));
+
+        let order_def = ns.get_authority_definition("order/").unwrap();
+        assert_eq!(order_def.authority_nodes.len(), 2); // n2, n3
+        assert!(order_def.authority_nodes.contains(&NodeId("n2".into())));
+        assert!(order_def.authority_nodes.contains(&NodeId("n3".into())));
+    }
+
+    #[test]
+    fn recalculate_authorities_bumps_version_once() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &[]));
+        ns.set_placement_policy(make_certified_policy("order/", &[]));
+        let version_before = *ns.version();
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Store, &[]),
+        ];
+
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 2);
+        // Version should bump only once (not once per changed definition).
+        assert_eq!(ns.version().0, version_before.0 + 1);
     }
 }
