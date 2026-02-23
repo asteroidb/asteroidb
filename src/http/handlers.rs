@@ -141,6 +141,38 @@ pub async fn get_certification_status(
 }
 
 // ---------------------------------------------------------------
+// Internal frontier handlers
+// ---------------------------------------------------------------
+
+/// `POST /api/internal/frontiers`
+///
+/// Receives frontier updates from a peer and applies them to the local
+/// `AckFrontierSet`. Monotonicity is enforced by `AckFrontierSet::update()`.
+pub async fn post_internal_frontiers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::network::frontier_sync::FrontierPushRequest>,
+) -> Json<crate::network::frontier_sync::FrontierPushResponse> {
+    let mut api = state.certified.lock().await;
+    let mut accepted = 0;
+    for frontier in req.frontiers {
+        api.update_frontier(frontier);
+        accepted += 1;
+    }
+    Json(crate::network::frontier_sync::FrontierPushResponse { accepted })
+}
+
+/// `GET /api/internal/frontiers`
+///
+/// Returns all frontiers currently tracked by this node.
+pub async fn get_internal_frontiers(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::network::frontier_sync::FrontierPullResponse> {
+    let api = state.certified.lock().await;
+    let frontiers = api.all_frontiers().into_iter().cloned().collect();
+    Json(crate::network::frontier_sync::FrontierPullResponse { frontiers })
+}
+
+// ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
 

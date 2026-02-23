@@ -366,6 +366,14 @@ impl CertifiedApi {
     pub fn namespace(&self) -> &SystemNamespace {
         &self.namespace
     }
+
+    /// Return all tracked frontiers.
+    ///
+    /// Useful for serving the internal frontier pull endpoint and for
+    /// the automatic frontier synchronisation pipeline.
+    pub fn all_frontiers(&self) -> Vec<&AckFrontier> {
+        self.frontiers.all()
+    }
 }
 
 #[cfg(test)]
