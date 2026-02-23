@@ -5,9 +5,9 @@ use axum::routing::{get, post};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_eventual, get_internal_frontiers, get_policy, get_version_history,
-    internal_keys, internal_sync, list_authorities, list_policies, post_internal_frontiers,
-    remove_policy, set_authority_definition, set_placement_policy,
+    get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy,
+    get_version_history, internal_keys, internal_sync, list_authorities, list_policies,
+    post_internal_frontiers, remove_policy, set_authority_definition, set_placement_policy,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -42,6 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_policy).delete(remove_policy),
         )
         .route("/api/control-plane/versions", get(get_version_history))
+        .route("/api/metrics", get(get_metrics))
         .with_state(state)
 }
 
@@ -56,6 +57,7 @@ mod tests {
         EventualReadResponse, PlacementPolicyResponse, StatusResponse, VersionHistoryResponse,
         WriteResponse,
     };
+    use crate::ops::metrics::RuntimeMetrics;
     use crate::types::{CertificationStatus, KeyRange, NodeId};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -85,6 +87,7 @@ mod tests {
             eventual: Mutex::new(EventualApi::new(node_id.clone())),
             certified: Mutex::new(CertifiedApi::new(node_id, Arc::clone(&namespace))),
             namespace,
+            metrics: Arc::new(RuntimeMetrics::default()),
         })
     }
 
@@ -826,5 +829,88 @@ mod tests {
         // initial(1) + auth_def(2) + policy_set(3) + policy_set(4)
         assert_eq!(versions.current_version, 4);
         assert_eq!(versions.history.len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // Metrics endpoint
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_valid_json() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // Verify all expected fields are present.
+        assert!(json.get("pending_count").is_some());
+        assert!(json.get("certified_total").is_some());
+        assert!(json.get("certification_latency_mean_us").is_some());
+        assert!(json.get("frontier_skew_ms").is_some());
+        assert!(json.get("sync_failure_rate").is_some());
+        assert!(json.get("sync_attempt_total").is_some());
+        assert!(json.get("sync_failure_total").is_some());
+
+        // Default values should be zero.
+        assert_eq!(json["pending_count"], 0);
+        assert_eq!(json["certified_total"], 0);
+        assert_eq!(json["frontier_skew_ms"], 0);
+        assert_eq!(json["sync_attempt_total"], 0);
+        assert_eq!(json["sync_failure_total"], 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_updated_values() {
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        state.metrics.pending_count.store(5, Ordering::Relaxed);
+        state.metrics.certified_total.store(10, Ordering::Relaxed);
+        state
+            .metrics
+            .certification_latency_sum_us
+            .store(2000, Ordering::Relaxed);
+        state
+            .metrics
+            .certification_latency_count
+            .store(4, Ordering::Relaxed);
+        state.metrics.frontier_skew_ms.store(42, Ordering::Relaxed);
+        state
+            .metrics
+            .sync_attempt_total
+            .store(20, Ordering::Relaxed);
+        state.metrics.sync_failure_total.store(3, Ordering::Relaxed);
+
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(json["pending_count"], 5);
+        assert_eq!(json["certified_total"], 10);
+        assert_eq!(json["frontier_skew_ms"], 42);
+        assert_eq!(json["sync_attempt_total"], 20);
+        assert_eq!(json["sync_failure_total"], 3);
+        // Mean latency: 2000 / 4 = 500.0
+        assert!((json["certification_latency_mean_us"].as_f64().unwrap() - 500.0).abs() < 0.01);
+        // Failure rate: 3 / 20 = 0.15
+        assert!((json["sync_failure_rate"].as_f64().unwrap() - 0.15).abs() < 0.01);
     }
 }

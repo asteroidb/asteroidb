@@ -9,6 +9,7 @@ use crate::api::eventual::EventualApi;
 use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
+use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
 use crate::placement::PlacementPolicy;
 use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
@@ -27,6 +28,7 @@ pub struct AppState {
     pub eventual: Mutex<EventualApi>,
     pub certified: Mutex<CertifiedApi>,
     pub namespace: Arc<RwLock<SystemNamespace>>,
+    pub metrics: Arc<RuntimeMetrics>,
 }
 
 // ---------------------------------------------------------------
@@ -429,6 +431,18 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
         .collect();
 
     Json(KeyDumpResponse { entries })
+}
+
+// ---------------------------------------------------------------
+// Metrics handler
+// ---------------------------------------------------------------
+
+/// `GET /api/metrics`
+///
+/// Returns a snapshot of runtime operational metrics (pending count,
+/// certification latency, frontier skew, sync failure rate).
+pub async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsSnapshot> {
+    Json(state.metrics.snapshot())
 }
 
 // ---------------------------------------------------------------

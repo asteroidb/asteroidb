@@ -20,6 +20,7 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -55,6 +56,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         eventual: Mutex::new(EventualApi::new(nid.clone())),
         certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace))),
         namespace,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     let app = router(state.clone());

@@ -15,6 +15,7 @@ use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId};
 
@@ -56,6 +57,7 @@ async fn two_node_anti_entropy_convergence() {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns1))),
         namespace: ns1,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Build state for node 2.
@@ -64,6 +66,7 @@ async fn two_node_anti_entropy_convergence() {
         eventual: Mutex::new(EventualApi::new(node_id("node-2"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-2"), Arc::clone(&ns2))),
         namespace: ns2,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Write some data to node 1.
@@ -238,6 +241,7 @@ async fn pull_based_sync() {
         eventual: Mutex::new(EventualApi::new(node_id("source"))),
         certified: Mutex::new(CertifiedApi::new(node_id("source"), Arc::clone(&ns_source))),
         namespace: ns_source,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     {
@@ -287,6 +291,7 @@ async fn sync_endpoint_partial_failure() {
         eventual: Mutex::new(EventualApi::new(node_id("target"))),
         certified: Mutex::new(CertifiedApi::new(node_id("target"), Arc::clone(&ns_target))),
         namespace: ns_target,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     // Pre-populate with a counter at "k".
@@ -376,6 +381,7 @@ async fn three_node_convergence_via_sync() {
             eventual: Mutex::new(EventualApi::new(nid.clone())),
             certified: Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i))),
             namespace: ns_i,
+            metrics: Arc::new(RuntimeMetrics::default()),
         });
         states.push(state);
     }
@@ -478,6 +484,7 @@ async fn internal_keys_endpoint() {
         eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
         certified: Mutex::new(CertifiedApi::new(node_id("node-1"), Arc::clone(&ns_keys))),
         namespace: ns_keys,
+        metrics: Arc::new(RuntimeMetrics::default()),
     });
 
     {
