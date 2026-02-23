@@ -102,7 +102,12 @@ pub async fn certified_write(
 ) -> Result<Json<CertifiedWriteResponse>, ApiError> {
     let on_timeout = match req.on_timeout.as_str() {
         "error" => OnTimeout::Error,
-        _ => OnTimeout::Pending,
+        "pending" => OnTimeout::Pending,
+        other => {
+            return Err(ApiError(CrdtError::InvalidArgument(format!(
+                "invalid on_timeout value: {other}; expected \"error\" or \"pending\""
+            ))));
+        }
     };
 
     let crdt_value = json_to_crdt_value(&req.value)?;
