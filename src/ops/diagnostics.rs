@@ -203,6 +203,8 @@ pub fn collect_node_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, RwLock};
+
     use super::*;
     use crate::api::certified::{CertifiedApi, OnTimeout, RetentionPolicy};
     use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
@@ -248,13 +250,17 @@ mod tests {
         CrdtValue::Counter(counter)
     }
 
-    fn default_namespace() -> SystemNamespace {
+    fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+        Arc::new(RwLock::new(ns))
+    }
+
+    fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         let mut ns = SystemNamespace::new();
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(""),
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
         });
-        ns
+        wrap_ns(ns)
     }
 
     // ---------------------------------------------------------------

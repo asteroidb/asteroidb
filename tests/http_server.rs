@@ -1,6 +1,6 @@
 //! Integration tests for HTTP server startup, API access, and graceful shutdown.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
@@ -26,9 +26,12 @@ fn test_state() -> Arc<AppState> {
         ],
     });
 
+    let namespace = Arc::new(RwLock::new(ns));
+
     Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
-        certified: Mutex::new(CertifiedApi::new(node_id, ns)),
+        certified: Mutex::new(CertifiedApi::new(node_id, Arc::clone(&namespace))),
+        namespace,
     })
 }
 

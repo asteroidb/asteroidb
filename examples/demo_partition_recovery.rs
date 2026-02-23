@@ -4,6 +4,8 @@
 /// and recovery, demonstrating CRDT convergence and certified confirmation.
 ///
 /// Run: `cargo run --example demo_partition_recovery`
+use std::sync::{Arc, RwLock};
+
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
@@ -82,7 +84,7 @@ fn main() {
         },
         authority_nodes: vec![node_a.clone(), node_b.clone(), node_c.clone()],
     });
-    let mut certified_api = CertifiedApi::new(node_a.clone(), namespace);
+    let mut certified_api = CertifiedApi::new(node_a.clone(), Arc::new(RwLock::new(namespace)));
     println!("  Nodes: node-A, node-B, node-C");
     println!("  Authority set: all 3 nodes (majority = 2)");
     println!("  Key: \"sensor/temperature\" (PN-Counter)");

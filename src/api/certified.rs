@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
@@ -80,7 +82,7 @@ pub struct CertifiedApi {
     store: Store,
     clock: Hlc,
     frontiers: AckFrontierSet,
-    namespace: SystemNamespace,
+    namespace: Arc<RwLock<SystemNamespace>>,
     pending_writes: Vec<PendingWrite>,
     retention: RetentionPolicy,
     /// Cumulative count of pending writes evicted due to `max_entries` pressure.
@@ -92,7 +94,7 @@ impl CertifiedApi {
     ///
     /// The `namespace` provides authority definitions for key-range-scoped
     /// certification decisions via longest-prefix match.
-    pub fn new(node_id: NodeId, namespace: SystemNamespace) -> Self {
+    pub fn new(node_id: NodeId, namespace: Arc<RwLock<SystemNamespace>>) -> Self {
         Self {
             store: Store::new(),
             clock: Hlc::new(node_id.0),
@@ -107,7 +109,7 @@ impl CertifiedApi {
     /// Create a new `CertifiedApi` with a custom retention policy.
     pub fn with_retention(
         node_id: NodeId,
-        namespace: SystemNamespace,
+        namespace: Arc<RwLock<SystemNamespace>>,
         retention: RetentionPolicy,
     ) -> Self {
         Self {
@@ -127,15 +129,15 @@ impl CertifiedApi {
     /// namespace. Returns the key range, current policy version, and total
     /// authority count for that range.
     fn resolve_scope(&self, key: &str) -> Result<(KeyRange, PolicyVersion, usize), CrdtError> {
-        let auth_def = self.namespace.get_authorities_for_key(key).ok_or_else(|| {
+        let ns = self.namespace.read().unwrap();
+        let auth_def = ns.get_authorities_for_key(key).ok_or_else(|| {
             CrdtError::PolicyDenied(format!("no authority definition for key: {key}"))
         })?;
 
         let key_range = auth_def.key_range.clone();
         let total = auth_def.authority_nodes.len();
 
-        let policy_version = self
-            .namespace
+        let policy_version = ns
             .get_placement_policy(&key_range.prefix)
             .map(|p| p.version)
             .unwrap_or(PolicyVersion(1));
@@ -410,8 +412,8 @@ impl CertifiedApi {
         self.evicted_count
     }
 
-    /// Return a reference to the system namespace.
-    pub fn namespace(&self) -> &SystemNamespace {
+    /// Return a reference to the shared system namespace.
+    pub fn namespace(&self) -> &Arc<RwLock<SystemNamespace>> {
         &self.namespace
     }
 
@@ -442,6 +444,10 @@ mod tests {
         KeyRange {
             prefix: prefix.into(),
         }
+    }
+
+    fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
+        Arc::new(RwLock::new(ns))
     }
 
     fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> AckFrontier {
@@ -493,17 +499,17 @@ mod tests {
     /// Create a namespace with a single catch-all authority definition (prefix "")
     /// with 3 authorities. This preserves backward-compatible behaviour for
     /// existing tests.
-    fn default_namespace() -> SystemNamespace {
+    fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         make_namespace("", &["auth-1", "auth-2", "auth-3"])
     }
 
-    fn make_namespace(prefix: &str, authorities: &[&str]) -> SystemNamespace {
+    fn make_namespace(prefix: &str, authorities: &[&str]) -> Arc<RwLock<SystemNamespace>> {
         let mut ns = SystemNamespace::new();
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(prefix),
             authority_nodes: authorities.iter().map(|a| node(a)).collect(),
         });
-        ns
+        wrap_ns(ns)
     }
 
     // ---------------------------------------------------------------
@@ -1037,7 +1043,7 @@ mod tests {
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
         });
 
-        let mut api = CertifiedApi::new(node("node-1"), ns);
+        let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
         // Write to both ranges.
         api.certified_write("user/alice".into(), counter_value(1), OnTimeout::Pending)
@@ -1095,7 +1101,7 @@ mod tests {
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
         });
 
-        let mut api = CertifiedApi::new(node("node-1"), ns);
+        let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
         // Set different frontier levels for each range.
         api.update_frontier(make_frontier("auth-u1", 100, 0, "user/"));
@@ -1131,7 +1137,7 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3).with_certified(true),
         );
 
-        let mut api = CertifiedApi::new(node("node-1"), ns);
+        let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
         // Write a key — should resolve to data/ with policy version 2.
         api.certified_write("data/sensor".into(), counter_value(42), OnTimeout::Pending)
@@ -1179,7 +1185,7 @@ mod tests {
             authority_nodes: vec![node("auth-v1"), node("auth-v2")],
         });
 
-        let mut api = CertifiedApi::new(node("node-1"), ns);
+        let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
         // Write to user/vip/alice — should resolve to user/vip/ (2 authorities).
         api.certified_write(
@@ -1256,7 +1262,7 @@ mod tests {
             max_age_ms: 5_000,
             max_entries: 10_000,
         };
-        let mut api = CertifiedApi::with_retention(node("node-1"), ns, policy);
+        let mut api = CertifiedApi::with_retention(node("node-1"), wrap_ns(ns), policy);
 
         // Write to cert/ range (will be certified).
         api.certified_write("cert/key1".into(), counter_value(1), OnTimeout::Pending)

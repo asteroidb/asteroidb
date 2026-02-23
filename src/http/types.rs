@@ -137,6 +137,62 @@ pub struct StatusResponse {
 }
 
 // ---------------------------------------------------------------
+// Control-plane request types
+// ---------------------------------------------------------------
+
+/// Request body for `PUT /api/control-plane/authorities`.
+#[derive(Debug, Deserialize)]
+pub struct SetAuthorityDefinitionRequest {
+    pub key_range_prefix: String,
+    pub authority_nodes: Vec<String>,
+}
+
+/// Request body for `PUT /api/control-plane/policies`.
+#[derive(Debug, Deserialize)]
+pub struct SetPlacementPolicyRequest {
+    pub key_range_prefix: String,
+    pub replica_count: usize,
+    #[serde(default)]
+    pub required_tags: Vec<String>,
+    #[serde(default)]
+    pub forbidden_tags: Vec<String>,
+    #[serde(default)]
+    pub allow_local_write_on_partition: bool,
+    #[serde(default)]
+    pub certified: bool,
+}
+
+// ---------------------------------------------------------------
+// Control-plane response types
+// ---------------------------------------------------------------
+
+/// Response for authority definition endpoints.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthorityDefinitionResponse {
+    pub key_range_prefix: String,
+    pub authority_nodes: Vec<String>,
+}
+
+/// Response for placement policy endpoints.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlacementPolicyResponse {
+    pub key_range_prefix: String,
+    pub version: u64,
+    pub replica_count: usize,
+    pub required_tags: Vec<String>,
+    pub forbidden_tags: Vec<String>,
+    pub allow_local_write_on_partition: bool,
+    pub certified: bool,
+}
+
+/// Response for `GET /api/control-plane/versions`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VersionHistoryResponse {
+    pub current_version: u64,
+    pub history: Vec<u64>,
+}
+
+// ---------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------
 

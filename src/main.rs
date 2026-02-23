@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
@@ -34,16 +34,19 @@ async fn main() {
         ],
     });
 
+    let namespace = Arc::new(RwLock::new(ns));
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Mutex::new(EventualApi::new(node_id.clone())),
-        certified: Mutex::new(CertifiedApi::new(node_id.clone(), ns.clone())),
+        certified: Mutex::new(CertifiedApi::new(node_id.clone(), Arc::clone(&namespace))),
+        namespace: Arc::clone(&namespace),
     });
 
     let app = router(state);
 
     // Build NodeRunner with its own CertifiedApi for background processing.
-    let runner_api = CertifiedApi::new(node_id.clone(), ns);
+    let runner_api = CertifiedApi::new(node_id.clone(), Arc::clone(&namespace));
     let engine = CompactionEngine::with_defaults();
     let mut runner = NodeRunner::new(node_id, runner_api, engine, NodeRunnerConfig::default());
     let shutdown_handle = runner.shutdown_handle();

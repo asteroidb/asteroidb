@@ -4,8 +4,10 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use super::handlers::{
-    AppState, certified_write, eventual_write, get_certification_status, get_certified,
-    get_eventual, get_internal_frontiers, internal_keys, internal_sync, post_internal_frontiers,
+    AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
+    get_certified, get_eventual, get_internal_frontiers, get_policy, get_version_history,
+    internal_keys, internal_sync, list_authorities, list_policies, post_internal_frontiers,
+    remove_policy, set_authority_definition, set_placement_policy,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -22,6 +24,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/internal/sync", post(internal_sync))
         .route("/api/internal/keys", get(internal_keys))
+        // Control-plane endpoints
+        .route(
+            "/api/control-plane/authorities",
+            get(list_authorities).put(set_authority_definition),
+        )
+        .route(
+            "/api/control-plane/authorities/{prefix}",
+            get(get_authority_definition),
+        )
+        .route(
+            "/api/control-plane/policies",
+            get(list_policies).put(set_placement_policy),
+        )
+        .route(
+            "/api/control-plane/policies/{prefix}",
+            get(get_policy).delete(remove_policy),
+        )
+        .route("/api/control-plane/versions", get(get_version_history))
         .with_state(state)
 }
 
@@ -32,13 +52,15 @@ mod tests {
     use crate::api::eventual::EventualApi;
     use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
     use crate::http::types::{
-        CertifiedReadResponse, CertifiedWriteResponse, CrdtValueJson, EventualReadResponse,
-        StatusResponse, WriteResponse,
+        AuthorityDefinitionResponse, CertifiedReadResponse, CertifiedWriteResponse, CrdtValueJson,
+        EventualReadResponse, PlacementPolicyResponse, StatusResponse, VersionHistoryResponse,
+        WriteResponse,
     };
     use crate::types::{CertificationStatus, KeyRange, NodeId};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use std::sync::RwLock;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
 
@@ -57,9 +79,12 @@ mod tests {
             ],
         });
 
+        let namespace = Arc::new(RwLock::new(ns));
+
         Arc::new(AppState {
             eventual: Mutex::new(EventualApi::new(node_id.clone())),
-            certified: Mutex::new(CertifiedApi::new(node_id, ns)),
+            certified: Mutex::new(CertifiedApi::new(node_id, Arc::clone(&namespace))),
+            namespace,
         })
     }
 
@@ -517,5 +542,289 @@ mod tests {
         let body = body_string(resp.into_body()).await;
         let read_resp: CertifiedReadResponse = serde_json::from_str(&body).unwrap();
         assert!(read_resp.value.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane: Authority definitions
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn control_plane_list_authorities() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let defs: Vec<AuthorityDefinitionResponse> = serde_json::from_str(&body).unwrap();
+        // test_state creates one catch-all authority definition
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].key_range_prefix, "");
+        assert_eq!(defs[0].authority_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn control_plane_set_and_get_authority() {
+        let state = test_state();
+        let app = router(state);
+
+        // Set a new authority definition
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"user/","authority_nodes":["auth-u1","auth-u2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let def: AuthorityDefinitionResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(def.key_range_prefix, "user/");
+        assert_eq!(def.authority_nodes, vec!["auth-u1", "auth-u2"]);
+
+        // Get it back
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities/user%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let def: AuthorityDefinitionResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(def.key_range_prefix, "user/");
+        assert_eq!(def.authority_nodes.len(), 2);
+
+        // List should now have 2 definitions
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let defs: Vec<AuthorityDefinitionResponse> = serde_json::from_str(&body).unwrap();
+        assert_eq!(defs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn control_plane_get_nonexistent_authority() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities/missing%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane: Placement policies
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn control_plane_set_and_get_policy() {
+        let state = test_state();
+        let app = router(state);
+
+        // Set a placement policy
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"user/","replica_count":3,"required_tags":["dc:tokyo"],"certified":true}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let policy: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(policy.key_range_prefix, "user/");
+        assert_eq!(policy.replica_count, 3);
+        assert!(policy.certified);
+        assert_eq!(policy.required_tags, vec!["dc:tokyo"]);
+
+        // Get it back
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/user%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let policy: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(policy.key_range_prefix, "user/");
+        assert_eq!(policy.replica_count, 3);
+    }
+
+    #[tokio::test]
+    async fn control_plane_list_policies_empty() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/control-plane/policies")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let policies: Vec<PlacementPolicyResponse> = serde_json::from_str(&body).unwrap();
+        assert!(policies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_plane_remove_policy() {
+        let state = test_state();
+        let app = router(state);
+
+        // First set a policy
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"data/","replica_count":5}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // Remove it
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/data%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let removed: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(removed.key_range_prefix, "data/");
+
+        // Should be gone now
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/data%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn control_plane_remove_nonexistent_policy() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/missing%2F")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane: Version history
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn control_plane_version_history() {
+        let state = test_state();
+        let app = router(state);
+
+        // Initial version history (namespace had 1 authority set → version 2)
+        let req = Request::builder()
+            .uri("/api/control-plane/versions")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(versions.current_version, 2);
+        assert_eq!(versions.history, vec![1, 2]);
+
+        // Set a policy → version should increment
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"test/","replica_count":1}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // Check version history again
+        let req = Request::builder()
+            .uri("/api/control-plane/versions")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(versions.current_version, 3);
+        assert_eq!(versions.history, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn control_plane_update_policy_increments_version() {
+        let state = test_state();
+        let app = router(state);
+
+        // Set policy twice → version should increment each time
+        for i in 0..2 {
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/control-plane/policies")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"key_range_prefix":"data/","replica_count":{}}}"#,
+                    i + 1
+                )))
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+
+        let req = Request::builder()
+            .uri("/api/control-plane/versions")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
+        // initial(1) + auth_def(2) + policy_set(3) + policy_set(4)
+        assert_eq!(versions.current_version, 4);
+        assert_eq!(versions.history.len(), 4);
     }
 }
