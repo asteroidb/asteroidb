@@ -103,7 +103,7 @@ Authority ノード群の過半数合意 (majority consensus) により、Eventu
 cargo run
 ```
 
-起動すると、ノードが 3 つの Authority ノード (`auth-1`, `auth-2`, `auth-3`) を含むデフォルト構成でバックグラウンド処理を開始します。`Ctrl-C` で停止します。
+起動すると、HTTP サーバーが `127.0.0.1:3000` で起動し、3 つの Authority ノード (`auth-1`, `auth-2`, `auth-3`) を含むデフォルト構成でバックグラウンド処理を開始します。バインドアドレスは環境変数 `ASTEROIDB_BIND_ADDR` で、ノード ID は `ASTEROIDB_NODE_ID` で変更可能です。`Ctrl-C` で停止します。
 
 ### HTTP API エンドポイント一覧
 
@@ -114,6 +114,8 @@ cargo run
 | `POST` | `/api/certified/write` | Certified write |
 | `GET` | `/api/certified/{key}` | Certified read (ステータス付き) |
 | `GET` | `/api/status/{key}` | 認証ステータス確認 |
+
+> **URL エンコーディングに関する注意**: `{key}` は URL の単一パスセグメントとしてマッチします。キーにスラッシュ (`/`) などの特殊文字を含む場合は、URL エンコードが必要です。例: キー `sensor/temp` は `sensor%2Ftemp` と記述してください。エンコードしない場合、ルーティングが正しく行われず 404 エラーになります。
 
 ### 3.1 Eventual Read/Write
 
@@ -209,14 +211,14 @@ curl -X POST http://localhost:3000/api/certified/write \
 **認証ステータスの確認:**
 
 ```bash
-curl http://localhost:3000/api/status/sensor/temp
+curl http://localhost:3000/api/status/sensor%2Ftemp
 # => {"key":"sensor/temp","status":"pending"}
 ```
 
 **Certified read (値 + ステータス + frontier):**
 
 ```bash
-curl http://localhost:3000/api/certified/sensor/temp
+curl http://localhost:3000/api/certified/sensor%2Ftemp
 # => {
 #      "key": "sensor/temp",
 #      "value": {"type": "counter", "value": 42},
