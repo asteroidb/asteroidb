@@ -54,7 +54,7 @@ async fn two_node_anti_entropy_convergence() {
     // Build state for node 1.
     let ns1 = wrap_ns(default_namespace());
     let state1 = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("node-1")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("node-1"),
             Arc::clone(&ns1),
@@ -67,7 +67,7 @@ async fn two_node_anti_entropy_convergence() {
     // Build state for node 2.
     let ns2 = wrap_ns(default_namespace());
     let state2 = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("node-2"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("node-2")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("node-2"),
             Arc::clone(&ns2),
@@ -246,7 +246,7 @@ async fn pull_based_sync() {
     // Build state with some data.
     let ns_source = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("source"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("source")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("source"),
             Arc::clone(&ns_source),
@@ -302,7 +302,7 @@ async fn sync_endpoint_partial_failure() {
 
     let ns_target = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("target"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("target")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("target"),
             Arc::clone(&ns_target),
@@ -396,7 +396,7 @@ async fn three_node_convergence_via_sync() {
         let nid = node_id(&format!("node-{}", i + 1));
         let ns_i = wrap_ns(default_namespace());
         let state = Arc::new(AppState {
-            eventual: Mutex::new(EventualApi::new(nid.clone())),
+            eventual: Arc::new(Mutex::new(EventualApi::new(nid.clone()))),
             certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&ns_i)))),
             namespace: ns_i,
             metrics: Arc::new(RuntimeMetrics::default()),
@@ -500,7 +500,7 @@ async fn internal_keys_endpoint() {
 
     let ns_keys = wrap_ns(default_namespace());
     let state = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("node-1"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("node-1")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("node-1"),
             Arc::clone(&ns_keys),
@@ -565,7 +565,7 @@ async fn full_sync_records_remote_frontier_not_local() {
 
     let ns_remote = wrap_ns(default_namespace());
     let remote_state = Arc::new(AppState {
-        eventual: Mutex::new(EventualApi::new(node_id("remote"))),
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("remote")))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
             node_id("remote"),
             Arc::clone(&ns_remote),
