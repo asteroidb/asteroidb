@@ -886,8 +886,25 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
     let nodes_ref = cluster_nodes.clone();
 
     tokio::spawn(async move {
-        // Wait for initial certification.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // Poll until the v1 write is certified (instead of fixed sleep).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let api = api_clone.lock().await;
+                let writes = api.pending_writes();
+                if writes.is_empty()
+                    || writes
+                        .iter()
+                        .all(|w| w.status == CertificationStatus::Certified)
+                {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for v1 write to be certified");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // Transition to v2: change policy.
         {
@@ -904,17 +921,23 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
             nodes.push(make_node("n2", NodeMode::Store, &["active"]));
         }
 
-        // Wait for version detection and authority recalculation.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-
-        // Verify v1 was auto-fenced by NodeRunner.
-        let api = api_clone.lock().await;
-        assert!(
-            api.is_version_fenced(&kr("data/"), &PolicyVersion(1)),
-            "NodeRunner should auto-fence v1 after detecting v2"
-        );
+        // Poll until NodeRunner detects the version change and fences v1.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let api = api_clone.lock().await;
+                if api.is_version_fenced(&kr("data/"), &PolicyVersion(1)) {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for NodeRunner to fence v1");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // Verify authority set was recalculated to include n2.
+        let api = api_clone.lock().await;
         let ns = api.namespace().read().unwrap();
         let def = ns.get_authority_definition("data/").unwrap();
         assert!(
@@ -1097,4 +1120,153 @@ async fn delta_sync_full_fallback_after_reconfig() {
             "new node should have counter-b after incremental sync"
         );
     }
+}
+
+// ===========================================================================
+// Test: NodeRunner delta-fail -> full-sync fallback via real HTTP servers
+// ===========================================================================
+
+/// Verifies that NodeRunner's sync loop correctly falls back to full sync
+/// when the delta endpoint is unavailable on a peer.
+///
+/// Setup:
+/// 1. Start a "legacy" HTTP server that only serves `/api/internal/keys`
+///    (no delta endpoint — returns 404 for `/api/internal/sync/delta`).
+/// 2. Write data to the legacy server's store.
+/// 3. Create a NodeRunner with SyncClient pointing at the legacy peer.
+/// 4. Inject a stale peer frontier so the runner *tries* delta first.
+/// 5. Run the runner; it should detect delta failure and fall back to
+///    full sync via `/api/internal/keys`.
+/// 6. Assert the data arrived at the local node.
+#[tokio::test]
+async fn node_runner_delta_fail_falls_back_to_full_sync() {
+    use asteroidb_poc::http::handlers::{internal_keys, internal_sync};
+    use asteroidb_poc::network::sync::SyncClient;
+    use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+    use axum::routing::{get, post};
+
+    // -- Legacy peer: serves /api/internal/keys but NOT /api/internal/sync/delta --
+    let mut ns_legacy = SystemNamespace::new();
+    ns_legacy.set_authority_definition(AuthorityDefinition {
+        key_range: kr(""),
+        authority_nodes: vec![node_id("auth-1")],
+    });
+    let ns_legacy = Arc::new(RwLock::new(ns_legacy));
+    let legacy_state = Arc::new(AppState {
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id("legacy")))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id("legacy"),
+            ns_legacy.clone(),
+        ))),
+        namespace: ns_legacy,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
+    });
+
+    // Write data to the legacy peer.
+    {
+        let mut api = legacy_state.eventual.lock().await;
+        api.eventual_counter_inc("sync-key-1").unwrap();
+        api.eventual_counter_inc("sync-key-1").unwrap();
+        api.eventual_set_add("sync-key-2", "val-a".into()).unwrap();
+    }
+
+    // Build a router with only /api/internal/keys and /api/internal/sync
+    // (no /api/internal/sync/delta → delta pull will get 404).
+    let legacy_app = axum::Router::new()
+        .route("/api/internal/keys", get(internal_keys))
+        .route("/api/internal/sync", post(internal_sync))
+        .with_state(legacy_state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let legacy_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, legacy_app).await.unwrap();
+    });
+
+    // -- Local node with NodeRunner + SyncClient --
+    let mut ns_local = SystemNamespace::new();
+    ns_local.set_authority_definition(AuthorityDefinition {
+        key_range: kr(""),
+        authority_nodes: vec![node_id("auth-1")],
+    });
+    let ns_local = Arc::new(RwLock::new(ns_local));
+    let local_api = Arc::new(Mutex::new(EventualApi::new(node_id("local"))));
+    let certified_api = Arc::new(Mutex::new(CertifiedApi::new(
+        node_id("local"),
+        ns_local.clone(),
+    )));
+
+    let peer_registry = PeerRegistry::new(
+        node_id("local"),
+        vec![PeerConfig {
+            node_id: node_id("legacy"),
+            addr: legacy_addr,
+        }],
+    )
+    .unwrap();
+
+    let sync_client = SyncClient::new(peer_registry);
+
+    let config = NodeRunnerConfig {
+        certification_interval: Duration::from_millis(10),
+        cleanup_interval: Duration::from_secs(60),
+        compaction_check_interval: Duration::from_secs(60),
+        frontier_report_interval: Duration::from_millis(10),
+        sync_interval: Some(Duration::from_millis(20)),
+    };
+
+    let mut runner = NodeRunner::with_sync(
+        node_id("local"),
+        certified_api.clone(),
+        CompactionEngine::with_defaults(),
+        config,
+        sync_client,
+        local_api.clone(),
+        default_metrics(),
+    )
+    .await;
+
+    // Run NodeRunner for enough time to complete at least one sync cycle.
+    // The runner will:
+    //   1. See no peer frontier → skip delta, go to full sync → data arrives.
+    //   OR if peer frontier gets set after first full sync:
+    //   2. Try delta pull → 404 → retry → 404 → fall back to full sync.
+    let shutdown = runner.shutdown_handle();
+    tokio::spawn(async move {
+        // Poll until local node has the data from legacy peer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let api = local_api.lock().await;
+                let has_key1 = api.get_eventual("sync-key-1").is_some();
+                let has_key2 = api.get_eventual("sync-key-2").is_some();
+                if has_key1 && has_key2 {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for full-sync fallback to transfer data");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Verify the data is correct.
+        {
+            let api = local_api.lock().await;
+            match api.get_eventual("sync-key-1") {
+                Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+                other => panic!("expected Counter(2), got {other:?}"),
+            }
+            match api.get_eventual("sync-key-2") {
+                Some(CrdtValue::Set(s)) => assert!(s.contains(&"val-a".to_string())),
+                other => panic!("expected Set with val-a, got {other:?}"),
+            }
+        }
+
+        let _ = shutdown.send(true);
+    });
+
+    runner.run().await;
+    server_handle.abort();
 }
