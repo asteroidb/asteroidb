@@ -64,7 +64,21 @@ where
     ///
     /// This removes existing dots for the key (superseding prior presence)
     /// and adds a fresh dot. The value is updated via LWW-Register.
-    pub fn set(&mut self, key: K, value: V, timestamp: HlcTimestamp, node_id: &NodeId) {
+    ///
+    /// Returns `true` if the value was updated, `false` if the timestamp
+    /// was stale compared to the current LWW-Register value. When `false`
+    /// is returned, no dots are modified to prevent inconsistency between
+    /// key presence and the register value.
+    pub fn set(&mut self, key: K, value: V, timestamp: HlcTimestamp, node_id: &NodeId) -> bool {
+        // Pre-check: if the key already has a higher or equal timestamp,
+        // skip the entire operation to avoid adding a dot without updating
+        // the register value.
+        if let Some(entry) = self.entries.get(&key)
+            && timestamp <= *entry.1.timestamp()
+        {
+            return false;
+        }
+
         let dot = self.next_dot(node_id);
 
         let entry = self.entries.entry(key).or_insert_with(|| {
@@ -78,9 +92,10 @@ where
             self.deferred.insert(d);
         }
 
-        // Add the new dot.
+        // Add the new dot and update the register value.
         entry.0.insert(dot);
         entry.1.set(value, timestamp);
+        true
     }
 
     /// Delete a key using OR-Set remove semantics.
@@ -434,6 +449,59 @@ mod tests {
         let mut map: OrMap<String, i32> = OrMap::new();
         map.delete(&"nope".to_string());
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn set_after_merge_with_higher_timestamp_is_noop() {
+        // Regression test for #126: after merging a higher-timestamp value,
+        // a local set with a lower timestamp should be a no-op.
+        let mut map_a = OrMap::new();
+        map_a.set(
+            "k".to_string(),
+            "value_a".to_string(),
+            ts(100, 0, "node-a"),
+            &node("node-a"),
+        );
+
+        let mut map_b = OrMap::new();
+        map_b.set(
+            "k".to_string(),
+            "value_b".to_string(),
+            ts(200, 0, "node-b"),
+            &node("node-b"),
+        );
+
+        // A merges B: register now holds value_b (ts=200).
+        map_a.merge(&map_b);
+        assert_eq!(map_a.get(&"k".to_string()), Some(&"value_b".to_string()));
+
+        // A tries to set with ts=150 (stale). Should be rejected.
+        let updated = map_a.set(
+            "k".to_string(),
+            "value_c".to_string(),
+            ts(150, 0, "node-a"),
+            &node("node-a"),
+        );
+        assert!(!updated, "set with stale timestamp should return false");
+        assert_eq!(map_a.get(&"k".to_string()), Some(&"value_b".to_string()));
+    }
+
+    #[test]
+    fn set_returns_true_on_success() {
+        let mut map = OrMap::new();
+        let result = map.set("k".to_string(), 42, ts(100, 0, "node-a"), &node("node-a"));
+        assert!(result);
+        assert_eq!(map.get(&"k".to_string()), Some(&42));
+    }
+
+    #[test]
+    fn set_with_equal_timestamp_is_noop() {
+        let mut map = OrMap::new();
+        map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+
+        let updated = map.set("k".to_string(), 2, ts(100, 0, "node-a"), &node("node-a"));
+        assert!(!updated);
+        assert_eq!(map.get(&"k".to_string()), Some(&1));
     }
 
     #[test]
