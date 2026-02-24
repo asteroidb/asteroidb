@@ -1216,6 +1216,8 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         sync_interval: Some(Duration::from_millis(20)),
     };
 
+    let metrics = Arc::new(RuntimeMetrics::default());
+
     let mut runner = NodeRunner::with_sync(
         node_id("local"),
         certified_api.clone(),
@@ -1223,16 +1225,20 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         config,
         sync_client,
         local_api.clone(),
-        default_metrics(),
+        metrics.clone(),
     )
     .await;
 
-    // Run NodeRunner for enough time to complete at least one sync cycle.
-    // The runner will:
-    //   1. See no peer frontier → skip delta, go to full sync → data arrives.
-    //   OR if peer frontier gets set after first full sync:
-    //   2. Try delta pull → 404 → retry → 404 → fall back to full sync.
+    // Inject a stale peer frontier so the runner *tries* delta first.
+    // This forces the delta-fail -> full-sync fallback path because the
+    // legacy server has no /api/internal/sync/delta endpoint.
+    runner.inject_peer_frontier(&legacy_addr.to_string(), hlc(1, 0, "stale"));
+
+    // Run NodeRunner; the sync cycle will:
+    //   1. See injected peer frontier → try delta pull → 404 → retry → 404
+    //   2. Fall back to full sync via /api/internal/keys → data arrives
     let shutdown = runner.shutdown_handle();
+    let metrics_check = metrics.clone();
     tokio::spawn(async move {
         // Poll until local node has the data from legacy peer.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1263,6 +1269,15 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
                 other => panic!("expected Set with val-a, got {other:?}"),
             }
         }
+
+        // Verify the fallback path was actually taken via metrics.
+        let fallback_count = metrics_check
+            .sync_fallback_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fallback_count > 0,
+            "sync_fallback_total should be > 0, proving delta-fail -> full-sync path was taken"
+        );
 
         let _ = shutdown.send(true);
     });

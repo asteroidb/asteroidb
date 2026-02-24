@@ -118,6 +118,9 @@ pub struct RuntimeMetrics {
 
     /// Cumulative sync attempt count.
     pub sync_attempt_total: AtomicU64,
+
+    /// Cumulative count of delta-fail -> full-sync fallback events.
+    pub sync_fallback_total: AtomicU64,
 }
 
 impl RuntimeMetrics {

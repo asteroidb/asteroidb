@@ -243,6 +243,15 @@ impl NodeRunner {
         self.eventual_api = Some(api);
     }
 
+    /// Inject a peer frontier for testing purposes.
+    ///
+    /// This forces the next sync cycle to attempt delta sync first for
+    /// the given peer address, which is useful for testing the
+    /// delta-fail -> full-sync fallback path.
+    pub fn inject_peer_frontier(&mut self, peer_addr: &str, frontier: HlcTimestamp) {
+        self.peer_frontiers.insert(peer_addr.to_string(), frontier);
+    }
+
     /// Return a reference to the node ID.
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
@@ -697,6 +706,9 @@ impl NodeRunner {
                     peer = %peer.node_id.0,
                     "delta sync failed, falling back to full sync"
                 );
+                self.metrics
+                    .sync_fallback_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
 
             // Full sync fallback: pull all keys from peer.
