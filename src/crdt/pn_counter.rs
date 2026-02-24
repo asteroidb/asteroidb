@@ -53,10 +53,18 @@ impl PnCounter {
     }
 
     /// Return the current counter value: `sum(P) - sum(N)`.
+    ///
+    /// Uses saturating arithmetic to prevent overflow. If the difference exceeds
+    /// `i64::MAX` or is less than `i64::MIN`, the result is clamped to the
+    /// respective bound.
     pub fn value(&self) -> i64 {
         let pos: u64 = self.p.values().sum();
         let neg: u64 = self.n.values().sum();
-        pos as i64 - neg as i64
+        if pos >= neg {
+            (pos - neg).min(i64::MAX as u64) as i64
+        } else {
+            -((neg - pos).min(i64::MAX as u64) as i64)
+        }
     }
 
     /// Merge another PN-Counter into this one by taking the element-wise maximum
@@ -356,5 +364,84 @@ mod tests {
         let mut merged_rev = counter_b.clone();
         merged_rev.merge(&counter_a);
         assert_eq!(merged_rev.value(), 104);
+    }
+
+    #[test]
+    fn value_saturates_when_pos_exceeds_i64_max() {
+        // Two nodes each contribute more than i64::MAX / 2, so total pos > i64::MAX.
+        let na = node("node-a");
+        let nb = node("node-b");
+
+        let mut counter = PnCounter::new();
+        counter.p.insert(na, u64::MAX / 2 + 1);
+        counter.p.insert(nb, u64::MAX / 2 + 1);
+        // pos = u64::MAX / 2 + 1 + u64::MAX / 2 + 1 = u64::MAX + 1, but sum wraps to 0.
+        // Actually let's use values that sum to > i64::MAX but don't overflow u64::sum.
+        let mut counter2 = PnCounter::new();
+        counter2.p.insert(node("a"), i64::MAX as u64);
+        counter2.p.insert(node("b"), 1);
+        // pos = i64::MAX + 1 which is > i64::MAX
+        assert_eq!(counter2.value(), i64::MAX);
+    }
+
+    #[test]
+    fn value_saturates_when_neg_exceeds_i64_max() {
+        let mut counter = PnCounter::new();
+        counter.n.insert(node("a"), i64::MAX as u64);
+        counter.n.insert(node("b"), 1);
+        // neg = i64::MAX + 1, pos = 0, so result should saturate to -i64::MAX
+        assert_eq!(counter.value(), -i64::MAX);
+    }
+
+    #[test]
+    fn value_saturates_large_positive_difference() {
+        let mut counter = PnCounter::new();
+        counter.p.insert(node("a"), u64::MAX);
+        counter.n.insert(node("b"), 0);
+        // pos - neg = u64::MAX, clamped to i64::MAX
+        assert_eq!(counter.value(), i64::MAX);
+    }
+
+    #[test]
+    fn value_saturates_large_negative_difference() {
+        let mut counter = PnCounter::new();
+        counter.p.insert(node("a"), 0);
+        counter.n.insert(node("b"), u64::MAX);
+        // neg - pos = u64::MAX, clamped to -i64::MAX
+        assert_eq!(counter.value(), -i64::MAX);
+    }
+
+    #[test]
+    fn from_value_i64_min_roundtrips() {
+        // i64::MIN has unsigned_abs() = i64::MAX + 1, which exceeds i64::MAX.
+        // value() should saturate to -i64::MAX (not overflow).
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, i64::MIN);
+        // The internal n map has value i64::MAX + 1 = 9223372036854775808.
+        // value() computes -(min(9223372036854775808, i64::MAX)) = -i64::MAX.
+        assert_eq!(counter.value(), -i64::MAX);
+    }
+
+    #[test]
+    fn from_value_i64_max_roundtrips() {
+        let n = node("node-a");
+        let counter = PnCounter::from_value(&n, i64::MAX);
+        assert_eq!(counter.value(), i64::MAX);
+    }
+
+    #[test]
+    fn value_exact_i64_max_boundary() {
+        // Exactly i64::MAX should not be clamped.
+        let mut counter = PnCounter::new();
+        counter.p.insert(node("a"), i64::MAX as u64);
+        assert_eq!(counter.value(), i64::MAX);
+    }
+
+    #[test]
+    fn value_exact_neg_i64_max_boundary() {
+        // neg = i64::MAX, pos = 0 => result is exactly -i64::MAX (no clamping needed).
+        let mut counter = PnCounter::new();
+        counter.n.insert(node("a"), i64::MAX as u64);
+        assert_eq!(counter.value(), -i64::MAX);
     }
 }
