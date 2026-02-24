@@ -151,6 +151,13 @@ where
             entry.1.merge(other_reg);
         }
 
+        // Apply other's tombstones to self-only entries (keys not in other.entries).
+        for (key, (dots, _)) in &mut self.entries {
+            if !other.entries.contains_key(key) {
+                dots.retain(|dot| !other.deferred.contains(dot));
+            }
+        }
+
         // Remove entries with no remaining dots.
         self.entries.retain(|_, (dots, _)| !dots.is_empty());
 
@@ -402,6 +409,63 @@ mod tests {
 
         map_a.merge(&map_b);
         assert!(!map_a.contains_key(&"k".to_string()));
+    }
+
+    #[test]
+    fn delete_propagates_to_self_only_entry_via_merge() {
+        // Regression test for #124:
+        // Both replicas have key "k". Node B deletes "k", so "k" is NOT in
+        // B's entries but IS in B's deferred. When A merges B, A's self-only
+        // entry for "k" must have its dots checked against B's deferred set.
+        let mut map_a = OrMap::new();
+        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+
+        // Clone to B so both replicas share the same dot for "k".
+        let mut map_b = map_a.clone();
+
+        // B deletes "k" — dot moves to B's deferred, entry removed.
+        map_b.delete(&"k".to_string());
+        assert!(!map_b.contains_key(&"k".to_string()));
+
+        // A still has "k". Merge B into A.
+        // Before fix: "k" survived because the merge loop only iterated
+        // over other.entries (which doesn't contain "k").
+        map_a.merge(&map_b);
+        assert!(
+            !map_a.contains_key(&"k".to_string()),
+            "delete on B should propagate to A via merge"
+        );
+        assert!(map_a.is_empty());
+    }
+
+    #[test]
+    fn delete_propagates_to_self_only_entry_with_other_keys_surviving() {
+        // Ensure the fix only removes the correct key and not unrelated ones.
+        let mut map_a = OrMap::new();
+        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        map_a.set(
+            "other".to_string(),
+            99,
+            ts(101, 0, "node-a"),
+            &node("node-a"),
+        );
+
+        let mut map_b = map_a.clone();
+
+        // B deletes only "k".
+        map_b.delete(&"k".to_string());
+
+        map_a.merge(&map_b);
+        assert!(
+            !map_a.contains_key(&"k".to_string()),
+            "deleted key should be gone"
+        );
+        assert_eq!(
+            map_a.get(&"other".to_string()),
+            Some(&99),
+            "unrelated key should survive"
+        );
+        assert_eq!(map_a.len(), 1);
     }
 
     #[test]
