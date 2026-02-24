@@ -63,7 +63,13 @@ impl PnCounter {
         if pos >= neg {
             (pos - neg).min(i64::MAX as u64) as i64
         } else {
-            -((neg - pos).min(i64::MAX as u64) as i64)
+            let diff = neg - pos;
+            let min_mag = (i64::MAX as u64) + 1;
+            if diff >= min_mag {
+                i64::MIN
+            } else {
+                -(diff as i64)
+            }
         }
     }
 
@@ -389,8 +395,8 @@ mod tests {
         let mut counter = PnCounter::new();
         counter.n.insert(node("a"), i64::MAX as u64);
         counter.n.insert(node("b"), 1);
-        // neg = i64::MAX + 1, pos = 0, so result should saturate to -i64::MAX
-        assert_eq!(counter.value(), -i64::MAX);
+        // neg = i64::MAX + 1, pos = 0, so result should saturate to i64::MIN
+        assert_eq!(counter.value(), i64::MIN);
     }
 
     #[test]
@@ -407,19 +413,18 @@ mod tests {
         let mut counter = PnCounter::new();
         counter.p.insert(node("a"), 0);
         counter.n.insert(node("b"), u64::MAX);
-        // neg - pos = u64::MAX, clamped to -i64::MAX
-        assert_eq!(counter.value(), -i64::MAX);
+        // neg - pos = u64::MAX, clamped to i64::MIN
+        assert_eq!(counter.value(), i64::MIN);
     }
 
     #[test]
     fn from_value_i64_min_roundtrips() {
         // i64::MIN has unsigned_abs() = i64::MAX + 1, which exceeds i64::MAX.
-        // value() should saturate to -i64::MAX (not overflow).
+        // value() should round-trip to i64::MIN (not overflow).
         let n = node("node-a");
         let counter = PnCounter::from_value(&n, i64::MIN);
         // The internal n map has value i64::MAX + 1 = 9223372036854775808.
-        // value() computes -(min(9223372036854775808, i64::MAX)) = -i64::MAX.
-        assert_eq!(counter.value(), -i64::MAX);
+        assert_eq!(counter.value(), i64::MIN);
     }
 
     #[test]

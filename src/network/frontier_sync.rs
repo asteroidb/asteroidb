@@ -45,7 +45,7 @@ impl FrontierSyncClient {
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to build FrontierSyncClient HTTP client"),
         }
     }
 
