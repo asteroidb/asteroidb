@@ -1201,7 +1201,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         node_id("local"),
         vec![PeerConfig {
             node_id: node_id("legacy"),
-            addr: legacy_addr,
+            addr: legacy_addr.to_string(),
         }],
     )
     .unwrap();

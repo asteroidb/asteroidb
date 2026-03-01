@@ -99,6 +99,34 @@ Authority ノード群の過半数合意 (majority consensus) により、Eventu
 
 ### ノードの起動
 
+**方法 1: 設定ファイルを使用する（推奨）**
+
+`ASTEROIDB_CONFIG` 環境変数に設定ファイルのパスを指定して起動します。設定ファイルにはノード ID、バインドアドレス、ピア情報がすべて含まれるため、マルチノード構成を簡単に管理できます。
+
+```bash
+ASTEROIDB_CONFIG=configs/node-1.json cargo run
+```
+
+設定ファイルの例 (`configs/node-1.json`):
+
+```json
+{
+  "node": { "id": "node-1", "mode": "Both", "tags": [] },
+  "bind_addr": "0.0.0.0:3000",
+  "peers": {
+    "self_id": "node-1",
+    "peers": {
+      "node-2": { "node_id": "node-2", "addr": "127.0.0.1:3001" },
+      "node-3": { "node_id": "node-3", "addr": "127.0.0.1:3002" }
+    }
+  }
+}
+```
+
+ピアが設定ファイルに定義されている場合、ノード間の anti-entropy sync が自動的に有効化されます。
+
+**方法 2: 環境変数を使用する**
+
 ```bash
 cargo run
 ```

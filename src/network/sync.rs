@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -173,7 +172,7 @@ impl SyncClient {
     /// Sends `GET /api/internal/keys` to the peer and returns the
     /// full [`KeyDumpResponse`] including entries and the remote
     /// peer's frontier. Returns `None` on failure.
-    pub async fn pull_all_keys(&self, peer_addr: &std::net::SocketAddr) -> Option<KeyDumpResponse> {
+    pub async fn pull_all_keys(&self, peer_addr: &str) -> Option<KeyDumpResponse> {
         let url = format!("http://{}/api/internal/keys", peer_addr);
 
         match self.http_client.get(&url).send().await {
@@ -223,7 +222,7 @@ impl SyncClient {
     /// Returns `None` on failure.
     pub async fn pull_delta(
         &self,
-        peer_addr: &SocketAddr,
+        peer_addr: &str,
         sender: &str,
         frontier: &HlcTimestamp,
     ) -> Option<DeltaSyncResponse> {
@@ -264,7 +263,7 @@ impl SyncClient {
     /// Returns `true` on success.
     pub async fn push_delta(
         &self,
-        peer_addr: &SocketAddr,
+        peer_addr: &str,
         entries: HashMap<String, CrdtValue>,
         sender_id: &str,
     ) -> bool {
@@ -377,7 +376,7 @@ mod tests {
             nid("node-1"),
             vec![PeerConfig {
                 node_id: nid("node-2"),
-                addr: "127.0.0.1:8001".parse().unwrap(),
+                addr: "127.0.0.1:8001".to_string(),
             }],
         )
         .unwrap();
@@ -392,7 +391,7 @@ mod tests {
             nid("node-1"),
             vec![PeerConfig {
                 node_id: nid("node-2"),
-                addr: "127.0.0.1:8001".parse().unwrap(),
+                addr: "127.0.0.1:8001".to_string(),
             }],
         )
         .unwrap();
@@ -409,7 +408,7 @@ mod tests {
             vec![PeerConfig {
                 node_id: nid("node-2"),
                 // Unreachable address.
-                addr: "127.0.0.1:1".parse().unwrap(),
+                addr: "127.0.0.1:1".to_string(),
             }],
         )
         .unwrap();
@@ -440,8 +439,7 @@ mod tests {
             .unwrap();
         let client = SyncClient::with_client(registry, http_client);
 
-        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let result = client.pull_all_keys(&addr).await;
+        let result = client.pull_all_keys("127.0.0.1:1").await;
         assert!(result.is_none());
     }
 
@@ -518,8 +516,9 @@ mod tests {
             .unwrap();
         let client = SyncClient::with_client(registry, http_client);
 
-        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let result = client.pull_delta(&addr, "node-1", &hlc(0, 0, "")).await;
+        let result = client
+            .pull_delta("127.0.0.1:1", "node-1", &hlc(0, 0, ""))
+            .await;
         assert!(result.is_none());
     }
 
@@ -528,8 +527,9 @@ mod tests {
         let registry = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
         let client = SyncClient::new(registry);
 
-        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let result = client.push_delta(&addr, HashMap::new(), "node-1").await;
+        let result = client
+            .push_delta("127.0.0.1:1", HashMap::new(), "node-1")
+            .await;
         assert!(result);
     }
 }

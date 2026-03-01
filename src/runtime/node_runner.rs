@@ -639,7 +639,7 @@ impl NodeRunner {
         let mut any_success = false;
 
         for peer in &peers {
-            let peer_key = peer.addr.to_string();
+            let peer_key = peer.addr.clone();
 
             // Try delta sync if we have a frontier for this peer.
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {

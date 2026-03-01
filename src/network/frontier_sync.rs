@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -59,7 +58,7 @@ impl FrontierSyncClient {
     /// Returns the number of frontiers accepted by the peer.
     pub async fn push_frontiers(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: &str,
         frontiers: Vec<AckFrontier>,
     ) -> Result<FrontierPushResponse, reqwest::Error> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
@@ -81,7 +80,7 @@ impl FrontierSyncClient {
     /// The returned frontiers can be applied locally via `AckFrontierSet::update()`.
     pub async fn pull_frontiers(
         &self,
-        peer_addr: SocketAddr,
+        peer_addr: &str,
     ) -> Result<FrontierPullResponse, reqwest::Error> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
 
