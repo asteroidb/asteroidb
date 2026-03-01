@@ -54,6 +54,7 @@ fn test_state() -> Arc<AppState> {
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
+        peer_persist_path: None,
     })
 }
 

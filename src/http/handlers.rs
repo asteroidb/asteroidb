@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use axum::Json;
@@ -38,6 +39,9 @@ pub struct AppState {
     /// Peer registry for node join/leave bootstrap.
     /// `None` when peer tracking is not needed (e.g. unit tests).
     pub peers: Option<Arc<Mutex<PeerRegistry>>>,
+    /// File path to persist the peer registry to on join/leave.
+    /// `None` disables persistence (e.g. unit tests).
+    pub peer_persist_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -561,8 +565,9 @@ pub async fn internal_join(
 
     let joining_node_id = NodeId(req.node_id.clone());
 
-    // Add the joining node to our peer registry.
-    {
+    // Add the joining node and snapshot peer list under one lock acquisition,
+    // then release the lock before performing blocking I/O.
+    let (peer_list, persist_snapshot) = {
         let mut registry = peers_registry.lock().await;
         registry
             .add_peer(PeerConfig {
@@ -570,13 +575,14 @@ pub async fn internal_join(
                 addr: req.address.clone(),
             })
             .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
-    }
 
-    // Build the response: current peer list + namespace snapshot.
-    let peer_list: Vec<PeerInfo> = {
-        let registry = peers_registry.lock().await;
+        // Snapshot the serialised state while we hold the lock.
+        let snapshot = state
+            .peer_persist_path
+            .as_ref()
+            .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
 
-        // Include all known peers (including the seed node itself).
+        // Build the peer list response while the lock is held.
         let mut list: Vec<PeerInfo> = registry
             .all_peers_owned()
             .into_iter()
@@ -585,15 +591,23 @@ pub async fn internal_join(
                 address: p.addr.clone(),
             })
             .collect();
-
-        // Also include the seed node (self) in the list so the joiner
-        // knows about everyone.
-        // We cannot get the seed's own address from the registry, so
-        // we omit it here -- the joiner already knows the seed's address
-        // since it sent this request to it.
         list.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        list
+
+        (list, snapshot)
     };
+    // Lock is released here — persist outside the critical section.
+
+    if let Some(path) = &state.peer_persist_path
+        && let Some(json) = persist_snapshot
+    {
+        let path = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            eprintln!("warning: failed to persist peer registry: {e}");
+        }
+    }
 
     let ns_snapshot = {
         let ns = state.namespace.read().unwrap();
@@ -622,10 +636,38 @@ pub async fn internal_leave(
 
     let leaving_node_id = NodeId(req.node_id);
 
-    let mut registry = peers_registry.lock().await;
-    let removed = registry
-        .remove_peer(&leaving_node_id)
-        .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    // Remove peer and snapshot serialised state under the lock, then
+    // release before performing blocking I/O.
+    let (removed, persist_snapshot) = {
+        let mut registry = peers_registry.lock().await;
+        let removed = registry
+            .remove_peer(&leaving_node_id)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+
+        let snapshot = if removed.is_some() {
+            state
+                .peer_persist_path
+                .as_ref()
+                .and_then(|_| serde_json::to_string_pretty(&*registry).ok())
+        } else {
+            None
+        };
+
+        (removed, snapshot)
+    };
+    // Lock is released here.
+
+    if let Some(path) = &state.peer_persist_path
+        && let Some(json) = persist_snapshot
+    {
+        let path = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            eprintln!("warning: failed to persist peer registry: {e}");
+        }
+    }
 
     Ok(Json(LeaveResponse {
         success: removed.is_some(),
@@ -647,6 +689,24 @@ pub async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsSnap
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
+
+/// Write `data` to `path` atomically: write to a sibling `.tmp` file, then
+/// rename. Cleans up the temp file on failure.
+fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp_path, data) {
+        return Err(e.to_string());
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        // Clean up stranded temp file on rename failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
 
 /// Maximum allowed absolute value for counter initialization via HTTP API.
 ///

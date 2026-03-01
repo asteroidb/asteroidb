@@ -58,6 +58,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
+        peer_persist_path: None,
     });
 
     let app = router(state.clone());

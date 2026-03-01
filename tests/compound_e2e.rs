@@ -144,6 +144,7 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         namespace: ns,
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
+        peer_persist_path: None,
     })
 }
 
@@ -1161,6 +1162,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         namespace: ns_legacy,
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
+        peer_persist_path: None,
     });
 
     // Write data to the legacy peer.
