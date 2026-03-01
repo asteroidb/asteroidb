@@ -40,6 +40,8 @@ async fn main() {
         }
     };
 
+    let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN").ok();
+
     println!("AsteroidDB starting... (node_id={})", node_id.0);
 
     let mut ns = SystemNamespace::new();
@@ -129,6 +131,7 @@ async fn main() {
         metrics: Arc::clone(&metrics),
         peers: Some(Arc::clone(&shared_peers)),
         peer_persist_path: Some(peer_persist_path),
+        internal_token,
     });
 
     let app = router(state);

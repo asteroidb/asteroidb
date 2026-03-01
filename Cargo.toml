@@ -12,6 +12,7 @@ rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+subtle = "2"
 tracing = "0.1"
 
 [dev-dependencies]

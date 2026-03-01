@@ -133,6 +133,14 @@ cargo run
 
 起動すると、HTTP サーバーが `127.0.0.1:3000` で起動し、3 つの Authority ノード (`auth-1`, `auth-2`, `auth-3`) を含むデフォルト構成でバックグラウンド処理を開始します。バインドアドレスは環境変数 `ASTEROIDB_BIND_ADDR` で、ノード ID は `ASTEROIDB_NODE_ID` で変更可能です。`Ctrl-C` で停止します。
 
+### 環境変数
+
+| 変数 | 説明 | デフォルト |
+|------|------|-----------|
+| `ASTEROIDB_BIND_ADDR` | HTTP サーバーのバインドアドレス | `127.0.0.1:3000` |
+| `ASTEROIDB_NODE_ID` | ノード ID | `node-1` |
+| `ASTEROIDB_INTERNAL_TOKEN` | Internal API (`/api/internal/*`) の Bearer トークン。設定すると、ノード間通信に `Authorization: Bearer <token>` ヘッダが必要になります。未設定の場合は認証なしで動作します (後方互換) | 未設定 (認証なし) |
+
 ### HTTP API エンドポイント一覧
 
 #### Client API

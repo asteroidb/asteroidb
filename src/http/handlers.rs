@@ -42,6 +42,9 @@ pub struct AppState {
     /// File path to persist the peer registry to on join/leave.
     /// `None` disables persistence (e.g. unit tests).
     pub peer_persist_path: Option<PathBuf>,
+    /// Shared token for authenticating internal API requests.
+    /// `None` means no authentication is required (backwards compatibility).
+    pub internal_token: Option<String>,
 }
 
 // ---------------------------------------------------------------

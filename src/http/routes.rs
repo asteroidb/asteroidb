@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::middleware;
 use axum::routing::{get, post};
 
+use super::auth::require_internal_token;
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
     get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy,
@@ -13,13 +15,8 @@ use super::handlers::{
 
 /// Build the HTTP API router with all endpoints.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/api/eventual/write", post(eventual_write))
-        .route("/api/eventual/{key}", get(get_eventual))
-        .route("/api/certified/write", post(certified_write))
-        .route("/api/certified/verify", post(verify_proof))
-        .route("/api/certified/{key}", get(get_certified))
-        .route("/api/status/{key}", get(get_certification_status))
+    // Internal routes protected by Bearer token authentication.
+    let internal_routes = Router::new()
         .route(
             "/api/internal/frontiers",
             post(post_internal_frontiers).get(get_internal_frontiers),
@@ -29,6 +26,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/internal/keys", get(internal_keys))
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_internal_token,
+        ));
+
+    Router::new()
+        // Public API routes
+        .route("/api/eventual/write", post(eventual_write))
+        .route("/api/eventual/{key}", get(get_eventual))
+        .route("/api/certified/write", post(certified_write))
+        .route("/api/certified/verify", post(verify_proof))
+        .route("/api/certified/{key}", get(get_certified))
+        .route("/api/status/{key}", get(get_certification_status))
+        // Internal routes (with auth middleware)
+        .merge(internal_routes)
         // Control-plane endpoints
         .route(
             "/api/control-plane/authorities",
@@ -98,6 +110,7 @@ mod tests {
             metrics: Arc::new(RuntimeMetrics::default()),
             peers: None,
             peer_persist_path: None,
+            internal_token: None,
         })
     }
 
@@ -1202,5 +1215,130 @@ mod tests {
         let body = body_string(resp.into_body()).await;
         let result: FrontierPushResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(result.accepted, 1, "newer frontier should be accepted");
+    }
+
+    // ---------------------------------------------------------------
+    // Internal API authentication tests
+    // ---------------------------------------------------------------
+
+    fn test_state_with_token(token: &str) -> Arc<AppState> {
+        let node_id = NodeId("test-node".into());
+
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            authority_nodes: vec![
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+        });
+
+        let namespace = Arc::new(RwLock::new(ns));
+
+        Arc::new(AppState {
+            eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(
+                node_id,
+                Arc::clone(&namespace),
+            ))),
+            namespace,
+            metrics: Arc::new(RuntimeMetrics::default()),
+            peers: None,
+            internal_token: Some(token.to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn internal_api_without_token_returns_401() {
+        let state = test_state_with_token("secret-token");
+        let app = router(state);
+
+        // Request to internal API without Authorization header.
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_api_with_wrong_token_returns_401() {
+        let state = test_state_with_token("secret-token");
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_api_with_correct_token_succeeds() {
+        let state = test_state_with_token("secret-token");
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .header("authorization", "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_api_no_token_configured_allows_all() {
+        // When no token is configured (None), all requests pass through.
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_api_not_affected_by_internal_token() {
+        let state = test_state_with_token("secret-token");
+        let app = router(state);
+
+        // Public API should work without any token.
+        let req = Request::builder()
+            .uri("/api/eventual/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_api_malformed_auth_header_returns_401() {
+        let state = test_state_with_token("secret-token");
+        let app = router(state);
+
+        // "Basic" instead of "Bearer"
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .header("authorization", "Basic secret-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

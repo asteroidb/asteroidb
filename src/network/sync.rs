@@ -89,6 +89,8 @@ pub struct DeltaSyncResponse {
 pub struct SyncClient {
     peer_registry: PeerRegistry,
     http_client: reqwest::Client,
+    /// Optional Bearer token for authenticating with internal API endpoints.
+    internal_token: Option<String>,
 }
 
 impl SyncClient {
@@ -101,6 +103,20 @@ impl SyncClient {
         Self {
             peer_registry,
             http_client,
+            internal_token: None,
+        }
+    }
+
+    /// Create a new `SyncClient` with a Bearer token for internal API auth.
+    pub fn with_token(peer_registry: PeerRegistry, token: String) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("failed to build HTTP client");
+        Self {
+            peer_registry,
+            http_client,
+            internal_token: Some(token),
         }
     }
 
@@ -109,6 +125,15 @@ impl SyncClient {
         Self {
             peer_registry,
             http_client,
+            internal_token: None,
+        }
+    }
+
+    /// Attach a Bearer token to a request builder if configured.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.internal_token {
+            Some(token) => builder.bearer_auth(token),
+            None => builder,
         }
     }
 
@@ -138,7 +163,12 @@ impl SyncClient {
         for peer in self.peer_registry.all_peers() {
             let url = format!("http://{}/api/internal/sync", peer.addr);
 
-            match self.http_client.post(&url).json(&request).send().await {
+            match self
+                .apply_auth(self.http_client.post(&url))
+                .json(&request)
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         success_count += 1;
@@ -175,7 +205,7 @@ impl SyncClient {
     pub async fn pull_all_keys(&self, peer_addr: &str) -> Option<KeyDumpResponse> {
         let url = format!("http://{}/api/internal/keys", peer_addr);
 
-        match self.http_client.get(&url).send().await {
+        match self.apply_auth(self.http_client.get(&url)).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.json::<KeyDumpResponse>().await {
@@ -232,7 +262,12 @@ impl SyncClient {
             frontier: frontier.clone(),
         };
 
-        match self.http_client.post(&url).json(&req).send().await {
+        match self
+            .apply_auth(self.http_client.post(&url))
+            .json(&req)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.json::<DeltaSyncResponse>().await {
@@ -277,7 +312,12 @@ impl SyncClient {
             entries,
         };
 
-        match self.http_client.post(&url).json(&request).send().await {
+        match self
+            .apply_auth(self.http_client.post(&url))
+            .json(&request)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if resp.status().is_success() {
                     tracing::debug!("delta push succeeded");

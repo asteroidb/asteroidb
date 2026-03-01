@@ -64,6 +64,7 @@ async fn spawn_node_with_peers(
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: Some(peer_registry),
         peer_persist_path: None,
+        internal_token: None,
     });
 
     let app = router(state.clone());

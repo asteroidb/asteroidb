@@ -35,6 +35,8 @@ pub struct FrontierPullResponse {
 /// deduplication) is handled by `AckFrontierSet::update()`.
 pub struct FrontierSyncClient {
     http_client: reqwest::Client,
+    /// Optional Bearer token for authenticating with internal API endpoints.
+    internal_token: Option<String>,
 }
 
 impl FrontierSyncClient {
@@ -45,6 +47,26 @@ impl FrontierSyncClient {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build FrontierSyncClient HTTP client"),
+            internal_token: None,
+        }
+    }
+
+    /// Create a new sync client with a Bearer token for internal API auth.
+    pub fn with_token(token: String) -> Self {
+        Self {
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build FrontierSyncClient HTTP client"),
+            internal_token: Some(token),
+        }
+    }
+
+    /// Attach a Bearer token to a request builder if configured.
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.internal_token {
+            Some(token) => builder.bearer_auth(token),
+            None => builder,
         }
     }
 
@@ -64,8 +86,7 @@ impl FrontierSyncClient {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
         let body = FrontierPushRequest { frontiers };
 
-        self.http_client
-            .post(&url)
+        self.apply_auth(self.http_client.post(&url))
             .json(&body)
             .send()
             .await?
@@ -84,8 +105,7 @@ impl FrontierSyncClient {
     ) -> Result<FrontierPullResponse, reqwest::Error> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
 
-        self.http_client
-            .get(&url)
+        self.apply_auth(self.http_client.get(&url))
             .send()
             .await?
             .error_for_status()?
