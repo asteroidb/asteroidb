@@ -101,6 +101,16 @@ jobs:
           path: test-output.txt
           retention-days: 7
 
+  doc-drift:
+    name: Document Drift Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for API document drift
+        run: bash scripts/check-doc-drift.sh
+
   build:
     name: Release Build
     runs-on: ubuntu-latest

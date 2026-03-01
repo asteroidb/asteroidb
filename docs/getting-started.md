@@ -135,6 +135,8 @@ cargo run
 
 ### HTTP API エンドポイント一覧
 
+#### Client API
+
 | メソッド | パス | 説明 |
 |---------|------|------|
 | `POST` | `/api/eventual/write` | Eventual write (CRDT 操作) |
@@ -150,7 +152,38 @@ cargo run
 | `GET/DELETE` | `/api/control-plane/policies/{prefix}` | 配置ポリシーの取得/削除 |
 | `GET` | `/api/control-plane/versions` | ポリシーバージョン履歴 |
 
-> **URL エンコーディングに関する注意**: `{key}` は URL の単一パスセグメントとしてマッチします。キーにスラッシュ (`/`) などの特殊文字を含む場合は、URL エンコードが必要です。例: キー `sensor/temp` は `sensor%2Ftemp` と記述してください。エンコードしない場合、ルーティングが正しく行われず 404 エラーになります。
+> **URL エンコーディングに関する注意**: `{key}` / `{prefix}` は URL の単一パスセグメントとしてマッチします。キーにスラッシュ (`/`) などの特殊文字を含む場合は、URL エンコードが必要です。例: キー `sensor/temp` は `sensor%2Ftemp` と記述してください。エンコードしない場合、ルーティングが正しく行われず 404 エラーになります。
+
+#### Internal API (ノード間通信)
+
+| メソッド | パス | 説明 |
+|---------|------|------|
+| `POST` | `/api/internal/frontiers` | フロンティア送信 |
+| `GET` | `/api/internal/frontiers` | フロンティア取得 |
+| `POST` | `/api/internal/sync` | フルステート同期 |
+| `POST` | `/api/internal/sync/delta` | デルタ同期 |
+| `GET` | `/api/internal/keys` | キー一覧取得 |
+| `POST` | `/api/internal/join` | ノード参加 |
+| `POST` | `/api/internal/leave` | ノード離脱 |
+
+#### Control Plane API
+
+| メソッド | パス | 説明 |
+|---------|------|------|
+| `GET` | `/api/control-plane/authorities` | Authority 一覧取得 |
+| `PUT` | `/api/control-plane/authorities` | Authority 定義設定 |
+| `GET` | `/api/control-plane/authorities/{prefix}` | Authority 定義取得 |
+| `GET` | `/api/control-plane/policies` | ポリシー一覧取得 |
+| `PUT` | `/api/control-plane/policies` | 配置ポリシー設定 |
+| `GET` | `/api/control-plane/policies/{prefix}` | ポリシー取得 |
+| `DELETE` | `/api/control-plane/policies/{prefix}` | ポリシー削除 |
+| `GET` | `/api/control-plane/versions` | バージョン履歴取得 |
+
+#### Operational
+
+| メソッド | パス | 説明 |
+|---------|------|------|
+| `GET` | `/api/metrics` | メトリクス取得 |
 
 ### 3.1 Eventual Read/Write
 
@@ -366,12 +399,12 @@ let result = consensus.propose_policy_update(
 
 AsteroidDB のテストは以下のカテゴリに分かれています:
 
-| カテゴリ | 実行方法 | 説明 |
-|---------|---------|------|
-| **ユニットテスト** | `cargo test --lib` | 各モジュール内の `#[cfg(test)] mod tests` |
-| **統合テスト** | `cargo test --test integration` | `tests/integration/` 配下 |
-| **分断耐性テスト** | `cargo test --test partition_tolerance` | `tests/partition_tolerance.rs` |
-| **Store/CRDT/HLC テスト** | `cargo test --test store_crdt_hlc` | `tests/store_crdt_hlc.rs` |
+| カテゴリ | 実行方法 | テスト数 (目安) | 説明 |
+|---------|---------|---------|------|
+| **ユニットテスト** | `cargo test --lib` | 400+ | 各モジュール内の `#[cfg(test)] mod tests` |
+| **統合テスト** | `cargo test --test integration` | 90+ | `tests/integration/` 配下 |
+| **分断耐性テスト** | `cargo test --test partition_tolerance` | 25+ | `tests/partition_tolerance.rs` |
+| **Store/CRDT/HLC テスト** | `cargo test --test store_crdt_hlc` | 25+ | `tests/store_crdt_hlc.rs` |
 
 ### テスト実行コマンド
 
@@ -403,7 +436,7 @@ cargo test eventual_counter_inc
 
 ### テストカバレッジの概要
 
-テストは以下のモジュールを網羅しています。  
+テストは以下のモジュールを網羅しています。
 最新の件数は `cargo test -- --list` で確認してください。
 
 - **CRDT 実装** (`src/crdt/`): マージの可換性・結合性・冪等性、収束性
