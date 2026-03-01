@@ -17,7 +17,7 @@ use asteroidb_poc::types::{KeyRange, NodeId};
 #[tokio::main]
 async fn main() {
     // Load configuration: either from a config file or from individual env vars.
-    let (node_id, bind_addr, peer_registry) = match std::env::var("ASTEROIDB_CONFIG") {
+    let (node_id, bind_addr, config_peer_registry) = match std::env::var("ASTEROIDB_CONFIG") {
         Ok(config_path) => match NodeConfig::load(&config_path) {
             Ok(config) => {
                 let node_id = config.node.id;
@@ -66,16 +66,61 @@ async fn main() {
         Arc::clone(&namespace),
     )));
 
+    // Determine persistence directory for peer registry.
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("ASTEROIDB_DATA_DIR").unwrap_or_else(|_| "./data".into()),
+    );
+    let peer_persist_path = PeerRegistry::persist_path(&data_dir);
+
     // Share a single EventualApi between HTTP handlers and NodeRunner
     // so that HTTP writes are visible to the anti-entropy sync loop.
     let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id.clone())));
 
-    // Build peer registry: from config file or empty (nodes join dynamically
-    // via POST /api/internal/join).
-    let has_peers = peer_registry.as_ref().is_some_and(|r| r.peer_count() > 0);
-    let shared_peers = Arc::new(Mutex::new(peer_registry.unwrap_or_else(|| {
-        PeerRegistry::new(node_id.clone(), vec![]).expect("empty peer list is always valid")
-    })));
+    // Build peer registry: if a config file provided peers, use those;
+    // otherwise try to load persisted state from disk; finally fall back
+    // to an empty registry (nodes join dynamically via POST /api/internal/join).
+    let (shared_peers, has_peers) = if let Some(registry) = config_peer_registry {
+        let has = registry.peer_count() > 0;
+        (Arc::new(Mutex::new(registry)), has)
+    } else {
+        // No config file — try loading persisted peer registry from disk.
+        let registry = if peer_persist_path.exists() {
+            match PeerRegistry::load(&peer_persist_path) {
+                Ok(loaded) => {
+                    if *loaded.self_id() == node_id {
+                        println!(
+                            "Loaded peer registry from {} ({} peers, generation {})",
+                            peer_persist_path.display(),
+                            loaded.peer_count(),
+                            loaded.generation(),
+                        );
+                        loaded
+                    } else {
+                        eprintln!(
+                            "warning: saved peer registry has self_id={}, expected {}; ignoring",
+                            loaded.self_id().0,
+                            node_id.0,
+                        );
+                        PeerRegistry::new(node_id.clone(), vec![])
+                            .expect("empty peer list is always valid")
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to load peer registry from {}: {e}; starting with empty registry",
+                        peer_persist_path.display(),
+                    );
+                    PeerRegistry::new(node_id.clone(), vec![])
+                        .expect("empty peer list is always valid")
+                }
+            }
+        } else {
+            PeerRegistry::new(node_id.clone(), vec![])
+                .expect("empty peer list is always valid")
+        };
+        let has = registry.peer_count() > 0;
+        (Arc::new(Mutex::new(registry)), has)
+    };
 
     // Build shared HTTP state.
     let state = Arc::new(AppState {
@@ -84,6 +129,7 @@ async fn main() {
         namespace: Arc::clone(&namespace),
         metrics: Arc::clone(&metrics),
         peers: Some(Arc::clone(&shared_peers)),
+        peer_persist_path: Some(peer_persist_path),
     });
 
     let app = router(state);

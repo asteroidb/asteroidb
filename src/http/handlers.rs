@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use axum::Json;
@@ -38,6 +39,9 @@ pub struct AppState {
     /// Peer registry for node join/leave bootstrap.
     /// `None` when peer tracking is not needed (e.g. unit tests).
     pub peers: Option<Arc<Mutex<PeerRegistry>>>,
+    /// File path to persist the peer registry to on join/leave.
+    /// `None` disables persistence (e.g. unit tests).
+    pub peer_persist_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------
@@ -570,6 +574,13 @@ pub async fn internal_join(
                 addr: req.address.clone(),
             })
             .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+
+        // Persist updated registry to disk.
+        if let Some(path) = &state.peer_persist_path
+            && let Err(e) = registry.save(path)
+        {
+            eprintln!("warning: failed to persist peer registry: {e}");
+        }
     }
 
     // Build the response: current peer list + namespace snapshot.
@@ -626,6 +637,14 @@ pub async fn internal_leave(
     let removed = registry
         .remove_peer(&leaving_node_id)
         .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+
+    // Persist updated registry to disk if a peer was actually removed.
+    if removed.is_some()
+        && let Some(path) = &state.peer_persist_path
+        && let Err(e) = registry.save(path)
+    {
+        eprintln!("warning: failed to persist peer registry: {e}");
+    }
 
     Ok(Json(LeaveResponse {
         success: removed.is_some(),

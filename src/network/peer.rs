@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -158,6 +158,44 @@ impl PeerRegistry {
     /// compare successive values to detect membership changes.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Persist the registry to a JSON file using atomic write (write to
+    /// temp file, then rename) to prevent corruption on crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerError::Io`] on file-system errors and [`PeerError::Json`]
+    /// on serialisation errors.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), PeerError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| PeerError::Io(e.to_string()))?;
+        }
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| PeerError::Json(e.to_string()))?;
+
+        // Atomic write: write to a sibling temp file, then rename.
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &json).map_err(|e| PeerError::Io(e.to_string()))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| PeerError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a `PeerRegistry` from a JSON file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerError::Io`] on file-system errors and [`PeerError::Json`]
+    /// if the file contents are not valid JSON.
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, PeerError> {
+        let data = std::fs::read_to_string(path).map_err(|e| PeerError::Io(e.to_string()))?;
+        serde_json::from_str(&data).map_err(|e| PeerError::Json(e.to_string()))
+    }
+
+    /// Return the default persistence path for the given data directory.
+    pub fn persist_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("peer_registry.json")
     }
 }
 
@@ -662,5 +700,93 @@ mod tests {
 
         let err = PeerError::Json("bad json".into());
         assert_eq!(err.to_string(), "json error: bad json");
+    }
+
+    // ---- PeerRegistry save / load persistence ----
+
+    #[test]
+    fn registry_save_and_load_roundtrip() {
+        let mut reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        reg.add_peer(peer("node-2", "127.0.0.1:8001")).unwrap();
+        reg.add_peer(peer("node-3", "127.0.0.1:8002")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = PeerRegistry::persist_path(dir.path());
+
+        reg.save(&path).unwrap();
+        let loaded = PeerRegistry::load(&path).unwrap();
+
+        assert_eq!(loaded.self_id(), &nid("node-1"));
+        assert_eq!(loaded.peer_count(), 2);
+        assert!(loaded.get_peer(&nid("node-2")).is_some());
+        assert!(loaded.get_peer(&nid("node-3")).is_some());
+        assert_eq!(loaded.generation(), 2);
+    }
+
+    #[test]
+    fn registry_load_after_remove_reflects_removal() {
+        let mut reg = PeerRegistry::new(
+            nid("node-1"),
+            vec![
+                peer("node-2", "127.0.0.1:8001"),
+                peer("node-3", "127.0.0.1:8002"),
+            ],
+        )
+        .unwrap();
+        reg.remove_peer(&nid("node-2")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = PeerRegistry::persist_path(dir.path());
+        reg.save(&path).unwrap();
+
+        let loaded = PeerRegistry::load(&path).unwrap();
+        assert_eq!(loaded.peer_count(), 1);
+        assert!(loaded.get_peer(&nid("node-2")).is_none());
+        assert!(loaded.get_peer(&nid("node-3")).is_some());
+    }
+
+    #[test]
+    fn registry_load_corrupt_file_returns_json_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PeerRegistry::persist_path(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(&path, "not valid json {{{{").unwrap();
+
+        let result = PeerRegistry::load(&path);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PeerError::Json(_) => {}
+            other => panic!("expected Json error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_load_nonexistent_returns_io_error() {
+        let result = PeerRegistry::load("/nonexistent/path/peer_registry.json");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PeerError::Io(_) => {}
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_persist_path_returns_expected() {
+        let p = PeerRegistry::persist_path(std::path::Path::new("/data"));
+        assert_eq!(p, std::path::PathBuf::from("/data/peer_registry.json"));
+    }
+
+    #[test]
+    fn registry_save_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested").join("deep");
+        let path = PeerRegistry::persist_path(&nested);
+
+        let reg = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        reg.save(&path).unwrap();
+
+        let loaded = PeerRegistry::load(&path).unwrap();
+        assert_eq!(loaded.self_id(), &nid("node-1"));
+        assert_eq!(loaded.peer_count(), 0);
     }
 }
