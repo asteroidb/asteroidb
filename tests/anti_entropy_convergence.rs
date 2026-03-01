@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::http::handlers::AppState;
@@ -63,6 +64,7 @@ async fn two_node_anti_entropy_convergence() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     // Build state for node 2.
@@ -77,6 +79,7 @@ async fn two_node_anti_entropy_convergence() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     // Write some data to node 1.
@@ -257,6 +260,7 @@ async fn pull_based_sync() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     {
@@ -314,6 +318,7 @@ async fn sync_endpoint_partial_failure() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     // Pre-populate with a counter at "k".
@@ -406,6 +411,7 @@ async fn three_node_convergence_via_sync() {
             metrics: Arc::new(RuntimeMetrics::default()),
             peers: None,
             peer_persist_path: None,
+            consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         });
         states.push(state);
     }
@@ -514,6 +520,7 @@ async fn internal_keys_endpoint() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     {
@@ -580,6 +587,7 @@ async fn full_sync_records_remote_frontier_not_local() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     // Write data to the remote node.

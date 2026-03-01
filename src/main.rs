@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::compaction::CompactionEngine;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
@@ -121,6 +122,13 @@ async fn main() {
         (Arc::new(Mutex::new(registry)), has)
     };
 
+    // Build control-plane consensus with the same authority nodes (FR-009).
+    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![
+        NodeId("auth-1".into()),
+        NodeId("auth-2".into()),
+        NodeId("auth-3".into()),
+    ])));
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -129,6 +137,7 @@ async fn main() {
         metrics: Arc::clone(&metrics),
         peers: Some(Arc::clone(&shared_peers)),
         peer_persist_path: Some(peer_persist_path),
+        consensus,
     });
 
     let app = router(state);

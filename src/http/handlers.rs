@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::api::certified::{CertifiedApi, OnTimeout};
 use crate::api::eventual::EventualApi;
+use crate::control_plane::consensus::ControlPlaneConsensus;
 use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
@@ -42,6 +43,8 @@ pub struct AppState {
     /// File path to persist the peer registry to on join/leave.
     /// `None` disables persistence (e.g. unit tests).
     pub peer_persist_path: Option<PathBuf>,
+    /// Control-plane consensus for gating namespace updates (FR-009).
+    pub consensus: Arc<Mutex<ControlPlaneConsensus>>,
 }
 
 // ---------------------------------------------------------------
@@ -262,11 +265,11 @@ pub async fn get_authority_definition(
 /// `PUT /api/control-plane/authorities`
 ///
 /// Sets an authority definition in the system namespace.
+/// Requires majority approval from authority nodes (FR-009).
 pub async fn set_authority_definition(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetAuthorityDefinitionRequest>,
-) -> Json<AuthorityDefinitionResponse> {
-    let mut ns = state.namespace.write().unwrap();
+) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
     let def = AuthorityDefinition {
         key_range: KeyRange {
             prefix: req.key_range_prefix.clone(),
@@ -277,11 +280,24 @@ pub async fn set_authority_definition(
             .map(|n| NodeId(n.clone()))
             .collect(),
     };
-    ns.set_authority_definition(def);
-    Json(AuthorityDefinitionResponse {
+    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
+
+    // Validate majority consensus (FR-009).
+    {
+        let mut consensus = state.consensus.lock().await;
+        consensus.propose_authority_update(def.clone(), &approvals)?;
+    }
+
+    // Apply to shared namespace for read handlers and CertifiedApi.
+    {
+        let mut ns = state.namespace.write().unwrap();
+        ns.set_authority_definition(def);
+    }
+
+    Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: req.key_range_prefix,
         authority_nodes: req.authority_nodes,
-    })
+    }))
 }
 
 /// `GET /api/control-plane/policies`
@@ -334,39 +350,46 @@ pub async fn get_policy(
 /// `PUT /api/control-plane/policies`
 ///
 /// Sets a placement policy in the system namespace.
+/// Requires majority approval from authority nodes (FR-009).
 pub async fn set_placement_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetPlacementPolicyRequest>,
-) -> Json<PlacementPolicyResponse> {
-    let mut ns = state.namespace.write().unwrap();
-    let current_version = ns.version().0;
+) -> Result<Json<PlacementPolicyResponse>, ApiError> {
+    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    let mut policy = PlacementPolicy::new(
-        PolicyVersion(current_version + 1),
-        KeyRange {
-            prefix: req.key_range_prefix.clone(),
-        },
-        req.replica_count,
-    );
+    // Read current version from shared namespace.
+    let policy = {
+        let ns = state.namespace.read().unwrap();
+        let current_version = ns.version().0;
 
-    if !req.required_tags.is_empty() {
-        policy = policy.with_required_tags(
-            req.required_tags
-                .iter()
-                .map(|t| crate::types::Tag(t.clone()))
-                .collect(),
+        let mut policy = PlacementPolicy::new(
+            PolicyVersion(current_version + 1),
+            KeyRange {
+                prefix: req.key_range_prefix.clone(),
+            },
+            req.replica_count,
         );
-    }
-    if !req.forbidden_tags.is_empty() {
-        policy = policy.with_forbidden_tags(
-            req.forbidden_tags
-                .iter()
-                .map(|t| crate::types::Tag(t.clone()))
-                .collect(),
-        );
-    }
-    policy = policy.with_local_write_on_partition(req.allow_local_write_on_partition);
-    policy = policy.with_certified(req.certified);
+
+        if !req.required_tags.is_empty() {
+            policy = policy.with_required_tags(
+                req.required_tags
+                    .iter()
+                    .map(|t| crate::types::Tag(t.clone()))
+                    .collect(),
+            );
+        }
+        if !req.forbidden_tags.is_empty() {
+            policy = policy.with_forbidden_tags(
+                req.forbidden_tags
+                    .iter()
+                    .map(|t| crate::types::Tag(t.clone()))
+                    .collect(),
+            );
+        }
+        policy = policy.with_local_write_on_partition(req.allow_local_write_on_partition);
+        policy = policy.with_certified(req.certified);
+        policy
+    };
 
     let resp = PlacementPolicyResponse {
         key_range_prefix: policy.key_range.prefix.clone(),
@@ -378,8 +401,19 @@ pub async fn set_placement_policy(
         certified: policy.certified,
     };
 
-    ns.set_placement_policy(policy);
-    Json(resp)
+    // Validate majority consensus (FR-009).
+    {
+        let mut consensus = state.consensus.lock().await;
+        consensus.propose_policy_update(policy.clone(), &approvals)?;
+    }
+
+    // Apply to shared namespace for read handlers and CertifiedApi.
+    {
+        let mut ns = state.namespace.write().unwrap();
+        ns.set_placement_policy(policy);
+    }
+
+    Ok(Json(resp))
 }
 
 /// `DELETE /api/control-plane/policies/{prefix}`
