@@ -160,8 +160,10 @@ impl PeerRegistry {
         self.generation
     }
 
-    /// Persist the registry to a JSON file using atomic write (write to
-    /// temp file, then rename) to prevent corruption on crash.
+    /// Persist the registry to a JSON file using write-to-temp-then-rename
+    /// to reduce the window for partial-write corruption. Note that this
+    /// does not call `fsync`, so durability across hard power loss is not
+    /// guaranteed; the `load` fallback handles truncated files gracefully.
     ///
     /// # Errors
     ///
@@ -175,10 +177,14 @@ impl PeerRegistry {
         let json =
             serde_json::to_string_pretty(self).map_err(|e| PeerError::Json(e.to_string()))?;
 
-        // Atomic write: write to a sibling temp file, then rename.
+        // Write to a sibling temp file, then rename.
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &json).map_err(|e| PeerError::Io(e.to_string()))?;
-        std::fs::rename(&tmp_path, path).map_err(|e| PeerError::Io(e.to_string()))?;
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            // Clean up stranded temp file on rename failure.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(PeerError::Io(e.to_string()));
+        }
         Ok(())
     }
 

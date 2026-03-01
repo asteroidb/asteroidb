@@ -115,8 +115,7 @@ async fn main() {
                 }
             }
         } else {
-            PeerRegistry::new(node_id.clone(), vec![])
-                .expect("empty peer list is always valid")
+            PeerRegistry::new(node_id.clone(), vec![]).expect("empty peer list is always valid")
         };
         let has = registry.peer_count() > 0;
         (Arc::new(Mutex::new(registry)), has)
