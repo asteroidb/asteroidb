@@ -189,13 +189,19 @@ pub struct StatusResponse {
 // ---------------------------------------------------------------
 
 /// Request body for `PUT /api/control-plane/authorities`.
+///
+/// Requires majority approval from authority nodes (FR-009).
 #[derive(Debug, Deserialize)]
 pub struct SetAuthorityDefinitionRequest {
     pub key_range_prefix: String,
     pub authority_nodes: Vec<String>,
+    /// Node IDs that have approved this update.
+    pub approvals: Vec<String>,
 }
 
 /// Request body for `PUT /api/control-plane/policies`.
+///
+/// Requires majority approval from authority nodes (FR-009).
 #[derive(Debug, Deserialize)]
 pub struct SetPlacementPolicyRequest {
     pub key_range_prefix: String,
@@ -208,6 +214,8 @@ pub struct SetPlacementPolicyRequest {
     pub allow_local_write_on_partition: bool,
     #[serde(default)]
     pub certified: bool,
+    /// Node IDs that have approved this update.
+    pub approvals: Vec<String>,
 }
 
 // ---------------------------------------------------------------

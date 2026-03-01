@@ -24,6 +24,7 @@ use asteroidb_poc::authority::certificate::{
 };
 use asteroidb_poc::authority::verifier::verify_proof_with_registry;
 use asteroidb_poc::compaction::CompactionEngine;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
@@ -145,6 +146,7 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     })
 }
 
@@ -1163,6 +1165,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     // Write data to the legacy peer.

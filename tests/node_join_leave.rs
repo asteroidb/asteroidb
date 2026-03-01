@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
@@ -64,6 +65,7 @@ async fn spawn_node_with_peers(
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: Some(peer_registry),
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     });
 
     let app = router(state.clone());

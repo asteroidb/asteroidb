@@ -146,9 +146,11 @@ cargo run
 | `GET` | `/api/certified/{key}` | Certified read (ステータス付き) |
 | `GET` | `/api/status/{key}` | 認証ステータス確認 |
 | `GET` | `/api/metrics` | ランタイムメトリクス取得 |
-| `GET/PUT` | `/api/control-plane/authorities` | Authority 定義の一覧/更新 |
+| `PUT` | `/api/control-plane/authorities` | Authority 定義の設定 (要過半数承認) |
+| `GET` | `/api/control-plane/authorities` | Authority 定義の一覧 |
 | `GET` | `/api/control-plane/authorities/{prefix}` | Authority 定義の取得 |
-| `GET/PUT` | `/api/control-plane/policies` | 配置ポリシーの一覧/更新 |
+| `PUT` | `/api/control-plane/policies` | 配置ポリシーの設定 (要過半数承認) |
+| `GET` | `/api/control-plane/policies` | 配置ポリシーの一覧 |
 | `GET/DELETE` | `/api/control-plane/policies/{prefix}` | 配置ポリシーの取得/削除 |
 | `GET` | `/api/control-plane/versions` | ポリシーバージョン履歴 |
 
@@ -302,94 +304,86 @@ curl http://localhost:3000/api/certified/sensor%2Ftemp
 
 ### 3.3 System Namespace でポリシー設定
 
-System Namespace は HTTP API または Rust API で設定できます。
+System Namespace は HTTP API または Rust API 経由で設定します。すべての更新には Authority ノード群の過半数承認 (`approvals`) が必要です (FR-009)。
 
-HTTP API 例:
+#### HTTP API での設定
+
+**Authority 定義の設定:**
 
 ```bash
-# Authority 定義を更新
 curl -X PUT http://localhost:3000/api/control-plane/authorities \
   -H "Content-Type: application/json" \
   -d '{
-    "key_range_prefix":"sensor/",
-    "authority_nodes":["auth-1","auth-2","auth-3"]
+    "key_range_prefix": "sensor/",
+    "authority_nodes": ["auth-1", "auth-2", "auth-3"],
+    "approvals": ["auth-1", "auth-2"]
   }'
+# => {"key_range_prefix":"sensor/","authority_nodes":["auth-1","auth-2","auth-3"]}
+```
 
-# 配置ポリシーを更新
+**配置ポリシーの設定:**
+
+```bash
 curl -X PUT http://localhost:3000/api/control-plane/policies \
   -H "Content-Type: application/json" \
   -d '{
-    "key_range_prefix":"sensor/",
-    "replica_count":3,
-    "required_tags":["region:us-east"],
-    "forbidden_tags":[],
-    "allow_local_write_on_partition":true,
-    "certified":true
+    "key_range_prefix": "sensor/",
+    "replica_count": 3,
+    "required_tags": ["region:us-east"],
+    "certified": true,
+    "approvals": ["auth-1", "auth-2"]
   }'
+# => {"key_range_prefix":"sensor/","version":3,"replica_count":3,...}
 ```
 
-Rust API 例:
+承認が過半数に達しない場合は `403 POLICY_DENIED` が返されます:
+
+```bash
+curl -X PUT http://localhost:3000/api/control-plane/policies \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key_range_prefix": "sensor/",
+    "replica_count": 3,
+    "approvals": ["auth-1"]
+  }'
+# => 403 {"error_code":"POLICY_DENIED","message":"insufficient approvals for policy update"}
+```
+
+#### Rust API での設定
 
 ```rust
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::types::{KeyRange, NodeId, PolicyVersion};
 
-// System Namespace の作成
-let mut ns = SystemNamespace::new();
+// Authority ノードのリストで ControlPlaneConsensus を作成
+let authority_nodes = vec![
+    NodeId("auth-1".into()),
+    NodeId("auth-2".into()),
+    NodeId("auth-3".into()),
+];
+let mut consensus = ControlPlaneConsensus::new(authority_nodes);
 
-// Authority 定義: "sensor/" プレフィックスのキーに対する Authority ノード群
-ns.set_authority_definition(AuthorityDefinition {
+// Authority 定義の更新を提案 (過半数の承認が必要)
+let def = AuthorityDefinition {
     key_range: KeyRange { prefix: "sensor/".into() },
     authority_nodes: vec![
         NodeId("auth-1".into()),
         NodeId("auth-2".into()),
         NodeId("auth-3".into()),
     ],
-});
+};
+let approvals = [NodeId("auth-1".into()), NodeId("auth-2".into())];
+consensus.propose_authority_update(def, &approvals).unwrap();
 
-// 配置ポリシー: レプリカ数3、認証対象
+// 配置ポリシーの更新を提案
 let policy = PlacementPolicy::new(
-    PolicyVersion(1),
-    KeyRange { prefix: "sensor/".into() },
-    3,  // replica_count
-)
-.with_certified(true)
-.with_required_tags(vec!["region:us-east".into()])
-.with_local_write_on_partition(true);
-
-ns.set_placement_policy(policy);
-
-// ポリシーの確認
-let p = ns.get_placement_policy("sensor/").unwrap();
-println!("Replica count: {}", p.replica_count);
-
-// キーに対する Authority の解決 (最長プレフィックスマッチ)
-let auth = ns.get_authorities_for_key("sensor/temp").unwrap();
-println!("Authority nodes: {:?}", auth.authority_nodes);
-```
-
-Control-plane ポリシー更新の合意:
-
-```rust
-use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
-
-// Control-plane consensus で配置ポリシーの更新を提案
-let mut consensus = ControlPlaneConsensus::new(ns);
-let new_policy = PlacementPolicy::new(
     PolicyVersion(2),
     KeyRange { prefix: "sensor/".into() },
     5,  // レプリカ数を 5 に変更
 );
-
-// Authority ノード群の過半数承認を集めて適用
-let result = consensus.propose_policy_update(
-    new_policy,
-    vec![
-        NodeId("auth-1".into()),
-        NodeId("auth-2".into()),
-    ],
-);
+let result = consensus.propose_policy_update(policy, &approvals);
 // majority (2/3) に達していれば Ok(())
 ```
 

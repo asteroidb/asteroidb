@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
@@ -29,6 +30,12 @@ fn test_state() -> Arc<AppState> {
 
     let namespace = Arc::new(RwLock::new(ns));
 
+    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![
+        NodeId("auth-1".into()),
+        NodeId("auth-2".into()),
+        NodeId("auth-3".into()),
+    ])));
+
     Arc::new(AppState {
         eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
         certified: Arc::new(Mutex::new(CertifiedApi::new(
@@ -39,6 +46,7 @@ fn test_state() -> Arc<AppState> {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus,
     })
 }
 

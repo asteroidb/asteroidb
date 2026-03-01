@@ -8,6 +8,7 @@ use std::sync::RwLock;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::http::handlers::AppState;
@@ -55,6 +56,7 @@ fn test_state() -> Arc<AppState> {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
     })
 }
 

@@ -98,6 +98,13 @@ mod tests {
             metrics: Arc::new(RuntimeMetrics::default()),
             peers: None,
             peer_persist_path: None,
+            consensus: Arc::new(Mutex::new(
+                crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ]),
+            )),
         })
     }
 
@@ -587,13 +594,13 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Set a new authority definition
+        // Set a new authority definition (majority: 2 of 3 approvals)
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/authorities")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"user/","authority_nodes":["auth-u1","auth-u2"]}"#,
+                r#"{"key_range_prefix":"user/","authority_nodes":["auth-u1","auth-u2"],"approvals":["auth-1","auth-2"]}"#,
             ))
             .unwrap();
 
@@ -654,13 +661,13 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Set a placement policy
+        // Set a placement policy (majority: 2 of 3 approvals)
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"user/","replica_count":3,"required_tags":["dc:tokyo"],"certified":true}"#,
+                r#"{"key_range_prefix":"user/","replica_count":3,"required_tags":["dc:tokyo"],"certified":true,"approvals":["auth-1","auth-2"]}"#,
             ))
             .unwrap();
 
@@ -712,13 +719,13 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // First set a policy
+        // First set a policy (with majority approvals)
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"data/","replica_count":5}"#,
+                r#"{"key_range_prefix":"data/","replica_count":5,"approvals":["auth-1","auth-2"]}"#,
             ))
             .unwrap();
         app.clone().oneshot(req).await.unwrap();
@@ -791,7 +798,7 @@ mod tests {
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"test/","replica_count":1}"#,
+                r#"{"key_range_prefix":"test/","replica_count":1,"approvals":["auth-1","auth-2"]}"#,
             ))
             .unwrap();
         app.clone().oneshot(req).await.unwrap();
@@ -821,7 +828,7 @@ mod tests {
                 .uri("/api/control-plane/policies")
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    r#"{{"key_range_prefix":"data/","replica_count":{}}}"#,
+                    r#"{{"key_range_prefix":"data/","replica_count":{},"approvals":["auth-1","auth-2"]}}"#,
                     i + 1
                 )))
                 .unwrap();
@@ -839,6 +846,155 @@ mod tests {
         // initial(1) + auth_def(2) + policy_set(3) + policy_set(4)
         assert_eq!(versions.current_version, 4);
         assert_eq!(versions.history.len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane: Consensus enforcement (FR-009)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn control_plane_authority_without_majority_returns_403() {
+        let state = test_state();
+        let app = router(state);
+
+        // Only 1 approval (need 2 of 3 for majority)
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"denied/","authority_nodes":["a1"],"approvals":["auth-1"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error_code"], "POLICY_DENIED");
+
+        // Verify it was not applied
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities/denied%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn control_plane_policy_without_majority_returns_403() {
+        let state = test_state();
+        let app = router(state);
+
+        // Empty approvals (need 2 of 3 for majority)
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"denied/","replica_count":3,"approvals":[]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error_code"], "POLICY_DENIED");
+
+        // Verify it was not applied
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/denied%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn control_plane_authority_with_majority_succeeds() {
+        let state = test_state();
+        let app = router(state);
+
+        // 2 of 3 approvals = majority
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"ok/","authority_nodes":["a1","a2"],"approvals":["auth-1","auth-3"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify it was applied
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities/ok%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let def: AuthorityDefinitionResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(def.key_range_prefix, "ok/");
+        assert_eq!(def.authority_nodes, vec!["a1", "a2"]);
+    }
+
+    #[tokio::test]
+    async fn control_plane_policy_with_majority_succeeds() {
+        let state = test_state();
+        let app = router(state);
+
+        // All 3 approvals
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"ok/","replica_count":5,"approvals":["auth-1","auth-2","auth-3"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify it was applied
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/ok%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let policy: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(policy.key_range_prefix, "ok/");
+        assert_eq!(policy.replica_count, 5);
+    }
+
+    #[tokio::test]
+    async fn control_plane_non_authority_approvals_rejected() {
+        let state = test_state();
+        let app = router(state);
+
+        // 2 approvals but from non-authority nodes
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"bad/","replica_count":3,"approvals":["unknown-1","unknown-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ---------------------------------------------------------------
