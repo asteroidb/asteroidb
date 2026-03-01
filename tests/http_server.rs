@@ -47,6 +47,7 @@ fn test_state() -> Arc<AppState> {
         peers: None,
         peer_persist_path: None,
         consensus,
+        internal_token: None,
     })
 }
 

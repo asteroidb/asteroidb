@@ -133,6 +133,16 @@ cargo run
 
 起動すると、HTTP サーバーが `127.0.0.1:3000` で起動し、3 つの Authority ノード (`auth-1`, `auth-2`, `auth-3`) を含むデフォルト構成でバックグラウンド処理を開始します。バインドアドレスは環境変数 `ASTEROIDB_BIND_ADDR` で、ノード ID は `ASTEROIDB_NODE_ID` で変更可能です。`Ctrl-C` で停止します。
 
+**Internal API 認証 (オプション)**
+
+`ASTEROIDB_INTERNAL_TOKEN` 環境変数を設定すると、`/api/internal/*` エンドポイントに Bearer トークン認証が適用されます。すべてのクラスタノードに同じトークンを設定してください。
+
+```bash
+ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
+```
+
+トークンが設定されている場合、ノード間通信 (SyncClient, FrontierSyncClient) は自動的に `Authorization: Bearer <token>` ヘッダを付与します。トークンが未設定の場合、認証なしで動作します (後方互換性あり)。
+
 ### HTTP API エンドポイント一覧
 
 #### Client API

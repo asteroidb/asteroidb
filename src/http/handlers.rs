@@ -45,6 +45,10 @@ pub struct AppState {
     pub peer_persist_path: Option<PathBuf>,
     /// Control-plane consensus for gating namespace updates (FR-009).
     pub consensus: Arc<Mutex<ControlPlaneConsensus>>,
+    /// Optional shared token for authenticating internal API requests.
+    /// When `Some`, all `/api/internal/*` routes require a matching
+    /// `Authorization: Bearer <token>` header.
+    pub internal_token: Option<String>,
 }
 
 // ---------------------------------------------------------------
