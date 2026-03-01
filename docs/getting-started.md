@@ -24,7 +24,7 @@ source $HOME/.cargo/env
 
 ```bash
 git clone <repository-url>
-cd asteroidb-poc
+cd asteroidb
 ```
 
 ### ビルド
@@ -42,9 +42,9 @@ cargo build --release
 CI gate と同等のチェック:
 
 ```bash
-cargo fmt --check              # フォーマット確認
-cargo clippy -- -D warnings    # lint
-cargo test                     # 全テスト実行
+cargo fmt --all -- --check                         # フォーマット確認
+cargo clippy --all-targets --all-features -- -D warnings  # lint
+cargo test                                        # 全テスト実行
 ```
 
 ## 2. アーキテクチャ概要
@@ -112,8 +112,15 @@ cargo run
 | `POST` | `/api/eventual/write` | Eventual write (CRDT 操作) |
 | `GET` | `/api/eventual/{key}` | Eventual read |
 | `POST` | `/api/certified/write` | Certified write |
+| `POST` | `/api/certified/verify` | Proof bundle の検証 |
 | `GET` | `/api/certified/{key}` | Certified read (ステータス付き) |
 | `GET` | `/api/status/{key}` | 認証ステータス確認 |
+| `GET` | `/api/metrics` | ランタイムメトリクス取得 |
+| `GET/PUT` | `/api/control-plane/authorities` | Authority 定義の一覧/更新 |
+| `GET` | `/api/control-plane/authorities/{prefix}` | Authority 定義の取得 |
+| `GET/PUT` | `/api/control-plane/policies` | 配置ポリシーの一覧/更新 |
+| `GET/DELETE` | `/api/control-plane/policies/{prefix}` | 配置ポリシーの取得/削除 |
+| `GET` | `/api/control-plane/versions` | ポリシーバージョン履歴 |
 
 > **URL エンコーディングに関する注意**: `{key}` は URL の単一パスセグメントとしてマッチします。キーにスラッシュ (`/`) などの特殊文字を含む場合は、URL エンコードが必要です。例: キー `sensor/temp` は `sensor%2Ftemp` と記述してください。エンコードしない場合、ルーティングが正しく行われず 404 エラーになります。
 
@@ -234,7 +241,33 @@ curl http://localhost:3000/api/certified/sensor%2Ftemp
 
 ### 3.3 System Namespace でポリシー設定
 
-System Namespace は Rust API 経由で設定します。以下は配置ポリシーと Authority 定義の設定例です。
+System Namespace は HTTP API または Rust API で設定できます。
+
+HTTP API 例:
+
+```bash
+# Authority 定義を更新
+curl -X PUT http://localhost:3000/api/control-plane/authorities \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key_range_prefix":"sensor/",
+    "authority_nodes":["auth-1","auth-2","auth-3"]
+  }'
+
+# 配置ポリシーを更新
+curl -X PUT http://localhost:3000/api/control-plane/policies \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key_range_prefix":"sensor/",
+    "replica_count":3,
+    "required_tags":["region:us-east"],
+    "forbidden_tags":[],
+    "allow_local_write_on_partition":true,
+    "certified":true
+  }'
+```
+
+Rust API 例:
 
 ```rust
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -305,12 +338,12 @@ let result = consensus.propose_policy_update(
 
 AsteroidDB のテストは以下のカテゴリに分かれています:
 
-| カテゴリ | 実行方法 | テスト数 | 説明 |
-|---------|---------|---------|------|
-| **ユニットテスト** | `cargo test --lib` | 410 | 各モジュール内の `#[cfg(test)] mod tests` |
-| **統合テスト** | `cargo test --test integration` | 93 | `tests/integration/` 配下 |
-| **分断耐性テスト** | `cargo test --test partition_tolerance` | 25 | `tests/partition_tolerance.rs` |
-| **Store/CRDT/HLC テスト** | `cargo test --test store_crdt_hlc` | 27 | `tests/store_crdt_hlc.rs` |
+| カテゴリ | 実行方法 | 説明 |
+|---------|---------|------|
+| **ユニットテスト** | `cargo test --lib` | 各モジュール内の `#[cfg(test)] mod tests` |
+| **統合テスト** | `cargo test --test integration` | `tests/integration/` 配下 |
+| **分断耐性テスト** | `cargo test --test partition_tolerance` | `tests/partition_tolerance.rs` |
+| **Store/CRDT/HLC テスト** | `cargo test --test store_crdt_hlc` | `tests/store_crdt_hlc.rs` |
 
 ### テスト実行コマンド
 
@@ -342,7 +375,8 @@ cargo test eventual_counter_inc
 
 ### テストカバレッジの概要
 
-テストは以下のモジュールを網羅しています (合計 555 テスト):
+テストは以下のモジュールを網羅しています。  
+最新の件数は `cargo test -- --list` で確認してください。
 
 - **CRDT 実装** (`src/crdt/`): マージの可換性・結合性・冪等性、収束性
 - **HLC** (`src/hlc.rs`): 単調性、因果順序
@@ -424,7 +458,7 @@ curl -X POST http://localhost:3003/api/eventual/write \
   -d '{"type":"set_add","key":"users","element":"alice"}'
 ```
 
-> **注**: 現時点ではノード間のデータ同期 (レプリケーション) は docker compose 構成では未接続です。各ノードは独立した HTTP API サーバとして動作します。ノード間通信の統合は今後の Issue で対応予定です。
+> **注**: `docker-compose.yml` のデフォルト構成では peer bootstrap を行わないため、ノード間レプリケーションは有効化されません。各ノードは独立した HTTP API サーバとして動作します。
 
 ### クラスタの停止
 
@@ -468,14 +502,18 @@ cargo run
 - **Certification processing** (1秒間隔): pending write を再評価
 - **Cleanup** (5秒間隔): 期限切れ pending write の除去
 - **Compaction check** (10秒間隔): チェックポイント作成の判定
+- **Frontier report** (1秒間隔): Authority ノードの場合のみ frontier を報告
+- **Anti-entropy sync** (2秒間隔): SyncClient が設定され、かつ peers がある場合のみ実行
 
-`Ctrl-C` でグレースフルシャットダウンされ、実行統計が表示されます:
+`Ctrl-C` で終了できます:
 
 ```
 AsteroidDB starting...
+HTTP server listening on 127.0.0.1:3000
 Node run loop started. Press Ctrl-C to stop.
 ^C
-Node stopped. Stats: RunLoopStats { certification_ticks: 15, cleanup_ticks: 3, compaction_check_ticks: 1 }
+Shutting down...
+AsteroidDB stopped.
 ```
 
 ### Partition Tolerance のデモ
@@ -495,7 +533,13 @@ cargo test --test partition_tolerance -- --nocapture
 
 ### demo_partition_recovery
 
-> 注: `demo_partition_recovery` example は今後追加予定です。現時点では上記のテストスイートで分断耐性を検証できます。
+`demo_partition_recovery` は実装済みです。
+
+```bash
+cargo run --example demo_partition_recovery
+```
+
+このデモは、3ノードの分断と復旧、CRDT 収束、Certified 状態遷移を一連で確認できます。
 
 ## 7. トラブルシューティング
 
@@ -530,7 +574,7 @@ cargo test --test partition_tolerance -- --nocapture
 
 ### よくある問題
 
-**Q: `cargo clippy -- -D warnings` で警告が出る**
+**Q: `cargo clippy --all-targets --all-features -- -D warnings` で警告が出る**
 
 A: コードの修正が必要です。clippy の指摘に従って修正してください。CI gate はこのチェックを通過する必要があります。
 
