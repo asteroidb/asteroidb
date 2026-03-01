@@ -129,6 +129,9 @@ async fn main() {
         NodeId("auth-3".into()),
     ])));
 
+    // Optional shared token for authenticating internal API requests.
+    let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN").ok();
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -138,6 +141,7 @@ async fn main() {
         peers: Some(Arc::clone(&shared_peers)),
         peer_persist_path: Some(peer_persist_path),
         consensus,
+        internal_token: internal_token.clone(),
     });
 
     let app = router(state);
@@ -148,7 +152,11 @@ async fn main() {
     let mut runner = if has_peers {
         // Config file provided peers — enable anti-entropy sync.
         let sync_registry = shared_peers.lock().await.clone();
-        let sync_client = SyncClient::new(sync_registry);
+        let sync_client = if let Some(ref token) = internal_token {
+            SyncClient::with_token(sync_registry, token.clone())
+        } else {
+            SyncClient::new(sync_registry)
+        };
         NodeRunner::with_sync(
             node_id,
             Arc::clone(&certified_api),

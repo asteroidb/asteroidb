@@ -243,6 +243,14 @@ impl NodeRunner {
         self.eventual_api = Some(api);
     }
 
+    /// Replace the sync client used for anti-entropy replication.
+    ///
+    /// Useful for injecting a token-enabled `SyncClient` after
+    /// construction when the token is not known at `NodeRunner` creation time.
+    pub fn set_sync_client(&mut self, client: SyncClient) {
+        self.sync_client = Some(client);
+    }
+
     /// Inject a peer frontier for testing purposes.
     ///
     /// This forces the next sync cycle to attempt delta sync first for
