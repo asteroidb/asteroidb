@@ -561,6 +561,19 @@ pub async fn internal_join(
 
     let joining_node_id = NodeId(req.node_id.clone());
 
+    // Validate peer address: must be host:port without path/query/fragment
+    // components to prevent SSRF via URL injection.
+    if req.address.contains('/')
+        || req.address.contains('?')
+        || req.address.contains('#')
+        || req.address.contains('@')
+    {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "invalid peer address: {}",
+            req.address
+        ))));
+    }
+
     // Add the joining node to our peer registry.
     {
         let mut registry = peers_registry.lock().await;
