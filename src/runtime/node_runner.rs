@@ -243,6 +243,16 @@ impl NodeRunner {
         self.eventual_api = Some(api);
     }
 
+    /// Set the anti-entropy sync client.
+    ///
+    /// The caller should construct the `SyncClient` with a Bearer token
+    /// (via [`SyncClient::with_token`]) when internal API authentication
+    /// is enabled, so that outbound node-to-node requests include the
+    /// `Authorization` header.
+    pub fn set_sync_client(&mut self, client: SyncClient) {
+        self.sync_client = Some(client);
+    }
+
     /// Inject a peer frontier for testing purposes.
     ///
     /// This forces the next sync cycle to attempt delta sync first for

@@ -28,8 +28,8 @@ pub async fn require_internal_token(
         .get("authorization")
         .and_then(|v| v.to_str().ok());
 
-    let provided_token = match auth_header {
-        Some(header) if header.starts_with("Bearer ") => &header[7..],
+    let provided_token = match auth_header.and_then(|h| h.strip_prefix("Bearer ")) {
+        Some(token) => token,
         _ => {
             return (
                 StatusCode::UNAUTHORIZED,

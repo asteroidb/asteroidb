@@ -9,7 +9,7 @@ services:
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
       ASTEROIDB_NODE_ID: "node-1"
-      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN:-changeme}"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
     networks:
       - asteroidb
 
@@ -23,7 +23,7 @@ services:
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
       ASTEROIDB_NODE_ID: "node-2"
-      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN:-changeme}"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
     networks:
       - asteroidb
 
@@ -37,7 +37,7 @@ services:
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
       ASTEROIDB_NODE_ID: "node-3"
-      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN:-changeme}"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
     networks:
       - asteroidb
 

@@ -1247,6 +1247,7 @@ mod tests {
             namespace,
             metrics: Arc::new(RuntimeMetrics::default()),
             peers: None,
+            peer_persist_path: None,
             internal_token: Some(token.to_string()),
         })
     }

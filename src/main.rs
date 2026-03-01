@@ -131,7 +131,7 @@ async fn main() {
         metrics: Arc::clone(&metrics),
         peers: Some(Arc::clone(&shared_peers)),
         peer_persist_path: Some(peer_persist_path),
-        internal_token,
+        internal_token: internal_token.clone(),
     });
 
     let app = router(state);
@@ -141,8 +141,14 @@ async fn main() {
     let engine = CompactionEngine::with_defaults();
     let mut runner = if has_peers {
         // Config file provided peers — enable anti-entropy sync.
+        // When an internal token is configured, use `SyncClient::with_token`
+        // so that outbound node-to-node HTTP requests include the
+        // `Authorization: Bearer` header.
         let sync_registry = shared_peers.lock().await.clone();
-        let sync_client = SyncClient::new(sync_registry);
+        let sync_client = match &internal_token {
+            Some(token) => SyncClient::with_token(sync_registry, token.clone()),
+            None => SyncClient::new(sync_registry),
+        };
         NodeRunner::with_sync(
             node_id,
             Arc::clone(&certified_api),
