@@ -552,18 +552,12 @@ pub async fn internal_join(
     Json(req): Json<JoinRequest>,
 ) -> Result<Json<JoinResponse>, ApiError> {
     use crate::network::PeerConfig;
-    use std::net::SocketAddr;
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
             "peer registry not configured".to_string(),
         ))
     })?;
-
-    let addr: SocketAddr = req
-        .address
-        .parse()
-        .map_err(|e| ApiError(CrdtError::InvalidArgument(format!("invalid address: {e}"))))?;
 
     let joining_node_id = NodeId(req.node_id.clone());
 
@@ -573,7 +567,7 @@ pub async fn internal_join(
         registry
             .add_peer(PeerConfig {
                 node_id: joining_node_id.clone(),
-                addr,
+                addr: req.address.clone(),
             })
             .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
     }
@@ -588,7 +582,7 @@ pub async fn internal_join(
             .into_iter()
             .map(|p| PeerInfo {
                 node_id: p.node_id.0,
-                address: p.addr.to_string(),
+                address: p.addr.clone(),
             })
             .collect();
 

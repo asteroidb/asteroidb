@@ -117,7 +117,7 @@ async fn two_node_anti_entropy_convergence() {
         node_id("node-1"),
         vec![PeerConfig {
             node_id: node_id("node-2"),
-            addr: addr2,
+            addr: addr2.to_string(),
         }],
     )
     .unwrap();
@@ -139,7 +139,7 @@ async fn two_node_anti_entropy_convergence() {
         node_id("node-2"),
         vec![PeerConfig {
             node_id: node_id("node-1"),
-            addr: addr1,
+            addr: addr1.to_string(),
         }],
     )
     .unwrap();
@@ -274,7 +274,7 @@ async fn pull_based_sync() {
     let registry = PeerRegistry::new(node_id("puller"), vec![]).unwrap();
     let sync_client = SyncClient::new(registry);
 
-    let pulled = sync_client.pull_all_keys(&addr).await;
+    let pulled = sync_client.pull_all_keys(&addr.to_string()).await;
     assert!(pulled.is_some(), "pull should succeed");
 
     let dump = pulled.unwrap();
@@ -449,7 +449,7 @@ async fn three_node_convergence_via_sync() {
                 .filter(|&j| j != i)
                 .map(|j| PeerConfig {
                     node_id: node_id(&format!("node-{}", j + 1)),
-                    addr: addrs[j],
+                    addr: addrs[j].to_string(),
                 })
                 .collect();
 
@@ -600,7 +600,7 @@ async fn full_sync_records_remote_frontier_not_local() {
     let registry = PeerRegistry::new(node_id("local"), vec![]).unwrap();
     let sync_client = SyncClient::new(registry);
 
-    let dump = sync_client.pull_all_keys(&remote_addr).await;
+    let dump = sync_client.pull_all_keys(&remote_addr.to_string()).await;
     assert!(dump.is_some(), "pull should succeed");
 
     let dump = dump.unwrap();

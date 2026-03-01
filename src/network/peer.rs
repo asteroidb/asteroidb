@@ -36,8 +36,11 @@ pub enum PeerError {
 pub struct PeerConfig {
     /// Unique identifier of the remote node.
     pub node_id: NodeId,
-    /// Socket address (ip:port) the remote node is listening on.
-    pub addr: SocketAddr,
+    /// Address (host:port) the remote node is listening on.
+    ///
+    /// Accepts both IP:port (e.g., `"127.0.0.1:3000"`) and hostname:port
+    /// (e.g., `"asteroidb-node-2:3000"`) formats.
+    pub addr: String,
 }
 
 /// Registry that holds validated peer configurations.
@@ -212,26 +215,25 @@ impl NodeConfig {
 pub fn generate_cluster_configs(count: usize, base_port: u16) -> Vec<NodeConfig> {
     use crate::types::NodeMode;
 
-    // Pre-build the (node_id, addr) pairs.
-    let entries: Vec<(NodeId, SocketAddr)> = (0..count)
+    // Pre-build the (node_id, bind_addr, peer_addr_str) tuples.
+    let entries: Vec<(NodeId, SocketAddr, String)> = (0..count)
         .map(|i| {
             let id = NodeId(format!("node-{}", i + 1));
-            let addr: SocketAddr = format!("127.0.0.1:{}", base_port + i as u16)
-                .parse()
-                .expect("valid socket addr");
-            (id, addr)
+            let addr_str = format!("127.0.0.1:{}", base_port + i as u16);
+            let bind_addr: SocketAddr = addr_str.parse().expect("valid socket addr");
+            (id, bind_addr, addr_str)
         })
         .collect();
 
     entries
         .iter()
-        .map(|(self_id, bind_addr)| {
+        .map(|(self_id, bind_addr, _)| {
             let peers: Vec<PeerConfig> = entries
                 .iter()
-                .filter(|(id, _)| id != self_id)
-                .map(|(id, addr)| PeerConfig {
+                .filter(|(id, _, _)| id != self_id)
+                .map(|(id, _, addr_str)| PeerConfig {
                     node_id: id.clone(),
-                    addr: *addr,
+                    addr: addr_str.clone(),
                 })
                 .collect();
 
@@ -259,7 +261,7 @@ mod tests {
     fn peer(id: &str, addr: &str) -> PeerConfig {
         PeerConfig {
             node_id: nid(id),
-            addr: addr.parse().unwrap(),
+            addr: addr.to_string(),
         }
     }
 
@@ -424,6 +426,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn node_config_load_project_config_files() {
+        // Verify that the shipped configs/node-*.json files are loadable.
+        for i in 1..=3 {
+            let path = format!("configs/node-{i}.json");
+            let config = NodeConfig::load(&path).unwrap_or_else(|e| {
+                panic!("failed to load {path}: {e}");
+            });
+            let expected_id = format!("node-{i}");
+            assert_eq!(config.node.id, nid(&expected_id));
+            assert_eq!(config.node.mode, NodeMode::Both);
+            // Each node has 2 peers (the other two nodes).
+            assert_eq!(config.peers.peer_count(), 2);
+            assert_eq!(config.peers.self_id(), &nid(&expected_id));
+        }
+    }
+
     // ---- generate_cluster_configs ----
 
     #[test]
@@ -467,10 +486,10 @@ mod tests {
         // Cross-reference: node-1's peer entry for node-2 should have the
         // same addr as node-2's bind_addr.
         let p12 = configs[0].peers.get_peer(&nid("node-2")).unwrap();
-        assert_eq!(p12.addr, configs[1].bind_addr);
+        assert_eq!(p12.addr, configs[1].bind_addr.to_string());
 
         let p13 = configs[0].peers.get_peer(&nid("node-3")).unwrap();
-        assert_eq!(p13.addr, configs[2].bind_addr);
+        assert_eq!(p13.addr, configs[2].bind_addr.to_string());
     }
 
     #[test]
