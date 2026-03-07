@@ -80,9 +80,8 @@ async fn main() {
     // Build peer registry: if a config file provided peers, use those;
     // otherwise try to load persisted state from disk; finally fall back
     // to an empty registry (nodes join dynamically via POST /api/internal/join).
-    let (shared_peers, has_peers) = if let Some(registry) = config_peer_registry {
-        let has = registry.peer_count() > 0;
-        (Arc::new(Mutex::new(registry)), has)
+    let shared_peers = if let Some(registry) = config_peer_registry {
+        Arc::new(Mutex::new(registry))
     } else {
         // No config file — try loading persisted peer registry from disk.
         let registry = if peer_persist_path.exists() {
@@ -118,8 +117,7 @@ async fn main() {
         } else {
             PeerRegistry::new(node_id.clone(), vec![]).expect("empty peer list is always valid")
         };
-        let has = registry.peer_count() > 0;
-        (Arc::new(Mutex::new(registry)), has)
+        Arc::new(Mutex::new(registry))
     };
 
     // Build control-plane consensus with the same authority nodes (FR-009).
@@ -148,36 +146,25 @@ async fn main() {
 
     // NodeRunner uses the same CertifiedApi and EventualApi instances
     // for background processing, ensuring sync sees HTTP writes.
+    // Always create a SyncClient so that peers added dynamically via
+    // /api/internal/join are picked up by anti-entropy sync (the sync
+    // loop skips when the peer list is empty, so there is no overhead).
     let engine = CompactionEngine::with_defaults();
-    let mut runner = if has_peers {
-        // Config file provided peers — enable anti-entropy sync.
-        let sync_client = if let Some(ref token) = internal_token {
-            SyncClient::with_token(Arc::clone(&shared_peers), token.clone())
-        } else {
-            SyncClient::new(Arc::clone(&shared_peers))
-        };
-        NodeRunner::with_sync(
-            node_id,
-            Arc::clone(&certified_api),
-            engine,
-            NodeRunnerConfig::default(),
-            sync_client,
-            Arc::clone(&eventual_api),
-            Arc::clone(&metrics),
-        )
-        .await
+    let sync_client = if let Some(ref token) = internal_token {
+        SyncClient::with_token(Arc::clone(&shared_peers), token.clone())
     } else {
-        let mut r = NodeRunner::new(
-            node_id,
-            Arc::clone(&certified_api),
-            engine,
-            NodeRunnerConfig::default(),
-            Arc::clone(&metrics),
-        )
-        .await;
-        r.set_eventual_api(eventual_api);
-        r
+        SyncClient::new(Arc::clone(&shared_peers))
     };
+    let mut runner = NodeRunner::with_sync(
+        node_id,
+        Arc::clone(&certified_api),
+        engine,
+        NodeRunnerConfig::default(),
+        sync_client,
+        Arc::clone(&eventual_api),
+        Arc::clone(&metrics),
+    )
+    .await;
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.

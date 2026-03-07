@@ -748,6 +748,13 @@ impl NodeRunner {
             }
         }
 
+        // Prune stale peer frontiers: remove entries for peers that are no
+        // longer in the registry (e.g. removed via membership changes).
+        let active_addrs: std::collections::HashSet<&String> =
+            peers.iter().map(|p| &p.addr).collect();
+        self.peer_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+
         if !any_success && !peers.is_empty() {
             self.metrics
                 .sync_failure_total
