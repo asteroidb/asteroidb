@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +24,7 @@ pub const CURRENT_FORMAT_VERSION: u32 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedStore {
     format_version: u32,
-    #[serde(flatten)]
-    data: serde_json::Value,
+    store: serde_json::Value,
 }
 
 /// A CRDT value stored in the KVS.
@@ -132,7 +133,7 @@ impl Store {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let envelope = PersistedStore {
             format_version: CURRENT_FORMAT_VERSION,
-            data: store_value,
+            store: store_value,
         };
         let json = serde_json::to_string(&envelope)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -141,9 +142,11 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Atomic write: write to temp file, then rename.
+        // Atomic write: write to temp file, fsync, then rename.
         let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, json)?;
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
         Ok(())
     }
@@ -180,15 +183,19 @@ impl Store {
             ));
         }
 
-        // Extract the store data (strip the envelope fields).
+        // Extract the store data from the envelope.
         let store_data = if parsed.get("format_version").is_some() {
-            // Versioned format: the store fields are flattened alongside format_version.
-            // Remove format_version to get the raw store data.
-            let mut obj = parsed;
-            if let Some(map) = obj.as_object_mut() {
-                map.remove("format_version");
+            if let Some(store_field) = parsed.get("store") {
+                // New versioned format: store data is in the "store" field.
+                store_field.clone()
+            } else {
+                // Legacy versioned format (flatten): strip format_version to get raw store data.
+                let mut obj = parsed;
+                if let Some(map) = obj.as_object_mut() {
+                    map.remove("format_version");
+                }
+                obj
             }
-            obj
         } else {
             // Legacy format (v1): the entire JSON is the store.
             parsed
@@ -203,12 +210,17 @@ impl Store {
         serde_json::from_value(migrated).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Load a store from a snapshot, falling back to an empty store on any error.
+    /// Load a store from a snapshot, falling back to an empty store only when
+    /// the file is missing.
     ///
-    /// This is the recommended way to load at startup: if the snapshot file
-    /// is missing or corrupted, the store starts fresh.
-    pub fn load_snapshot_or_default(path: &Path) -> Self {
-        Self::load_snapshot(path).unwrap_or_default()
+    /// Returns an error for incompatible versions or other I/O failures to
+    /// prevent silent data loss.
+    pub fn load_snapshot_or_default(path: &Path) -> io::Result<Self> {
+        match Self::load_snapshot(path) {
+            Ok(store) => Ok(store),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Merge a CRDT value into an existing entry.
@@ -835,18 +847,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
 
-        let store = Store::load_snapshot_or_default(&path);
+        let store = Store::load_snapshot_or_default(&path).unwrap();
         assert!(store.is_empty());
     }
 
     #[test]
-    fn load_snapshot_or_default_corrupt_file() {
+    fn load_snapshot_or_default_corrupt_file_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.json");
         std::fs::write(&path, "not valid json {{{").unwrap();
 
-        let store = Store::load_snapshot_or_default(&path);
-        assert!(store.is_empty());
+        let result = Store::load_snapshot_or_default(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_snapshot_or_default_incompatible_version_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.json");
+
+        let json = serde_json::json!({
+            "format_version": 99,
+            "store": { "data": {}, "timestamps": {} }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = Store::load_snapshot_or_default(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("incompatible"));
     }
 
     #[test]
