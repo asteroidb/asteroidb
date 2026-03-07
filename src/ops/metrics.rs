@@ -261,6 +261,21 @@ pub struct RuntimeMetrics {
     /// Cumulative count of delta-fail -> full-sync fallback events.
     pub sync_fallback_total: AtomicU64,
 
+    /// Cumulative number of rebalance operations started.
+    pub rebalance_start_total: AtomicU64,
+
+    /// Cumulative number of keys successfully migrated during rebalance.
+    pub rebalance_keys_migrated: AtomicU64,
+
+    /// Cumulative number of keys that failed migration during rebalance.
+    pub rebalance_keys_failed: AtomicU64,
+
+    /// Cumulative number of rebalance operations completed.
+    pub rebalance_complete_total: AtomicU64,
+
+    /// Sum of rebalance durations in microseconds.
+    pub rebalance_duration_sum_us: AtomicU64,
+
     /// Per-peer sync statistics (peer_id -> stats).
     peer_sync_stats: Mutex<HashMap<String, PeerSyncStats>>,
 
@@ -282,6 +297,11 @@ impl Default for RuntimeMetrics {
             sync_failure_total: AtomicU64::default(),
             sync_attempt_total: AtomicU64::default(),
             sync_fallback_total: AtomicU64::default(),
+            rebalance_start_total: AtomicU64::default(),
+            rebalance_keys_migrated: AtomicU64::default(),
+            rebalance_keys_failed: AtomicU64::default(),
+            rebalance_complete_total: AtomicU64::default(),
+            rebalance_duration_sum_us: AtomicU64::default(),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
             window_duration: Duration::from_secs(WINDOW_SECS),
@@ -357,6 +377,42 @@ impl RuntimeMetrics {
         window.record(now, latency, self.window_duration);
     }
 
+    /// Record the start of a rebalance operation.
+    pub fn record_rebalance_start(&self, _key_range: &str, plan_size: usize) {
+        self.rebalance_start_total.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            key_range = _key_range,
+            plan_size = plan_size,
+            "rebalance started"
+        );
+    }
+
+    /// Record progress of a rebalance operation.
+    pub fn record_rebalance_progress(
+        &self,
+        _key_range: &str,
+        keys_migrated: u64,
+        keys_failed: u64,
+    ) {
+        self.rebalance_keys_migrated
+            .fetch_add(keys_migrated, Ordering::Relaxed);
+        self.rebalance_keys_failed
+            .fetch_add(keys_failed, Ordering::Relaxed);
+    }
+
+    /// Record the completion of a rebalance operation.
+    pub fn record_rebalance_complete(&self, _key_range: &str, duration: Duration) {
+        self.rebalance_complete_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.rebalance_duration_sum_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        tracing::info!(
+            key_range = _key_range,
+            duration_ms = duration.as_millis() as u64,
+            "rebalance completed"
+        );
+    }
+
     /// Create a snapshot for JSON serialization.
     pub fn snapshot(&self) -> MetricsSnapshot {
         self.snapshot_at(Instant::now())
@@ -387,6 +443,10 @@ impl RuntimeMetrics {
             sync_failure_total: self.sync_failure_total.load(Ordering::Relaxed),
             peer_sync: peer_snapshots,
             certification_latency_window: cert_latency_window,
+            rebalance_start_total: self.rebalance_start_total.load(Ordering::Relaxed),
+            rebalance_keys_migrated: self.rebalance_keys_migrated.load(Ordering::Relaxed),
+            rebalance_keys_failed: self.rebalance_keys_failed.load(Ordering::Relaxed),
+            rebalance_complete_total: self.rebalance_complete_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -436,6 +496,14 @@ pub struct MetricsSnapshot {
     pub peer_sync: HashMap<String, PeerSyncSnapshot>,
     /// Windowed certification latency statistics.
     pub certification_latency_window: CertificationLatencySnapshot,
+    /// Cumulative number of rebalance operations started.
+    pub rebalance_start_total: u64,
+    /// Cumulative number of keys successfully migrated during rebalance.
+    pub rebalance_keys_migrated: u64,
+    /// Cumulative number of keys that failed migration during rebalance.
+    pub rebalance_keys_failed: u64,
+    /// Cumulative number of rebalance operations completed.
+    pub rebalance_complete_total: u64,
 }
 
 #[cfg(test)]

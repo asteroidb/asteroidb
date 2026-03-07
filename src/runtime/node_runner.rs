@@ -16,6 +16,8 @@ use crate::network::membership::MembershipClient;
 use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
+use crate::placement::PlacementPolicy;
+use crate::placement::rebalance::{DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -103,6 +105,29 @@ pub struct NodeRunner {
     tracked_cluster_generation: u64,
     /// Optional membership client for periodic peer list exchange (ping).
     membership_client: Option<MembershipClient>,
+    /// Active rebalance plans being executed, keyed by key range prefix.
+    ///
+    /// When a policy version change is detected, a [`RebalancePlan`] is
+    /// computed and stored here. Each sync cycle processes a bounded batch
+    /// of additions from the plan. Once all additions have been pushed,
+    /// the plan is removed.
+    active_rebalance_plans: HashMap<String, ActiveRebalance>,
+    /// Snapshot of old placement policies for rebalance plan computation.
+    ///
+    /// When a policy version change is detected, the old policy is needed
+    /// to compute which nodes are new/removed targets.
+    tracked_policies: HashMap<String, PlacementPolicy>,
+}
+
+/// State for an in-progress rebalance operation.
+#[derive(Debug, Clone)]
+struct ActiveRebalance {
+    /// The computed rebalance plan.
+    plan: RebalancePlan,
+    /// Number of additions already pushed.
+    additions_offset: usize,
+    /// When this rebalance operation started.
+    started_at: Instant,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -159,12 +184,13 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions) = {
+        let (reporter, tracked_versions, tracked_policies) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
-            (reporter, versions)
+            let policies = Self::snapshot_policies(&ns);
+            (reporter, versions, policies)
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -191,6 +217,8 @@ impl NodeRunner {
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
             membership_client: None,
+            active_rebalance_plans: HashMap::new(),
+            tracked_policies,
         }
     }
 
@@ -208,12 +236,13 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::new()));
-        let (reporter, tracked_versions) = {
+        let (reporter, tracked_versions, tracked_policies) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
-            (reporter, versions)
+            let policies = Self::snapshot_policies(&ns);
+            (reporter, versions, policies)
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -240,6 +269,8 @@ impl NodeRunner {
             cluster_nodes,
             tracked_cluster_generation: 0,
             membership_client: None,
+            active_rebalance_plans: HashMap::new(),
+            tracked_policies,
         }
     }
 
@@ -331,6 +362,14 @@ impl NodeRunner {
             .collect()
     }
 
+    /// Snapshot current placement policies (cloned) for rebalance computation.
+    fn snapshot_policies(ns: &SystemNamespace) -> HashMap<String, PlacementPolicy> {
+        ns.all_placement_policies()
+            .into_iter()
+            .map(|p| (p.key_range.prefix.clone(), p.clone()))
+            .collect()
+    }
+
     /// Detect policy version changes, membership changes, and fence old versions.
     ///
     /// Compares the current namespace policy versions against the tracked
@@ -411,8 +450,205 @@ impl NodeRunner {
             }
         }
 
-        // Update tracked versions.
+        // Compute rebalance plans for changed policies.
+        self.compute_rebalance_plans(&changes, &deleted_prefixes)
+            .await;
+
+        // Update tracked versions and policies.
         self.tracked_policy_versions = current_versions;
+        let new_policies: HashMap<String, PlacementPolicy> = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
+            Self::snapshot_policies(&ns)
+        };
+        self.tracked_policies = new_policies;
+    }
+
+    /// Compute rebalance plans for policy changes and queue them for execution.
+    async fn compute_rebalance_plans(
+        &mut self,
+        changes: &[(String, PolicyVersion, PolicyVersion)],
+        deleted_prefixes: &[(String, PolicyVersion)],
+    ) {
+        // We need the eventual API to read current keys.
+        let Some(eventual_api) = &self.eventual_api else {
+            return;
+        };
+
+        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+
+        // Get new policies from the namespace.
+        let new_policies: HashMap<String, PlacementPolicy> = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
+            Self::snapshot_policies(&ns)
+        };
+
+        let api = eventual_api.lock().await;
+
+        for (prefix, _old_version, _new_version) in changes {
+            let new_policy = match new_policies.get(prefix) {
+                Some(p) => p,
+                None => continue,
+            };
+            let old_policy = self.tracked_policies.get(prefix);
+
+            let current_keys: Vec<String> = api
+                .store()
+                .keys_with_prefix(prefix)
+                .into_iter()
+                .cloned()
+                .collect();
+
+            if current_keys.is_empty() {
+                continue;
+            }
+
+            let plan = RebalancePlan::compute(
+                old_policy,
+                new_policy,
+                &nodes,
+                &current_keys,
+                &self.node_id,
+            );
+
+            if !plan.is_empty() {
+                self.metrics
+                    .record_rebalance_start(prefix, plan.total_operations());
+                self.active_rebalance_plans.insert(
+                    prefix.clone(),
+                    ActiveRebalance {
+                        plan,
+                        additions_offset: 0,
+                        started_at: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        // For deleted policies, clear any active rebalance for that prefix.
+        for (prefix, _) in deleted_prefixes {
+            self.active_rebalance_plans.remove(prefix);
+        }
+    }
+
+    /// Execute one batch of pending rebalance operations.
+    ///
+    /// For each active rebalance plan, pushes up to `max_keys_per_cycle`
+    /// key additions to their target nodes using the sync client. Once
+    /// all additions have been processed, the plan is marked complete.
+    async fn execute_rebalance_batch(&mut self) {
+        if self.active_rebalance_plans.is_empty() {
+            return;
+        }
+
+        let Some(sync_client) = &self.sync_client else {
+            return;
+        };
+        let Some(eventual_api) = &self.eventual_api else {
+            return;
+        };
+
+        let max_keys = DEFAULT_REBALANCE_BATCH_SIZE;
+        let mut completed_prefixes: Vec<String> = Vec::new();
+
+        // Collect the prefixes to iterate without borrowing self mutably.
+        let prefixes: Vec<String> = self.active_rebalance_plans.keys().cloned().collect();
+
+        for prefix in &prefixes {
+            let rebalance = match self.active_rebalance_plans.get(prefix) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let batch = rebalance
+                .plan
+                .additions_batch(rebalance.additions_offset, max_keys);
+            if batch.is_empty() {
+                // All additions have been processed.
+                let duration = rebalance.started_at.elapsed();
+                self.metrics.record_rebalance_complete(prefix, duration);
+                completed_prefixes.push(prefix.clone());
+                continue;
+            }
+
+            // Group additions by target node.
+            let mut by_target: HashMap<&NodeId, Vec<&str>> = HashMap::new();
+            for addition in batch {
+                by_target
+                    .entry(&addition.target_node)
+                    .or_default()
+                    .push(&addition.key);
+            }
+
+            let mut migrated = 0u64;
+            let mut failed = 0u64;
+
+            // Look up peer addresses from the registry.
+            let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+
+            for (target_node, keys) in &by_target {
+                // Find the peer address for this target node.
+                let peer = peers.iter().find(|p| p.node_id == **target_node);
+                let Some(peer) = peer else {
+                    // Target node not in peer registry; count as failed.
+                    failed += keys.len() as u64;
+                    continue;
+                };
+
+                // Collect entries to push.
+                let api = eventual_api.lock().await;
+                let entries: Vec<(String, crate::store::kv::CrdtValue)> = keys
+                    .iter()
+                    .filter_map(|k| api.store().get(k).map(|v| (k.to_string(), v.clone())))
+                    .collect();
+                drop(api);
+
+                if entries.is_empty() {
+                    continue;
+                }
+
+                let push_result = sync_client
+                    .push_changed_keys(&peer.addr, entries, &self.node_id.0, DEFAULT_BATCH_SIZE)
+                    .await;
+
+                match push_result {
+                    Ok(pushed) => {
+                        migrated += pushed as u64;
+                    }
+                    Err(e) => {
+                        migrated += e.pushed as u64;
+                        failed += (keys.len() - e.pushed) as u64;
+                        tracing::warn!(
+                            target_node = %target_node.0,
+                            error = %e,
+                            "rebalance push failed"
+                        );
+                    }
+                }
+            }
+
+            self.metrics
+                .record_rebalance_progress(prefix, migrated, failed);
+
+            // Advance the offset.
+            let batch_len = batch.len();
+            if let Some(rebalance) = self.active_rebalance_plans.get_mut(prefix) {
+                rebalance.additions_offset += batch_len;
+
+                // Check if we just finished.
+                if rebalance.additions_offset >= rebalance.plan.additions.len() {
+                    let duration = rebalance.started_at.elapsed();
+                    self.metrics.record_rebalance_complete(prefix, duration);
+                    completed_prefixes.push(prefix.clone());
+                }
+            }
+        }
+
+        // Remove completed rebalance plans.
+        for prefix in completed_prefixes {
+            self.active_rebalance_plans.remove(&prefix);
+        }
     }
 
     /// Detect cluster membership changes and recalculate authorities.
@@ -551,6 +787,7 @@ impl NodeRunner {
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
+                    self.execute_rebalance_batch().await;
                     stats.sync_ticks += 1;
                 }
                 _ = ping_interval.tick(), if ping_enabled => {
@@ -2052,6 +2289,221 @@ mod tests {
             def.authority_nodes.len(),
             3,
             "authority should be recalculated after version bump"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Rebalance tests (#176)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn policy_change_triggers_rebalance_plan() {
+        use crate::api::eventual::EventualApi;
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Start with a policy requiring dc:tokyo tag.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        // Set up cluster nodes: n1 has dc:tokyo, n2 has dc:osaka.
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("node-1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:osaka"]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+        };
+
+        // Create an EventualApi with some keys in the data/ prefix.
+        let eventual_api = EventualApi::new(node_id("node-1"));
+        let eventual_api = Arc::new(Mutex::new(eventual_api));
+
+        // Add keys to the store.
+        {
+            let mut ea = eventual_api.lock().await;
+            let mut counter = crate::crdt::pn_counter::PnCounter::new();
+            counter.increment(&node_id("node-1"));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+        }
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_api.clone());
+
+        // Initial detection to establish baseline tracked state.
+        runner.detect_version_changes().await;
+        assert!(
+            runner.active_rebalance_plans.is_empty(),
+            "no rebalance plans should exist initially"
+        );
+
+        // Change the policy to remove the required tag (now all nodes match).
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock.namespace().write().unwrap();
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3));
+        }
+
+        // Detect version changes, which should compute a rebalance plan.
+        runner.detect_version_changes().await;
+
+        // n2 now matches the new policy but didn't match the old one.
+        // A rebalance plan should have been created for data/.
+        assert!(
+            runner.active_rebalance_plans.contains_key("data/"),
+            "rebalance plan should be created when policy changes"
+        );
+
+        let rebalance = &runner.active_rebalance_plans["data/"];
+        assert!(
+            !rebalance.plan.additions.is_empty(),
+            "rebalance plan should have additions for new matching nodes"
+        );
+        assert_eq!(rebalance.additions_offset, 0);
+
+        // Verify metrics recorded the start.
+        let metrics = runner.metrics();
+        assert_eq!(
+            metrics.rebalance_start_total.load(Ordering::Relaxed),
+            1,
+            "rebalance_start_total should be 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebalance_rate_limiting() {
+        use crate::placement::rebalance::RebalanceAddition;
+        use crate::placement::rebalance::RebalancePlan;
+
+        // Create a plan with many additions to verify batch limiting.
+        let plan = RebalancePlan {
+            key_range: kr("data/"),
+            additions: (0..200)
+                .map(|i| RebalanceAddition {
+                    key: format!("data/k{i}"),
+                    target_node: node_id("n2"),
+                })
+                .collect(),
+            removals: vec![],
+        };
+
+        // First batch should return exactly DEFAULT_REBALANCE_BATCH_SIZE entries.
+        let batch = plan.additions_batch(0, 50);
+        assert_eq!(batch.len(), 50);
+        assert_eq!(batch[0].key, "data/k0");
+        assert_eq!(batch[49].key, "data/k49");
+
+        // Second batch.
+        let batch2 = plan.additions_batch(50, 50);
+        assert_eq!(batch2.len(), 50);
+        assert_eq!(batch2[0].key, "data/k50");
+
+        // Last batch.
+        let batch_last = plan.additions_batch(150, 50);
+        assert_eq!(batch_last.len(), 50);
+
+        // Past the end.
+        let batch_past = plan.additions_batch(200, 50);
+        assert!(batch_past.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_policy_clears_rebalance_plan() {
+        use crate::api::eventual::EventualApi;
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("node-1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Store, &[]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+        };
+
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));
+
+        {
+            let mut ea = eventual_api.lock().await;
+            let mut counter = crate::crdt::pn_counter::PnCounter::new();
+            counter.increment(&node_id("node-1"));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+        }
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes,
+        )
+        .await;
+        runner.set_eventual_api(eventual_api);
+
+        // Initial detect to establish baseline.
+        runner.detect_version_changes().await;
+
+        // Manually insert a fake active rebalance plan for data/.
+        runner.active_rebalance_plans.insert(
+            "data/".to_string(),
+            ActiveRebalance {
+                plan: crate::placement::rebalance::RebalancePlan {
+                    key_range: kr("data/"),
+                    additions: vec![],
+                    removals: vec![],
+                },
+                additions_offset: 0,
+                started_at: Instant::now(),
+            },
+        );
+        assert!(runner.active_rebalance_plans.contains_key("data/"));
+
+        // Delete the policy.
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock.namespace().write().unwrap();
+            ns.remove_placement_policy("data/");
+        }
+
+        runner.detect_version_changes().await;
+
+        // After detection of deletion, the rebalance plan should be cleared.
+        assert!(
+            !runner.active_rebalance_plans.contains_key("data/"),
+            "rebalance plan should be cleared when policy is deleted"
         );
     }
 }
