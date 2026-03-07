@@ -348,7 +348,7 @@ async fn ping_exchange_reconciles_peer_lists() {
         .unwrap(),
     ));
 
-    let membership = MembershipClient::new(
+    let mut membership = MembershipClient::new(
         node_id("node-2"),
         addr2.to_string(),
         Arc::clone(&peer_registry),

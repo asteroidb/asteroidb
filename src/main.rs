@@ -184,15 +184,6 @@ async fn main() {
         )
     };
 
-    // Fan-out join: announce this node's presence to all known peers.
-    // This runs after the seed join has populated the peer registry,
-    // ensuring all peers learn about this node without relying solely
-    // on the seed.
-    let fan_out_count = membership_client.fan_out_join().await;
-    if fan_out_count > 0 {
-        println!("Fan-out join announced to {fan_out_count} peers");
-    }
-
     let mut runner = NodeRunner::with_sync(
         node_id.clone(),
         Arc::clone(&certified_api),
@@ -205,17 +196,19 @@ async fn main() {
     .await;
 
     // Build a second membership client for the runner's periodic ping loop.
-    // (The first one was consumed by fan_out_join above; the runner needs
-    // its own instance to avoid ownership issues.)
     let runner_membership_client = if let Some(ref token) = internal_token {
         MembershipClient::with_token(
-            node_id,
+            node_id.clone(),
             advertise_addr.clone(),
             Arc::clone(&shared_peers),
             token.clone(),
         )
     } else {
-        MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
+        MembershipClient::new(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+        )
     };
     runner.set_membership_client(runner_membership_client);
 
@@ -232,6 +225,29 @@ async fn main() {
     }
     println!("Node run loop started. Press Ctrl-C to stop.");
 
+    // Fan-out join: announce this node's presence to all known peers.
+    // Spawned as a background task so that unreachable peers do not
+    // block the server startup (Codex P1).
+    tokio::spawn(async move {
+        let fan_out_count = membership_client.fan_out_join().await;
+        if fan_out_count > 0 {
+            println!("Fan-out join announced to {fan_out_count} peers");
+        }
+    });
+
+    // Build a membership client for the shutdown path so we can
+    // announce departure before stopping.
+    let shutdown_membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id,
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
+    };
+
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
@@ -243,6 +259,11 @@ async fn main() {
         }
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down...");
+            // Announce departure to all peers before stopping (P1-1).
+            let leave_count = shutdown_membership_client.fan_out_leave().await;
+            if leave_count > 0 {
+                println!("Fan-out leave acknowledged by {leave_count} peers");
+            }
             let _ = shutdown_handle.send(true);
         }
     }

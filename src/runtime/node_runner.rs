@@ -946,8 +946,8 @@ impl NodeRunner {
     }
 
     /// Run one cycle of peer list exchange (membership gossip).
-    async fn run_ping(&self) {
-        if let Some(membership_client) = &self.membership_client {
+    async fn run_ping(&mut self) {
+        if let Some(membership_client) = &mut self.membership_client {
             let discovered = membership_client.ping_all().await;
             if discovered > 0 {
                 tracing::info!(

@@ -752,13 +752,13 @@ pub async fn internal_announce(
 
     let announcing_node_id = NodeId(req.node_id.clone());
 
-    if req.joining {
+    let (result, persist_snapshot) = if req.joining {
         let mut registry = peers_registry.lock().await;
         // Silently accept if the peer is already known (idempotent).
         if registry.get_peer(&announcing_node_id).is_some() {
             return Ok(Json(AnnounceResponse { accepted: true }));
         }
-        match registry.add_peer(PeerConfig {
+        let result = match registry.add_peer(PeerConfig {
             node_id: announcing_node_id,
             addr: req.address,
         }) {
@@ -768,17 +768,42 @@ pub async fn internal_announce(
                 Ok(Json(AnnounceResponse { accepted: true }))
             }
             Err(e) => Err(ApiError(CrdtError::InvalidArgument(e.to_string()))),
-        }
+        };
+        let snapshot = state
+            .peer_persist_path
+            .as_ref()
+            .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
+        (result, snapshot)
     } else {
         let mut registry = peers_registry.lock().await;
-        match registry.remove_peer(&announcing_node_id) {
+        let result = match registry.remove_peer(&announcing_node_id) {
             Ok(_) => Ok(Json(AnnounceResponse { accepted: true })),
             Err(crate::network::PeerError::SelfInPeerList(_)) => {
                 Ok(Json(AnnounceResponse { accepted: true }))
             }
             Err(e) => Err(ApiError(CrdtError::InvalidArgument(e.to_string()))),
+        };
+        let snapshot = state
+            .peer_persist_path
+            .as_ref()
+            .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
+        (result, snapshot)
+    };
+
+    // Persist outside the lock.
+    if let Some(path) = &state.peer_persist_path
+        && let Some(json) = persist_snapshot
+    {
+        let path = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            eprintln!("warning: failed to persist peer registry after announce: {e}");
         }
     }
+
+    result
 }
 
 // ---------------------------------------------------------------
@@ -803,26 +828,56 @@ pub async fn internal_ping(
     })?;
 
     // Reconcile: add any peers from the sender that we don't know about.
-    {
+    let peers_changed = {
         let mut registry = peers_registry.lock().await;
+        let mut changed = false;
         for peer_info in &req.known_peers {
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_none() {
                 // Ignore errors (e.g. self-in-peer-list, duplicates).
-                let _ = registry.add_peer(PeerConfig {
-                    node_id: peer_nid,
-                    addr: peer_info.address.clone(),
-                });
+                if registry
+                    .add_peer(PeerConfig {
+                        node_id: peer_nid,
+                        addr: peer_info.address.clone(),
+                    })
+                    .is_ok()
+                {
+                    changed = true;
+                }
             }
         }
 
         // Also ensure the sender itself is registered.
         let sender_nid = NodeId(req.sender_id.clone());
-        if registry.get_peer(&sender_nid).is_none() {
-            let _ = registry.add_peer(PeerConfig {
-                node_id: sender_nid,
-                addr: req.sender_addr.clone(),
-            });
+        if registry.get_peer(&sender_nid).is_none()
+            && registry
+                .add_peer(PeerConfig {
+                    node_id: sender_nid,
+                    addr: req.sender_addr.clone(),
+                })
+                .is_ok()
+        {
+            changed = true;
+        }
+
+        changed
+    };
+
+    // Persist registry if it changed (Codex P2).
+    if peers_changed && let Some(path) = &state.peer_persist_path {
+        let snapshot = {
+            let registry = peers_registry.lock().await;
+            serde_json::to_string_pretty(&*registry).ok()
+        };
+        if let Some(json) = snapshot {
+            let path = path.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                eprintln!("warning: failed to persist peer registry after ping: {e}");
+            }
         }
     }
 
