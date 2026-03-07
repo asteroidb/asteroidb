@@ -218,6 +218,15 @@ pub struct SetPlacementPolicyRequest {
     pub approvals: Vec<String>,
 }
 
+/// Request body for `DELETE /api/control-plane/policies/{prefix}`.
+///
+/// Requires majority approval from authority nodes (FR-009).
+#[derive(Debug, Deserialize)]
+pub struct RemovePolicyRequest {
+    /// Node IDs that have approved this removal.
+    pub approvals: Vec<String>,
+}
+
 // ---------------------------------------------------------------
 // Control-plane response types
 // ---------------------------------------------------------------

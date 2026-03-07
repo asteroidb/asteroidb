@@ -59,6 +59,21 @@ impl ControlPlaneConsensus {
         Ok(())
     }
 
+    /// Proposes a placement policy removal. Removes only if a majority of
+    /// authority nodes have approved (FR-009).
+    pub fn propose_policy_removal(
+        &mut self,
+        prefix: &str,
+        approvals: &[NodeId],
+    ) -> Result<Option<PlacementPolicy>, CrdtError> {
+        if !self.has_majority(approvals) {
+            return Err(CrdtError::PolicyDenied(
+                "insufficient approvals for policy removal".into(),
+            ));
+        }
+        Ok(self.namespace.remove_placement_policy(prefix))
+    }
+
     /// Returns `true` if the given approvals constitute a majority of the
     /// authority nodes. Duplicate approvals from the same node are counted
     /// only once, and approvals from non-authority nodes are ignored.
@@ -271,6 +286,48 @@ mod tests {
         assert_eq!(c.namespace().all_placement_policies().len(), 1);
         assert_eq!(c.namespace().all_authority_definitions().len(), 1);
         assert_eq!(*c.namespace().version(), PolicyVersion(3));
+    }
+
+    // --- propose_policy_removal ---
+
+    #[test]
+    fn propose_policy_removal_with_majority_succeeds() {
+        let mut c = three_node_consensus();
+        let approvals = [node_id("n1"), node_id("n2")];
+        c.propose_policy_update(make_policy("user/"), &approvals)
+            .unwrap();
+        assert!(c.namespace().get_placement_policy("user/").is_some());
+
+        let removed = c.propose_policy_removal("user/", &approvals).unwrap();
+        assert!(removed.is_some());
+        assert!(c.namespace().get_placement_policy("user/").is_none());
+    }
+
+    #[test]
+    fn propose_policy_removal_without_majority_fails() {
+        let mut c = three_node_consensus();
+        let approvals = [node_id("n1"), node_id("n2")];
+        c.propose_policy_update(make_policy("user/"), &approvals)
+            .unwrap();
+
+        let result = c.propose_policy_removal("user/", &[node_id("n1")]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CrdtError::PolicyDenied(msg) => {
+                assert!(msg.contains("insufficient approvals"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // Policy should still exist
+        assert!(c.namespace().get_placement_policy("user/").is_some());
+    }
+
+    #[test]
+    fn propose_policy_removal_nonexistent_returns_none() {
+        let mut c = three_node_consensus();
+        let approvals = [node_id("n1"), node_id("n2")];
+        let removed = c.propose_policy_removal("missing/", &approvals).unwrap();
+        assert!(removed.is_none());
     }
 
     #[test]
