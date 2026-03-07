@@ -28,8 +28,16 @@ impl WriteRateBucket {
     }
 
     /// Record `count` operations at the given timestamp (milliseconds).
+    ///
+    /// If the last entry has the same timestamp, the count is merged to avoid
+    /// unbounded growth when called per-operation (e.g. via `record_op_at`).
     fn record(&mut self, timestamp_ms: u64, count: u64, window_ms: u64) {
         self.evict_expired(timestamp_ms, window_ms);
+        if let Some((ts, existing)) = self.entries.back_mut().filter(|(ts, _)| *ts == timestamp_ms) {
+            *existing += count;
+            let _ = ts;
+            return;
+        }
         self.entries.push_back((timestamp_ms, count));
     }
 
