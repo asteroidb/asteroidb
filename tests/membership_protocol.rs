@@ -357,9 +357,9 @@ async fn ping_exchange_reconciles_peer_lists() {
         Arc::clone(&peer_registry),
     );
 
-    let ping_stats = membership.ping_all().await;
+    let ping_result = membership.ping_all().await;
     assert!(
-        ping_stats.discovered >= 1,
+        ping_result.discovered >= 1,
         "node-2 should discover at least node-3 via ping"
     );
 
