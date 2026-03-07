@@ -24,12 +24,20 @@ pub struct Dot {
 /// Elements are associated with the set of dots that added them.
 /// Removal only tombstones the currently observed dots, so a concurrent
 /// add (with a new dot) always wins.
+///
+/// A causal context (`deferred` set) tracks all dots that have been removed.
+/// During merge, dots present in the remote's deferred set are discarded,
+/// ensuring that a remove on one replica propagates correctly to others.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrSet<T: Eq + Hash> {
     /// Maps each element to the set of dots that justify its presence.
     elements: HashMap<T, HashSet<Dot>>,
     /// Per-node monotonic counters used to generate fresh dots.
     counters: HashMap<NodeId, u64>,
+    /// Causal context / tombstone set: all dots that have ever been removed.
+    /// Needed so merge can distinguish "this dot was removed" from "never seen".
+    #[serde(default)]
+    deferred: HashSet<Dot>,
 }
 
 impl<T> OrSet<T>
@@ -41,6 +49,7 @@ where
         Self {
             elements: HashMap::new(),
             counters: HashMap::new(),
+            deferred: HashSet::new(),
         }
     }
 
@@ -55,11 +64,18 @@ where
         self.elements.entry(element).or_default().insert(dot);
     }
 
-    /// Removes an element by discarding all of its currently observed dots.
+    /// Removes an element by moving all of its currently observed dots
+    /// into the causal context (deferred / tombstone set).
     ///
-    /// If the element is not present this is a no-op.
+    /// If the element is not present this is a no-op. After removal,
+    /// merging with a replica that still has those dots will NOT resurrect
+    /// the element, because the dots are in the deferred set.
     pub fn remove(&mut self, element: &T) {
-        self.elements.remove(element);
+        if let Some(dots) = self.elements.remove(element) {
+            for d in dots {
+                self.deferred.insert(d);
+            }
+        }
     }
 
     /// Returns `true` if the set currently contains the element.
@@ -94,18 +110,42 @@ where
 
     /// Merges another OR-Set into this one.
     ///
-    /// For each element the resulting dot-set is the union of both sides.
-    /// This gives add-wins semantics: if node A adds an element while node B
-    /// concurrently removes it, the add's fresh dot survives the merge.
+    /// For each element:
+    /// - Dots from the other side are added only if NOT in our deferred set.
+    /// - Dots on our side are removed if they ARE in the other's deferred set.
     ///
-    /// Node counters are also merged by taking the maximum.
+    /// This gives correct observed-remove semantics: a remove on one
+    /// replica propagates via its deferred set, while a concurrent add
+    /// (with a fresh dot not in anyone's deferred set) survives — giving
+    /// add-wins behaviour.
+    ///
+    /// Node counters are merged by taking the maximum.
+    /// Deferred (tombstone) sets are merged as a union.
     pub fn merge(&mut self, other: &OrSet<T>) {
+        // Process elements present in the other replica.
         for (elem, other_dots) in &other.elements {
             let dots = self.elements.entry(elem.clone()).or_default();
+
+            // Add dots from other that we haven't tombstoned.
             for dot in other_dots {
-                dots.insert(dot.clone());
+                if !self.deferred.contains(dot) {
+                    dots.insert(dot.clone());
+                }
+            }
+
+            // Remove our dots that the other has tombstoned.
+            dots.retain(|dot| !other.deferred.contains(dot));
+        }
+
+        // Apply other's tombstones to self-only elements (not in other.elements).
+        for (elem, dots) in &mut self.elements {
+            if !other.elements.contains_key(elem) {
+                dots.retain(|dot| !other.deferred.contains(dot));
             }
         }
+
+        // Remove entries with no remaining dots.
+        self.elements.retain(|_, dots| !dots.is_empty());
 
         // Merge counters so future dots stay globally unique.
         for (node_id, &other_counter) in &other.counters {
@@ -113,6 +153,11 @@ where
             if other_counter > *counter {
                 *counter = other_counter;
             }
+        }
+
+        // Merge deferred (tombstone) sets.
+        for dot in &other.deferred {
+            self.deferred.insert(dot.clone());
         }
     }
 }
@@ -362,5 +407,268 @@ mod tests {
         set.remove(&42);
         assert_eq!(set.len(), 1);
         assert!(!set.contains(&42));
+    }
+
+    // ---------------------------------------------------------------
+    // Remove propagation via causal context (#200)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn remove_propagates_across_replicas() {
+        // Both replicas share "x". B removes "x". After merging B into A,
+        // "x" should be gone — the bug before #200 was that A's dot for "x"
+        // survived because merge was a pure union.
+        let na = node("A");
+        let mut common = OrSet::new();
+        common.add("x".to_string(), &na);
+
+        let mut replica_a = common.clone();
+        let mut replica_b = common.clone();
+
+        // B removes "x".
+        replica_b.remove(&"x".to_string());
+        assert!(!replica_b.contains(&"x".to_string()));
+
+        // Merge B into A — A should now also be missing "x".
+        replica_a.merge(&replica_b);
+        assert!(
+            !replica_a.contains(&"x".to_string()),
+            "remove on B should propagate to A via merge"
+        );
+        assert!(replica_a.is_empty());
+    }
+
+    #[test]
+    fn remove_propagates_symmetrically() {
+        // Same test but merging in the other direction.
+        let na = node("A");
+        let mut common = OrSet::new();
+        common.add("x".to_string(), &na);
+
+        let mut replica_a = common.clone();
+        let mut replica_b = common.clone();
+
+        // A removes "x".
+        replica_a.remove(&"x".to_string());
+
+        // Merge A into B.
+        replica_b.merge(&replica_a);
+        assert!(
+            !replica_b.contains(&"x".to_string()),
+            "remove on A should propagate to B via merge"
+        );
+    }
+
+    #[test]
+    fn concurrent_add_and_remove_add_wins() {
+        // A adds "x" again (new dot) while B removes "x" (old dot).
+        // After merge, the new dot from A should survive — add-wins.
+        let na = node("A");
+
+        let mut common = OrSet::new();
+        common.add("x".to_string(), &na);
+
+        let mut replica_a = common.clone();
+        let mut replica_b = common.clone();
+
+        // A adds "x" again (fresh dot, counter=2).
+        replica_a.add("x".to_string(), &na);
+
+        // B removes "x" (only has the original dot with counter=1).
+        replica_b.remove(&"x".to_string());
+
+        // Merge B into A — A's new dot (counter=2) is NOT in B's deferred.
+        replica_a.merge(&replica_b);
+        assert!(
+            replica_a.contains(&"x".to_string()),
+            "add-wins: concurrent add should survive remove"
+        );
+
+        // Merge A into B — symmetric result.
+        replica_b.merge(&replica_a);
+        assert!(
+            replica_b.contains(&"x".to_string()),
+            "add-wins: symmetric merge should also preserve the element"
+        );
+    }
+
+    #[test]
+    fn both_replicas_remove_then_merge() {
+        // Both replicas remove the same element. After merge, the element
+        // should still be gone.
+        let na = node("A");
+        let mut common = OrSet::new();
+        common.add("x".to_string(), &na);
+
+        let mut replica_a = common.clone();
+        let mut replica_b = common.clone();
+
+        replica_a.remove(&"x".to_string());
+        replica_b.remove(&"x".to_string());
+
+        replica_a.merge(&replica_b);
+        assert!(!replica_a.contains(&"x".to_string()));
+
+        replica_b.merge(&replica_a);
+        assert!(!replica_b.contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn remove_propagates_only_for_correct_element() {
+        // Ensure removing "x" on B does not affect unrelated "y" on A.
+        let na = node("A");
+        let nb = node("B");
+
+        let mut replica_a = OrSet::new();
+        replica_a.add("x".to_string(), &na);
+        replica_a.add("y".to_string(), &na);
+
+        let mut replica_b = replica_a.clone();
+
+        // B removes only "x".
+        replica_b.remove(&"x".to_string());
+
+        replica_a.merge(&replica_b);
+        assert!(
+            !replica_a.contains(&"x".to_string()),
+            "removed element should be gone"
+        );
+        assert!(
+            replica_a.contains(&"y".to_string()),
+            "unrelated element should survive"
+        );
+        assert_eq!(replica_a.len(), 1);
+
+        // Also test: B adds something new that should survive.
+        replica_b.add("z".to_string(), &nb);
+        replica_a.merge(&replica_b);
+        assert!(replica_a.contains(&"z".to_string()));
+        assert_eq!(replica_a.len(), 2); // "y" and "z"
+    }
+
+    #[test]
+    fn multiple_add_remove_cycles_converge() {
+        // Simulate several add/remove cycles across two replicas.
+        let na = node("A");
+
+        let mut replica_a = OrSet::new();
+        let mut replica_b = OrSet::new();
+
+        // A adds "x".
+        replica_a.add("x".to_string(), &na);
+        // Sync.
+        replica_b.merge(&replica_a);
+        assert!(replica_b.contains(&"x".to_string()));
+
+        // B removes "x".
+        replica_b.remove(&"x".to_string());
+        // Sync.
+        replica_a.merge(&replica_b);
+        assert!(!replica_a.contains(&"x".to_string()));
+
+        // A adds "x" again (fresh dot).
+        replica_a.add("x".to_string(), &na);
+        // Sync.
+        replica_b.merge(&replica_a);
+        assert!(replica_b.contains(&"x".to_string()));
+
+        // B removes "x" again.
+        replica_b.remove(&"x".to_string());
+        // A concurrently adds "x" yet again.
+        replica_a.add("x".to_string(), &na);
+
+        // Cross-merge — A's newest add should win.
+        replica_a.merge(&replica_b);
+        replica_b.merge(&replica_a);
+
+        assert!(replica_a.contains(&"x".to_string()));
+        assert!(replica_b.contains(&"x".to_string()));
+        assert_eq!(replica_a.elements(), replica_b.elements());
+    }
+
+    #[test]
+    fn three_replica_convergence() {
+        let na = node("A");
+        let nb = node("B");
+        let nc = node("C");
+
+        let mut r1 = OrSet::new();
+        let mut r2 = OrSet::new();
+        let mut r3 = OrSet::new();
+
+        // Everyone adds something.
+        r1.add("x".to_string(), &na);
+        r2.add("y".to_string(), &nb);
+        r3.add("z".to_string(), &nc);
+
+        // Full exchange round.
+        let snap1 = r1.clone();
+        let snap2 = r2.clone();
+        let snap3 = r3.clone();
+        r1.merge(&snap2);
+        r1.merge(&snap3);
+        r2.merge(&snap1);
+        r2.merge(&snap3);
+        r3.merge(&snap1);
+        r3.merge(&snap2);
+
+        assert_eq!(r1.len(), 3);
+        assert_eq!(r1.elements(), r2.elements());
+        assert_eq!(r2.elements(), r3.elements());
+
+        // R2 removes "x".
+        r2.remove(&"x".to_string());
+
+        // Full exchange again.
+        let snap1 = r1.clone();
+        let snap2 = r2.clone();
+        let snap3 = r3.clone();
+        r1.merge(&snap2);
+        r1.merge(&snap3);
+        r2.merge(&snap1);
+        r2.merge(&snap3);
+        r3.merge(&snap1);
+        r3.merge(&snap2);
+
+        // All replicas should agree: "x" is gone, "y" and "z" remain.
+        for r in [&r1, &r2, &r3] {
+            assert!(!r.contains(&"x".to_string()), "x should be removed");
+            assert!(r.contains(&"y".to_string()), "y should survive");
+            assert!(r.contains(&"z".to_string()), "z should survive");
+            assert_eq!(r.len(), 2);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Serde round-trip with deferred (#200)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn serde_round_trip_with_deferred() {
+        let na = node("A");
+        let mut set = OrSet::new();
+        set.add("hello".to_string(), &na);
+        set.add("world".to_string(), &na);
+        set.remove(&"hello".to_string());
+
+        let json = serde_json::to_string(&set).unwrap();
+        let restored: OrSet<String> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.len(), 1);
+        assert!(!restored.contains(&"hello".to_string()));
+        assert!(restored.contains(&"world".to_string()));
+
+        // The deferred set should have been preserved.
+        assert!(!restored.deferred.is_empty());
+    }
+
+    #[test]
+    fn serde_backward_compat_missing_deferred() {
+        // Old serialized format without "deferred" field should still
+        // deserialize thanks to #[serde(default)].
+        let json = r#"{"elements":{"a":[{"node_id":"A","counter":1}]},"counters":{"A":1}}"#;
+        let set: OrSet<String> = serde_json::from_str(json).unwrap();
+        assert!(set.contains(&"a".to_string()));
+        assert!(set.deferred.is_empty());
     }
 }
