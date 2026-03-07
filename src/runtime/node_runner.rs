@@ -8,6 +8,8 @@ use tokio::sync::{Mutex, watch};
 
 use crate::api::certified::CertifiedApi;
 use crate::api::eventual::EventualApi;
+use crate::authority::bls::BlsKeypair;
+use crate::authority::certificate::{EpochConfig, EpochManager};
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
@@ -22,6 +24,17 @@ use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
 };
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+
+/// Configuration for BLS key generation in [`NodeRunner`].
+///
+/// When present, the node generates a BLS keypair and registers its public
+/// key in the `EpochManager`'s keyset registry. Nodes without this config
+/// continue using Ed25519 signatures only (backward compat).
+#[derive(Debug, Clone)]
+pub struct BlsConfig {
+    /// 32-byte seed (IKM) for BLS key generation.
+    pub seed: [u8; 32],
+}
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
 #[derive(Debug, Clone)]
@@ -42,6 +55,16 @@ pub struct NodeRunnerConfig {
     /// Set to `None` to disable periodic ping.
     /// Default: 10 seconds.
     pub ping_interval: Option<Duration>,
+    /// How often to check for epoch boundaries and perform key rotation.
+    /// Default: 60 seconds.
+    pub epoch_check_interval: Duration,
+    /// Epoch configuration for key rotation (FR-008).
+    /// Default: 24h epoch duration, 7 grace epochs.
+    pub epoch_config: EpochConfig,
+    /// Optional BLS key configuration. When `Some`, the node generates a BLS
+    /// keypair and registers it in the keyset registry, enabling BLS
+    /// certificate mode. When `None`, only Ed25519 certificates are used.
+    pub bls_config: Option<BlsConfig>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -53,6 +76,9 @@ impl Default for NodeRunnerConfig {
             frontier_report_interval: Duration::from_secs(1),
             sync_interval: Some(Duration::from_secs(2)),
             ping_interval: Some(Duration::from_secs(10)),
+            epoch_check_interval: Duration::from_secs(60),
+            epoch_config: EpochConfig::default(),
+            bls_config: None,
         }
     }
 }
@@ -122,6 +148,18 @@ pub struct NodeRunner {
     /// When a policy version change is detected, the old policy is needed
     /// to compute which nodes are new/removed targets.
     tracked_policies: HashMap<String, PlacementPolicy>,
+    /// Epoch manager for key rotation lifecycle (FR-008).
+    ///
+    /// Tracks epoch boundaries and manages keyset rotation. The runner
+    /// periodically calls `check_and_rotate()` to detect epoch transitions
+    /// and perform automatic key rotation when staged keys are available.
+    epoch_manager: EpochManager,
+    /// Optional BLS keypair for this node.
+    ///
+    /// Generated from `BlsConfig::seed` when BLS is configured. Used to
+    /// produce BLS signatures and enable `DualModeCertificate` with
+    /// `CertificateMode::Bls` instead of Ed25519-only certificates.
+    bls_keypair: Option<BlsKeypair>,
 }
 
 /// State for an in-progress rebalance operation.
@@ -150,9 +188,37 @@ pub struct RunLoopStats {
     pub sync_ticks: u64,
     /// Number of membership ping ticks executed.
     pub ping_ticks: u64,
+    /// Number of epoch check ticks executed.
+    pub epoch_check_ticks: u64,
 }
 
 impl NodeRunner {
+    /// Initialize epoch manager and optional BLS keypair from config.
+    ///
+    /// Uses the current wall-clock time as the epoch base so that epoch 0
+    /// starts at the time the node is created.
+    fn init_epoch_and_bls(
+        config: &NodeRunnerConfig,
+        node_id: &NodeId,
+    ) -> (EpochManager, Option<BlsKeypair>) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let epoch_manager = EpochManager::new(config.epoch_config.clone(), now_secs);
+
+        let bls_keypair = config.bls_config.as_ref().map(|bls_cfg| {
+            let kp = BlsKeypair::generate(&bls_cfg.seed);
+            tracing::info!(
+                node_id = %node_id.0,
+                "BLS keypair generated for node"
+            );
+            kp
+        });
+
+        (epoch_manager, bls_keypair)
+    }
+
     /// Create a new `NodeRunner` without anti-entropy sync.
     ///
     /// Automatically discovers whether this node is an authority and
@@ -202,6 +268,7 @@ impl NodeRunner {
         } else {
             None
         };
+        let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -225,6 +292,8 @@ impl NodeRunner {
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
             tracked_policies,
+            epoch_manager,
+            bls_keypair,
         }
     }
 
@@ -256,6 +325,7 @@ impl NodeRunner {
             None
         };
 
+        let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -278,6 +348,8 @@ impl NodeRunner {
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
             tracked_policies,
+            epoch_manager,
+            bls_keypair,
         }
     }
 
@@ -363,6 +435,46 @@ impl NodeRunner {
     /// Return a shared reference to the cluster node list.
     pub fn cluster_nodes(&self) -> &Arc<std::sync::RwLock<Vec<Node>>> {
         &self.cluster_nodes
+    }
+
+    /// Return a reference to the epoch manager.
+    pub fn epoch_manager(&self) -> &EpochManager {
+        &self.epoch_manager
+    }
+
+    /// Return a mutable reference to the epoch manager.
+    pub fn epoch_manager_mut(&mut self) -> &mut EpochManager {
+        &mut self.epoch_manager
+    }
+
+    /// Return whether this node has BLS keys configured.
+    pub fn has_bls_keys(&self) -> bool {
+        self.bls_keypair.is_some()
+    }
+
+    /// Return a reference to the BLS keypair, if configured.
+    pub fn bls_keypair(&self) -> Option<&BlsKeypair> {
+        self.bls_keypair.as_ref()
+    }
+
+    /// Return the current certificate mode based on BLS availability.
+    ///
+    /// Returns `CertificateMode::Bls` when BLS keys are configured and
+    /// registered in the keyset registry, otherwise `CertificateMode::Ed25519`.
+    pub fn certificate_mode(&self) -> crate::authority::certificate::CertificateMode {
+        use crate::authority::certificate::CertificateMode;
+        if self.bls_keypair.is_some() {
+            let version = self.epoch_manager.registry().current_version();
+            if self
+                .epoch_manager
+                .registry()
+                .get_bls_key(&version, &self.node_id.0)
+                .is_some()
+            {
+                return CertificateMode::Bls;
+            }
+        }
+        CertificateMode::Ed25519
     }
 
     /// Snapshot the current policy version for each placement policy
@@ -762,7 +874,7 @@ impl NodeRunner {
 
     /// Run the node event loop until shutdown is signalled.
     ///
-    /// This drives four periodic tasks using `tokio::time::interval`:
+    /// This drives periodic background tasks using `tokio::time::interval`:
     /// 1. **Certification processing** -- calls `process_certifications()` on the
     ///    `CertifiedApi` to promote pending writes whose frontiers have advanced.
     /// 2. **Cleanup** -- calls `cleanup()` to expire old pending writes and
@@ -773,6 +885,8 @@ impl NodeRunner {
     ///    frontier updates from the current HLC time and applies them locally.
     ///    This drives the automatic frontier pipeline so callers never need
     ///    to call `update_frontier` manually.
+    /// 5. **Epoch check** -- checks for epoch boundary crossings and performs
+    ///    key rotation when staged keys are available (FR-008).
     ///
     /// Returns [`RunLoopStats`] with tick counters after shutdown completes.
     pub async fn run(&mut self) -> RunLoopStats {
@@ -795,6 +909,10 @@ impl NodeRunner {
         let mut frontier_interval = tokio::time::interval_at(
             start + self.config.frontier_report_interval,
             self.config.frontier_report_interval,
+        );
+        let mut epoch_interval = tokio::time::interval_at(
+            start + self.config.epoch_check_interval,
+            self.config.epoch_check_interval,
         );
 
         // Sync interval: only create if sync is configured.
@@ -841,6 +959,10 @@ impl NodeRunner {
                 _ = frontier_interval.tick(), if self.frontier_reporter.is_some() => {
                     self.report_frontiers().await;
                     stats.frontier_report_ticks += 1;
+                }
+                _ = epoch_interval.tick() => {
+                    self.check_epoch_rotation();
+                    stats.epoch_check_ticks += 1;
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
@@ -940,6 +1062,28 @@ impl NodeRunner {
         let now_ms = self.clock.now().physical;
         let mut api = self.certified_api.lock().await;
         api.cleanup(now_ms);
+    }
+
+    /// Check for epoch boundary crossings and perform key rotation.
+    ///
+    /// Calls `EpochManager::check_and_rotate()` with the current wall-clock
+    /// time. If a rotation event occurs, logs the transition. This enables
+    /// automatic keyset rotation at epoch boundaries per FR-008.
+    fn check_epoch_rotation(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if let Some(event) = self.epoch_manager.check_and_rotate(now_ms) {
+            tracing::info!(
+                node_id = %self.node_id.0,
+                new_version = event.new_version.0,
+                epoch = event.epoch,
+                cleaned = event.cleaned_versions.len(),
+                "epoch rotation completed"
+            );
+        }
     }
 
     /// Generate and apply frontier reports for this authority node.
@@ -1406,6 +1550,7 @@ mod tests {
             frontier_report_interval: Duration::from_millis(100),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner =
@@ -1455,6 +1600,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1507,6 +1653,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1562,6 +1709,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner =
@@ -1651,6 +1799,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner =
@@ -1719,6 +1868,7 @@ mod tests {
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1777,6 +1927,7 @@ mod tests {
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1841,6 +1992,7 @@ mod tests {
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1905,6 +2057,7 @@ mod tests {
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::new(
@@ -1973,6 +2126,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -2073,6 +2227,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -2175,6 +2330,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -2252,6 +2408,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         // First run: let it pick up the initial policy.
@@ -2321,6 +2478,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         // First run to establish baseline.
@@ -2414,6 +2572,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         // Create an EventualApi with some keys in the data/ prefix.
@@ -2540,6 +2699,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));

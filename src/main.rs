@@ -13,7 +13,7 @@ use asteroidb_poc::network::membership::MembershipClient;
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{NodeConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
-use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
+use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
 
 #[tokio::main]
@@ -163,6 +163,24 @@ async fn main() {
 
     let app = router(state);
 
+    // Parse optional BLS key seed from environment variable.
+    // When set, the node generates a BLS keypair and enables BLS certificate mode.
+    let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
+        let bytes: Vec<u8> = (0..hex_seed.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(hex_seed.get(i..i + 2).unwrap_or(""), 16).ok())
+            .collect();
+        let mut seed = [0u8; 32];
+        let len = bytes.len().min(32);
+        seed[..len].copy_from_slice(&bytes[..len]);
+        BlsConfig { seed }
+    });
+
+    let runner_config = NodeRunnerConfig {
+        bls_config,
+        ..NodeRunnerConfig::default()
+    };
+
     // NodeRunner uses the same CertifiedApi and EventualApi instances
     // for background processing, ensuring sync sees HTTP writes.
     // Always create a SyncClient so that peers added dynamically via
@@ -194,7 +212,7 @@ async fn main() {
         node_id.clone(),
         Arc::clone(&certified_api),
         engine,
-        NodeRunnerConfig::default(),
+        runner_config,
         sync_client,
         Arc::clone(&eventual_api),
         Arc::clone(&metrics),
