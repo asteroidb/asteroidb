@@ -148,6 +148,8 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     })
 }
 
@@ -1168,6 +1170,8 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     // Write data to the legacy peer.

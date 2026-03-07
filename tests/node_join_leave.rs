@@ -58,20 +58,27 @@ async fn spawn_node_with_peers(
         PeerRegistry::new(nid.clone(), initial_peers).expect("valid peer list"),
     ));
 
+    // Bind first so we know the address before constructing AppState.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
     let state = Arc::new(AppState {
         eventual: Arc::new(Mutex::new(EventualApi::new(nid.clone()))),
-        certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            nid.clone(),
+            Arc::clone(&namespace),
+        ))),
         namespace,
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: Some(peer_registry),
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: Some(nid),
+        self_addr: Some(addr.to_string()),
     });
 
     let app = router(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -230,6 +237,12 @@ async fn node_join_receives_peers_and_converges() {
         "peer list should contain the joining node: {:?}",
         peer_ids
     );
+    // The seed node (node-1) must also be present in the peer list (#163).
+    assert!(
+        peer_ids.contains(&"node-1"),
+        "peer list should contain the seed node (node-1): {:?}",
+        peer_ids
+    );
 
     // Verify the namespace snapshot is present and not null.
     assert!(
@@ -309,6 +322,12 @@ async fn node_leave_removes_from_registry() {
     assert!(
         has_node2,
         "peer list should contain leave-node-2 after join"
+    );
+    // Seed node must also be present (#163).
+    let has_seed = join_resp.peers.iter().any(|p| p.node_id == "leave-node-1");
+    assert!(
+        has_seed,
+        "peer list should contain the seed node (leave-node-1) after join"
     );
 
     // --- Node-2 leaves node-1 ---

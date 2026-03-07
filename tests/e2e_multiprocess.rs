@@ -62,6 +62,8 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     let app = router(state.clone());

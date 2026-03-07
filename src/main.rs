@@ -142,6 +142,8 @@ async fn main() {
         peer_persist_path: Some(peer_persist_path),
         consensus,
         internal_token: internal_token.clone(),
+        self_node_id: Some(node_id.clone()),
+        self_addr: Some(bind_addr.clone()),
     });
 
     let app = router(state);
