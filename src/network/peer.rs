@@ -215,6 +215,16 @@ pub struct NodeConfig {
     pub node: Node,
     /// Socket address this node listens on.
     pub bind_addr: SocketAddr,
+    /// Optional routable address advertised to peers.
+    ///
+    /// When a node binds to a wildcard address like `0.0.0.0:3000`, peer
+    /// nodes cannot route traffic back using that address. Set this field
+    /// to the externally reachable `host:port` (e.g., a container name or
+    /// public IP) so that the join protocol advertises a usable address.
+    ///
+    /// If `None`, `bind_addr` is used as the advertise address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_addr: Option<String>,
     /// Registry of known remote peers.
     pub peers: PeerRegistry,
 }
@@ -287,6 +297,7 @@ pub fn generate_cluster_configs(count: usize, base_port: u16) -> Vec<NodeConfig>
             NodeConfig {
                 node: Node::new(self_id.clone(), NodeMode::Both),
                 bind_addr: *bind_addr,
+                advertise_addr: None,
                 peers: registry,
             }
         })
@@ -427,6 +438,7 @@ mod tests {
         let config = NodeConfig {
             node: Node::new(nid("node-1"), NodeMode::Store),
             bind_addr: "127.0.0.1:8000".parse().unwrap(),
+            advertise_addr: None,
             peers: reg,
         };
 

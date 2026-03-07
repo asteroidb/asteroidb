@@ -18,28 +18,37 @@ use asteroidb_poc::types::{KeyRange, NodeId};
 #[tokio::main]
 async fn main() {
     // Load configuration: either from a config file or from individual env vars.
-    let (node_id, bind_addr, config_peer_registry) = match std::env::var("ASTEROIDB_CONFIG") {
-        Ok(config_path) => match NodeConfig::load(&config_path) {
-            Ok(config) => {
-                let node_id = config.node.id;
-                let bind_addr = config.bind_addr.to_string();
-                let peer_registry = config.peers;
-                (node_id, bind_addr, Some(peer_registry))
+    let (node_id, bind_addr, advertise_addr, config_peer_registry) =
+        match std::env::var("ASTEROIDB_CONFIG") {
+            Ok(config_path) => match NodeConfig::load(&config_path) {
+                Ok(config) => {
+                    let node_id = config.node.id;
+                    let bind_addr = config.bind_addr.to_string();
+                    // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then config field, then bind_addr.
+                    let advertise_addr = std::env::var("ASTEROIDB_ADVERTISE_ADDR")
+                        .ok()
+                        .or(config.advertise_addr)
+                        .unwrap_or_else(|| bind_addr.clone());
+                    let peer_registry = config.peers;
+                    (node_id, bind_addr, advertise_addr, Some(peer_registry))
+                }
+                Err(e) => {
+                    eprintln!("error: failed to load config file '{config_path}': {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => {
+                let bind_addr = std::env::var("ASTEROIDB_BIND_ADDR")
+                    .unwrap_or_else(|_| "127.0.0.1:3000".into());
+                let node_id_str =
+                    std::env::var("ASTEROIDB_NODE_ID").unwrap_or_else(|_| "node-1".into());
+                let node_id = NodeId(node_id_str);
+                // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then fall back to bind_addr.
+                let advertise_addr =
+                    std::env::var("ASTEROIDB_ADVERTISE_ADDR").unwrap_or_else(|_| bind_addr.clone());
+                (node_id, bind_addr, advertise_addr, None)
             }
-            Err(e) => {
-                eprintln!("error: failed to load config file '{config_path}': {e}");
-                std::process::exit(1);
-            }
-        },
-        Err(_) => {
-            let bind_addr =
-                std::env::var("ASTEROIDB_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
-            let node_id_str =
-                std::env::var("ASTEROIDB_NODE_ID").unwrap_or_else(|_| "node-1".into());
-            let node_id = NodeId(node_id_str);
-            (node_id, bind_addr, None)
-        }
-    };
+        };
 
     println!("AsteroidDB starting... (node_id={})", node_id.0);
 
@@ -143,7 +152,7 @@ async fn main() {
         consensus,
         internal_token: internal_token.clone(),
         self_node_id: Some(node_id.clone()),
-        self_addr: Some(bind_addr.clone()),
+        self_addr: Some(advertise_addr.clone()),
     });
 
     let app = router(state);
@@ -189,6 +198,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind to {bind_addr}: {e}"));
 
     println!("HTTP server listening on {bind_addr}");
+    if advertise_addr != bind_addr {
+        println!("Advertise address: {advertise_addr}");
+    }
     println!("Node run loop started. Press Ctrl-C to stop.");
 
     tokio::select! {
