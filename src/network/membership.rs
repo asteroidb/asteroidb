@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
@@ -17,15 +17,26 @@ use crate::types::NodeId;
 /// Number of consecutive ping failures before a peer is automatically evicted.
 const MAX_PING_FAILURES: u32 = 3;
 
-/// Statistics returned from a [`MembershipClient::ping_all`] round.
+/// Per-peer RTT measurement from a successful ping round.
+#[derive(Debug, Clone)]
+pub struct PeerRtt {
+    /// The node ID of the peer.
+    pub node_id: NodeId,
+    /// Measured round-trip time.
+    pub rtt: Duration,
+}
+
+/// Result of a `ping_all` round.
 #[derive(Debug, Clone, Default)]
-pub struct PingStats {
+pub struct PingAllResult {
     /// Number of new peers discovered during this ping round.
     pub discovered: usize,
     /// Number of peers that responded successfully.
     pub successes: usize,
     /// Number of peers that failed to respond.
     pub failures: usize,
+    /// Per-peer RTT measurements for successful pings.
+    pub peer_rtts: Vec<PeerRtt>,
 }
 
 /// Client for the membership protocol.
@@ -173,8 +184,9 @@ impl MembershipClient {
     /// Peers that fail to respond for [`MAX_PING_FAILURES`] consecutive
     /// rounds are automatically evicted from the registry.
     ///
-    /// Returns [`PingStats`] with discovered peers and per-peer success/failure counts.
-    pub async fn ping_all(&mut self) -> PingStats {
+    /// Returns a [`PingAllResult`] containing discovered peers,
+    /// per-peer success/failure counts, and RTT measurements for successful pings.
+    pub async fn ping_all(&mut self) -> PingAllResult {
         let my_peers = {
             let registry = self.peer_registry.lock().await;
             let mut list: Vec<PeerInfo> = registry
@@ -203,15 +215,18 @@ impl MembershipClient {
         };
 
         let peers = self.peer_registry.lock().await.all_peers_owned();
-        let mut stats = PingStats::default();
+        let mut stats = PingAllResult::default();
+        let mut peer_rtts: Vec<PeerRtt> = Vec::new();
 
         for peer in &peers {
             let url = format!("http://{}/api/internal/ping", peer.addr);
             let peer_key = peer.node_id.0.clone();
+            let ping_start = Instant::now();
 
             match self.authorized_post(&url).json(&request).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
+                        let rtt = ping_start.elapsed();
                         // Reset failure count on successful response.
                         self.failed_ping_counts.remove(&peer_key);
                         stats.successes += 1;
@@ -219,6 +234,10 @@ impl MembershipClient {
                             let discovered = self.reconcile_peers(&ping_resp.known_peers).await;
                             stats.discovered += discovered;
                         }
+                        peer_rtts.push(PeerRtt {
+                            node_id: peer.node_id.clone(),
+                            rtt,
+                        });
                     } else {
                         tracing::warn!(
                             peer = %peer.node_id.0,
@@ -278,6 +297,7 @@ impl MembershipClient {
             }
         }
 
+        stats.peer_rtts = peer_rtts;
         stats
     }
 
@@ -356,10 +376,11 @@ mod tests {
         ));
         let mut client =
             MembershipClient::new(nid("node-1"), "127.0.0.1:3000".to_string(), registry);
-        let stats = client.ping_all().await;
-        assert_eq!(stats.discovered, 0);
-        assert_eq!(stats.successes, 0);
-        assert_eq!(stats.failures, 0);
+        let result = client.ping_all().await;
+        assert_eq!(result.discovered, 0);
+        assert_eq!(result.successes, 0);
+        assert_eq!(result.failures, 0);
+        assert!(result.peer_rtts.is_empty());
     }
 
     #[tokio::test]

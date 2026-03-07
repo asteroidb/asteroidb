@@ -20,9 +20,11 @@ use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::ops::slo::{SLO_AUTHORITY_AVAILABILITY, SLO_REPLICATION_CONVERGENCE, SloTracker};
 use crate::placement::PlacementPolicy;
+use crate::placement::latency::LatencyModel;
 use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
 };
+use crate::placement::topology::TopologyView;
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// Configuration for BLS key generation in [`NodeRunner`].
@@ -160,6 +162,16 @@ pub struct NodeRunner {
     /// produce BLS signatures and enable `DualModeCertificate` with
     /// `CertificateMode::Bls` instead of Ed25519-only certificates.
     bls_keypair: Option<BlsKeypair>,
+    /// Shared latency model for recording RTT measurements to peers.
+    ///
+    /// Updated after every successful sync or ping interaction. The same
+    /// `Arc` is shared with `AppState` so that placement policies and the
+    /// `/api/topology` endpoint have access to live latency data.
+    latency_model: Option<Arc<std::sync::RwLock<LatencyModel>>>,
+    /// Shared topology view rebuilt periodically from cluster nodes and
+    /// latency data. The same `Arc` is shared with `AppState` so the
+    /// `/api/topology` endpoint returns current data.
+    topology_view: Option<Arc<std::sync::RwLock<TopologyView>>>,
 }
 
 /// State for an in-progress rebalance operation.
@@ -294,6 +306,8 @@ impl NodeRunner {
             tracked_policies,
             epoch_manager,
             bls_keypair,
+            latency_model: None,
+            topology_view: None,
         }
     }
 
@@ -350,6 +364,8 @@ impl NodeRunner {
             tracked_policies,
             epoch_manager,
             bls_keypair,
+            latency_model: None,
+            topology_view: None,
         }
     }
 
@@ -386,6 +402,27 @@ impl NodeRunner {
     /// construction when the token is not known at `NodeRunner` creation time.
     pub fn set_sync_client(&mut self, client: SyncClient) {
         self.sync_client = Some(client);
+    }
+
+    /// Set the shared latency model for recording peer RTT measurements.
+    ///
+    /// The same `Arc` should be shared with `AppState` so that placement
+    /// policies and the `/api/topology` endpoint see live latency data.
+    pub fn set_latency_model(&mut self, model: Arc<std::sync::RwLock<LatencyModel>>) {
+        self.latency_model = Some(model);
+    }
+
+    /// Set the shared topology view.
+    ///
+    /// The same `Arc` should be shared with `AppState` so that the
+    /// `/api/topology` endpoint returns current data.
+    pub fn set_topology_view(&mut self, view: Arc<std::sync::RwLock<TopologyView>>) {
+        self.topology_view = Some(view);
+    }
+
+    /// Return a reference to the shared latency model, if configured.
+    pub fn latency_model(&self) -> Option<&Arc<std::sync::RwLock<LatencyModel>>> {
+        self.latency_model.as_ref()
     }
 
     /// Inject a peer frontier for testing purposes.
@@ -475,6 +512,35 @@ impl NodeRunner {
             }
         }
         CertificateMode::Ed25519
+    }
+
+    /// Record an RTT measurement from this node to a peer.
+    ///
+    /// No-op if `latency_model` is not configured.
+    fn record_peer_rtt(&self, peer_id: &NodeId, rtt: Duration) {
+        if let Some(ref model) = self.latency_model {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let rtt_ms = rtt.as_secs_f64() * 1000.0;
+            let mut m = model.write().unwrap();
+            m.update_latency(&self.node_id, peer_id, rtt_ms, now_ms);
+        }
+    }
+
+    /// Rebuild the shared topology view from the current cluster nodes
+    /// and latency model.
+    ///
+    /// No-op if `topology_view` or `latency_model` is not configured.
+    fn rebuild_topology(&self) {
+        let (Some(topo_arc), Some(model_arc)) = (&self.topology_view, &self.latency_model) else {
+            return;
+        };
+        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+        let model = model_arc.read().unwrap();
+        let new_view = TopologyView::build(&nodes, &model);
+        *topo_arc.write().unwrap() = new_view;
     }
 
     /// Snapshot the current policy version for each placement policy
@@ -870,6 +936,9 @@ impl NodeRunner {
                 self.frontier_reporter = None;
             }
         }
+
+        // Rebuild topology view to reflect the new membership.
+        self.rebuild_topology();
     }
 
     /// Run the node event loop until shutdown is signalled.
@@ -1280,8 +1349,9 @@ impl NodeRunner {
                     }
 
                     any_success = true;
-                    self.metrics
-                        .record_peer_sync_success(peer_id, peer_start.elapsed());
+                    let elapsed = peer_start.elapsed();
+                    self.record_peer_rtt(&peer.node_id, elapsed);
+                    self.metrics.record_peer_sync_success(peer_id, elapsed);
                     self.peer_backoffs
                         .entry(peer_key.clone())
                         .or_default()
@@ -1289,6 +1359,7 @@ impl NodeRunner {
                     tracing::debug!(
                         peer = %peer.node_id.0,
                         delta_entries = delta_resp.entries.len(),
+                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
                         "delta sync pull succeeded"
                     );
                     continue;
@@ -1315,14 +1386,16 @@ impl NodeRunner {
                     }
 
                     any_success = true;
-                    self.metrics
-                        .record_peer_sync_success(peer_id, peer_start.elapsed());
+                    let elapsed = peer_start.elapsed();
+                    self.record_peer_rtt(&peer.node_id, elapsed);
+                    self.metrics.record_peer_sync_success(peer_id, elapsed);
                     self.peer_backoffs
                         .entry(peer_key.clone())
                         .or_default()
                         .record_success();
                     tracing::debug!(
                         peer = %peer.node_id.0,
+                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
                         "delta sync retry succeeded"
                     );
                     continue;
@@ -1361,14 +1434,16 @@ impl NodeRunner {
                 // sync cycle will fall back to full sync again, which is safe.
 
                 any_success = true;
-                self.metrics
-                    .record_peer_sync_success(peer_id, peer_start.elapsed());
+                let elapsed = peer_start.elapsed();
+                self.record_peer_rtt(&peer.node_id, elapsed);
+                self.metrics.record_peer_sync_success(peer_id, elapsed);
                 self.peer_backoffs
                     .entry(peer_key)
                     .or_default()
                     .record_success();
                 tracing::debug!(
                     peer = %peer.node_id.0,
+                    rtt_ms = elapsed.as_secs_f64() * 1000.0,
                     "full sync fallback succeeded"
                 );
             } else {
@@ -1396,6 +1471,11 @@ impl NodeRunner {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
+        // Rebuild topology view with fresh latency data.
+        if any_success {
+            self.rebuild_topology();
+        }
+
         tracing::debug!(
             node = %self.node_id.0,
             "anti-entropy sync cycle completed (delta-based)"
@@ -1405,24 +1485,40 @@ impl NodeRunner {
     /// Run one cycle of peer list exchange (membership gossip).
     async fn run_ping(&mut self) {
         if let Some(membership_client) = &mut self.membership_client {
-            let stats = membership_client.ping_all().await;
+            let result = membership_client.ping_all().await;
 
             // Record authority availability SLO: 1.0 per successful ping,
             // 0.0 per failed ping.
             if let Some(slo) = &self.slo_tracker {
-                for _ in 0..stats.successes {
+                for _ in 0..result.successes {
                     slo.record_observation(SLO_AUTHORITY_AVAILABILITY, 100.0);
                 }
-                for _ in 0..stats.failures {
+                for _ in 0..result.failures {
                     slo.record_observation(SLO_AUTHORITY_AVAILABILITY, 0.0);
                 }
             }
 
-            if stats.discovered > 0 {
+            // Record per-peer RTT measurements from successful pings.
+            for rtt_entry in &result.peer_rtts {
+                self.record_peer_rtt(&rtt_entry.node_id, rtt_entry.rtt);
+            }
+
+            if result.discovered > 0 {
                 tracing::info!(
                     node = %self.node_id.0,
-                    discovered = stats.discovered,
+                    discovered = result.discovered,
+                    ping_rtts = result.peer_rtts.len(),
                     "peer list exchange discovered new peers"
+                );
+                // Membership changed — rebuild topology.
+                self.rebuild_topology();
+            } else if !result.peer_rtts.is_empty() {
+                // Latency data updated — rebuild topology.
+                self.rebuild_topology();
+                tracing::debug!(
+                    node = %self.node_id.0,
+                    ping_rtts = result.peer_rtts.len(),
+                    "peer list exchange completed, no new peers"
                 );
             } else {
                 tracing::debug!(
@@ -2767,6 +2863,7 @@ mod tests {
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
             ping_interval: None,
+            ..NodeRunnerConfig::default()
         };
 
         let slo_tracker = Arc::new(SloTracker::new());

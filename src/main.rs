@@ -144,6 +144,21 @@ async fn main() {
     // SLO tracker shared between HTTP handlers and NodeRunner.
     let slo_tracker = Arc::new(asteroidb_poc::ops::slo::SloTracker::new());
 
+    // Shared latency model and topology view for placement policies and the
+    // /api/topology endpoint. The same Arc instances are shared between
+    // AppState (read by HTTP handlers) and NodeRunner (updated by sync/ping).
+    let shared_latency_model = Arc::new(std::sync::RwLock::new(
+        asteroidb_poc::placement::latency::LatencyModel::new(),
+    ));
+    let shared_cluster_nodes: Arc<std::sync::RwLock<Vec<asteroidb_poc::node::Node>>> =
+        Arc::new(std::sync::RwLock::new(Vec::new()));
+    let shared_topology_view = Arc::new(std::sync::RwLock::new(
+        asteroidb_poc::placement::topology::TopologyView::build(
+            &[],
+            &asteroidb_poc::placement::latency::LatencyModel::new(),
+        ),
+    ));
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -156,8 +171,8 @@ async fn main() {
         internal_token: internal_token.clone(),
         self_node_id: Some(node_id.clone()),
         self_addr: Some(advertise_addr.clone()),
-        latency_model: None,
-        cluster_nodes: None,
+        latency_model: Some(Arc::clone(&shared_latency_model)),
+        cluster_nodes: Some(Arc::clone(&shared_cluster_nodes)),
         slo_tracker: Arc::clone(&slo_tracker),
     });
 
@@ -236,6 +251,8 @@ async fn main() {
     };
     runner.set_membership_client(runner_membership_client);
     runner.set_slo_tracker(slo_tracker);
+    runner.set_latency_model(Arc::clone(&shared_latency_model));
+    runner.set_topology_view(Arc::clone(&shared_topology_view));
 
     let shutdown_handle = runner.shutdown_handle();
 
