@@ -91,6 +91,7 @@ fn fast_config() -> NodeRunnerConfig {
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     }
 }
 
@@ -307,6 +308,7 @@ async fn timeout_auto_detection() {
         frontier_report_interval: Duration::from_secs(60),
         sync_interval: None,
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     };
 
     let mut runner = NodeRunner::new(

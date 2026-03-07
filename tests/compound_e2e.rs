@@ -100,6 +100,7 @@ fn fast_config() -> NodeRunnerConfig {
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     }
 }
 
@@ -1238,6 +1239,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: Some(Duration::from_millis(20)),
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     };
 
     let metrics = Arc::new(RuntimeMetrics::default());

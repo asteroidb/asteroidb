@@ -312,6 +312,7 @@ async fn node_runner_auto_detects_version_changes() {
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     };
 
     let mut runner =

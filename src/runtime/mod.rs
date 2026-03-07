@@ -1,3 +1,3 @@
 mod node_runner;
 
-pub use node_runner::{NodeRunner, NodeRunnerConfig, RunLoopStats};
+pub use node_runner::{BlsConfig, NodeRunner, NodeRunnerConfig, RunLoopStats};

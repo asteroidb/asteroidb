@@ -77,6 +77,7 @@ fn fast_config() -> NodeRunnerConfig {
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
         ping_interval: None,
+        ..NodeRunnerConfig::default()
     }
 }
 
