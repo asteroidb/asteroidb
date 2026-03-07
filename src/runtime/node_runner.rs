@@ -12,7 +12,7 @@ use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::hlc::{Hlc, HlcTimestamp};
-use crate::network::sync::SyncClient;
+use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
@@ -82,6 +82,9 @@ pub struct NodeRunner {
     /// Per-peer last known frontier for delta sync.
     /// Maps peer address string to its last known frontier.
     peer_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer exponential backoff state for sync retries.
+    /// Tracks consecutive failures and gates retry attempts.
+    peer_backoffs: HashMap<String, PeerBackoff>,
     /// Known cluster nodes for authority auto-reconfiguration.
     ///
     /// When this list changes (node join/leave), the runner triggers
@@ -173,6 +176,7 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            peer_backoffs: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
@@ -221,6 +225,7 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            peer_backoffs: HashMap::new(),
             cluster_nodes,
             tracked_cluster_generation: 0,
         }
@@ -665,9 +670,11 @@ impl NodeRunner {
     /// Run one cycle of delta-based anti-entropy sync.
     ///
     /// For each peer:
-    /// 1. If we have a known frontier for the peer, try delta pull.
-    /// 2. Apply received entries and update the peer's frontier.
-    /// 3. On failure, fall back to full sync.
+    /// 1. Check per-peer backoff; skip peers that are still in cooldown.
+    /// 2. If we have a known frontier, push only changed keys (batched).
+    /// 3. Pull delta entries from the peer and apply locally.
+    /// 4. On failure, fall back to full sync.
+    /// 5. Update backoff state on success/failure.
     async fn run_sync(&mut self) {
         let Some(sync_client) = &self.sync_client else {
             return;
@@ -688,10 +695,85 @@ impl NodeRunner {
             let peer_id = &peer.node_id.0;
             let peer_start = Instant::now();
 
-            // Try delta sync if we have a frontier for this peer.
+            // Check per-peer backoff; skip if still in cooldown.
+            let backoff = self.peer_backoffs.entry(peer_key.clone()).or_default();
+            if !backoff.is_ready() {
+                tracing::debug!(
+                    peer = %peer.node_id.0,
+                    failures = backoff.consecutive_failures,
+                    "skipping peer due to backoff"
+                );
+                continue;
+            }
+
+            // --- Push phase: send only changed local keys to peer ---
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
+                let api = eventual_api.lock().await;
+                let changed: Vec<(String, crate::store::kv::CrdtValue)> = api
+                    .store()
+                    .entries_since(frontier)
+                    .into_iter()
+                    .map(|(key, value, _hlc)| (key, value))
+                    .collect();
+                let changed_count = changed.len();
+                drop(api);
+
+                if !changed.is_empty() {
+                    let push_result = sync_client
+                        .push_changed_keys(&peer.addr, changed, &self.node_id.0, DEFAULT_BATCH_SIZE)
+                        .await;
+
+                    match push_result {
+                        Ok(pushed) => {
+                            tracing::debug!(
+                                peer = %peer.node_id.0,
+                                pushed_keys = pushed,
+                                total_changed = changed_count,
+                                "delta push succeeded"
+                            );
+                            // Update peer frontier so next cycle only sends
+                            // entries newer than this point.
+                            let api = eventual_api.lock().await;
+                            if let Some(local_frontier) = api.store().current_frontier() {
+                                self.peer_frontiers.insert(peer_key.clone(), local_frontier);
+                            }
+                            drop(api);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer.node_id.0,
+                                error = %e,
+                                pushed = e.pushed,
+                                "delta push failed"
+                            );
+                            // Even on partial failure, if some entries were
+                            // pushed we advance the frontier so they are not
+                            // re-sent on the next cycle.
+                            if e.pushed > 0 {
+                                let api = eventual_api.lock().await;
+                                if let Some(local_frontier) = api.store().current_frontier() {
+                                    self.peer_frontiers.insert(peer_key.clone(), local_frontier);
+                                }
+                                drop(api);
+                            }
+                            // Record failure and move to next peer.
+                            self.peer_backoffs
+                                .entry(peer_key.clone())
+                                .or_default()
+                                .record_failure();
+                            self.metrics
+                                .sync_failure_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // --- Pull phase: pull delta (or full) from peer ---
+            if let Some(frontier) = self.peer_frontiers.get(&peer_key).cloned() {
                 let delta_result = sync_client
-                    .pull_delta(&peer.addr, &self.node_id.0, frontier)
+                    .pull_delta(&peer.addr, &self.node_id.0, &frontier)
                     .await;
 
                 if let Some(delta_resp) = delta_result {
@@ -714,6 +796,10 @@ impl NodeRunner {
                     any_success = true;
                     self.metrics
                         .record_peer_sync_success(peer_id, peer_start.elapsed());
+                    self.peer_backoffs
+                        .entry(peer_key.clone())
+                        .or_default()
+                        .record_success();
                     tracing::debug!(
                         peer = %peer.node_id.0,
                         delta_entries = delta_resp.entries.len(),
@@ -724,7 +810,7 @@ impl NodeRunner {
 
                 // Delta sync failed; retry once.
                 let retry_result = sync_client
-                    .pull_delta(&peer.addr, &self.node_id.0, frontier)
+                    .pull_delta(&peer.addr, &self.node_id.0, &frontier)
                     .await;
 
                 if let Some(delta_resp) = retry_result {
@@ -745,6 +831,10 @@ impl NodeRunner {
                     any_success = true;
                     self.metrics
                         .record_peer_sync_success(peer_id, peer_start.elapsed());
+                    self.peer_backoffs
+                        .entry(peer_key.clone())
+                        .or_default()
+                        .record_success();
                     tracing::debug!(
                         peer = %peer.node_id.0,
                         "delta sync retry succeeded"
@@ -755,7 +845,7 @@ impl NodeRunner {
                 // Both delta attempts failed; fall through to full sync.
                 tracing::warn!(
                     peer = %peer.node_id.0,
-                    "delta sync failed, falling back to full sync"
+                    "delta sync pull failed, falling back to full sync"
                 );
                 self.metrics
                     .sync_fallback_total
@@ -776,7 +866,8 @@ impl NodeRunner {
                 // delta pulls to miss remote updates between the remote's true
                 // frontier and our local frontier.
                 if let Some(remote_frontier) = dump.frontier {
-                    self.peer_frontiers.insert(peer_key, remote_frontier);
+                    self.peer_frontiers
+                        .insert(peer_key.clone(), remote_frontier);
                 }
                 // If the remote did not report a frontier (e.g. empty store or
                 // older peer that doesn't support the field), we intentionally
@@ -786,20 +877,31 @@ impl NodeRunner {
                 any_success = true;
                 self.metrics
                     .record_peer_sync_success(peer_id, peer_start.elapsed());
+                self.peer_backoffs
+                    .entry(peer_key)
+                    .or_default()
+                    .record_success();
                 tracing::debug!(
                     peer = %peer.node_id.0,
                     "full sync fallback succeeded"
                 );
             } else {
                 self.metrics.record_peer_sync_failure(peer_id);
+                // Full sync also failed; record failure for backoff.
+                self.peer_backoffs
+                    .entry(peer_key)
+                    .or_default()
+                    .record_failure();
             }
         }
 
-        // Prune stale peer frontiers: remove entries for peers that are no
-        // longer in the registry (e.g. removed via membership changes).
+        // Prune stale peer frontiers and backoffs: remove entries for peers
+        // that are no longer in the registry (e.g. removed via membership changes).
         let active_addrs: std::collections::HashSet<&String> =
             peers.iter().map(|p| &p.addr).collect();
         self.peer_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.peer_backoffs
             .retain(|addr, _| active_addrs.contains(addr));
 
         if !any_success && !peers.is_empty() {
