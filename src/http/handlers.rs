@@ -169,20 +169,53 @@ pub async fn get_certified(
         node_id: f.node_id,
     });
 
-    let proof = read.proof.map(|p| ProofBundleJson {
-        key_range_prefix: p.key_range.prefix,
-        frontier: FrontierJson {
-            physical: p.frontier_hlc.physical,
-            logical: p.frontier_hlc.logical,
-            node_id: p.frontier_hlc.node_id,
-        },
-        policy_version: p.policy_version.0,
-        contributing_authorities: p
-            .contributing_authorities
-            .into_iter()
-            .map(|n| n.0)
-            .collect(),
-        total_authorities: p.total_authorities,
+    let proof = read.proof.map(|p| {
+        let certificate = p.certificate.map(|cert| {
+            use super::types::{AuthoritySignatureJson, CertificateJson};
+            CertificateJson {
+                keyset_version: cert.keyset_version.0,
+                signatures: cert
+                    .signatures
+                    .iter()
+                    .map(|s| {
+                        let pk_hex: String = s
+                            .public_key
+                            .as_bytes()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        let sig_hex: String = s
+                            .signature
+                            .to_bytes()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        AuthoritySignatureJson {
+                            authority_id: s.authority_id.0.clone(),
+                            public_key: pk_hex,
+                            signature: sig_hex,
+                            keyset_version: s.keyset_version.0,
+                        }
+                    })
+                    .collect(),
+            }
+        });
+        ProofBundleJson {
+            key_range_prefix: p.key_range.prefix,
+            frontier: FrontierJson {
+                physical: p.frontier_hlc.physical,
+                logical: p.frontier_hlc.logical,
+                node_id: p.frontier_hlc.node_id,
+            },
+            policy_version: p.policy_version.0,
+            contributing_authorities: p
+                .contributing_authorities
+                .into_iter()
+                .map(|n| n.0)
+                .collect(),
+            total_authorities: p.total_authorities,
+            certificate,
+        }
     });
 
     Json(CertifiedReadResponse {
@@ -484,27 +517,55 @@ pub async fn get_version_history(
 /// proof bundle represents genuine Authority consensus.
 pub async fn verify_proof(Json(req): Json<VerifyProofRequest>) -> Json<VerifyProofResponse> {
     use crate::api::certified::ProofBundle;
+    use crate::authority::certificate::{AuthoritySignature, KeysetVersion, MajorityCertificate};
     use crate::authority::verifier;
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
 
+    let key_range = KeyRange {
+        prefix: req.key_range_prefix,
+    };
+    let frontier_hlc = HlcTimestamp {
+        physical: req.frontier.physical,
+        logical: req.frontier.logical,
+        node_id: req.frontier.node_id,
+    };
+    let policy_version = PolicyVersion(req.policy_version);
+
+    // Reconstruct the certificate from the HTTP payload, if provided.
+    let certificate = req.certificate.and_then(|cert_json| {
+        let mut cert = MajorityCertificate::new(
+            key_range.clone(),
+            frontier_hlc.clone(),
+            policy_version,
+            KeysetVersion(cert_json.keyset_version),
+        );
+        for sig_json in &cert_json.signatures {
+            let pk_bytes = hex_to_bytes_32(&sig_json.public_key)?;
+            let sig_bytes = hex_to_bytes_64(&sig_json.signature)?;
+            let public_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).ok()?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+            cert.add_signature(AuthoritySignature {
+                authority_id: NodeId(sig_json.authority_id.clone()),
+                public_key,
+                signature,
+                keyset_version: KeysetVersion(sig_json.keyset_version),
+            });
+        }
+        Some(cert)
+    });
+
     let bundle = ProofBundle {
-        key_range: KeyRange {
-            prefix: req.key_range_prefix,
-        },
-        frontier_hlc: HlcTimestamp {
-            physical: req.frontier.physical,
-            logical: req.frontier.logical,
-            node_id: req.frontier.node_id,
-        },
-        policy_version: PolicyVersion(req.policy_version),
+        key_range,
+        frontier_hlc,
+        policy_version,
         contributing_authorities: req
             .contributing_authorities
             .into_iter()
             .map(NodeId)
             .collect(),
         total_authorities: req.total_authorities,
-        certificate: None,
+        certificate,
     };
 
     let result = verifier::verify_proof(&bundle);
@@ -515,6 +576,29 @@ pub async fn verify_proof(Json(req): Json<VerifyProofRequest>) -> Json<VerifyPro
         contributing_count: result.contributing_count,
         required_count: result.required_count,
     })
+}
+
+/// Decode a hex string into a 32-byte array. Returns `None` on failure.
+fn hex_to_bytes_32(hex: &str) -> Option<[u8; 32]> {
+    let bytes = hex_to_bytes(hex)?;
+    bytes.try_into().ok()
+}
+
+/// Decode a hex string into a 64-byte array. Returns `None` on failure.
+fn hex_to_bytes_64(hex: &str) -> Option<[u8; 64]> {
+    let bytes = hex_to_bytes(hex)?;
+    bytes.try_into().ok()
+}
+
+/// Decode a hex string into a byte vector. Returns `None` on failure.
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
 }
 
 // ---------------------------------------------------------------
