@@ -1,4 +1,5 @@
 pub mod ack_frontier;
+pub mod bls;
 pub mod certificate;
 pub mod frontier_reporter;
 pub mod verifier;

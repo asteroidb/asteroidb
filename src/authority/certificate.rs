@@ -4,6 +4,7 @@ use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::authority::bls::{self, BlsPublicKey, BlsSignature};
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -113,6 +114,28 @@ pub enum CertError {
 
     #[error("authority {0} not found in keyset registry")]
     AuthorityNotInRegistry(String),
+}
+
+/// Certificate signature mode: Ed25519 (individual signatures) or BLS (aggregated).
+///
+/// Serializable so that old nodes can detect BLS certificates and fall back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificateMode {
+    /// Traditional per-authority Ed25519 signatures.
+    Ed25519,
+    /// Aggregated BLS12-381 signature (single signature for N signers).
+    Bls,
+}
+
+/// Event emitted when a key rotation occurs.
+#[derive(Debug, Clone)]
+pub struct RotationEvent {
+    /// The new keyset version that was activated.
+    pub new_version: KeysetVersion,
+    /// The epoch at which the rotation happened.
+    pub epoch: u64,
+    /// Keyset versions that were cleaned up as stale.
+    pub cleaned_versions: Vec<u64>,
 }
 
 /// Keyset version for key rotation management.
@@ -247,6 +270,27 @@ impl KeysetRegistry {
     pub fn registered_epoch(&self, version: &KeysetVersion) -> Option<u64> {
         self.keysets.get(&version.0).map(|e| e.registered_epoch)
     }
+
+    /// Remove keyset versions whose registration epoch is beyond the grace
+    /// period relative to `current_epoch`. The current version is never removed.
+    ///
+    /// Returns the list of removed keyset version numbers.
+    pub fn cleanup_stale_keysets(&mut self, current_epoch: u64, config: &EpochConfig) -> Vec<u64> {
+        let current = self.current;
+        let stale: Vec<u64> = self
+            .keysets
+            .iter()
+            .filter(|(ver, entry)| {
+                **ver != current && current_epoch > entry.registered_epoch + config.grace_epochs
+            })
+            .map(|(ver, _)| *ver)
+            .collect();
+
+        for ver in &stale {
+            self.keysets.remove(ver);
+        }
+        stale
+    }
 }
 
 impl Default for KeysetRegistry {
@@ -266,6 +310,14 @@ pub struct EpochManager {
     registry: KeysetRegistry,
     /// Base timestamp (seconds) from which epochs are counted.
     epoch_base_secs: u64,
+    /// The epoch in which the last rotation was performed (if any).
+    last_rotation_epoch: Option<u64>,
+    /// Total number of rotations performed.
+    rotation_count: u64,
+    /// Timestamp (ms) of the last rotation.
+    last_rotation_time_ms: Option<u64>,
+    /// Optional pending keyset staged for the next epoch boundary.
+    staged_keys: Option<Vec<(NodeId, VerifyingKey)>>,
 }
 
 impl EpochManager {
@@ -277,6 +329,10 @@ impl EpochManager {
             config,
             registry: KeysetRegistry::new(),
             epoch_base_secs,
+            last_rotation_epoch: None,
+            rotation_count: 0,
+            last_rotation_time_ms: None,
+            staged_keys: None,
         }
     }
 
@@ -311,6 +367,9 @@ impl EpochManager {
         let new_version = KeysetVersion(self.registry.current + 1);
         self.registry
             .register_keyset(new_version.clone(), epoch, new_keys)?;
+        self.last_rotation_epoch = Some(epoch);
+        self.rotation_count += 1;
+        self.last_rotation_time_ms = Some(now_secs * 1000);
         Ok(new_version)
     }
 
@@ -349,6 +408,70 @@ impl EpochManager {
             });
         }
         Ok(())
+    }
+
+    /// Stage a keyset for automatic rotation at the next epoch boundary.
+    ///
+    /// The staged keys will be consumed by `check_and_rotate` when the
+    /// epoch transitions.
+    pub fn stage_keys(&mut self, keys: Vec<(NodeId, VerifyingKey)>) {
+        self.staged_keys = Some(keys);
+    }
+
+    /// Check if an epoch boundary has been crossed and, if staged keys are
+    /// available, perform an automatic rotation.
+    ///
+    /// Returns `Some(RotationEvent)` if a rotation occurred, `None` otherwise.
+    ///
+    /// Also cleans up stale keysets beyond the grace period.
+    pub fn check_and_rotate(&mut self, current_time_ms: u64) -> Option<RotationEvent> {
+        let now_secs = current_time_ms / 1000;
+        let epoch = self.current_epoch(now_secs);
+
+        // Only rotate if the epoch has advanced past our last rotation epoch.
+        let should_rotate = match self.last_rotation_epoch {
+            Some(last) => epoch > last,
+            None => true, // No rotation has ever happened.
+        };
+
+        if !should_rotate {
+            return None;
+        }
+
+        // We need staged keys to rotate.
+        let keys = self.staged_keys.take()?;
+
+        let new_version = self.rotate_keyset(now_secs, keys).ok()?;
+        self.last_rotation_time_ms = Some(current_time_ms);
+
+        // Clean up stale keysets.
+        let cleaned = self.registry.cleanup_stale_keysets(epoch, &self.config);
+
+        Some(RotationEvent {
+            new_version,
+            epoch,
+            cleaned_versions: cleaned,
+        })
+    }
+
+    /// Return the total number of rotations performed.
+    pub fn rotation_count(&self) -> u64 {
+        self.rotation_count
+    }
+
+    /// Return the timestamp (ms) of the last rotation, if any.
+    pub fn last_rotation_time_ms(&self) -> Option<u64> {
+        self.last_rotation_time_ms
+    }
+
+    /// Return the epoch of the last rotation, if any.
+    pub fn last_rotation_epoch(&self) -> Option<u64> {
+        self.last_rotation_epoch
+    }
+
+    /// Return a mutable reference to the underlying keyset registry.
+    pub fn registry_mut(&mut self) -> &mut KeysetRegistry {
+        &mut self.registry
     }
 }
 
@@ -504,6 +627,161 @@ impl MajorityCertificate {
     /// Return references to the authority IDs that have signed.
     pub fn signers(&self) -> Vec<&NodeId> {
         self.signatures.iter().map(|s| &s.authority_id).collect()
+    }
+}
+
+/// A dual-mode certificate that supports both Ed25519 and BLS signature modes.
+///
+/// Old nodes that don't understand BLS can detect the mode and fall back to
+/// Ed25519 verification. New nodes can use the compact BLS aggregated signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DualModeCertificate {
+    /// The signature mode used for this certificate.
+    pub mode: CertificateMode,
+    /// The key range this certificate covers.
+    pub key_range: KeyRange,
+    /// The HLC frontier timestamp at the time of certification.
+    pub frontier_hlc: HlcTimestamp,
+    /// The policy version under which this certificate was issued.
+    pub policy_version: PolicyVersion,
+    /// The keyset version used for signing.
+    pub keyset_version: KeysetVersion,
+    /// Ed25519 signatures (populated when mode == Ed25519).
+    #[serde(default)]
+    pub ed25519_signatures: Vec<AuthoritySignature>,
+    /// Authority IDs that signed (used in BLS mode to know who participated).
+    #[serde(default)]
+    pub bls_signer_ids: Vec<NodeId>,
+    /// BLS public keys corresponding to `bls_signer_ids` (same order).
+    #[serde(default)]
+    pub bls_public_keys: Vec<BlsPublicKey>,
+    /// The aggregated BLS signature (populated when mode == Bls).
+    pub bls_aggregated_signature: Option<BlsSignature>,
+}
+
+impl DualModeCertificate {
+    /// Create a new Ed25519-mode certificate (wraps existing behavior).
+    pub fn new_ed25519(
+        key_range: KeyRange,
+        frontier_hlc: HlcTimestamp,
+        policy_version: PolicyVersion,
+        keyset_version: KeysetVersion,
+    ) -> Self {
+        Self {
+            mode: CertificateMode::Ed25519,
+            key_range,
+            frontier_hlc,
+            policy_version,
+            keyset_version,
+            ed25519_signatures: Vec::new(),
+            bls_signer_ids: Vec::new(),
+            bls_public_keys: Vec::new(),
+            bls_aggregated_signature: None,
+        }
+    }
+
+    /// Create a new BLS-mode certificate.
+    pub fn new_bls(
+        key_range: KeyRange,
+        frontier_hlc: HlcTimestamp,
+        policy_version: PolicyVersion,
+        keyset_version: KeysetVersion,
+    ) -> Self {
+        Self {
+            mode: CertificateMode::Bls,
+            key_range,
+            frontier_hlc,
+            policy_version,
+            keyset_version,
+            ed25519_signatures: Vec::new(),
+            bls_signer_ids: Vec::new(),
+            bls_public_keys: Vec::new(),
+            bls_aggregated_signature: None,
+        }
+    }
+
+    /// Add an Ed25519 signature (only effective in Ed25519 mode).
+    pub fn add_ed25519_signature(&mut self, sig: AuthoritySignature) {
+        if self.mode != CertificateMode::Ed25519 {
+            return;
+        }
+        if self
+            .ed25519_signatures
+            .iter()
+            .any(|s| s.authority_id == sig.authority_id)
+        {
+            return;
+        }
+        self.ed25519_signatures.push(sig);
+    }
+
+    /// Set the aggregated BLS signature along with signer information.
+    ///
+    /// `signers` is a list of (authority_id, bls_public_key) pairs.
+    pub fn set_bls_aggregate(
+        &mut self,
+        signers: Vec<(NodeId, BlsPublicKey)>,
+        aggregated_sig: BlsSignature,
+    ) {
+        self.bls_signer_ids = signers.iter().map(|(id, _)| id.clone()).collect();
+        self.bls_public_keys = signers.into_iter().map(|(_, pk)| pk).collect();
+        self.bls_aggregated_signature = Some(aggregated_sig);
+    }
+
+    /// Return the number of unique signers.
+    pub fn signer_count(&self) -> usize {
+        match self.mode {
+            CertificateMode::Ed25519 => {
+                let unique: std::collections::HashSet<&NodeId> = self
+                    .ed25519_signatures
+                    .iter()
+                    .map(|s| &s.authority_id)
+                    .collect();
+                unique.len()
+            }
+            CertificateMode::Bls => self.bls_signer_ids.len(),
+        }
+    }
+
+    /// Check whether a strict majority of authorities have signed.
+    pub fn has_majority(&self, total_authorities: usize) -> bool {
+        let needed = majority_threshold(total_authorities);
+        self.signer_count() >= needed
+    }
+
+    /// Verify the certificate against the given message bytes.
+    ///
+    /// Dispatches to Ed25519 or BLS verification based on the mode.
+    pub fn verify(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        match self.mode {
+            CertificateMode::Ed25519 => {
+                let mut valid_signers = Vec::new();
+                for sig in &self.ed25519_signatures {
+                    sig.public_key
+                        .verify(message, &sig.signature)
+                        .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
+                    valid_signers.push(sig.authority_id.clone());
+                }
+                Ok(valid_signers)
+            }
+            CertificateMode::Bls => {
+                let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
+                    CertError::InvalidSignature("missing BLS aggregated signature".into())
+                })?;
+
+                if self.bls_public_keys.is_empty() {
+                    return Err(CertError::InvalidSignature("no BLS public keys".into()));
+                }
+
+                if bls::aggregate_verify(&self.bls_public_keys, message, agg_sig) {
+                    Ok(self.bls_signer_ids.clone())
+                } else {
+                    Err(CertError::InvalidSignature(
+                        "BLS aggregate verification failed".into(),
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -1317,5 +1595,303 @@ mod tests {
             ),
             "expected AuthorityNotInRegistry, got: {result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // DualModeCertificate tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dual_mode_ed25519_sign_and_verify() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+
+        for i in 0..3 {
+            let (sk, vk) = make_key_pair();
+            let sig = sign_message(&sk, &message);
+            cert.add_ed25519_signature(make_auth_sig(NodeId(format!("auth-{i}")), vk, sig));
+        }
+
+        assert_eq!(cert.signer_count(), 3);
+        assert!(cert.has_majority(5));
+
+        let valid = cert.verify(&message).unwrap();
+        assert_eq!(valid.len(), 3);
+    }
+
+    #[test]
+    fn dual_mode_bls_sign_and_verify() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let mut signers = Vec::new();
+        let mut bls_sigs = Vec::new();
+
+        for seed in 10..15u8 {
+            let mut ikm = [0u8; 32];
+            ikm[0] = seed;
+            ikm[31] = seed.wrapping_add(42);
+            let kp = crate::authority::bls::BlsKeypair::generate(&ikm);
+            let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+            signers.push((NodeId(format!("bls-auth-{seed}")), kp.public_key.clone()));
+            bls_sigs.push(sig);
+        }
+
+        let agg = crate::authority::bls::aggregate_signatures(&bls_sigs);
+        cert.set_bls_aggregate(signers, agg);
+
+        assert_eq!(cert.signer_count(), 5);
+        assert!(cert.has_majority(9)); // 5 >= 9/2+1=5
+
+        let valid = cert.verify(&message).unwrap();
+        assert_eq!(valid.len(), 5);
+    }
+
+    #[test]
+    fn dual_mode_bls_wrong_message_fails() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let mut ikm = [0u8; 32];
+        ikm[0] = 99;
+        let kp = crate::authority::bls::BlsKeypair::generate(&ikm);
+        let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+        cert.set_bls_aggregate(vec![(NodeId("a".into()), kp.public_key.clone())], agg);
+
+        let result = cert.verify(b"wrong message");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dual_mode_ed25519_still_works_after_bls_added() {
+        // Backward compatibility: Ed25519 cert verifies correctly even when
+        // the codebase supports BLS.
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_ed25519_signature(make_auth_sig(NodeId("ed-auth".into()), vk, sig));
+
+        assert_eq!(cert.mode, CertificateMode::Ed25519);
+        let valid = cert.verify(&message).unwrap();
+        assert_eq!(valid, vec![NodeId("ed-auth".into())]);
+    }
+
+    #[test]
+    fn dual_mode_bls_no_signature_fails() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        // No aggregated signature set → should fail.
+        let result = cert.verify(&message);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dual_mode_serde_roundtrip_ed25519() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_ed25519_signature(make_auth_sig(NodeId("a".into()), vk, sig));
+
+        let json = serde_json::to_string(&cert).unwrap();
+        let restored: DualModeCertificate = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.mode, CertificateMode::Ed25519);
+        assert!(restored.verify(&message).is_ok());
+    }
+
+    #[test]
+    fn dual_mode_serde_roundtrip_bls() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let mut ikm = [0u8; 32];
+        ikm[0] = 77;
+        let kp = crate::authority::bls::BlsKeypair::generate(&ikm);
+        let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+        cert.set_bls_aggregate(vec![(NodeId("b".into()), kp.public_key.clone())], agg);
+
+        let json = serde_json::to_string(&cert).unwrap();
+        let restored: DualModeCertificate = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.mode, CertificateMode::Bls);
+        assert!(restored.verify(&message).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // Auto-rotation lifecycle tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn check_and_rotate_at_epoch_boundary() {
+        let config = EpochConfig {
+            duration_secs: 100,
+            grace_epochs: 2,
+        };
+        let mut manager = EpochManager::new(config, 0);
+
+        // First rotation at epoch 0.
+        let (_, vk1) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk1)]);
+
+        let event = manager.check_and_rotate(0).unwrap();
+        assert_eq!(event.new_version, KeysetVersion(1));
+        assert_eq!(event.epoch, 0);
+        assert_eq!(manager.rotation_count(), 1);
+
+        // Same epoch → should not rotate again (no staged keys consumed).
+        let (_, vk2) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk2)]);
+        assert!(manager.check_and_rotate(50).is_none()); // still epoch 0
+
+        // Advance to epoch 1 → should rotate.
+        let event = manager.check_and_rotate(100_000).unwrap(); // 100s = epoch 1
+        assert_eq!(event.new_version, KeysetVersion(2));
+        assert_eq!(event.epoch, 1);
+        assert_eq!(manager.rotation_count(), 2);
+    }
+
+    #[test]
+    fn check_and_rotate_without_staged_keys_returns_none() {
+        let config = EpochConfig {
+            duration_secs: 100,
+            grace_epochs: 2,
+        };
+        let mut manager = EpochManager::new(config, 0);
+
+        // No staged keys → nothing to rotate.
+        assert!(manager.check_and_rotate(0).is_none());
+    }
+
+    #[test]
+    fn check_and_rotate_cleans_stale_keysets() {
+        let config = EpochConfig {
+            duration_secs: 100,
+            grace_epochs: 2,
+        };
+        let mut manager = EpochManager::new(config, 0);
+
+        // Rotate at epoch 0.
+        let (_, vk1) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk1)]);
+        manager.check_and_rotate(0);
+
+        // Rotate at epoch 1.
+        let (_, vk2) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk2)]);
+        manager.check_and_rotate(100_000); // epoch 1
+
+        // Rotate at epoch 2.
+        let (_, vk3) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk3)]);
+        manager.check_and_rotate(200_000); // epoch 2
+
+        // Rotate at epoch 5 (grace=2, so version 1 registered at epoch 0 should be stale: 5 > 0+2).
+        let (_, vk4) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk4)]);
+        let event = manager.check_and_rotate(500_000).unwrap(); // epoch 5
+        assert_eq!(event.new_version, KeysetVersion(4));
+
+        // Versions 1 (epoch 0) and 2 (epoch 1) should be cleaned.
+        // Version 3 (epoch 2) => 5 > 2+2 = 4, so it should also be cleaned.
+        assert!(event.cleaned_versions.contains(&1));
+        assert!(event.cleaned_versions.contains(&2));
+    }
+
+    #[test]
+    fn rotation_metrics_tracked() {
+        let config = EpochConfig {
+            duration_secs: 100,
+            grace_epochs: 2,
+        };
+        let mut manager = EpochManager::new(config, 0);
+
+        assert_eq!(manager.rotation_count(), 0);
+        assert!(manager.last_rotation_time_ms().is_none());
+        assert!(manager.last_rotation_epoch().is_none());
+
+        let (_, vk) = make_key_pair();
+        manager.stage_keys(vec![(NodeId("a".into()), vk)]);
+        manager.check_and_rotate(50_000); // 50s = epoch 0
+
+        assert_eq!(manager.rotation_count(), 1);
+        assert_eq!(manager.last_rotation_time_ms(), Some(50_000));
+        assert_eq!(manager.last_rotation_epoch(), Some(0));
+    }
+
+    #[test]
+    fn cleanup_stale_keysets_preserves_current() {
+        let mut registry = KeysetRegistry::new();
+        let (_, vk1) = make_key_pair();
+        let (_, vk2) = make_key_pair();
+
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("a".into()), vk1)])
+            .unwrap();
+        registry
+            .register_keyset(KeysetVersion(2), 5, vec![(NodeId("a".into()), vk2)])
+            .unwrap();
+
+        let config = EpochConfig {
+            duration_secs: 86400,
+            grace_epochs: 3,
+        };
+
+        // At epoch 10: version 1 (epoch 0, grace 3) is stale (10 > 0+3).
+        // version 2 is current → never removed.
+        let cleaned = registry.cleanup_stale_keysets(10, &config);
+        assert_eq!(cleaned, vec![1]);
+        assert!(registry.get_keys(&KeysetVersion(1)).is_none());
+        assert!(registry.get_keys(&KeysetVersion(2)).is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // CertificateMode serde tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn certificate_mode_serde_roundtrip() {
+        let ed = CertificateMode::Ed25519;
+        let bls_mode = CertificateMode::Bls;
+
+        let ed_json = serde_json::to_string(&ed).unwrap();
+        let bls_json = serde_json::to_string(&bls_mode).unwrap();
+
+        let ed_back: CertificateMode = serde_json::from_str(&ed_json).unwrap();
+        let bls_back: CertificateMode = serde_json::from_str(&bls_json).unwrap();
+
+        assert_eq!(ed, ed_back);
+        assert_eq!(bls_mode, bls_back);
     }
 }
