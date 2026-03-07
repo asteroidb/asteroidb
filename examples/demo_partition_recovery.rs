@@ -83,6 +83,7 @@ fn main() {
             prefix: String::new(),
         },
         authority_nodes: vec![node_a.clone(), node_b.clone(), node_c.clone()],
+        auto_generated: false,
     });
     let mut certified_api = CertifiedApi::new(node_a.clone(), Arc::new(RwLock::new(namespace)));
     println!("  Nodes: node-A, node-B, node-C");

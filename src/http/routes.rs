@@ -106,6 +106,7 @@ mod tests {
                 NodeId("auth-2".into()),
                 NodeId("auth-3".into()),
             ],
+            auto_generated: false,
         });
 
         let namespace = Arc::new(RwLock::new(ns));

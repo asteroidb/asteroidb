@@ -73,6 +73,7 @@ fn three_authority_namespace() -> SystemNamespace {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+        auto_generated: false,
     });
     ns
 }
@@ -227,6 +228,7 @@ async fn single_authority_self_certification() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
+        auto_generated: false,
     });
 
     let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
@@ -530,14 +532,17 @@ async fn mixed_outcomes_all_observable() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("cert/"),
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+        auto_generated: false,
     });
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("stale/"),
         authority_nodes: vec![node_id("auth-s1"), node_id("auth-s2"), node_id("auth-s3")],
+        auto_generated: false,
     });
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("rej/"),
         authority_nodes: vec![node_id("auth-r1"), node_id("auth-r2"), node_id("auth-r3")],
+        auto_generated: false,
     });
 
     let retention = RetentionPolicy {
@@ -595,10 +600,12 @@ async fn cleanup_after_auto_certification() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("a/"),
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+        auto_generated: false,
     });
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("b/"),
         authority_nodes: vec![node_id("auth-b1"), node_id("auth-b2"), node_id("auth-b3")],
+        auto_generated: false,
     });
 
     let mut api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));

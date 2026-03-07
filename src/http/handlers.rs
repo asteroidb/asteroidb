@@ -283,6 +283,7 @@ pub async fn set_authority_definition(
             .iter()
             .map(|n| NodeId(n.clone()))
             .collect(),
+        auto_generated: false,
     };
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 

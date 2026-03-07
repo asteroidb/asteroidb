@@ -120,6 +120,7 @@ fn full_version_switch_with_certified_api() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     // Start at policy version 1.
     ns.set_placement_policy(
@@ -231,6 +232,7 @@ fn cross_version_frontier_pollution_prevented() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3).with_certified(true),
@@ -291,6 +293,7 @@ async fn node_runner_auto_detects_version_changes() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node("auth-1")],
+        auto_generated: false,
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 1).with_certified(true),
@@ -356,6 +359,7 @@ fn multiple_version_transitions() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3).with_certified(true),

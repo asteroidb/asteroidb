@@ -94,6 +94,7 @@ fn make_namespace(prefix: &str, authorities: &[&str]) -> Arc<RwLock<SystemNamesp
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range(prefix),
         authority_nodes: authorities.iter().map(|a| node(a)).collect(),
+        auto_generated: false,
     });
     wrap_ns(ns)
 }
@@ -895,10 +896,12 @@ fn cross_range_certification_contamination_prevented() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range("user/"),
         authority_nodes: vec![node("auth-u1"), node("auth-u2"), node("auth-u3")],
+        auto_generated: false,
     });
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range("order/"),
         authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
+        auto_generated: false,
     });
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
@@ -968,6 +971,7 @@ fn policy_version_transition_certification() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range("data/"),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     // Policy at version 2.
     ns.set_placement_policy(
@@ -1012,11 +1016,13 @@ fn longest_prefix_authority_resolution_in_integration() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range("user/"),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     // Narrow: 2 authorities for user/vip/ (only majority of 2 needed)
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range("user/vip/"),
         authority_nodes: vec![node("auth-v1"), node("auth-v2")],
+        auto_generated: false,
     });
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
