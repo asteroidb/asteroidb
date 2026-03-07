@@ -1051,6 +1051,8 @@ mod tests {
         assert!(json.get("sync_failure_rate").is_some());
         assert!(json.get("sync_attempt_total").is_some());
         assert!(json.get("sync_failure_total").is_some());
+        assert!(json.get("peer_sync").is_some());
+        assert!(json.get("certification_latency_window").is_some());
 
         // Default values should be zero.
         assert_eq!(json["pending_count"], 0);
@@ -1058,6 +1060,10 @@ mod tests {
         assert_eq!(json["frontier_skew_ms"], 0);
         assert_eq!(json["sync_attempt_total"], 0);
         assert_eq!(json["sync_failure_total"], 0);
+
+        // New fields should have default/empty values.
+        assert!(json["peer_sync"].as_object().unwrap().is_empty());
+        assert_eq!(json["certification_latency_window"]["sample_count"], 0);
     }
 
     #[tokio::test]
@@ -1104,6 +1110,59 @@ mod tests {
         assert!((json["certification_latency_mean_us"].as_f64().unwrap() - 500.0).abs() < 0.01);
         // Failure rate: 3 / 20 = 0.15
         assert!((json["sync_failure_rate"].as_f64().unwrap() - 0.15).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_includes_peer_sync_and_cert_window() {
+        use std::time::Duration;
+
+        let state = test_state();
+
+        // Record per-peer sync metrics.
+        state
+            .metrics
+            .record_peer_sync_success("node-a", Duration::from_millis(10));
+        state
+            .metrics
+            .record_peer_sync_success("node-a", Duration::from_millis(20));
+        state.metrics.record_peer_sync_failure("node-b");
+
+        // Record certification latency window samples.
+        state
+            .metrics
+            .record_certification_latency(Duration::from_millis(50));
+
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        // Verify per-peer sync stats.
+        let peer_sync = json["peer_sync"].as_object().unwrap();
+        assert_eq!(peer_sync.len(), 2);
+
+        let node_a = &peer_sync["node-a"];
+        assert_eq!(node_a["success_count"], 2);
+        assert_eq!(node_a["failure_count"], 0);
+        // Mean of 10ms and 20ms = 15ms = 15000us
+        assert!((node_a["mean_latency_us"].as_f64().unwrap() - 15000.0).abs() < 1.0);
+
+        let node_b = &peer_sync["node-b"];
+        assert_eq!(node_b["success_count"], 0);
+        assert_eq!(node_b["failure_count"], 1);
+
+        // Verify certification latency window.
+        let cert_window = &json["certification_latency_window"];
+        assert_eq!(cert_window["sample_count"], 1);
+        assert!((cert_window["mean_us"].as_f64().unwrap() - 50000.0).abs() < 1.0);
     }
 
     // ---------------------------------------------------------------

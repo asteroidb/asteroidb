@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, watch};
 
@@ -566,6 +566,8 @@ impl NodeRunner {
         let mut newly_certified = 0u64;
         let mut latency_sum = 0u64;
 
+        let mut cert_latencies: Vec<Duration> = Vec::new();
+
         for (i, pw) in writes.iter().enumerate() {
             if pw.status == CertificationStatus::Pending {
                 pending += 1;
@@ -577,7 +579,9 @@ impl NodeRunner {
                     .is_some_and(|(s, _)| *s == CertificationStatus::Pending);
                 if was_pending {
                     newly_certified += 1;
-                    latency_sum += now_ms.saturating_sub(pw.timestamp.physical) * 1000;
+                    let latency_ms = now_ms.saturating_sub(pw.timestamp.physical);
+                    latency_sum += latency_ms * 1000;
+                    cert_latencies.push(Duration::from_millis(latency_ms));
                 }
             }
         }
@@ -596,6 +600,11 @@ impl NodeRunner {
             self.metrics
                 .certification_latency_count
                 .fetch_add(newly_certified, Ordering::Relaxed);
+
+            // Record individual certification latencies into the sliding window.
+            for latency in cert_latencies {
+                self.metrics.record_certification_latency(latency);
+            }
         }
     }
 
@@ -676,6 +685,8 @@ impl NodeRunner {
 
         for peer in &peers {
             let peer_key = peer.addr.clone();
+            let peer_id = &peer.node_id.0;
+            let peer_start = Instant::now();
 
             // Try delta sync if we have a frontier for this peer.
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
@@ -701,6 +712,8 @@ impl NodeRunner {
                     }
 
                     any_success = true;
+                    self.metrics
+                        .record_peer_sync_success(peer_id, peer_start.elapsed());
                     tracing::debug!(
                         peer = %peer.node_id.0,
                         delta_entries = delta_resp.entries.len(),
@@ -730,6 +743,8 @@ impl NodeRunner {
                     }
 
                     any_success = true;
+                    self.metrics
+                        .record_peer_sync_success(peer_id, peer_start.elapsed());
                     tracing::debug!(
                         peer = %peer.node_id.0,
                         "delta sync retry succeeded"
@@ -769,10 +784,14 @@ impl NodeRunner {
                 // sync cycle will fall back to full sync again, which is safe.
 
                 any_success = true;
+                self.metrics
+                    .record_peer_sync_success(peer_id, peer_start.elapsed());
                 tracing::debug!(
                     peer = %peer.node_id.0,
                     "full sync fallback succeeded"
                 );
+            } else {
+                self.metrics.record_peer_sync_failure(peer_id);
             }
         }
 
