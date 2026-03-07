@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -12,7 +13,7 @@ use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespac
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
-use crate::ops::slo::{SloSnapshot, SloTracker};
+use crate::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloSnapshot, SloTracker};
 use crate::placement::PlacementPolicy;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
@@ -117,8 +118,15 @@ pub async fn get_eventual(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<EventualReadResponse> {
+    let start = Instant::now();
     let api = state.eventual.lock().await;
     let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
+    drop(api);
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    state
+        .slo_tracker
+        .record_observation(SLO_EVENTUAL_READ_P99, elapsed_ms);
 
     Json(EventualReadResponse { key, value })
 }
@@ -159,6 +167,7 @@ pub async fn get_certified(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<CertifiedReadResponse> {
+    let start = Instant::now();
     let api = state.certified.lock().await;
     let read = api.get_certified(&key);
 
@@ -217,6 +226,11 @@ pub async fn get_certified(
             certificate,
         }
     });
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    state
+        .slo_tracker
+        .record_observation(SLO_CERTIFIED_READ_P99, elapsed_ms);
 
     Json(CertifiedReadResponse {
         key,

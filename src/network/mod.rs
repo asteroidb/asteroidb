@@ -4,5 +4,5 @@ mod peer;
 pub mod sync;
 
 pub use frontier_sync::FrontierSyncClient;
-pub use membership::MembershipClient;
+pub use membership::{MembershipClient, PingStats};
 pub use peer::{NodeConfig, PeerConfig, PeerError, PeerRegistry, generate_cluster_configs};

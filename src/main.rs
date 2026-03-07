@@ -141,6 +141,9 @@ async fn main() {
     // Optional shared token for authenticating internal API requests.
     let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN").ok();
 
+    // SLO tracker shared between HTTP handlers and NodeRunner.
+    let slo_tracker = Arc::new(asteroidb_poc::ops::slo::SloTracker::new());
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -155,7 +158,7 @@ async fn main() {
         self_addr: Some(advertise_addr.clone()),
         latency_model: None,
         cluster_nodes: None,
-        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        slo_tracker: Arc::clone(&slo_tracker),
     });
 
     let app = router(state);
@@ -214,6 +217,7 @@ async fn main() {
         )
     };
     runner.set_membership_client(runner_membership_client);
+    runner.set_slo_tracker(slo_tracker);
 
     let shutdown_handle = runner.shutdown_handle();
 

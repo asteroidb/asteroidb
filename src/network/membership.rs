@@ -17,6 +17,17 @@ use crate::types::NodeId;
 /// Number of consecutive ping failures before a peer is automatically evicted.
 const MAX_PING_FAILURES: u32 = 3;
 
+/// Statistics returned from a [`MembershipClient::ping_all`] round.
+#[derive(Debug, Clone, Default)]
+pub struct PingStats {
+    /// Number of new peers discovered during this ping round.
+    pub discovered: usize,
+    /// Number of peers that responded successfully.
+    pub successes: usize,
+    /// Number of peers that failed to respond.
+    pub failures: usize,
+}
+
 /// Client for the membership protocol.
 ///
 /// Provides methods for fan-out announce (join/leave) and periodic
@@ -162,8 +173,8 @@ impl MembershipClient {
     /// Peers that fail to respond for [`MAX_PING_FAILURES`] consecutive
     /// rounds are automatically evicted from the registry.
     ///
-    /// Returns the number of new peers discovered through this exchange.
-    pub async fn ping_all(&mut self) -> usize {
+    /// Returns [`PingStats`] with discovered peers and per-peer success/failure counts.
+    pub async fn ping_all(&mut self) -> PingStats {
         let my_peers = {
             let registry = self.peer_registry.lock().await;
             let mut list: Vec<PeerInfo> = registry
@@ -192,7 +203,7 @@ impl MembershipClient {
         };
 
         let peers = self.peer_registry.lock().await.all_peers_owned();
-        let mut total_discovered = 0;
+        let mut stats = PingStats::default();
 
         for peer in &peers {
             let url = format!("http://{}/api/internal/ping", peer.addr);
@@ -203,9 +214,10 @@ impl MembershipClient {
                     if resp.status().is_success() {
                         // Reset failure count on successful response.
                         self.failed_ping_counts.remove(&peer_key);
+                        stats.successes += 1;
                         if let Ok(ping_resp) = resp.json::<PingResponse>().await {
                             let discovered = self.reconcile_peers(&ping_resp.known_peers).await;
-                            total_discovered += discovered;
+                            stats.discovered += discovered;
                         }
                     } else {
                         tracing::warn!(
@@ -216,6 +228,7 @@ impl MembershipClient {
                         // Treat non-success as a failure for eviction purposes.
                         let count = self.failed_ping_counts.entry(peer_key).or_insert(0);
                         *count += 1;
+                        stats.failures += 1;
                     }
                 }
                 Err(e) => {
@@ -226,6 +239,7 @@ impl MembershipClient {
                     );
                     let count = self.failed_ping_counts.entry(peer_key).or_insert(0);
                     *count += 1;
+                    stats.failures += 1;
                 }
             }
         }
@@ -264,7 +278,7 @@ impl MembershipClient {
             }
         }
 
-        total_discovered
+        stats
     }
 
     /// Reconcile a received peer list with the local registry.
@@ -342,8 +356,10 @@ mod tests {
         ));
         let mut client =
             MembershipClient::new(nid("node-1"), "127.0.0.1:3000".to_string(), registry);
-        let count = client.ping_all().await;
-        assert_eq!(count, 0);
+        let stats = client.ping_all().await;
+        assert_eq!(stats.discovered, 0);
+        assert_eq!(stats.successes, 0);
+        assert_eq!(stats.failures, 0);
     }
 
     #[tokio::test]
