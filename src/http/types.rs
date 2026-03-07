@@ -400,6 +400,23 @@ impl IntoResponse for ApiError {
                 "TIMEOUT",
                 "timeout".to_string(),
             ),
+            CrdtError::IncompatibleVersion {
+                data_version,
+                code_version,
+            } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INCOMPATIBLE_VERSION",
+                format!(
+                    "data version {data_version} incompatible with code version {code_version}"
+                ),
+            ),
+            CrdtError::MigrationFailed {
+                from, to, reason, ..
+            } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MIGRATION_FAILED",
+                format!("migration v{from} to v{to} failed: {reason}"),
+            ),
             CrdtError::Internal(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", msg.clone())
             }
