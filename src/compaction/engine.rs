@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::authority::ack_frontier::AckFrontierSet;
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, PolicyVersion};
+
+use super::tuner::AdaptiveCompactionConfig;
 
 /// Configuration for compaction triggers (FR-010).
 ///
@@ -70,8 +72,12 @@ pub enum RevalidationTrigger {
 pub struct CompactionEngine {
     config: CompactionConfig,
     checkpoints: HashMap<String, Checkpoint>,
+    /// Full checkpoint history per key range prefix (newest last).
+    checkpoint_history: HashMap<String, VecDeque<Checkpoint>>,
     ops_count: HashMap<String, u64>,
     revalidation_log: Vec<(HlcTimestamp, RevalidationTrigger)>,
+    /// Optional adaptive tuning configuration.
+    adaptive_config: Option<AdaptiveCompactionConfig>,
 }
 
 impl CompactionEngine {
@@ -80,8 +86,10 @@ impl CompactionEngine {
         Self {
             config,
             checkpoints: HashMap::new(),
+            checkpoint_history: HashMap::new(),
             ops_count: HashMap::new(),
             revalidation_log: Vec::new(),
+            adaptive_config: None,
         }
     }
 
@@ -90,9 +98,76 @@ impl CompactionEngine {
         Self::new(CompactionConfig::default())
     }
 
+    /// Create a new compaction engine with adaptive tuning enabled.
+    pub fn with_adaptive(adaptive: AdaptiveCompactionConfig) -> Self {
+        let config = adaptive.effective().clone();
+        Self {
+            config,
+            checkpoints: HashMap::new(),
+            checkpoint_history: HashMap::new(),
+            ops_count: HashMap::new(),
+            revalidation_log: Vec::new(),
+            adaptive_config: Some(adaptive),
+        }
+    }
+
+    /// Return a reference to the adaptive config, if enabled.
+    pub fn adaptive_config(&self) -> Option<&AdaptiveCompactionConfig> {
+        self.adaptive_config.as_ref()
+    }
+
+    /// Return a mutable reference to the adaptive config, if enabled.
+    pub fn adaptive_config_mut(&mut self) -> Option<&mut AdaptiveCompactionConfig> {
+        self.adaptive_config.as_mut()
+    }
+
+    /// Run a tuning cycle. Call this periodically (e.g. every 30s).
+    ///
+    /// Updates the effective config from the adaptive tuner. Returns
+    /// `true` if thresholds changed.
+    pub fn tune(&mut self, now_ms: u64, avg_frontier_lag_ms: Option<u64>) -> bool {
+        if let Some(ref mut adaptive) = self.adaptive_config {
+            let changed = adaptive.tune(now_ms, avg_frontier_lag_ms);
+            if changed {
+                self.config = adaptive.effective().clone();
+            }
+            changed
+        } else {
+            false
+        }
+    }
+
+    /// Produce a diagnostic snapshot of the current tuning state.
+    ///
+    /// Returns `None` if adaptive tuning is not enabled.
+    pub fn tuning_snapshot(&self, now_ms: u64) -> Option<super::tuner::TuningSnapshot> {
+        self.adaptive_config
+            .as_ref()
+            .map(|a| a.tuning_snapshot(now_ms))
+    }
+
     /// Record an operation for the given key range, incrementing its ops counter.
+    ///
+    /// Uses the system clock to feed the adaptive write rate tracker (if enabled).
+    /// Prefer [`record_op_at`] when an explicit timestamp is available for
+    /// deterministic testing.
     pub fn record_op(&mut self, key_range: &KeyRange) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.record_op_at(key_range, now_ms);
+    }
+
+    /// Record an operation for the given key range at a specific timestamp.
+    ///
+    /// Increments the ops counter and feeds the adaptive write rate tracker
+    /// (if enabled) so that `tune()` can observe real write rates.
+    pub fn record_op_at(&mut self, key_range: &KeyRange, now_ms: u64) {
         *self.ops_count.entry(key_range.prefix.clone()).or_insert(0) += 1;
+        if let Some(ref mut adaptive) = self.adaptive_config {
+            adaptive.record_ops(&key_range.prefix, now_ms, 1);
+        }
     }
 
     /// Check whether a checkpoint should be created for the given key range.
@@ -121,7 +196,9 @@ impl CompactionEngine {
 
     /// Create a checkpoint for the given key range.
     ///
-    /// Records the current state and resets the operations counter for this range.
+    /// Records the current state, resets the operations counter for this range,
+    /// and applies the retention policy (evicting the oldest checkpoint if the
+    /// history exceeds `max_checkpoint_history`).
     pub fn create_checkpoint(
         &mut self,
         key_range: KeyRange,
@@ -140,10 +217,28 @@ impl CompactionEngine {
             ops_since_last,
         };
 
+        // Store in history with retention enforcement.
+        let history = self.checkpoint_history.entry(prefix.clone()).or_default();
+        history.push_back(checkpoint.clone());
+
+        let max_history = self
+            .adaptive_config
+            .as_ref()
+            .map(|a| a.max_checkpoint_history)
+            .unwrap_or(usize::MAX);
+        while history.len() > max_history {
+            history.pop_front();
+        }
+
         self.checkpoints.insert(prefix.clone(), checkpoint.clone());
         self.ops_count.insert(prefix, 0);
 
         checkpoint
+    }
+
+    /// Get the checkpoint history for a key range prefix.
+    pub fn checkpoint_history(&self, prefix: &str) -> Option<&VecDeque<Checkpoint>> {
+        self.checkpoint_history.get(prefix)
     }
 
     /// Get the latest checkpoint for a key range prefix.
@@ -215,6 +310,7 @@ impl CompactionEngine {
 mod tests {
     use super::*;
     use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+    use crate::compaction::tuner::AdaptiveCompactionConfig;
     use crate::types::NodeId;
 
     fn make_ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
@@ -645,5 +741,191 @@ mod tests {
         engine.record_op(&kr_user);
         assert!(engine.should_checkpoint(&kr_user, &now));
         assert!(!engine.should_checkpoint(&kr_order, &now));
+    }
+
+    // ---------------------------------------------------------------
+    // Checkpoint history and retention policy tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_history_accumulated() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        for i in 0..5 {
+            engine.create_checkpoint(
+                kr.clone(),
+                make_ts(1000 * (i + 1), 0, "node-a"),
+                format!("hash-{i}"),
+                PolicyVersion(1),
+            );
+        }
+
+        let history = engine.checkpoint_history("user/").unwrap();
+        assert_eq!(history.len(), 5);
+        assert_eq!(history.front().unwrap().digest_hash, "hash-0");
+        assert_eq!(history.back().unwrap().digest_hash, "hash-4");
+    }
+
+    #[test]
+    fn retention_policy_evicts_oldest() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::new(base);
+        adaptive.max_checkpoint_history = 3;
+
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+        let kr = make_key_range("user/");
+
+        // Create 5 checkpoints; only last 3 should remain.
+        for i in 0..5 {
+            engine.create_checkpoint(
+                kr.clone(),
+                make_ts(1000 * (i + 1), 0, "node-a"),
+                format!("hash-{i}"),
+                PolicyVersion(1),
+            );
+        }
+
+        let history = engine.checkpoint_history("user/").unwrap();
+        assert_eq!(history.len(), 3);
+        // Oldest surviving should be hash-2
+        assert_eq!(history.front().unwrap().digest_hash, "hash-2");
+        assert_eq!(history.back().unwrap().digest_hash, "hash-4");
+    }
+
+    #[test]
+    fn no_retention_limit_without_adaptive() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Without adaptive, history is unlimited.
+        for i in 0..20 {
+            engine.create_checkpoint(
+                kr.clone(),
+                make_ts(1000 * (i + 1), 0, "node-a"),
+                format!("hash-{i}"),
+                PolicyVersion(1),
+            );
+        }
+
+        let history = engine.checkpoint_history("user/").unwrap();
+        assert_eq!(history.len(), 20);
+    }
+
+    // ---------------------------------------------------------------
+    // Adaptive engine integration tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn adaptive_engine_tune_updates_config() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+
+        // Record high write rate (> 750 ops/sec dead zone boundary).
+        if let Some(ac) = engine.adaptive_config_mut() {
+            ac.record_ops("user/", 1_000, 800);
+        }
+
+        let changed = engine.tune(2_000, None);
+        assert!(changed);
+
+        // Config should be updated.
+        let kr = make_key_range("user/");
+        let now = make_ts(2_000, 0, "node-a");
+        // With ops_threshold now halved to 5000, 5000 ops should trigger.
+        for _ in 0..5_000 {
+            engine.record_op(&kr);
+        }
+        assert!(engine.should_checkpoint(&kr, &now));
+    }
+
+    #[test]
+    fn tuning_snapshot_returns_none_without_adaptive() {
+        let engine = CompactionEngine::with_defaults();
+        assert!(engine.tuning_snapshot(1_000).is_none());
+    }
+
+    #[test]
+    fn tuning_snapshot_returns_some_with_adaptive() {
+        let base = CompactionConfig::default();
+        let adaptive = AdaptiveCompactionConfig::new(base);
+        let engine = CompactionEngine::with_adaptive(adaptive);
+
+        let snap = engine.tuning_snapshot(1_000);
+        assert!(snap.is_some());
+        let snap = snap.unwrap();
+        assert_eq!(snap.effective_ops_threshold, 10_000);
+        assert_eq!(snap.effective_time_threshold_ms, 30_000);
+    }
+
+    // ---------------------------------------------------------------
+    // record_op feeds adaptive write rate tracker
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn record_op_at_feeds_write_rate_tracker() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+        let kr = make_key_range("user/");
+
+        // Record 100 ops at known timestamps via record_op_at
+        for i in 0..100 {
+            engine.record_op_at(&kr, 1_000 + i * 10);
+        }
+
+        // The write rate tracker should now have data
+        let ac = engine.adaptive_config().unwrap();
+        let rate = ac.write_rate("user/", 2_000);
+        assert!(rate > 0.0, "write rate should be positive, got {rate}");
+    }
+
+    #[test]
+    fn record_op_at_does_not_feed_tracker_without_adaptive() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Should not panic even without adaptive config
+        engine.record_op_at(&kr, 1_000);
+        assert_eq!(engine.ops_count.get("user/"), Some(&1));
+    }
+
+    #[test]
+    fn record_op_at_drives_tuning() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+        let kr = make_key_range("user/");
+
+        // Record enough ops via record_op_at to push rate above 750 ops/sec.
+        // 800 ops in 1 second = 800 ops/sec > 750.
+        for i in 0..800 {
+            engine.record_op_at(&kr, 1_000 + i);
+        }
+
+        // Tune should detect the high rate and halve ops_threshold.
+        let changed = engine.tune(2_000, None);
+        assert!(changed);
+        assert_eq!(
+            engine.adaptive_config().unwrap().effective().ops_threshold,
+            5_000
+        );
     }
 }
