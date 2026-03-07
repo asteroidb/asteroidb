@@ -351,6 +351,7 @@ async fn certification_safe_during_reconfiguration() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
+        auto_generated: false,
     });
 
     let shared_ns = wrap_ns(ns);
@@ -427,6 +428,7 @@ async fn authority_demotion_stops_frontier_reporting() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
+        auto_generated: false,
     });
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1)
         .with_certified(true)

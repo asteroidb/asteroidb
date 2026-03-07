@@ -577,6 +577,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(prefix),
             authority_nodes: authorities.iter().map(|a| node(a)).collect(),
+            auto_generated: false,
         });
         wrap_ns(ns)
     }
@@ -1106,10 +1107,12 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-u1"), node("auth-u2"), node("auth-u3")],
+            auto_generated: false,
         });
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("order/"),
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
@@ -1164,10 +1167,12 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-u1"), node("auth-u2"), node("auth-u3")],
+            auto_generated: false,
         });
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("order/"),
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
@@ -1200,6 +1205,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("data/"),
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
         });
         // Set placement policy at version 2.
         ns.set_placement_policy(
@@ -1247,11 +1253,13 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
         });
         // Narrower (higher-priority) authority set for user/vip/
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/vip/"),
             authority_nodes: vec![node("auth-v1"), node("auth-v2")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
@@ -1321,10 +1329,12 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("cert/"),
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
         });
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("stale/"),
             authority_nodes: vec![node("auth-s1"), node("auth-s2"), node("auth-s3")],
+            auto_generated: false,
         });
 
         let policy = RetentionPolicy {
@@ -1550,6 +1560,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("data/"),
             authority_nodes: vec![node("auth-a"), node("auth-b"), node("auth-c")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));

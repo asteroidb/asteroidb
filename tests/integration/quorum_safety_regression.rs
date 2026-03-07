@@ -99,6 +99,7 @@ fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: key_range(""),
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+        auto_generated: false,
     });
     wrap_ns(ns)
 }
@@ -368,6 +369,7 @@ fn duplicate_approval_authority_update_rejected() {
     let def = AuthorityDefinition {
         key_range: key_range("order/"),
         authority_nodes: vec![node("a1"), node("a2")],
+        auto_generated: false,
     };
     let result = consensus.propose_authority_update(def, &[node("n2"), node("n2")]);
 

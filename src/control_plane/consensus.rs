@@ -96,6 +96,7 @@ mod tests {
         AuthorityDefinition {
             key_range: key_range(prefix),
             authority_nodes: nodes.iter().map(|s| node_id(s)).collect(),
+            auto_generated: false,
         }
     }
 

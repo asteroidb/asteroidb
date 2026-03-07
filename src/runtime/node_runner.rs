@@ -867,6 +867,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(""),
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+            auto_generated: false,
         });
         wrap_ns(ns)
     }
@@ -1043,6 +1044,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("data/"),
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+            auto_generated: false,
         });
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
@@ -1320,6 +1322,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(""),
             authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
@@ -1372,6 +1375,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(""),
             authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
         });
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));

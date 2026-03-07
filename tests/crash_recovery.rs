@@ -67,6 +67,7 @@ fn make_authority_def(prefix: &str, nodes: &[&str]) -> AuthorityDefinition {
     AuthorityDefinition {
         key_range: kr(prefix),
         authority_nodes: nodes.iter().map(|s| NodeId((*s).into())).collect(),
+        auto_generated: false,
     }
 }
 

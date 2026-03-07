@@ -37,6 +37,7 @@ fn default_namespace() -> SystemNamespace {
             prefix: String::new(),
         },
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+        auto_generated: false,
     });
     ns
 }

@@ -226,6 +226,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("sensor/"),
         authority_nodes: vec![node_id("n1"), node_id("n2"), node_id("n3")],
+        auto_generated: false,
     });
 
     let shared_ns = wrap_ns(ns);
@@ -855,6 +856,7 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node_id("n1")],
+        auto_generated: false,
     });
 
     let shared_ns = wrap_ns(ns);
@@ -1047,6 +1049,7 @@ async fn delta_sync_full_fallback_after_reconfig() {
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+        auto_generated: false,
     });
 
     let shared_ns = wrap_ns(ns);
@@ -1156,6 +1159,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
     ns_legacy.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
+        auto_generated: false,
     });
     let ns_legacy = Arc::new(RwLock::new(ns_legacy));
     let legacy_state = Arc::new(AppState {
@@ -1200,6 +1204,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
     ns_local.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
+        auto_generated: false,
     });
     let ns_local = Arc::new(RwLock::new(ns_local));
     let local_api = Arc::new(Mutex::new(EventualApi::new(node_id("local"))));

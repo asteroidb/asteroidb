@@ -130,6 +130,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(prefix),
             authority_nodes: authorities.iter().map(|a| node(a)).collect(),
+            auto_generated: false,
         });
         ns
     }
@@ -175,10 +176,12 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-1"), node("auth-2")],
+            auto_generated: false,
         });
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("order/"),
             authority_nodes: vec![node("auth-1"), node("auth-3")],
+            auto_generated: false,
         });
 
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
@@ -199,6 +202,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("data/"),
             authority_nodes: vec![node("auth-1")],
+            auto_generated: false,
         });
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(3), kr("data/"), 2).with_certified(true),
@@ -328,6 +332,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-1")],
+            auto_generated: false,
         });
 
         let mut reporter = FrontierReporter::new(node("auth-1"), &ns);
@@ -337,6 +342,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("order/"),
             authority_nodes: vec![node("auth-1"), node("auth-2")],
+            auto_generated: false,
         });
 
         reporter.refresh_scopes(&ns);
@@ -349,6 +355,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-1"), node("auth-2")],
+            auto_generated: false,
         });
 
         let mut reporter = FrontierReporter::new(node("auth-1"), &ns);
@@ -358,6 +365,7 @@ mod tests {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr("user/"),
             authority_nodes: vec![node("auth-2"), node("auth-3")],
+            auto_generated: false,
         });
 
         reporter.refresh_scopes(&ns);
