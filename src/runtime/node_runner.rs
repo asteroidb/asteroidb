@@ -16,6 +16,7 @@ use crate::network::membership::MembershipClient;
 use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
+use crate::ops::slo::{SLO_AUTHORITY_AVAILABILITY, SLO_REPLICATION_CONVERGENCE, SloTracker};
 use crate::placement::PlacementPolicy;
 use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
@@ -107,6 +108,8 @@ pub struct NodeRunner {
     tracked_cluster_generation: u64,
     /// Optional membership client for periodic peer list exchange (ping).
     membership_client: Option<MembershipClient>,
+    /// Optional SLO tracker for recording operational observations.
+    slo_tracker: Option<Arc<SloTracker>>,
     /// Active rebalance plans being executed, keyed by key range prefix.
     ///
     /// When a policy version change is detected, a [`RebalancePlan`] is
@@ -219,6 +222,7 @@ impl NodeRunner {
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
             membership_client: None,
+            slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
             tracked_policies,
         }
@@ -271,6 +275,7 @@ impl NodeRunner {
             cluster_nodes,
             tracked_cluster_generation: 0,
             membership_client: None,
+            slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
             tracked_policies,
         }
@@ -279,6 +284,11 @@ impl NodeRunner {
     /// Set the membership client for periodic peer list exchange (ping).
     pub fn set_membership_client(&mut self, client: MembershipClient) {
         self.membership_client = Some(client);
+    }
+
+    /// Set the SLO tracker for recording operational observations.
+    pub fn set_slo_tracker(&mut self, tracker: Arc<SloTracker>) {
+        self.slo_tracker = Some(tracker);
     }
 
     /// Return a shutdown handle that can be used to signal graceful shutdown.
@@ -1050,6 +1060,18 @@ impl NodeRunner {
                                 total_changed = changed_count,
                                 "delta push succeeded"
                             );
+                            // Record replication convergence SLO: time from
+                            // entry write (HLC physical) to push completion.
+                            if let Some(slo) = &self.slo_tracker {
+                                let now_ms = self.clock.now().physical;
+                                for (_key, _val, hlc) in entries_with_hlc.iter().take(pushed) {
+                                    let convergence_ms = now_ms.saturating_sub(hlc.physical) as f64;
+                                    slo.record_observation(
+                                        SLO_REPLICATION_CONVERGENCE,
+                                        convergence_ms,
+                                    );
+                                }
+                            }
                             // Advance peer frontier to the max HLC of the
                             // pushed batch — NOT current_frontier(), which may
                             // have advanced past unpushed concurrent writes.
@@ -1239,11 +1261,23 @@ impl NodeRunner {
     /// Run one cycle of peer list exchange (membership gossip).
     async fn run_ping(&mut self) {
         if let Some(membership_client) = &mut self.membership_client {
-            let discovered = membership_client.ping_all().await;
-            if discovered > 0 {
+            let stats = membership_client.ping_all().await;
+
+            // Record authority availability SLO: 1.0 per successful ping,
+            // 0.0 per failed ping.
+            if let Some(slo) = &self.slo_tracker {
+                for _ in 0..stats.successes {
+                    slo.record_observation(SLO_AUTHORITY_AVAILABILITY, 100.0);
+                }
+                for _ in 0..stats.failures {
+                    slo.record_observation(SLO_AUTHORITY_AVAILABILITY, 0.0);
+                }
+            }
+
+            if stats.discovered > 0 {
                 tracing::info!(
                     node = %self.node_id.0,
-                    discovered,
+                    discovered = stats.discovered,
                     "peer list exchange discovered new peers"
                 );
             } else {
@@ -1300,6 +1334,7 @@ mod tests {
     use crate::crdt::pn_counter::PnCounter;
     use crate::hlc::HlcTimestamp;
     use crate::ops::metrics::RuntimeMetrics;
+    use crate::ops::slo::{SLO_REPLICATION_CONVERGENCE, SloTracker};
     use crate::store::kv::CrdtValue;
     use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
     use std::sync::{Arc, RwLock};
@@ -2558,6 +2593,43 @@ mod tests {
         assert!(
             !runner.active_rebalance_plans.contains_key("data/"),
             "rebalance plan should be cleared when policy is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_slo_tracker_wires_tracker_to_runner() {
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
+        let engine = CompactionEngine::with_defaults();
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_secs(60),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+        };
+
+        let slo_tracker = Arc::new(SloTracker::new());
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+
+        // Before setting, tracker should be None.
+        assert!(runner.slo_tracker.is_none());
+
+        runner.set_slo_tracker(Arc::clone(&slo_tracker));
+        assert!(runner.slo_tracker.is_some());
+
+        // Manually record an observation through the runner's tracker
+        // to verify the wiring works end-to-end.
+        if let Some(slo) = &runner.slo_tracker {
+            slo.record_observation(SLO_REPLICATION_CONVERGENCE, 42.0);
+        }
+
+        let snap = slo_tracker.snapshot();
+        let budget = &snap.budgets[SLO_REPLICATION_CONVERGENCE];
+        assert_eq!(
+            budget.total_requests, 1,
+            "expected 1 convergence observation after recording through runner's tracker"
         );
     }
 }

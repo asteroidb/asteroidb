@@ -10,6 +10,7 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloTracker};
 use asteroidb_poc::types::{KeyRange, NodeId};
 use tokio::sync::Mutex;
 
@@ -265,6 +266,127 @@ async fn certified_write_accepts_valid_on_timeout_values() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+
+    server.abort();
+}
+
+/// Create a test state that also returns the shared SloTracker handle.
+fn test_state_with_slo() -> (Arc<AppState>, Arc<SloTracker>) {
+    let node_id = NodeId("test-node".into());
+
+    let mut ns = SystemNamespace::new();
+    ns.set_authority_definition(AuthorityDefinition {
+        key_range: KeyRange {
+            prefix: String::new(),
+        },
+        authority_nodes: vec![
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into()),
+        ],
+        auto_generated: false,
+    });
+
+    let namespace = Arc::new(RwLock::new(ns));
+
+    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![
+        NodeId("auth-1".into()),
+        NodeId("auth-2".into()),
+        NodeId("auth-3".into()),
+    ])));
+
+    let slo_tracker = Arc::new(SloTracker::new());
+
+    let state = Arc::new(AppState {
+        eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
+        certified: Arc::new(Mutex::new(CertifiedApi::new(
+            node_id,
+            Arc::clone(&namespace),
+        ))),
+        namespace,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
+        peer_persist_path: None,
+        consensus,
+        internal_token: None,
+        self_node_id: None,
+        self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
+        slo_tracker: Arc::clone(&slo_tracker),
+    });
+
+    (state, slo_tracker)
+}
+
+#[tokio::test]
+async fn eventual_read_records_slo_observation() {
+    let (state, slo_tracker) = test_state_with_slo();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Perform an eventual read.
+    let resp = client
+        .get(format!("http://{addr}/api/eventual/some_key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // SLO snapshot should now show at least 1 observation for eventual read P99.
+    let snap = slo_tracker.snapshot();
+    let budget = &snap.budgets[SLO_EVENTUAL_READ_P99];
+    assert!(
+        budget.total_requests >= 1,
+        "expected at least 1 eventual read SLO observation, got {}",
+        budget.total_requests
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn certified_read_records_slo_observation() {
+    let (state, slo_tracker) = test_state_with_slo();
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Perform a certified read.
+    let resp = client
+        .get(format!("http://{addr}/api/certified/some_key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // SLO snapshot should now show at least 1 observation for certified read P99.
+    let snap = slo_tracker.snapshot();
+    let budget = &snap.budgets[SLO_CERTIFIED_READ_P99];
+    assert!(
+        budget.total_requests >= 1,
+        "expected at least 1 certified read SLO observation, got {}",
+        budget.total_requests
+    );
 
     server.abort();
 }
