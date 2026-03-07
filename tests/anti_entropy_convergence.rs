@@ -71,6 +71,7 @@ async fn two_node_anti_entropy_convergence() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     // Build state for node 2.
@@ -91,6 +92,7 @@ async fn two_node_anti_entropy_convergence() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     // Write some data to node 1.
@@ -277,6 +279,7 @@ async fn pull_based_sync() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     {
@@ -340,6 +343,7 @@ async fn sync_endpoint_partial_failure() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     // Pre-populate with a counter at "k".
@@ -438,6 +442,7 @@ async fn three_node_convergence_via_sync() {
             self_addr: None,
             latency_model: None,
             cluster_nodes: None,
+            slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
         });
         states.push(state);
     }
@@ -552,6 +557,7 @@ async fn internal_keys_endpoint() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     {
@@ -624,6 +630,7 @@ async fn full_sync_records_remote_frontier_not_local() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     // Write data to the remote node.

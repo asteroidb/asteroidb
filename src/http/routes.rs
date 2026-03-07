@@ -5,9 +5,9 @@ use axum::routing::{get, post};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy, get_topology,
-    get_version_history, internal_announce, internal_delta_sync, internal_join, internal_keys,
-    internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
+    get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy, get_slo,
+    get_topology, get_version_history, internal_announce, internal_delta_sync, internal_join,
+    internal_keys, internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
     post_internal_frontiers, remove_policy, set_authority_definition, set_placement_policy,
     verify_proof,
 };
@@ -70,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/control-plane/versions", get(get_version_history))
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
+        .route("/api/slo", get(get_slo))
         .with_state(state)
 }
 
@@ -137,6 +138,7 @@ mod tests {
             self_addr: None,
             latency_model: None,
             cluster_nodes: None,
+            slo_tracker: Arc::new(crate::ops::slo::SloTracker::new()),
         })
     }
 
