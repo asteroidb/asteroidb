@@ -156,7 +156,8 @@ impl PeerBackoff {
     /// with a random jitter of up to 25% of the computed delay.
     pub fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let base = Self::INITIAL_BACKOFF.saturating_mul(1u32 << self.consecutive_failures.min(5));
+        let base = Self::INITIAL_BACKOFF
+            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(5));
         let capped = base.min(Self::MAX_BACKOFF);
 
         // Add jitter: up to 25% of the capped delay.
@@ -187,7 +188,8 @@ impl PeerBackoff {
         if self.consecutive_failures == 0 {
             return Duration::ZERO;
         }
-        let base = Self::INITIAL_BACKOFF.saturating_mul(1u32 << self.consecutive_failures.min(5));
+        let base = Self::INITIAL_BACKOFF
+            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(5));
         base.min(Self::MAX_BACKOFF)
     }
 }
@@ -497,46 +499,6 @@ impl SyncClient {
             }
         }
     }
-
-    /// Push changed entries to a peer using batched delta sync.
-    ///
-    /// This is a convenience wrapper around [`Self::push_changed_keys`]
-    /// using the [`DEFAULT_BATCH_SIZE`].
-    ///
-    /// Returns `true` on success.
-    #[allow(dead_code)]
-    pub async fn push_delta(
-        &self,
-        peer_addr: &str,
-        entries: HashMap<String, CrdtValue>,
-        sender_id: &str,
-    ) -> bool {
-        if entries.is_empty() {
-            return true;
-        }
-
-        let url = format!("http://{peer_addr}/api/internal/sync");
-        let request = SyncRequest {
-            sender: sender_id.to_string(),
-            entries,
-        };
-
-        match self.authorized_post(&url).json(&request).send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    tracing::debug!("delta push succeeded");
-                    true
-                } else {
-                    tracing::warn!(status = %resp.status(), "delta push received non-success status");
-                    false
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "delta push failed");
-                false
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -798,17 +760,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[tokio::test]
-    async fn push_delta_empty_entries_returns_true() {
-        let registry = shared_registry(vec![]);
-        let client = SyncClient::new(registry);
-
-        let result = client
-            .push_delta("127.0.0.1:1", HashMap::new(), "node-1")
-            .await;
-        assert!(result);
-    }
-
     // ---------------------------------------------------------------
     // push_changed_keys tests
     // ---------------------------------------------------------------
@@ -905,6 +856,14 @@ mod tests {
         // Immediately after failure, the backoff should gate retries
         // (ready_at is in the future).
         assert!(!b.is_ready());
+    }
+
+    #[test]
+    fn backoff_first_failure_uses_initial_delay() {
+        let mut b = PeerBackoff::new();
+        b.record_failure();
+        // First failure should use INITIAL_BACKOFF (1s), not 2x.
+        assert_eq!(b.base_delay(), PeerBackoff::INITIAL_BACKOFF);
     }
 
     #[test]

@@ -731,13 +731,31 @@ impl NodeRunner {
                                 total_changed = changed_count,
                                 "delta push succeeded"
                             );
+                            // Update peer frontier so next cycle only sends
+                            // entries newer than this point.
+                            let api = eventual_api.lock().await;
+                            if let Some(local_frontier) = api.store().current_frontier() {
+                                self.peer_frontiers.insert(peer_key.clone(), local_frontier);
+                            }
+                            drop(api);
                         }
                         Err(e) => {
                             tracing::warn!(
                                 peer = %peer.node_id.0,
                                 error = %e,
+                                pushed = e.pushed,
                                 "delta push failed"
                             );
+                            // Even on partial failure, if some entries were
+                            // pushed we advance the frontier so they are not
+                            // re-sent on the next cycle.
+                            if e.pushed > 0 {
+                                let api = eventual_api.lock().await;
+                                if let Some(local_frontier) = api.store().current_frontier() {
+                                    self.peer_frontiers.insert(peer_key.clone(), local_frontier);
+                                }
+                                drop(api);
+                            }
                             // Record failure and move to next peer.
                             self.peer_backoffs
                                 .entry(peer_key.clone())
