@@ -143,6 +143,16 @@ impl RebalancePlan {
 /// Default maximum number of keys to migrate per sync cycle.
 pub const DEFAULT_REBALANCE_BATCH_SIZE: usize = 50;
 
+/// Compute how far the additions offset can advance given per-item success flags.
+///
+/// Returns the length of the longest contiguous prefix of `true` values in
+/// `succeeded`.  This ensures that the offset only advances past items that
+/// actually completed, preventing later successes from causing earlier
+/// failures to be skipped.
+pub fn contiguous_success_count(succeeded: &[bool]) -> usize {
+    succeeded.iter().take_while(|&&ok| ok).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +395,184 @@ mod tests {
         };
 
         assert!(plan.additions_batch(0, 10).is_empty());
+    }
+
+    // --- contiguous_success_count ---
+
+    #[test]
+    fn contiguous_success_all_succeed() {
+        // All items succeed → offset advances by full batch size.
+        assert_eq!(contiguous_success_count(&[true, true, true]), 3);
+    }
+
+    #[test]
+    fn contiguous_success_all_fail() {
+        // All items fail → offset does not advance.
+        assert_eq!(contiguous_success_count(&[false, false, false]), 0);
+    }
+
+    #[test]
+    fn contiguous_success_sparse_failure_at_start() {
+        // Item 0 fails, items 1 and 2 succeed → offset stays at 0.
+        assert_eq!(contiguous_success_count(&[false, true, true]), 0);
+    }
+
+    #[test]
+    fn contiguous_success_sparse_failure_in_middle() {
+        // Items 0,2 succeed but 1 fails → offset advances by 1 only.
+        assert_eq!(contiguous_success_count(&[true, false, true]), 1);
+    }
+
+    #[test]
+    fn contiguous_success_failure_at_end() {
+        // Items 0,1 succeed, item 2 fails → offset advances by 2.
+        assert_eq!(contiguous_success_count(&[true, true, false]), 2);
+    }
+
+    #[test]
+    fn contiguous_success_empty() {
+        // Empty batch → no advancement.
+        assert_eq!(contiguous_success_count(&[]), 0);
+    }
+
+    #[test]
+    fn contiguous_success_single_success() {
+        assert_eq!(contiguous_success_count(&[true]), 1);
+    }
+
+    #[test]
+    fn contiguous_success_single_failure() {
+        assert_eq!(contiguous_success_count(&[false]), 0);
+    }
+
+    // --- Offset tracking integration scenarios ---
+
+    /// Simulates the offset advancement pattern used by the rebalance executor.
+    /// Given a plan and a sequence of batch results (each a Vec<bool> of
+    /// per-addition success flags), returns the final offset.
+    fn simulate_offset_advancement(
+        plan: &RebalancePlan,
+        batch_size: usize,
+        batch_results: &[Vec<bool>],
+    ) -> usize {
+        let mut offset = 0;
+        for result in batch_results {
+            let batch = plan.additions_batch(offset, batch_size);
+            assert_eq!(
+                batch.len(),
+                result.len(),
+                "batch size mismatch at offset {offset}"
+            );
+            offset += contiguous_success_count(result);
+        }
+        offset
+    }
+
+    #[test]
+    fn offset_tracking_sparse_failures_no_skip() {
+        // 5 additions: batch_size=5, items 0,2 succeed but 1,3,4 fail.
+        // Offset should advance to 1 (only item 0 is contiguously successful).
+        let plan = RebalancePlan {
+            key_range: key_range("data/"),
+            additions: (0..5)
+                .map(|i| RebalanceAddition {
+                    key: format!("data/k{i}"),
+                    target_node: nid(&format!("n{}", i % 2)),
+                })
+                .collect(),
+            removals: vec![],
+        };
+
+        let offset =
+            simulate_offset_advancement(&plan, 5, &[vec![true, false, true, false, false]]);
+        assert_eq!(
+            offset, 1,
+            "offset should only advance past contiguous successes"
+        );
+
+        // Next batch starts at offset=1, items 1-4. If all succeed:
+        let batch = plan.additions_batch(1, 5);
+        assert_eq!(batch.len(), 4);
+        assert_eq!(batch[0].key, "data/k1"); // failed item is retried
+    }
+
+    #[test]
+    fn offset_tracking_all_fail_no_advance() {
+        let plan = RebalancePlan {
+            key_range: key_range("data/"),
+            additions: (0..3)
+                .map(|i| RebalanceAddition {
+                    key: format!("data/k{i}"),
+                    target_node: nid("n1"),
+                })
+                .collect(),
+            removals: vec![],
+        };
+
+        let offset = simulate_offset_advancement(&plan, 3, &[vec![false, false, false]]);
+        assert_eq!(offset, 0, "offset must not advance when all items fail");
+
+        // Retry should see the same batch.
+        let batch = plan.additions_batch(0, 3);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].key, "data/k0");
+    }
+
+    #[test]
+    fn offset_tracking_all_succeed_full_advance() {
+        let plan = RebalancePlan {
+            key_range: key_range("data/"),
+            additions: (0..6)
+                .map(|i| RebalanceAddition {
+                    key: format!("data/k{i}"),
+                    target_node: nid("n1"),
+                })
+                .collect(),
+            removals: vec![],
+        };
+
+        // Two batches of 3, all succeed.
+        let offset = simulate_offset_advancement(
+            &plan,
+            3,
+            &[vec![true, true, true], vec![true, true, true]],
+        );
+        assert_eq!(
+            offset, 6,
+            "offset should advance by full batch when all succeed"
+        );
+
+        // Past the end.
+        let batch = plan.additions_batch(6, 3);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn offset_tracking_gradual_progress_with_retries() {
+        // 4 additions, batch_size=4.
+        // Cycle 1: [true, false, false, false] → offset=1
+        // Cycle 2: [true, true, false]          → offset=3  (batch is items 1,2,3)
+        // Cycle 3: [true]                        → offset=4  (batch is item 3)
+        let plan = RebalancePlan {
+            key_range: key_range("data/"),
+            additions: (0..4)
+                .map(|i| RebalanceAddition {
+                    key: format!("data/k{i}"),
+                    target_node: nid("n1"),
+                })
+                .collect(),
+            removals: vec![],
+        };
+
+        let offset = simulate_offset_advancement(
+            &plan,
+            4,
+            &[
+                vec![true, false, false, false],
+                vec![true, true, false],
+                vec![true],
+            ],
+        );
+        assert_eq!(offset, 4, "should complete after gradual retries");
     }
 }
