@@ -996,11 +996,17 @@ impl NodeRunner {
             // --- Push phase: send only changed local keys to peer ---
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
                 let api = eventual_api.lock().await;
-                let changed: Vec<(String, crate::store::kv::CrdtValue)> = api
-                    .store()
-                    .entries_since(frontier)
-                    .into_iter()
-                    .map(|(key, value, _hlc)| (key, value))
+                // entries_since returns entries sorted by HLC; preserve the
+                // per-entry HLC so we can compute the correct frontier to
+                // advance to after a (possibly partial) push.
+                let entries_with_hlc: Vec<(
+                    String,
+                    crate::store::kv::CrdtValue,
+                    crate::hlc::HlcTimestamp,
+                )> = api.store().entries_since(frontier);
+                let changed: Vec<(String, crate::store::kv::CrdtValue)> = entries_with_hlc
+                    .iter()
+                    .map(|(key, value, _hlc)| (key.clone(), value.clone()))
                     .collect();
                 let changed_count = changed.len();
                 drop(api);
@@ -1018,13 +1024,13 @@ impl NodeRunner {
                                 total_changed = changed_count,
                                 "delta push succeeded"
                             );
-                            // Update peer frontier so next cycle only sends
-                            // entries newer than this point.
-                            let api = eventual_api.lock().await;
-                            if let Some(local_frontier) = api.store().current_frontier() {
-                                self.peer_frontiers.insert(peer_key.clone(), local_frontier);
+                            // Advance peer frontier to the max HLC of the
+                            // pushed batch — NOT current_frontier(), which may
+                            // have advanced past unpushed concurrent writes.
+                            if let Some((_key, _val, max_hlc)) = entries_with_hlc.last() {
+                                self.peer_frontiers
+                                    .insert(peer_key.clone(), max_hlc.clone());
                             }
-                            drop(api);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1033,15 +1039,16 @@ impl NodeRunner {
                                 pushed = e.pushed,
                                 "delta push failed"
                             );
-                            // Even on partial failure, if some entries were
-                            // pushed we advance the frontier so they are not
-                            // re-sent on the next cycle.
-                            if e.pushed > 0 {
-                                let api = eventual_api.lock().await;
-                                if let Some(local_frontier) = api.store().current_frontier() {
-                                    self.peer_frontiers.insert(peer_key.clone(), local_frontier);
-                                }
-                                drop(api);
+                            // On partial failure, advance the frontier only to
+                            // the HLC of the last successfully pushed entry.
+                            // entries_with_hlc is sorted by HLC, so index
+                            // `pushed - 1` is the last entry that was sent.
+                            if e.pushed > 0
+                                && let Some((_key, _val, last_pushed_hlc)) =
+                                    entries_with_hlc.get(e.pushed - 1)
+                            {
+                                self.peer_frontiers
+                                    .insert(peer_key.clone(), last_pushed_hlc.clone());
                             }
                             // Record failure and move to next peer.
                             self.peer_backoffs

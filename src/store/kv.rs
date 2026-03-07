@@ -1148,6 +1148,120 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // Batch frontier computation (#193)
+    // ---------------------------------------------------------------
+
+    /// Verify that the max HLC of a batch from entries_since corresponds to
+    /// the last element (entries are sorted by HLC).  This is the property
+    /// relied upon by the delta push fix: we advance the peer frontier to
+    /// the batch max, not the store's current_frontier().
+    #[test]
+    fn entries_since_batch_max_hlc_equals_last_entry() {
+        let mut store = Store::new();
+
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("a", ts(100, 0, "N1"));
+
+        store.put("b".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("b", ts(200, 0, "N1"));
+
+        store.put("c".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("c", ts(300, 0, "N1"));
+
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+
+        // The last entry should have the max HLC of the batch.
+        let batch_max_hlc = entries.last().map(|(_, _, hlc)| hlc.clone());
+        assert_eq!(batch_max_hlc, Some(ts(300, 0, "N1")));
+
+        // This batch max is NOT necessarily equal to current_frontier()
+        // if new writes occur concurrently. Simulate that:
+        store.put("d".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("d", ts(400, 0, "N1"));
+
+        // current_frontier now is ts(400), but our batch max was ts(300).
+        assert_eq!(store.current_frontier(), Some(ts(400, 0, "N1")));
+        // The batch we already captured still has max ts(300).
+        assert_eq!(entries.last().unwrap().2, ts(300, 0, "N1"));
+    }
+
+    /// Verify that on a partial push (only first N entries succeed),
+    /// the correct frontier is the HLC of entry at index N-1.
+    #[test]
+    fn entries_since_partial_batch_frontier() {
+        let mut store = Store::new();
+
+        store.put("a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("a", ts(100, 0, "N1"));
+
+        store.put("b".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("b", ts(200, 0, "N1"));
+
+        store.put("c".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("c", ts(300, 0, "N1"));
+
+        store.put("d".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("d", ts(400, 0, "N1"));
+
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+        assert_eq!(entries.len(), 4);
+
+        // If only 2 entries were pushed successfully, the frontier
+        // should advance to the HLC of entry at index 1 (0-based).
+        let pushed = 2;
+        let partial_frontier = &entries[pushed - 1].2;
+        assert_eq!(*partial_frontier, ts(200, 0, "N1"));
+
+        // Entries after this frontier should include the unpushed ones.
+        let remaining = store.entries_since(partial_frontier);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, "c");
+        assert_eq!(remaining[1].0, "d");
+    }
+
+    /// Concurrent writes during a push window must not be skipped.
+    /// The batch captured before the push should have a max HLC that
+    /// does NOT cover writes that occur during the push.
+    #[test]
+    fn concurrent_writes_during_push_not_skipped() {
+        let mut store = Store::new();
+
+        // Pre-existing entries (the "batch" to push).
+        store.put("x".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("x", ts(100, 0, "N1"));
+
+        store.put("y".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("y", ts(200, 0, "N1"));
+
+        // Capture the batch.
+        let frontier = ts(0, 0, "");
+        let batch = store.entries_since(&frontier);
+        let batch_max = batch.last().unwrap().2.clone();
+        assert_eq!(batch_max, ts(200, 0, "N1"));
+
+        // Simulate a concurrent write that occurs DURING the push.
+        store.put("z".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("z", ts(250, 0, "N1"));
+
+        // If we advance the frontier to batch_max (200), the concurrent
+        // write (250) will be picked up in the next cycle.
+        let next_batch = store.entries_since(&batch_max);
+        assert_eq!(next_batch.len(), 1);
+        assert_eq!(next_batch[0].0, "z");
+
+        // But if we had used current_frontier (250), we'd skip "z" forever!
+        let bad_frontier = store.current_frontier().unwrap();
+        assert_eq!(bad_frontier, ts(250, 0, "N1"));
+        let skipped = store.entries_since(&bad_frontier);
+        assert!(
+            skipped.is_empty(),
+            "using current_frontier would skip the concurrent write"
+        );
+    }
+
     #[test]
     fn migration_chain_v1_to_current_applied_on_load() {
         let dir = tempfile::tempdir().unwrap();

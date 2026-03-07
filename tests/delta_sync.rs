@@ -405,3 +405,112 @@ async fn delta_sync_frontier_advances_correctly() {
     assert_eq!(delta2.entries.len(), 1);
     assert_eq!(delta2.entries[0].key, "key-2");
 }
+
+// ---------------------------------------------------------------
+// Frontier must use batch max HLC, not current_frontier (#193)
+// ---------------------------------------------------------------
+
+/// Verify that writes happening after entries_since is called are NOT
+/// skipped when the peer frontier is advanced to the batch's max HLC
+/// rather than the store's current_frontier.
+#[tokio::test]
+async fn concurrent_writes_during_push_are_not_skipped() {
+    let state = test_state();
+
+    // Phase 1: write initial entries and capture the batch.
+    {
+        let mut api = state.eventual.lock().await;
+        api.eventual_counter_inc("batch-key-1").unwrap();
+        api.eventual_counter_inc("batch-key-2").unwrap();
+    }
+
+    // Capture entries_since(zero) — this is the "batch" that would be pushed.
+    let batch = {
+        let api = state.eventual.lock().await;
+        api.store().entries_since(&hlc(0, 0, ""))
+    };
+    assert_eq!(batch.len(), 2);
+    let batch_max_hlc = batch.last().unwrap().2.clone();
+
+    // Phase 2: a concurrent write happens AFTER the batch was captured
+    // but BEFORE the push completes (simulated by writing now).
+    {
+        let mut api = state.eventual.lock().await;
+        api.eventual_counter_inc("concurrent-key").unwrap();
+    }
+
+    // The store's current_frontier now includes the concurrent write.
+    let current_frontier = {
+        let api = state.eventual.lock().await;
+        api.store().current_frontier().unwrap()
+    };
+    assert!(
+        current_frontier > batch_max_hlc,
+        "current_frontier should be ahead of batch max"
+    );
+
+    // If we advance the peer frontier to batch_max_hlc (correct behavior),
+    // the concurrent write is picked up next cycle.
+    let next_delta = {
+        let api = state.eventual.lock().await;
+        api.store().entries_since(&batch_max_hlc)
+    };
+    assert_eq!(
+        next_delta.len(),
+        1,
+        "using batch max HLC should leave 1 entry for next cycle"
+    );
+    assert_eq!(next_delta[0].0, "concurrent-key");
+
+    // If we had used current_frontier (the bug), the concurrent write
+    // would be permanently skipped.
+    let bad_delta = {
+        let api = state.eventual.lock().await;
+        api.store().entries_since(&current_frontier)
+    };
+    assert!(
+        bad_delta.is_empty(),
+        "using current_frontier would skip the concurrent write (the bug)"
+    );
+}
+
+/// Verify that on partial push failure, advancing the frontier to the
+/// last successfully pushed entry's HLC preserves unpushed entries.
+#[tokio::test]
+async fn partial_failure_does_not_skip_entries() {
+    let state = test_state();
+
+    // Write 4 entries with distinct timestamps.
+    {
+        let mut api = state.eventual.lock().await;
+        api.eventual_counter_inc("entry-1").unwrap();
+        api.eventual_counter_inc("entry-2").unwrap();
+        api.eventual_counter_inc("entry-3").unwrap();
+        api.eventual_counter_inc("entry-4").unwrap();
+    }
+
+    // Capture the batch (sorted by HLC).
+    let batch = {
+        let api = state.eventual.lock().await;
+        api.store().entries_since(&hlc(0, 0, ""))
+    };
+    assert_eq!(batch.len(), 4);
+
+    // Simulate partial failure: only first 2 entries were pushed.
+    let pushed = 2;
+    let partial_frontier = batch[pushed - 1].2.clone();
+
+    // The remaining entries (3 and 4) should be returned on next cycle.
+    let remaining = {
+        let api = state.eventual.lock().await;
+        api.store().entries_since(&partial_frontier)
+    };
+    assert_eq!(
+        remaining.len(),
+        2,
+        "2 unpushed entries should remain after partial push"
+    );
+    let remaining_keys: Vec<&str> = remaining.iter().map(|(k, _, _)| k.as_str()).collect();
+    assert!(remaining_keys.contains(&"entry-3"));
+    assert!(remaining_keys.contains(&"entry-4"));
+}
