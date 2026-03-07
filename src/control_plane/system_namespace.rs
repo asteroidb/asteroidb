@@ -128,6 +128,25 @@ impl SystemNamespace {
         let policies: Vec<PlacementPolicy> = self.placement_policies.values().cloned().collect();
         let mut changed = 0;
 
+        // Collect the set of prefixes that currently have certified policies.
+        let certified_prefixes: std::collections::HashSet<&str> = policies
+            .iter()
+            .filter(|p| p.certified)
+            .map(|p| p.key_range.prefix.as_str())
+            .collect();
+
+        // Remove authority definitions whose prefix no longer has a certified policy.
+        let stale_prefixes: Vec<String> = self
+            .authority_definitions
+            .keys()
+            .filter(|prefix| !certified_prefixes.contains(prefix.as_str()))
+            .cloned()
+            .collect();
+        for prefix in stale_prefixes {
+            self.authority_definitions.remove(&prefix);
+            changed += 1;
+        }
+
         for policy in &policies {
             if !policy.certified {
                 continue;
@@ -831,5 +850,61 @@ mod tests {
         assert_eq!(changed, 2);
         // Version should bump only once (not once per changed definition).
         assert_eq!(ns.version().0, version_before.0 + 1);
+    }
+
+    #[test]
+    fn recalculate_authorities_removes_stale_after_policy_deletion() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("user/", &[]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Store, &[]),
+        ];
+
+        // Create the authority definition.
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 1);
+        assert!(ns.get_authority_definition("user/").is_some());
+
+        // Remove the policy, then recalculate.
+        ns.remove_placement_policy("user/");
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 1);
+        assert!(
+            ns.get_authority_definition("user/").is_none(),
+            "authority definition should be removed after policy deletion"
+        );
+    }
+
+    #[test]
+    fn recalculate_authorities_removes_stale_after_decertification() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("order/", &[]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &[]),
+            make_node("n2", NodeMode::Store, &[]),
+        ];
+
+        // Create the authority definition.
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 1);
+        assert!(ns.get_authority_definition("order/").is_some());
+
+        // Change the policy to certified=false, then recalculate.
+        let non_certified =
+            PlacementPolicy::new(PolicyVersion(1), key_range("order/"), 3).with_certified(false);
+        ns.set_placement_policy(non_certified);
+        let changed = ns.recalculate_authorities(&nodes);
+        assert_eq!(changed, 1);
+        assert!(
+            ns.get_authority_definition("order/").is_none(),
+            "authority definition should be removed after decertification"
+        );
     }
 }
