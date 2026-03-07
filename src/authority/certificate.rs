@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -180,8 +180,10 @@ pub struct KeysetRegistry {
 struct KeysetEntry {
     /// Epoch at which this keyset was registered.
     registered_epoch: u64,
-    /// Authority public keys for this version.
+    /// Authority Ed25519 public keys for this version.
     keys: Vec<(NodeId, VerifyingKey)>,
+    /// Optional BLS public keys for this version, keyed by authority ID.
+    bls_keys: std::collections::HashMap<String, BlsPublicKey>,
 }
 
 impl KeysetRegistry {
@@ -212,6 +214,7 @@ impl KeysetRegistry {
             KeysetEntry {
                 registered_epoch,
                 keys,
+                bls_keys: std::collections::HashMap::new(),
             },
         );
         self.current = version.0;
@@ -269,6 +272,37 @@ impl KeysetRegistry {
     /// Return the registration epoch for a keyset version, if it exists.
     pub fn registered_epoch(&self, version: &KeysetVersion) -> Option<u64> {
         self.keysets.get(&version.0).map(|e| e.registered_epoch)
+    }
+
+    /// Register BLS public keys for a keyset version.
+    ///
+    /// `bls_keys` maps authority ID strings to their BLS public keys.
+    /// The keyset version must already exist (i.e., `register_keyset` must have
+    /// been called first).
+    pub fn register_bls_keys(
+        &mut self,
+        version: &KeysetVersion,
+        bls_keys: Vec<(String, BlsPublicKey)>,
+    ) -> Result<(), CertError> {
+        let entry = self
+            .keysets
+            .get_mut(&version.0)
+            .ok_or(CertError::UnknownKeyset(version.0))?;
+        for (id, pk) in bls_keys {
+            entry.bls_keys.insert(id, pk);
+        }
+        Ok(())
+    }
+
+    /// Look up the BLS public key for a specific authority in a keyset version.
+    pub fn get_bls_key(
+        &self,
+        version: &KeysetVersion,
+        authority_id: &str,
+    ) -> Option<&BlsPublicKey> {
+        self.keysets
+            .get(&version.0)
+            .and_then(|entry| entry.bls_keys.get(authority_id))
     }
 
     /// Remove keyset versions whose registration epoch is beyond the grace
@@ -765,6 +799,22 @@ impl DualModeCertificate {
                 Ok(valid_signers)
             }
             CertificateMode::Bls => {
+                // P1-1: Validate signer ID / public key count match.
+                if self.bls_signer_ids.len() != self.bls_public_keys.len() {
+                    return Err(CertError::InvalidSignature(
+                        "signer ID / public key count mismatch".into(),
+                    ));
+                }
+
+                // P1-2: Reject duplicate signer IDs.
+                let unique_signers: HashSet<&str> =
+                    self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
+                if unique_signers.len() != self.bls_signer_ids.len() {
+                    return Err(CertError::InvalidSignature(
+                        "duplicate BLS signer IDs".into(),
+                    ));
+                }
+
                 let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
                     CertError::InvalidSignature("missing BLS aggregated signature".into())
                 })?;
@@ -774,6 +824,103 @@ impl DualModeCertificate {
                 }
 
                 if bls::aggregate_verify(&self.bls_public_keys, message, agg_sig) {
+                    Ok(self.bls_signer_ids.clone())
+                } else {
+                    Err(CertError::InvalidSignature(
+                        "BLS aggregate verification failed".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Verify the certificate using a keyset registry for key validation.
+    ///
+    /// For Ed25519 mode: builds a temporary `MajorityCertificate` and delegates
+    /// to `verify_signatures_with_registry`.
+    ///
+    /// For BLS mode: validates each signer ID against the registry's BLS keys,
+    /// then performs aggregate signature verification using registry-trusted keys.
+    pub fn verify_with_registry(
+        &self,
+        message: &[u8],
+        registry: &KeysetRegistry,
+        current_epoch: u64,
+        epoch_config: &EpochConfig,
+    ) -> Result<Vec<NodeId>, CertError> {
+        // Validate keyset version is known and not expired.
+        if !registry.is_version_valid(&self.keyset_version, current_epoch, epoch_config) {
+            if registry.get_keys(&self.keyset_version).is_none() {
+                return Err(CertError::UnknownKeyset(self.keyset_version.0));
+            }
+            let entry_epoch = registry.registered_epoch(&self.keyset_version).unwrap_or(0);
+            return Err(CertError::ExpiredKeyset {
+                version: self.keyset_version.0,
+                keyset_epoch: entry_epoch,
+                current_epoch,
+            });
+        }
+
+        match self.mode {
+            CertificateMode::Ed25519 => {
+                // Delegate to existing Ed25519 registry verification via
+                // MajorityCertificate.
+                let mut cert = MajorityCertificate::new(
+                    self.key_range.clone(),
+                    self.frontier_hlc.clone(),
+                    self.policy_version,
+                    self.keyset_version.clone(),
+                );
+                for sig in &self.ed25519_signatures {
+                    cert.add_signature(sig.clone());
+                }
+                cert.verify_signatures_with_registry(message, registry, current_epoch, epoch_config)
+            }
+            CertificateMode::Bls => {
+                // P1-1: Validate signer ID / public key count match.
+                if self.bls_signer_ids.len() != self.bls_public_keys.len() {
+                    return Err(CertError::InvalidSignature(
+                        "signer ID / public key count mismatch".into(),
+                    ));
+                }
+
+                // P1-2: Reject duplicate signer IDs.
+                let unique_signers: HashSet<&str> =
+                    self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
+                if unique_signers.len() != self.bls_signer_ids.len() {
+                    return Err(CertError::InvalidSignature(
+                        "duplicate BLS signer IDs".into(),
+                    ));
+                }
+
+                let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
+                    CertError::InvalidSignature("missing BLS aggregated signature".into())
+                })?;
+
+                if self.bls_signer_ids.is_empty() {
+                    return Err(CertError::InvalidSignature("no BLS signers".into()));
+                }
+
+                // P1-3: Cross-check each signer's public key against the registry.
+                let mut registry_keys = Vec::new();
+                for (i, signer_id) in self.bls_signer_ids.iter().enumerate() {
+                    let registry_key = registry
+                        .get_bls_key(&self.keyset_version, &signer_id.0)
+                        .ok_or_else(|| CertError::AuthorityNotInRegistry(signer_id.0.clone()))?;
+
+                    // Verify the embedded public key matches the registry.
+                    if self.bls_public_keys[i] != *registry_key {
+                        return Err(CertError::InvalidSignature(format!(
+                            "BLS public key mismatch for signer {}",
+                            signer_id.0
+                        )));
+                    }
+
+                    registry_keys.push(registry_key.clone());
+                }
+
+                // Verify aggregate signature against registry-trusted keys.
+                if bls::aggregate_verify(&registry_keys, message, agg_sig) {
                     Ok(self.bls_signer_ids.clone())
                 } else {
                     Err(CertError::InvalidSignature(
@@ -1893,5 +2040,183 @@ mod tests {
 
         assert_eq!(ed, ed_back);
         assert_eq!(bls_mode, bls_back);
+    }
+
+    // ---------------------------------------------------------------
+    // P1 security fix tests: BLS signer integrity & registry validation
+    // ---------------------------------------------------------------
+
+    fn make_bls_keypair(seed: u8) -> crate::authority::bls::BlsKeypair {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        ikm[31] = seed.wrapping_add(42);
+        crate::authority::bls::BlsKeypair::generate(&ikm)
+    }
+
+    #[test]
+    fn bls_verify_rejects_signer_key_count_mismatch() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let kp = make_bls_keypair(80);
+        let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+
+        // Set 1 signer ID but 0 public keys (mismatch).
+        cert.bls_signer_ids = vec![NodeId("a".into())];
+        cert.bls_public_keys = vec![]; // intentional mismatch
+        cert.bls_aggregated_signature = Some(agg);
+
+        let result = cert.verify(&message);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CertError::InvalidSignature(msg) => {
+                assert!(
+                    msg.contains("count mismatch"),
+                    "expected count mismatch error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSignature, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn bls_verify_rejects_duplicate_signer_ids() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let kp1 = make_bls_keypair(81);
+        let kp2 = make_bls_keypair(82);
+        let sig1 = crate::authority::bls::sign_message(kp1.secret_key(), &message);
+        let sig2 = crate::authority::bls::sign_message(kp2.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig1, sig2]);
+
+        // Same signer ID listed twice with different keys.
+        cert.bls_signer_ids = vec![NodeId("dup".into()), NodeId("dup".into())];
+        cert.bls_public_keys = vec![kp1.public_key.clone(), kp2.public_key.clone()];
+        cert.bls_aggregated_signature = Some(agg);
+
+        let result = cert.verify(&message);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            CertError::InvalidSignature(msg) => {
+                assert!(
+                    msg.contains("duplicate"),
+                    "expected duplicate error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSignature, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn bls_verify_with_registry_rejects_unknown_signer() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("known".into()), ed_vk)])
+            .unwrap();
+
+        // Register BLS key only for "known".
+        let kp_known = make_bls_keypair(83);
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![("known".into(), kp_known.public_key.clone())],
+            )
+            .unwrap();
+
+        // Build a cert that includes an unknown signer.
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+        let kp_unknown = make_bls_keypair(84);
+        let sig_known = crate::authority::bls::sign_message(kp_known.secret_key(), &message);
+        let sig_unknown = crate::authority::bls::sign_message(kp_unknown.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig_known, sig_unknown]);
+
+        cert.set_bls_aggregate(
+            vec![
+                (NodeId("known".into()), kp_known.public_key.clone()),
+                (NodeId("unknown".into()), kp_unknown.public_key.clone()),
+            ],
+            agg,
+        );
+
+        let config = EpochConfig::default();
+        let result = cert.verify_with_registry(&message, &registry, 0, &config);
+        assert!(
+            matches!(
+                result,
+                Err(CertError::AuthorityNotInRegistry(ref id)) if id == "unknown"
+            ),
+            "expected AuthorityNotInRegistry for 'unknown', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bls_verify_with_registry_accepts_valid_signers() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk1) = make_key_pair();
+        let (_, ed_vk2) = make_key_pair();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![
+                    (NodeId("auth-a".into()), ed_vk1),
+                    (NodeId("auth-b".into()), ed_vk2),
+                ],
+            )
+            .unwrap();
+
+        let kp_a = make_bls_keypair(85);
+        let kp_b = make_bls_keypair(86);
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![
+                    ("auth-a".into(), kp_a.public_key.clone()),
+                    ("auth-b".into(), kp_b.public_key.clone()),
+                ],
+            )
+            .unwrap();
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+        let sig_a = crate::authority::bls::sign_message(kp_a.secret_key(), &message);
+        let sig_b = crate::authority::bls::sign_message(kp_b.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig_a, sig_b]);
+
+        cert.set_bls_aggregate(
+            vec![
+                (NodeId("auth-a".into()), kp_a.public_key.clone()),
+                (NodeId("auth-b".into()), kp_b.public_key.clone()),
+            ],
+            agg,
+        );
+
+        let config = EpochConfig::default();
+        let result = cert.verify_with_registry(&message, &registry, 0, &config);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let signers = result.unwrap();
+        assert_eq!(signers.len(), 2);
+        assert_eq!(signers[0], NodeId("auth-a".into()));
+        assert_eq!(signers[1], NodeId("auth-b".into()));
     }
 }
