@@ -51,6 +51,8 @@ fn test_state() -> Arc<AppState> {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     })
 }
 

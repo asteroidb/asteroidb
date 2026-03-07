@@ -151,6 +151,8 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     })
 }
 
@@ -1177,6 +1179,8 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     // Write data to the legacy peer.
