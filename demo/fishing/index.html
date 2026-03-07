@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>漁獲高管理システム - AsteroidDB デモ</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Segoe UI', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+  background: linear-gradient(135deg, #0c1b33 0%, #1a3a5c 50%, #0c1b33 100%);
+  color: #e0e8f0;
+  min-height: 100vh;
+}
+header {
+  text-align: center;
+  padding: 24px 16px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+header h1 { font-size: 1.5rem; font-weight: 600; letter-spacing: 0.05em; }
+header h1 span { color: #4fc3f7; }
+header p { font-size: 0.8rem; color: #8899aa; margin-top: 4px; }
+
+/* Scenario bar */
+.scenario-bar {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  flex-wrap: wrap;
+}
+.scenario-btn {
+  padding: 8px 18px;
+  border: 1px solid #4fc3f7;
+  border-radius: 20px;
+  background: transparent;
+  color: #4fc3f7;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.3s;
+}
+.scenario-btn:hover { background: rgba(79,195,247,0.15); }
+.scenario-btn.active {
+  background: #4fc3f7;
+  color: #0c1b33;
+  font-weight: 600;
+}
+.scenario-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Main grid */
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.2fr;
+  gap: 16px;
+  padding: 16px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+@media (max-width: 800px) {
+  .main-grid { grid-template-columns: 1fr; }
+}
+
+/* Cards */
+.card {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  padding: 20px;
+  transition: border-color 0.3s;
+}
+.card.boat { border-left: 3px solid #4fc3f7; }
+.card.port { border-left: 3px solid #66bb6a; }
+.card.partitioned { border-left-color: #ff7043; opacity: 0.85; }
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.card-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+.status-badge {
+  font-size: 0.75rem;
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-weight: 500;
+}
+.status-badge.online {
+  background: rgba(102,187,106,0.2);
+  color: #66bb6a;
+  border: 1px solid rgba(102,187,106,0.3);
+}
+.status-badge.offline {
+  background: rgba(255,112,67,0.2);
+  color: #ff7043;
+  border: 1px solid rgba(255,112,67,0.3);
+}
+
+/* Fish rows */
+.fish-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.fish-row:last-child { border-bottom: none; }
+.fish-name { font-size: 0.9rem; }
+.fish-count {
+  font-size: 1.3rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 40px;
+  text-align: right;
+}
+.fish-buttons {
+  display: flex;
+  gap: 4px;
+}
+.fish-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  border: 1px solid rgba(79,195,247,0.4);
+  background: rgba(79,195,247,0.1);
+  color: #4fc3f7;
+  cursor: pointer;
+  font-size: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.fish-btn:hover {
+  background: rgba(79,195,247,0.3);
+}
+.fish-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* Port specifics */
+.cert-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255,255,255,0.1);
+}
+.cert-status {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.cert-status.none { background: rgba(150,150,150,0.2); color: #999; }
+.cert-status.pending { background: rgba(255,183,77,0.2); color: #ffb74d; }
+.cert-status.certified { background: rgba(102,187,106,0.2); color: #66bb6a; }
+
+/* Port fish row with certified column */
+.port-fish-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.port-fish-row:last-child { border-bottom: none; }
+.port-label { font-size: 0.75rem; color: #8899aa; }
+
+/* Event log */
+.log-panel {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 16px 24px;
+}
+.log-card {
+  background: rgba(0,0,0,0.3);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 16px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.log-card h3 {
+  font-size: 0.85rem;
+  color: #8899aa;
+  margin-bottom: 8px;
+}
+.log-entry {
+  font-size: 0.8rem;
+  padding: 3px 0;
+  font-family: 'Consolas', 'Menlo', monospace;
+  color: #b0bec5;
+}
+.log-entry .time { color: #4fc3f7; margin-right: 8px; }
+.log-entry.sync { color: #66bb6a; }
+.log-entry.partition { color: #ff7043; }
+.log-entry.certify { color: #ffb74d; }
+
+/* Explanation overlay */
+.explanation {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 16px 16px;
+}
+.explanation-box {
+  background: rgba(79,195,247,0.08);
+  border: 1px solid rgba(79,195,247,0.2);
+  border-radius: 10px;
+  padding: 14px 18px;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #b0d4f1;
+}
+.explanation-box strong { color: #4fc3f7; }
+
+/* Animated wave */
+.wave-bar {
+  height: 4px;
+  background: linear-gradient(90deg, transparent, #4fc3f7, transparent);
+  background-size: 200% 100%;
+  animation: wave 2s linear infinite;
+  margin: 0 16px;
+  border-radius: 2px;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.wave-bar.active { opacity: 1; }
+@keyframes wave {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>漁獲高管理システム <span>- AsteroidDB Demo</span></h1>
+  <p>分散CRDT + Authority認証による漁獲データ管理のPoCデモ</p>
+</header>
+
+<div class="scenario-bar" id="scenarioBar">
+  <button class="scenario-btn active" onclick="runScenario(0)">0. 初期状態</button>
+  <button class="scenario-btn" onclick="runScenario(1)">1. 出港前に記録</button>
+  <button class="scenario-btn" onclick="runScenario(2)">2. 出航 (通信断)</button>
+  <button class="scenario-btn" onclick="runScenario(3)">3. 洋上で操業</button>
+  <button class="scenario-btn" onclick="runScenario(4)">4. 帰港 (同期)</button>
+  <button class="scenario-btn" onclick="runScenario(5)">5. 水揚げ確定</button>
+</div>
+
+<div class="wave-bar" id="waveBar"></div>
+
+<div class="explanation" id="explanationArea">
+  <div class="explanation-box" id="explanationText">
+    デモを開始するには、上のシナリオボタンを順番にクリックしてください。<br>
+    各漁船が独立に漁獲を記録し、帰港時にCRDTマージで自動収束、漁協が最終確定する流れを体験できます。
+  </div>
+</div>
+
+<div class="main-grid">
+  <!-- Boat A -->
+  <div class="card boat" id="cardBoatA">
+    <div class="card-header">
+      <div class="card-title">漁船 第一丸</div>
+      <div class="status-badge online" id="statusA">接続中</div>
+    </div>
+    <div id="fishListA"></div>
+  </div>
+
+  <!-- Boat B -->
+  <div class="card boat" id="cardBoatB">
+    <div class="card-header">
+      <div class="card-title">漁船 第二丸</div>
+      <div class="status-badge online" id="statusB">接続中</div>
+    </div>
+    <div id="fishListB"></div>
+  </div>
+
+  <!-- Port -->
+  <div class="card port" id="cardPort">
+    <div class="card-header">
+      <div class="card-title">港 / 漁業協同組合</div>
+      <div class="status-badge online">常時接続</div>
+    </div>
+    <div>
+      <div style="font-size:0.75rem; color:#8899aa; margin-bottom:8px; display:grid; grid-template-columns:1fr auto auto; gap:12px;">
+        <span>魚種</span><span>集計</span><span>確定値</span>
+      </div>
+      <div id="fishListPort"></div>
+    </div>
+    <div class="cert-section">
+      <div style="font-size:0.8rem; color:#8899aa; margin-bottom:6px;">認証ステータス</div>
+      <div class="cert-status none" id="certStatus">未認証</div>
+    </div>
+  </div>
+</div>
+
+<div class="log-panel">
+  <div class="log-card">
+    <h3>イベントログ</h3>
+    <div id="logArea"></div>
+  </div>
+</div>
+
+<script>
+const FISH = [
+  { id: 'maguro', name: 'マグロ', emoji: '🐟' },
+  { id: 'ika',    name: 'イカ',   emoji: '🦑' },
+  { id: 'saba',   name: 'サバ',   emoji: '🐠' },
+  { id: 'tai',    name: 'タイ',   emoji: '🐡' },
+];
+
+const API = '';  // same origin
+
+let currentStep = 0;
+let polling = null;
+
+function log(msg, cls = '') {
+  const area = document.getElementById('logArea');
+  const now = new Date().toLocaleTimeString('ja-JP');
+  const div = document.createElement('div');
+  div.className = 'log-entry ' + cls;
+  div.innerHTML = `<span class="time">${now}</span>${msg}`;
+  area.prepend(div);
+}
+
+function setExplanation(html) {
+  document.getElementById('explanationText').innerHTML = html;
+}
+
+function setWave(on) {
+  document.getElementById('waveBar').classList.toggle('active', on);
+}
+
+async function api(path, method = 'GET', body = null) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(API + path, opts);
+  return res.json();
+}
+
+function renderBoatFish(containerId, boat, catches, canClick) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = '';
+  FISH.forEach(f => {
+    const count = catches[f.id] || 0;
+    const row = document.createElement('div');
+    row.className = 'fish-row';
+    row.innerHTML = `
+      <span class="fish-name">${f.emoji} ${f.name}</span>
+      <span class="fish-count" id="count-${boat}-${f.id}">${count}</span>
+      <div class="fish-buttons">
+        <button class="fish-btn" ${canClick ? '' : 'disabled'} onclick="recordCatch('${boat}','${f.id}')">+</button>
+      </div>
+    `;
+    el.appendChild(row);
+  });
+}
+
+function renderPortFish(catches, certified) {
+  const el = document.getElementById('fishListPort');
+  el.innerHTML = '';
+  FISH.forEach(f => {
+    const count = catches[f.id] || 0;
+    const certVal = certified[f.id];
+    const row = document.createElement('div');
+    row.className = 'port-fish-row';
+    row.innerHTML = `
+      <span class="fish-name">${f.emoji} ${f.name}</span>
+      <span class="fish-count">${count}</span>
+      <span class="fish-count" style="color:${certVal != null ? '#66bb6a' : '#555'}">${certVal != null ? certVal : '-'}</span>
+    `;
+    el.appendChild(row);
+  });
+}
+
+function setBoatStatus(boat, online) {
+  const badge = document.getElementById('status' + boat.toUpperCase());
+  const card = document.getElementById('cardBoat' + boat.toUpperCase());
+  if (online) {
+    badge.className = 'status-badge online';
+    badge.textContent = '接続中';
+    card.classList.remove('partitioned');
+  } else {
+    badge.className = 'status-badge offline';
+    badge.textContent = '通信圏外';
+    card.classList.add('partitioned');
+  }
+}
+
+function setCertStatus(status) {
+  const el = document.getElementById('certStatus');
+  if (status === 'Certified') {
+    el.className = 'cert-status certified';
+    el.textContent = '確定済み';
+  } else if (status === 'Pending') {
+    el.className = 'cert-status pending';
+    el.textContent = '確認中...';
+  } else {
+    el.className = 'cert-status none';
+    el.textContent = '未認証';
+  }
+}
+
+async function recordCatch(boat, fishId) {
+  try {
+    await api('/demo/catch', 'POST', { boat, fish: fishId });
+    const fish = FISH.find(f => f.id === fishId);
+    log(`${boat === 'a' ? '第一丸' : '第二丸'}: ${fish.name} を記録 (+1)`, '');
+    await refreshState();
+  } catch (e) {
+    log(`エラー: ${e.message}`, 'partition');
+  }
+}
+
+async function refreshState() {
+  try {
+    const state = await api('/demo/state');
+    renderBoatFish('fishListA', 'a', state.boat_a.catches, state.boat_a.can_record);
+    renderBoatFish('fishListB', 'b', state.boat_b.catches, state.boat_b.can_record);
+    renderPortFish(state.port.catches, state.port.certified_catches);
+    setBoatStatus('a', state.boat_a.connected);
+    setBoatStatus('b', state.boat_b.connected);
+    setCertStatus(state.port.certification_status);
+  } catch (e) {
+    // server not ready yet
+  }
+}
+
+function setActiveBtn(step) {
+  document.querySelectorAll('.scenario-btn').forEach((btn, i) => {
+    btn.classList.toggle('active', i === step);
+  });
+}
+
+async function runScenario(step) {
+  if (step > currentStep + 1) return; // must go in order
+  setActiveBtn(step);
+  setWave(true);
+  currentStep = step;
+
+  try {
+    const res = await api('/demo/scenario/' + step, 'POST');
+    if (res.log) res.log.forEach(l => log(l.message, l.class || ''));
+    if (res.explanation) setExplanation(res.explanation);
+    await refreshState();
+  } catch (e) {
+    log(`シナリオエラー: ${e.message}`, 'partition');
+  }
+
+  setWave(false);
+}
+
+// Initial load
+refreshState();
+// Poll state every 2s
+polling = setInterval(refreshState, 2000);
+</script>
+</body>
+</html>
