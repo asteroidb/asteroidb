@@ -26,7 +26,7 @@
     },
     {
       "name": "asymmetric-partition",
-      "description": "Block A->B but allow B->A using tc rules, verify consistency",
+      "description": "Block A->B but allow B->A using iptables rules, verify consistency",
       "script": "../fault-inject/scenario-asymmetric-partition.sh",
       "nodes": 3,
       "timeout_seconds": 120,

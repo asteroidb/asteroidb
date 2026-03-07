@@ -118,6 +118,10 @@ fi
 cleanup() {
     echo ""
     echo "[fault-inject] Tearing down cluster..."
+    # Flush iptables rules in all containers before tearing down
+    for container in asteroidb-node-1 asteroidb-node-2 asteroidb-node-3; do
+        docker exec "$container" iptables -F OUTPUT 2>/dev/null || true
+    done
     docker compose -f "$COMPOSE_FILE" down --timeout 5 2>/dev/null || true
 }
 trap cleanup EXIT
