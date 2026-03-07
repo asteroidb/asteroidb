@@ -23,12 +23,12 @@ use crate::network::sync::{
 };
 
 use super::types::{
-    ApiError, AuthorityDefinitionResponse, CertifiedReadResponse, CertifiedWriteRequest,
-    CertifiedWriteResponse, CrdtValueJson, EventualReadResponse, EventualWriteRequest,
-    FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, PeerInfo,
-    PlacementPolicyResponse, ProofBundleJson, SetAuthorityDefinitionRequest,
-    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
-    VersionHistoryResponse, WriteResponse,
+    AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
+    CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
+    EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
+    LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
+    ProofBundleJson, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse,
+    VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -726,6 +726,190 @@ pub async fn internal_leave(
 
     Ok(Json(LeaveResponse {
         success: removed.is_some(),
+    }))
+}
+
+// ---------------------------------------------------------------
+// Internal announce handler
+// ---------------------------------------------------------------
+
+/// `POST /api/internal/announce`
+///
+/// Receives a membership announcement from a peer. If the peer is
+/// joining, it is added to the local peer registry. If leaving, it
+/// is removed.
+pub async fn internal_announce(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AnnounceRequest>,
+) -> Result<Json<AnnounceResponse>, ApiError> {
+    use crate::network::PeerConfig;
+
+    let peers_registry = state.peers.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "peer registry not configured".to_string(),
+        ))
+    })?;
+
+    let announcing_node_id = NodeId(req.node_id.clone());
+
+    let (result, persist_snapshot) = if req.joining {
+        let mut registry = peers_registry.lock().await;
+        // Silently accept if the peer is already known (idempotent).
+        if registry.get_peer(&announcing_node_id).is_some() {
+            return Ok(Json(AnnounceResponse { accepted: true }));
+        }
+        let result = match registry.add_peer(PeerConfig {
+            node_id: announcing_node_id,
+            addr: req.address,
+        }) {
+            Ok(()) => Ok(Json(AnnounceResponse { accepted: true })),
+            // If it is our own ID, silently accept.
+            Err(crate::network::PeerError::SelfInPeerList(_)) => {
+                Ok(Json(AnnounceResponse { accepted: true }))
+            }
+            Err(e) => Err(ApiError(CrdtError::InvalidArgument(e.to_string()))),
+        };
+        let snapshot = state
+            .peer_persist_path
+            .as_ref()
+            .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
+        (result, snapshot)
+    } else {
+        let mut registry = peers_registry.lock().await;
+        let result = match registry.remove_peer(&announcing_node_id) {
+            Ok(_) => Ok(Json(AnnounceResponse { accepted: true })),
+            Err(crate::network::PeerError::SelfInPeerList(_)) => {
+                Ok(Json(AnnounceResponse { accepted: true }))
+            }
+            Err(e) => Err(ApiError(CrdtError::InvalidArgument(e.to_string()))),
+        };
+        let snapshot = state
+            .peer_persist_path
+            .as_ref()
+            .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
+        (result, snapshot)
+    };
+
+    // Persist outside the lock.
+    if let Some(path) = &state.peer_persist_path
+        && let Some(json) = persist_snapshot
+    {
+        let path = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            eprintln!("warning: failed to persist peer registry after announce: {e}");
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------
+// Internal ping handler
+// ---------------------------------------------------------------
+
+/// `POST /api/internal/ping`
+///
+/// Lightweight gossip endpoint for peer list exchange. The sender
+/// provides its known peers; the receiver reconciles and returns
+/// its own known peers. Both sides can detect and fill gaps.
+pub async fn internal_ping(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PingRequest>,
+) -> Result<Json<PingResponse>, ApiError> {
+    use crate::network::PeerConfig;
+
+    let peers_registry = state.peers.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "peer registry not configured".to_string(),
+        ))
+    })?;
+
+    // Reconcile: add any peers from the sender that we don't know about.
+    let peers_changed = {
+        let mut registry = peers_registry.lock().await;
+        let mut changed = false;
+        for peer_info in &req.known_peers {
+            let peer_nid = NodeId(peer_info.node_id.clone());
+            if registry.get_peer(&peer_nid).is_none() {
+                // Ignore errors (e.g. self-in-peer-list, duplicates).
+                if registry
+                    .add_peer(PeerConfig {
+                        node_id: peer_nid,
+                        addr: peer_info.address.clone(),
+                    })
+                    .is_ok()
+                {
+                    changed = true;
+                }
+            }
+        }
+
+        // Also ensure the sender itself is registered.
+        let sender_nid = NodeId(req.sender_id.clone());
+        if registry.get_peer(&sender_nid).is_none()
+            && registry
+                .add_peer(PeerConfig {
+                    node_id: sender_nid,
+                    addr: req.sender_addr.clone(),
+                })
+                .is_ok()
+        {
+            changed = true;
+        }
+
+        changed
+    };
+
+    // Persist registry if it changed (Codex P2).
+    if peers_changed && let Some(path) = &state.peer_persist_path {
+        let snapshot = {
+            let registry = peers_registry.lock().await;
+            serde_json::to_string_pretty(&*registry).ok()
+        };
+        if let Some(json) = snapshot {
+            let path = path.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            {
+                eprintln!("warning: failed to persist peer registry after ping: {e}");
+            }
+        }
+    }
+
+    // Build our own peer list to return.
+    let my_peers = {
+        let registry = peers_registry.lock().await;
+        let mut list: Vec<PeerInfo> = registry
+            .all_peers_owned()
+            .into_iter()
+            .map(|p| PeerInfo {
+                node_id: p.node_id.0,
+                address: p.addr,
+            })
+            .collect();
+
+        // Include self so the remote gets a complete view.
+        if let (Some(self_id), Some(self_addr)) = (&state.self_node_id, &state.self_addr) {
+            let already_present = list.iter().any(|p| p.node_id == self_id.0);
+            if !already_present {
+                list.push(PeerInfo {
+                    node_id: self_id.0.clone(),
+                    address: self_addr.clone(),
+                });
+            }
+        }
+
+        list.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        list
+    };
+
+    Ok(Json(PingResponse {
+        known_peers: my_peers,
     }))
 }
 

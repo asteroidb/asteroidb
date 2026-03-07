@@ -9,6 +9,7 @@ use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::network::membership::MembershipClient;
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{NodeConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
@@ -167,8 +168,24 @@ async fn main() {
     } else {
         SyncClient::new(Arc::clone(&shared_peers))
     };
+    // Build membership client for fan-out join/leave and periodic ping.
+    let membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+        )
+    };
+
     let mut runner = NodeRunner::with_sync(
-        node_id,
+        node_id.clone(),
         Arc::clone(&certified_api),
         engine,
         NodeRunnerConfig::default(),
@@ -177,6 +194,24 @@ async fn main() {
         Arc::clone(&metrics),
     )
     .await;
+
+    // Build a second membership client for the runner's periodic ping loop.
+    let runner_membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+        )
+    };
+    runner.set_membership_client(runner_membership_client);
+
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.
@@ -190,6 +225,29 @@ async fn main() {
     }
     println!("Node run loop started. Press Ctrl-C to stop.");
 
+    // Fan-out join: announce this node's presence to all known peers.
+    // Spawned as a background task so that unreachable peers do not
+    // block the server startup (Codex P1).
+    tokio::spawn(async move {
+        let fan_out_count = membership_client.fan_out_join().await;
+        if fan_out_count > 0 {
+            println!("Fan-out join announced to {fan_out_count} peers");
+        }
+    });
+
+    // Build a membership client for the shutdown path so we can
+    // announce departure before stopping.
+    let shutdown_membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id,
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
+    };
+
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
@@ -201,6 +259,11 @@ async fn main() {
         }
         _ = tokio::signal::ctrl_c() => {
             println!("\nShutting down...");
+            // Announce departure to all peers before stopping (P1-1).
+            let leave_count = shutdown_membership_client.fan_out_leave().await;
+            if leave_count > 0 {
+                println!("Fan-out leave acknowledged by {leave_count} peers");
+            }
             let _ = shutdown_handle.send(true);
         }
     }
