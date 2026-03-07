@@ -37,23 +37,34 @@ pub struct VerificationResult {
 /// the node that returned the proof.
 pub fn verify_proof(bundle: &ProofBundle) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
-    let has_majority = bundle.contributing_authorities.len() >= required;
 
-    let signatures_valid = bundle.certificate.as_ref().map(|cert| {
-        let message = create_certificate_message(
-            &bundle.key_range,
-            &bundle.frontier_hlc,
-            &bundle.policy_version,
-        );
-        cert.verify_signatures(&message).is_ok()
-    });
+    // Deduplicate contributing authorities before counting.
+    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
+        bundle.contributing_authorities.iter().collect();
+    let contributing_count = unique_authorities.len();
 
-    let valid = has_majority && signatures_valid.unwrap_or(true);
+    let has_majority = contributing_count >= required;
+
+    // A proof without a certificate is always invalid — a caller could
+    // fabricate a "valid" proof by simply listing enough authority IDs.
+    let signatures_valid = match bundle.certificate.as_ref() {
+        Some(cert) => {
+            let message = create_certificate_message(
+                &bundle.key_range,
+                &bundle.frontier_hlc,
+                &bundle.policy_version,
+            );
+            Some(cert.verify_signatures(&message).is_ok())
+        }
+        None => None,
+    };
+
+    let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
         valid,
         has_majority,
-        contributing_count: bundle.contributing_authorities.len(),
+        contributing_count,
         required_count: required,
         signatures_valid,
     }
@@ -76,24 +87,41 @@ pub fn verify_proof_with_registry(
     epoch_config: &EpochConfig,
 ) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
-    let has_majority = bundle.contributing_authorities.len() >= required;
 
-    let signatures_valid = bundle.certificate.as_ref().map(|cert| {
-        let message = create_certificate_message(
-            &bundle.key_range,
-            &bundle.frontier_hlc,
-            &bundle.policy_version,
-        );
-        cert.verify_signatures_with_registry(&message, registry, current_epoch, epoch_config)
-            .is_ok()
-    });
+    // Deduplicate contributing authorities before counting.
+    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
+        bundle.contributing_authorities.iter().collect();
+    let contributing_count = unique_authorities.len();
 
-    let valid = has_majority && signatures_valid.unwrap_or(true);
+    let has_majority = contributing_count >= required;
+
+    // A proof without a certificate is always invalid.
+    let signatures_valid = match bundle.certificate.as_ref() {
+        Some(cert) => {
+            let message = create_certificate_message(
+                &bundle.key_range,
+                &bundle.frontier_hlc,
+                &bundle.policy_version,
+            );
+            Some(
+                cert.verify_signatures_with_registry(
+                    &message,
+                    registry,
+                    current_epoch,
+                    epoch_config,
+                )
+                .is_ok(),
+            )
+        }
+        None => None,
+    };
+
+    let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
         valid,
         has_majority,
-        contributing_count: bundle.contributing_authorities.len(),
+        contributing_count,
         required_count: required,
         signatures_valid,
     }
@@ -111,7 +139,13 @@ pub fn verify_proof_with_registry_detailed(
     epoch_config: &EpochConfig,
 ) -> Result<VerificationResult, CertError> {
     let required = bundle.total_authorities / 2 + 1;
-    let has_majority = bundle.contributing_authorities.len() >= required;
+
+    // Deduplicate contributing authorities before counting.
+    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
+        bundle.contributing_authorities.iter().collect();
+    let contributing_count = unique_authorities.len();
+
+    let has_majority = contributing_count >= required;
 
     let signatures_valid = if let Some(cert) = &bundle.certificate {
         let message = create_certificate_message(
@@ -129,12 +163,12 @@ pub fn verify_proof_with_registry_detailed(
         None
     };
 
-    let valid = has_majority && signatures_valid.unwrap_or(true);
+    let valid = has_majority && signatures_valid == Some(true);
 
     Ok(VerificationResult {
         valid,
         has_majority,
-        contributing_count: bundle.contributing_authorities.len(),
+        contributing_count,
         required_count: required,
         signatures_valid,
     })
@@ -217,11 +251,13 @@ mod tests {
     }
 
     #[test]
-    fn valid_proof_passes_verification() {
+    fn proof_without_certificate_is_rejected() {
+        // Even with enough contributing authorities, a proof without a
+        // certificate must be rejected to prevent forged proofs.
         let proof = make_proof(3, 5, false);
         let result = verify_proof(&proof);
 
-        assert!(result.valid);
+        assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
         assert_eq!(result.required_count, 3); // 5/2+1 = 3
@@ -230,7 +266,7 @@ mod tests {
 
     #[test]
     fn proof_with_insufficient_authorities_fails() {
-        let proof = make_proof(2, 5, false);
+        let proof = make_proof(2, 5, true);
         let result = verify_proof(&proof);
 
         assert!(!result.valid);
@@ -240,23 +276,19 @@ mod tests {
     }
 
     #[test]
-    fn tampered_proof_detected() {
-        let mut proof = make_proof(3, 5, false);
+    fn duplicate_authorities_are_deduplicated() {
+        let mut proof = make_proof(2, 5, true);
 
-        // Tamper: add an extra fake authority to inflate the count.
-        proof
-            .contributing_authorities
-            .push(NodeId("fake-auth".into()));
-        // But total_authorities stays at 5, so this still passes majority check.
-        let result = verify_proof(&proof);
-        assert!(result.valid);
-        assert_eq!(result.contributing_count, 4);
+        // Duplicate an existing authority ID in contributing_authorities.
+        let dup = proof.contributing_authorities[0].clone();
+        proof.contributing_authorities.push(dup);
 
-        // Now tamper the other way: reduce contributing below majority.
-        proof.contributing_authorities.truncate(2);
+        // Raw length is 3, but unique count should still be 2 (below majority).
         let result = verify_proof(&proof);
         assert!(!result.valid);
         assert!(!result.has_majority);
+        assert_eq!(result.contributing_count, 2);
+        assert_eq!(result.required_count, 3);
     }
 
     #[test]
@@ -288,16 +320,16 @@ mod tests {
 
     #[test]
     fn exact_majority_threshold() {
-        // 1 of 1 = majority
-        let proof = make_proof(1, 1, false);
+        // 1 of 1 = majority (with valid certificate)
+        let proof = make_proof(1, 1, true);
         assert!(verify_proof(&proof).valid);
 
-        // 2 of 3 = majority (3/2+1 = 2)
-        let proof = make_proof(2, 3, false);
+        // 2 of 3 = majority (3/2+1 = 2) (with valid certificate)
+        let proof = make_proof(2, 3, true);
         assert!(verify_proof(&proof).valid);
 
         // 1 of 3 = not majority
-        let proof = make_proof(1, 3, false);
+        let proof = make_proof(1, 3, true);
         assert!(!verify_proof(&proof).valid);
     }
 

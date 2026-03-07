@@ -124,6 +124,28 @@ pub struct FrontierJson {
     pub node_id: String,
 }
 
+/// JSON-friendly representation of an individual authority signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthoritySignatureJson {
+    /// The authority node ID that produced this signature.
+    pub authority_id: String,
+    /// Hex-encoded Ed25519 public key (32 bytes).
+    pub public_key: String,
+    /// Hex-encoded Ed25519 signature (64 bytes).
+    pub signature: String,
+    /// The keyset version under which this signature was produced.
+    pub keyset_version: u64,
+}
+
+/// JSON-friendly representation of a majority certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificateJson {
+    /// The keyset version used for signing.
+    pub keyset_version: u64,
+    /// Individual authority signatures.
+    pub signatures: Vec<AuthoritySignatureJson>,
+}
+
 /// JSON-friendly representation of a verifiable proof bundle.
 ///
 /// Included in certified read responses so that external clients can
@@ -141,6 +163,10 @@ pub struct ProofBundleJson {
     pub contributing_authorities: Vec<String>,
     /// Total number of authorities in the set.
     pub total_authorities: usize,
+    /// The majority certificate with cryptographic signatures.
+    /// Must be present for the proof to be considered valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<CertificateJson>,
 }
 
 /// Response for `POST /api/certified/write`.
@@ -162,6 +188,10 @@ pub struct VerifyProofRequest {
     pub contributing_authorities: Vec<String>,
     /// Total number of authorities in the set.
     pub total_authorities: usize,
+    /// The majority certificate with cryptographic signatures.
+    /// Must be present for the proof to be considered valid.
+    #[serde(default)]
+    pub certificate: Option<CertificateJson>,
 }
 
 /// Response for `POST /api/certified/verify`.

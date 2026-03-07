@@ -1589,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn proof_bundle_verifiable_with_verifier() {
+    fn proof_without_certificate_rejected_by_verifier() {
         use crate::authority::verifier;
 
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());
@@ -1606,9 +1606,11 @@ mod tests {
         let result = api.get_certified("key1");
         let proof = result.proof.unwrap();
 
+        // Proofs without a certificate must be rejected to prevent forged proofs.
         let verification = verifier::verify_proof(&proof);
-        assert!(verification.valid);
+        assert!(!verification.valid);
         assert!(verification.has_majority);
+        assert!(verification.signatures_valid.is_none());
         assert_eq!(verification.contributing_count, 2);
         assert_eq!(verification.required_count, 2); // 3/2+1 = 2
     }

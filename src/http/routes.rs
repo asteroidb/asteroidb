@@ -1320,11 +1320,82 @@ mod tests {
 
     #[tokio::test]
     async fn verify_proof_valid() {
+        use crate::authority::certificate::{create_certificate_message, sign_message};
+        use crate::http::types::VerifyProofResponse;
+        use crate::types::PolicyVersion;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        // Build a real certificate with valid Ed25519 signatures.
+        let kr = KeyRange {
+            prefix: "user/".into(),
+        };
+        let hlc = crate::hlc::HlcTimestamp {
+            physical: 1000,
+            logical: 0,
+            node_id: "auth-1".into(),
+        };
+        let pv = PolicyVersion(1);
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let auth_ids = ["auth-1", "auth-2", "auth-3"];
+        let mut sigs_json = Vec::new();
+        for auth_id in &auth_ids {
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = sk.verifying_key();
+            let sig = sign_message(&sk, &message);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            sigs_json.push(serde_json::json!({
+                "authority_id": auth_id,
+                "public_key": pk_hex,
+                "signature": sig_hex,
+                "keyset_version": 1
+            }));
+        }
+
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": auth_ids,
+            "total_authorities": 5,
+            "certificate": {
+                "keyset_version": 1,
+                "signatures": sigs_json
+            }
+        });
+
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert!(result.valid);
+        assert!(result.has_majority);
+        assert_eq!(result.contributing_count, 3);
+        assert_eq!(result.required_count, 3); // 5/2+1 = 3
+    }
+
+    #[tokio::test]
+    async fn verify_proof_without_certificate_rejected() {
         use crate::http::types::VerifyProofResponse;
 
         let state = test_state();
         let app = router(state);
 
+        // A proof without a certificate must be rejected even when
+        // enough contributing authorities are listed.
         let req = Request::builder()
             .method("POST")
             .uri("/api/certified/verify")
@@ -1345,10 +1416,10 @@ mod tests {
 
         let body = body_string(resp.into_body()).await;
         let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
-        assert!(result.valid);
+        assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
-        assert_eq!(result.required_count, 3); // 5/2+1 = 3
+        assert_eq!(result.required_count, 3);
     }
 
     #[tokio::test]
