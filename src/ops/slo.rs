@@ -3,18 +3,31 @@
 //! Tracks error budgets for pre-defined SLOs and exposes a snapshot API
 //! for dashboards and alerting integration.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Whether the SLO target value is an upper or lower bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SloKind {
+    /// Value should be below target (e.g., latency < 50ms).
+    LessThan,
+    /// Value should be above target (e.g., availability > 99%).
+    GreaterThan,
+}
+
 /// Definition of a single SLO target.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SloTarget {
     /// Human-readable name of the SLO.
     pub name: String,
-    /// Target value (e.g., 100.0 for 100ms P99, 99.0 for 99% availability).
+    /// Comparison direction for violation detection.
+    pub kind: SloKind,
+    /// Target value (e.g., 50.0 for 50ms P99, 99.0 for 99% availability).
     pub target_value: f64,
+    /// Target percentage that must be met (e.g., 99.9 means 99.9% of observations must pass).
+    pub target_percentage: f64,
     /// Evaluation window in seconds (e.g., 3600 for 1 hour).
     pub window_secs: u64,
 }
@@ -28,6 +41,12 @@ pub struct SloBudget {
     pub total_requests: u64,
     /// Number of observations that violated the SLO.
     pub violations: u64,
+    /// Remaining error budget as a percentage (0.0 to 100.0).
+    pub budget_remaining: f64,
+    /// Whether the SLO is in warning state (>50% of budget consumed).
+    pub is_warning: bool,
+    /// Whether the SLO is in critical state (>80% of budget consumed).
+    pub is_critical: bool,
 }
 
 impl SloBudget {
@@ -37,29 +56,49 @@ impl SloBudget {
             target,
             total_requests: 0,
             violations: 0,
+            budget_remaining: 100.0,
+            is_warning: false,
+            is_critical: false,
         }
+    }
+
+    /// Build a budget from raw counts; computes derived fields automatically.
+    fn from_counts(target: SloTarget, total_requests: u64, violations: u64) -> Self {
+        let mut budget = Self {
+            target,
+            total_requests,
+            violations,
+            budget_remaining: 0.0,
+            is_warning: false,
+            is_critical: false,
+        };
+        budget.recompute();
+        budget
+    }
+
+    /// Recompute derived fields from current counts.
+    fn recompute(&mut self) {
+        self.budget_remaining = self.compute_budget_remaining();
+        self.is_warning = self.budget_remaining < 50.0;
+        self.is_critical = self.budget_remaining < 20.0;
     }
 
     /// Remaining error budget as a percentage (0.0 to 100.0).
     ///
-    /// Returns 100.0 when no requests have been observed (no budget consumed).
-    pub fn budget_remaining(&self) -> f64 {
+    /// The error budget is the fraction of allowed errors that has not yet
+    /// been consumed.  For a 99.9% SLO the allowed error rate is 0.1%;
+    /// if the actual error rate is 0.05% then 50% of the budget remains.
+    fn compute_budget_remaining(&self) -> f64 {
         if self.total_requests == 0 {
             return 100.0;
         }
-        let violation_rate = self.violations as f64 / self.total_requests as f64;
-        let remaining = (1.0 - violation_rate) * 100.0;
-        remaining.max(0.0)
-    }
-
-    /// Whether the SLO is in warning state (>50% of budget consumed).
-    pub fn is_warning(&self) -> bool {
-        self.budget_remaining() < 50.0
-    }
-
-    /// Whether the SLO is in critical state (>80% of budget consumed).
-    pub fn is_critical(&self) -> bool {
-        self.budget_remaining() < 20.0
+        let allowed_error_rate = 1.0 - (self.target.target_percentage / 100.0);
+        if allowed_error_rate <= 0.0 {
+            return 0.0;
+        }
+        let actual_error_rate = self.violations as f64 / self.total_requests as f64;
+        let budget_consumed = actual_error_rate / allowed_error_rate;
+        (1.0 - budget_consumed).max(0.0) * 100.0
     }
 }
 
@@ -114,28 +153,15 @@ impl SloState {
 
         let total = active.len() as u64;
 
-        // For "less than" SLOs (latency), a violation is value >= target.
-        // For "greater than" SLOs (availability), a violation is value < target.
-        let violations = if self.target.name.contains("availability") {
-            // Availability: each observation is a success (1.0) or failure (0.0).
-            // Violation means the observation was a failure.
-            active
-                .iter()
-                .filter(|o| o.value < self.target.target_value)
-                .count() as u64
-        } else {
-            // Latency / convergence: violation means value exceeds the target.
-            active
-                .iter()
-                .filter(|o| o.value >= self.target.target_value)
-                .count() as u64
-        };
+        let violations = active
+            .iter()
+            .filter(|o| match self.target.kind {
+                SloKind::LessThan => o.value > self.target.target_value,
+                SloKind::GreaterThan => o.value < self.target.target_value,
+            })
+            .count() as u64;
 
-        SloBudget {
-            target: self.target.clone(),
-            total_requests: total,
-            violations,
-        }
+        SloBudget::from_counts(self.target.clone(), total, violations)
     }
 }
 
@@ -157,22 +183,30 @@ fn default_slo_targets() -> Vec<SloTarget> {
     vec![
         SloTarget {
             name: SLO_EVENTUAL_READ_P99.to_string(),
+            kind: SloKind::LessThan,
             target_value: 50.0, // < 50ms
-            window_secs: 3600,  // 1 hour
+            target_percentage: 99.0,
+            window_secs: 3600, // 1 hour
         },
         SloTarget {
             name: SLO_CERTIFIED_READ_P99.to_string(),
+            kind: SloKind::LessThan,
             target_value: 500.0, // < 500ms
+            target_percentage: 99.0,
             window_secs: 3600,
         },
         SloTarget {
             name: SLO_REPLICATION_CONVERGENCE.to_string(),
+            kind: SloKind::LessThan,
             target_value: 5000.0, // < 5s (5000ms)
+            target_percentage: 95.0,
             window_secs: 3600,
         },
         SloTarget {
             name: SLO_AUTHORITY_AVAILABILITY.to_string(),
-            target_value: 1.0, // each observation is 1.0 (up) or 0.0 (down)
+            kind: SloKind::GreaterThan,
+            target_value: 99.0, // > 99%
+            target_percentage: 99.9,
             window_secs: 3600,
         },
     ]
@@ -252,94 +286,123 @@ impl SloTracker {
 mod tests {
     use super::*;
 
+    /// Helper to create a LessThan SloTarget with the given target_percentage.
+    fn lt_target(name: &str, target_value: f64, target_percentage: f64) -> SloTarget {
+        SloTarget {
+            name: name.into(),
+            kind: SloKind::LessThan,
+            target_value,
+            target_percentage,
+            window_secs: 3600,
+        }
+    }
+
+    /// Helper to create a GreaterThan SloTarget.
+    fn gt_target(name: &str, target_value: f64, target_percentage: f64) -> SloTarget {
+        SloTarget {
+            name: name.into(),
+            kind: SloKind::GreaterThan,
+            target_value,
+            target_percentage,
+            window_secs: 3600,
+        }
+    }
+
     #[test]
     fn budget_remaining_with_no_observations() {
-        let budget = SloBudget::new(SloTarget {
-            name: "test".into(),
-            target_value: 100.0,
-            window_secs: 3600,
-        });
-        assert_eq!(budget.budget_remaining(), 100.0);
-        assert!(!budget.is_warning());
-        assert!(!budget.is_critical());
+        let budget = SloBudget::new(lt_target("test", 100.0, 99.0));
+        assert_eq!(budget.budget_remaining, 100.0);
+        assert!(!budget.is_warning);
+        assert!(!budget.is_critical);
     }
 
     #[test]
     fn budget_remaining_no_violations() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 100,
-            violations: 0,
-        };
-        assert_eq!(budget.budget_remaining(), 100.0);
-        assert!(!budget.is_warning());
-        assert!(!budget.is_critical());
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 100, 0);
+        assert_eq!(budget.budget_remaining, 100.0);
+        assert!(!budget.is_warning);
+        assert!(!budget.is_critical);
     }
 
     #[test]
-    fn budget_remaining_half_violated() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 100,
-            violations: 50,
-        };
-        assert!((budget.budget_remaining() - 50.0).abs() < f64::EPSILON);
-        assert!(!budget.is_warning()); // exactly 50% remaining is not warning
-        assert!(!budget.is_critical());
+    fn budget_remaining_half_budget_consumed() {
+        // 99% SLO: allowed error rate = 1%.
+        // 0.5% actual error rate => 50% budget consumed => 50% remaining.
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 1000, 5);
+        assert!((budget.budget_remaining - 50.0).abs() < 0.01);
+        assert!(!budget.is_warning);
+        assert!(!budget.is_critical);
     }
 
     #[test]
     fn budget_warning_threshold() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 100,
-            violations: 51,
-        };
-        assert!(budget.is_warning());
-        assert!(!budget.is_critical());
+        // 99% SLO: allowed error rate = 1%.
+        // 0.6% actual error rate => 60% consumed => 40% remaining (warning).
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 1000, 6);
+        assert!(budget.is_warning);
+        assert!(!budget.is_critical);
     }
 
     #[test]
     fn budget_critical_threshold() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 100,
-            violations: 81,
-        };
-        assert!(budget.is_warning());
-        assert!(budget.is_critical());
+        // 99% SLO: allowed error rate = 1%.
+        // 0.9% actual error rate => 90% consumed => 10% remaining (critical).
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 1000, 9);
+        assert!(budget.is_warning);
+        assert!(budget.is_critical);
     }
 
     #[test]
     fn budget_all_violated() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 100,
-            violations: 100,
-        };
-        assert_eq!(budget.budget_remaining(), 0.0);
-        assert!(budget.is_warning());
-        assert!(budget.is_critical());
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 100, 100);
+        assert_eq!(budget.budget_remaining, 0.0);
+        assert!(budget.is_warning);
+        assert!(budget.is_critical);
+    }
+
+    #[test]
+    fn budget_one_pct_error_against_999_slo() {
+        // 99.9% SLO: allowed error rate = 0.1%.
+        // 1% actual error rate => 10x over budget => budget exhausted.
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.9), 1000, 10);
+        assert_eq!(budget.budget_remaining, 0.0);
+        assert!(budget.is_critical);
+    }
+
+    #[test]
+    fn violation_detection_less_than() {
+        let tracker = SloTracker::with_targets(vec![lt_target("latency", 100.0, 99.0)]);
+        let now = Instant::now();
+
+        // Exactly at target should NOT be a violation for LessThan.
+        tracker.record_observation_at("latency", 100.0, now);
+        // Below target: not a violation.
+        tracker.record_observation_at("latency", 50.0, now);
+        // Above target: violation.
+        tracker.record_observation_at("latency", 150.0, now);
+
+        let snap = tracker.snapshot_at(now);
+        let budget = &snap.budgets["latency"];
+        assert_eq!(budget.total_requests, 3);
+        assert_eq!(budget.violations, 1);
+    }
+
+    #[test]
+    fn violation_detection_greater_than() {
+        let tracker = SloTracker::with_targets(vec![gt_target("avail", 99.0, 99.9)]);
+        let now = Instant::now();
+
+        // Above target: not a violation.
+        tracker.record_observation_at("avail", 100.0, now);
+        // Exactly at target: not a violation for GreaterThan.
+        tracker.record_observation_at("avail", 99.0, now);
+        // Below target: violation.
+        tracker.record_observation_at("avail", 98.0, now);
+
+        let snap = tracker.snapshot_at(now);
+        let budget = &snap.budgets["avail"];
+        assert_eq!(budget.total_requests, 3);
+        assert_eq!(budget.violations, 1);
     }
 
     #[test]
@@ -355,11 +418,8 @@ mod tests {
 
     #[test]
     fn tracker_record_and_snapshot_latency() {
-        let tracker = SloTracker::with_targets(vec![SloTarget {
-            name: "test_latency".into(),
-            target_value: 100.0,
-            window_secs: 3600,
-        }]);
+        // 99% SLO with target_value 100.0
+        let tracker = SloTracker::with_targets(vec![lt_target("test_latency", 100.0, 99.0)]);
         let now = Instant::now();
 
         // 8 requests under target, 2 over target
@@ -374,38 +434,33 @@ mod tests {
         let budget = &snap.budgets["test_latency"];
         assert_eq!(budget.total_requests, 10);
         assert_eq!(budget.violations, 2);
-        assert!((budget.budget_remaining() - 80.0).abs() < f64::EPSILON);
+        // 20% error rate against 1% allowed => budget exhausted
+        assert_eq!(budget.budget_remaining, 0.0);
     }
 
     #[test]
     fn tracker_record_availability() {
-        let tracker = SloTracker::with_targets(vec![SloTarget {
-            name: "test_availability".into(),
-            target_value: 1.0,
-            window_secs: 3600,
-        }]);
+        // 99.9% SLO, target_value 99.0 (GreaterThan)
+        let tracker = SloTracker::with_targets(vec![gt_target("test_availability", 99.0, 99.9)]);
         let now = Instant::now();
 
-        // 9 up, 1 down
+        // 9 above threshold, 1 below
         for _ in 0..9 {
-            tracker.record_observation_at("test_availability", 1.0, now);
+            tracker.record_observation_at("test_availability", 100.0, now);
         }
-        tracker.record_observation_at("test_availability", 0.0, now);
+        tracker.record_observation_at("test_availability", 50.0, now);
 
         let snap = tracker.snapshot_at(now);
         let budget = &snap.budgets["test_availability"];
         assert_eq!(budget.total_requests, 10);
         assert_eq!(budget.violations, 1);
-        assert!((budget.budget_remaining() - 90.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn tracker_window_expiry() {
-        let tracker = SloTracker::with_targets(vec![SloTarget {
-            name: "test_latency".into(),
-            target_value: 100.0,
-            window_secs: 2,
-        }]);
+        let mut target = lt_target("test_latency", 100.0, 99.0);
+        target.window_secs = 2;
+        let tracker = SloTracker::with_targets(vec![target]);
         let base = Instant::now();
 
         // Record a violation at base time.
@@ -419,7 +474,7 @@ mod tests {
         let budget = &snap.budgets["test_latency"];
         assert_eq!(budget.total_requests, 1);
         assert_eq!(budget.violations, 0);
-        assert_eq!(budget.budget_remaining(), 100.0);
+        assert_eq!(budget.budget_remaining, 100.0);
     }
 
     #[test]
@@ -440,23 +495,20 @@ mod tests {
         let snap = tracker.snapshot_at(now);
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("eventual_read_p99"));
-        assert!(json.contains("budget"));
+        assert!(json.contains("budget_remaining"));
     }
 
     #[test]
-    fn slo_budget_serialization() {
-        let budget = SloBudget {
-            target: SloTarget {
-                name: "test".into(),
-                target_value: 100.0,
-                window_secs: 3600,
-            },
-            total_requests: 10,
-            violations: 2,
-        };
+    fn slo_budget_serialization_includes_derived_fields() {
+        let budget = SloBudget::from_counts(lt_target("test", 100.0, 99.0), 10, 2);
         let json = serde_json::to_string(&budget).unwrap();
         assert!(json.contains("\"total_requests\":10"));
         assert!(json.contains("\"violations\":2"));
         assert!(json.contains("\"target_value\":100.0"));
+        assert!(json.contains("\"budget_remaining\":"));
+        assert!(json.contains("\"is_warning\":"));
+        assert!(json.contains("\"is_critical\":"));
+        assert!(json.contains("\"kind\":"));
+        assert!(json.contains("\"target_percentage\":"));
     }
 }
