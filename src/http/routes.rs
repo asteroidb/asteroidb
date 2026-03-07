@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
@@ -15,8 +15,9 @@ use super::handlers::{
 /// Build the HTTP API router with all endpoints.
 ///
 /// When `AppState::internal_token` is `Some`, the `/api/internal/*`
-/// routes are protected by Bearer token authentication. When `None`,
-/// all routes are open (backwards-compatible).
+/// routes and control-plane mutation routes (`PUT`, `DELETE`) are
+/// protected by Bearer token authentication. When `None`, all routes
+/// are open (backwards-compatible).
 pub fn router(state: Arc<AppState>) -> Router {
     // Internal routes sub-router. Conditionally wrapped with auth middleware.
     let internal_routes = Router::new()
@@ -32,14 +33,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/internal/announce", post(internal_announce))
         .route("/api/internal/ping", post(internal_ping));
 
-    let internal_routes = if let Some(ref token) = state.internal_token {
-        let token = token.clone();
-        internal_routes.layer(axum::middleware::from_fn(move |req, next| {
-            let t = token.clone();
+    // Control-plane mutation routes sub-router (PUT / DELETE).
+    // These require internal token auth like the internal routes.
+    let cp_mutation_routes = Router::new()
+        .route(
+            "/api/control-plane/authorities",
+            put(set_authority_definition),
+        )
+        .route("/api/control-plane/policies", put(set_placement_policy))
+        .route(
+            "/api/control-plane/policies/{prefix}",
+            delete(remove_policy),
+        );
+
+    let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token {
+        let token1 = token.clone();
+        let token2 = token.clone();
+        let internal_routes = internal_routes.layer(axum::middleware::from_fn(move |req, next| {
+            let t = token1.clone();
             super::auth::require_bearer_token(req, next, t)
-        }))
+        }));
+        let cp_mutation_routes =
+            cp_mutation_routes.layer(axum::middleware::from_fn(move |req, next| {
+                let t = token2.clone();
+                super::auth::require_bearer_token(req, next, t)
+            }));
+        (internal_routes, cp_mutation_routes)
     } else {
-        internal_routes
+        (internal_routes, cp_mutation_routes)
     };
 
     Router::new()
@@ -50,23 +71,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/certified/{key}", get(get_certified))
         .route("/api/status/{key}", get(get_certification_status))
         .merge(internal_routes)
-        // Control-plane endpoints
-        .route(
-            "/api/control-plane/authorities",
-            get(list_authorities).put(set_authority_definition),
-        )
+        .merge(cp_mutation_routes)
+        // Control-plane read-only endpoints (public)
+        .route("/api/control-plane/authorities", get(list_authorities))
         .route(
             "/api/control-plane/authorities/{prefix}",
             get(get_authority_definition),
         )
-        .route(
-            "/api/control-plane/policies",
-            get(list_policies).put(set_placement_policy),
-        )
-        .route(
-            "/api/control-plane/policies/{prefix}",
-            get(get_policy).delete(remove_policy),
-        )
+        .route("/api/control-plane/policies", get(list_policies))
+        .route("/api/control-plane/policies/{prefix}", get(get_policy))
         .route("/api/control-plane/versions", get(get_version_history))
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
@@ -764,11 +777,12 @@ mod tests {
             .unwrap();
         app.clone().oneshot(req).await.unwrap();
 
-        // Remove it
+        // Remove it (with majority approvals)
         let req = Request::builder()
             .method("DELETE")
             .uri("/api/control-plane/policies/data%2F")
-            .body(Body::empty())
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1","auth-2"]}"#))
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -796,7 +810,8 @@ mod tests {
         let req = Request::builder()
             .method("DELETE")
             .uri("/api/control-plane/policies/missing%2F")
-            .body(Body::empty())
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1","auth-2"]}"#))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
@@ -1527,6 +1542,245 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane mutation auth tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cp_put_authorities_rejects_missing_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","authority_nodes":["a"],"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_put_authorities_rejects_wrong_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-secret")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","authority_nodes":["a"],"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_put_authorities_accepts_correct_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-secret")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","authority_nodes":["a"],"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cp_put_policies_rejects_missing_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_put_policies_rejects_wrong_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-secret")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_put_policies_accepts_correct_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-secret")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cp_delete_policy_rejects_missing_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/x%2F")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1","auth-2"]}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_delete_policy_rejects_wrong_token() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/x%2F")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-secret")
+            .body(Body::from(r#"{"approvals":["auth-1","auth-2"]}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cp_read_routes_unaffected_by_internal_token() {
+        // GET control-plane routes should remain open even with auth configured.
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        // GET authorities (list)
+        let req = Request::builder()
+            .uri("/api/control-plane/authorities")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET policies (list)
+        let req = Request::builder()
+            .uri("/api/control-plane/policies")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET versions
+        let req = Request::builder()
+            .uri("/api/control-plane/versions")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cp_mutation_without_token_config_allows_all() {
+        // No internal_token configured -> all mutation requests pass without auth.
+        let state = test_state_with_token(None);
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------
+    // Control-plane: DELETE quorum enforcement
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn control_plane_remove_policy_without_majority_returns_403() {
+        let state = test_state();
+        let app = router(state);
+
+        // First set a policy
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"data/","replica_count":5,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        // Try to remove with insufficient approvals (only 1 of 3)
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/data%2F")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1"]}"#))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Policy should still exist
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/data%2F")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }

@@ -30,8 +30,8 @@ use super::types::{
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
     EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
     LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
-    ProofBundleJson, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse,
-    VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
+    ProofBundleJson, RemovePolicyRequest, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest,
+    StatusResponse, VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -439,16 +439,32 @@ pub async fn set_placement_policy(
 /// `DELETE /api/control-plane/policies/{prefix}`
 ///
 /// Removes the placement policy for the given key range prefix.
+/// Requires majority approval from authority nodes (FR-009).
 pub async fn remove_policy(
     State(state): State<Arc<AppState>>,
     Path(prefix): Path<String>,
+    Json(req): Json<RemovePolicyRequest>,
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
-    let mut ns = state.namespace.write().unwrap();
-    let removed = ns.remove_placement_policy(&prefix).ok_or_else(|| {
+    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
+
+    // Validate majority consensus (FR-009).
+    let removed = {
+        let mut consensus = state.consensus.lock().await;
+        consensus.propose_policy_removal(&prefix, &approvals)?
+    };
+
+    let removed = removed.ok_or_else(|| {
         ApiError(CrdtError::KeyNotFound(format!(
             "placement policy: {prefix}"
         )))
     })?;
+
+    // Apply to shared namespace for read handlers and CertifiedApi.
+    {
+        let mut ns = state.namespace.write().unwrap();
+        ns.remove_placement_policy(&prefix);
+    }
+
     Ok(Json(PlacementPolicyResponse {
         key_range_prefix: removed.key_range.prefix.clone(),
         version: removed.version.0,
