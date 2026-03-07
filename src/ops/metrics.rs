@@ -447,6 +447,7 @@ impl RuntimeMetrics {
             rebalance_keys_migrated: self.rebalance_keys_migrated.load(Ordering::Relaxed),
             rebalance_keys_failed: self.rebalance_keys_failed.load(Ordering::Relaxed),
             rebalance_complete_total: self.rebalance_complete_total.load(Ordering::Relaxed),
+            rebalance_duration_sum_us: self.rebalance_duration_sum_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -504,6 +505,8 @@ pub struct MetricsSnapshot {
     pub rebalance_keys_failed: u64,
     /// Cumulative number of rebalance operations completed.
     pub rebalance_complete_total: u64,
+    /// Sum of rebalance durations in microseconds.
+    pub rebalance_duration_sum_us: u64,
 }
 
 #[cfg(test)]

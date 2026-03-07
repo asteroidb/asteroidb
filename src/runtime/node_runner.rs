@@ -513,8 +513,29 @@ impl NodeRunner {
             );
 
             if !plan.is_empty() {
+                // If there is already an in-progress plan for this prefix,
+                // record it as abandoned before overwriting.
+                if let Some(existing) = self.active_rebalance_plans.get(prefix) {
+                    tracing::warn!(
+                        key_range = %prefix,
+                        existing_additions = existing.plan.total_additions(),
+                        existing_offset = existing.additions_offset,
+                        "overwriting in-progress rebalance plan with new policy change"
+                    );
+                    self.metrics
+                        .record_rebalance_complete(prefix, Duration::ZERO);
+                }
+
+                if plan.removals_count() > 0 {
+                    tracing::info!(
+                        key_range = %prefix,
+                        removals = plan.removals_count(),
+                        "advisory removals detected (not executed; CRDT merge is idempotent)"
+                    );
+                }
+
                 self.metrics
-                    .record_rebalance_start(prefix, plan.total_operations());
+                    .record_rebalance_start(prefix, plan.total_additions());
                 self.active_rebalance_plans.insert(
                     prefix.clone(),
                     ActiveRebalance {

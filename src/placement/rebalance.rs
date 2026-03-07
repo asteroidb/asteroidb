@@ -10,13 +10,21 @@ use crate::types::{KeyRange, NodeId};
 /// set of keys currently stored on each node, this plan describes which
 /// keys must be copied to new target nodes (additions) and which keys
 /// should be removed from nodes that no longer match the policy (removals).
+///
+/// **Note on removals:** Removals are tracked for observability purposes only
+/// and are **not actively executed**. Because AsteroidDB uses CRDTs with
+/// idempotent merge semantics, orphan data on nodes that no longer match the
+/// policy is harmless — it will eventually become stale but cannot cause
+/// inconsistency. Actively deleting data across the cluster would add
+/// significant complexity and risk of data loss with no correctness benefit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebalancePlan {
     /// The key range this plan applies to.
     pub key_range: KeyRange,
     /// Keys that need to be pushed to new target nodes.
     pub additions: Vec<RebalanceAddition>,
-    /// Keys that should be removed from nodes that no longer match.
+    /// Keys on nodes that no longer match the policy (advisory only; not executed).
+    /// See struct-level documentation for rationale.
     pub removals: Vec<RebalanceRemoval>,
 }
 
@@ -102,9 +110,16 @@ impl RebalancePlan {
         }
     }
 
-    /// Returns the total number of operations (additions + removals) in this plan.
-    pub fn total_operations(&self) -> usize {
-        self.additions.len() + self.removals.len()
+    /// Returns the number of addition operations that will be executed.
+    ///
+    /// Only counts additions because removals are advisory-only (see struct docs).
+    pub fn total_additions(&self) -> usize {
+        self.additions.len()
+    }
+
+    /// Returns the number of advisory removals in this plan (not actively executed).
+    pub fn removals_count(&self) -> usize {
+        self.removals.len()
     }
 
     /// Returns `true` if this plan has no work to do.
@@ -172,7 +187,7 @@ mod tests {
         let plan = RebalancePlan::compute(Some(&policy), &policy, &nodes, &keys, &nid("n1"));
 
         assert!(plan.is_empty());
-        assert_eq!(plan.total_operations(), 0);
+        assert_eq!(plan.total_additions(), 0);
     }
 
     #[test]
@@ -303,13 +318,14 @@ mod tests {
     // --- RebalancePlan methods ---
 
     #[test]
-    fn total_operations_and_is_empty() {
+    fn total_additions_and_is_empty() {
         let empty = RebalancePlan {
             key_range: key_range("test/"),
             additions: vec![],
             removals: vec![],
         };
-        assert_eq!(empty.total_operations(), 0);
+        assert_eq!(empty.total_additions(), 0);
+        assert_eq!(empty.removals_count(), 0);
         assert!(empty.is_empty());
 
         let non_empty = RebalancePlan {
@@ -323,7 +339,9 @@ mod tests {
                 source_node: nid("n2"),
             }],
         };
-        assert_eq!(non_empty.total_operations(), 2);
+        // total_additions only counts additions (removals are advisory)
+        assert_eq!(non_empty.total_additions(), 1);
+        assert_eq!(non_empty.removals_count(), 1);
         assert!(!non_empty.is_empty());
     }
 
