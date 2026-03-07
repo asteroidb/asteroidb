@@ -17,7 +17,9 @@ use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::placement::PlacementPolicy;
-use crate::placement::rebalance::{DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan};
+use crate::placement::rebalance::{
+    DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
+};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -593,45 +595,67 @@ impl NodeRunner {
                 continue;
             }
 
-            // Group additions by target node.
-            let mut by_target: HashMap<&NodeId, Vec<&str>> = HashMap::new();
-            for addition in batch {
+            // Group additions by target node, tracking each entry's batch index
+            // so we can determine exactly which additions succeeded after push.
+            let batch_len = batch.len();
+            let mut by_target: HashMap<&NodeId, Vec<(usize, &str)>> = HashMap::new();
+            for (batch_idx, addition) in batch.iter().enumerate() {
                 by_target
                     .entry(&addition.target_node)
                     .or_default()
-                    .push(&addition.key);
+                    .push((batch_idx, &addition.key));
             }
 
+            let mut succeeded = vec![false; batch_len];
             let mut migrated = 0u64;
             let mut failed = 0u64;
 
             // Look up peer addresses from the registry.
             let peers = sync_client.peer_registry().lock().await.all_peers_owned();
 
-            for (target_node, keys) in &by_target {
+            for (target_node, indexed_keys) in &by_target {
                 // Find the peer address for this target node.
                 let peer = peers.iter().find(|p| p.node_id == **target_node);
                 let Some(peer) = peer else {
                     // Target node not in peer registry; count as failed.
-                    failed += keys.len() as u64;
+                    failed += indexed_keys.len() as u64;
                     continue;
                 };
 
-                // Collect entries to push.
+                // Collect entries to push (preserving group order).
                 let api = eventual_api.lock().await;
-                let entries: Vec<(String, crate::store::kv::CrdtValue)> = keys
+                let resolved: Vec<(usize, String, crate::store::kv::CrdtValue)> = indexed_keys
                     .iter()
-                    .filter_map(|k| api.store().get(k).map(|v| (k.to_string(), v.clone())))
+                    .filter_map(|(idx, k)| {
+                        api.store().get(k).map(|v| (*idx, k.to_string(), v.clone()))
+                    })
                     .collect();
                 drop(api);
 
-                if entries.is_empty() {
+                if resolved.is_empty() {
                     continue;
                 }
+
+                let entries: Vec<(String, crate::store::kv::CrdtValue)> = resolved
+                    .iter()
+                    .map(|(_, k, v)| (k.clone(), v.clone()))
+                    .collect();
 
                 let push_result = sync_client
                     .push_changed_keys(&peer.addr, entries, &self.node_id.0, DEFAULT_BATCH_SIZE)
                     .await;
+
+                let pushed_count = match &push_result {
+                    Ok(pushed) => *pushed,
+                    Err(e) => e.pushed,
+                };
+
+                // Mark the first `pushed_count` entries in this group as succeeded.
+                for (group_pos, (batch_idx, _, _)) in resolved.iter().enumerate() {
+                    if group_pos < pushed_count {
+                        succeeded[*batch_idx] = true;
+                    }
+                }
 
                 match push_result {
                     Ok(pushed) => {
@@ -639,7 +663,7 @@ impl NodeRunner {
                     }
                     Err(e) => {
                         migrated += e.pushed as u64;
-                        failed += (keys.len() - e.pushed) as u64;
+                        failed += (resolved.len() - e.pushed) as u64;
                         tracing::warn!(
                             target_node = %target_node.0,
                             error = %e,
@@ -652,10 +676,12 @@ impl NodeRunner {
             self.metrics
                 .record_rebalance_progress(prefix, migrated, failed);
 
-            // Advance the offset only by successfully migrated keys.
-            let advanced = migrated as usize;
+            // Advance the offset only past the contiguous block of successful
+            // additions from the start of the batch.  This prevents skipping
+            // failed additions that appear before later successes.
+            let contiguous_ok = contiguous_success_count(&succeeded);
             if let Some(rebalance) = self.active_rebalance_plans.get_mut(prefix) {
-                rebalance.additions_offset += advanced;
+                rebalance.additions_offset += contiguous_ok;
 
                 // Check if we just finished.
                 if rebalance.additions_offset >= rebalance.plan.additions.len() {
