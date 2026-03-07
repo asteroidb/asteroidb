@@ -128,7 +128,7 @@ async fn two_node_anti_entropy_convergence() {
         }],
     )
     .unwrap();
-    let sync_client1 = SyncClient::new(registry1);
+    let sync_client1 = SyncClient::new(Arc::new(Mutex::new(registry1)));
 
     // Snapshot node 1's store and push to node 2.
     let entries1: HashMap<String, CrdtValue> = {
@@ -150,7 +150,7 @@ async fn two_node_anti_entropy_convergence() {
         }],
     )
     .unwrap();
-    let sync_client2 = SyncClient::new(registry2);
+    let sync_client2 = SyncClient::new(Arc::new(Mutex::new(registry2)));
 
     let entries2: HashMap<String, CrdtValue> = {
         let api = state2.eventual.lock().await;
@@ -282,7 +282,7 @@ async fn pull_based_sync() {
 
     // Pull from the source node.
     let registry = PeerRegistry::new(node_id("puller"), vec![]).unwrap();
-    let sync_client = SyncClient::new(registry);
+    let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
 
     let pulled = sync_client.pull_all_keys(&addr.to_string()).await;
     assert!(pulled.is_some(), "pull should succeed");
@@ -470,7 +470,7 @@ async fn three_node_convergence_via_sync() {
                 .collect();
 
             let registry = PeerRegistry::new(self_id, peers).unwrap();
-            let sync_client = SyncClient::new(registry);
+            let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
 
             let entries: HashMap<String, CrdtValue> = {
                 let api = state.eventual.lock().await;
@@ -620,7 +620,7 @@ async fn full_sync_records_remote_frontier_not_local() {
 
     // Pull all keys from the remote.
     let registry = PeerRegistry::new(node_id("local"), vec![]).unwrap();
-    let sync_client = SyncClient::new(registry);
+    let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
 
     let dump = sync_client.pull_all_keys(&remote_addr.to_string()).await;
     assert!(dump.is_some(), "pull should succeed");

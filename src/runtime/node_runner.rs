@@ -643,7 +643,7 @@ impl NodeRunner {
             .sync_attempt_total
             .fetch_add(1, Ordering::Relaxed);
 
-        let peers: Vec<_> = sync_client.peer_registry().all_peers().to_vec();
+        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
 
         for peer in &peers {
@@ -747,6 +747,13 @@ impl NodeRunner {
                 );
             }
         }
+
+        // Prune stale peer frontiers: remove entries for peers that are no
+        // longer in the registry (e.g. removed via membership changes).
+        let active_addrs: std::collections::HashSet<&String> =
+            peers.iter().map(|p| &p.addr).collect();
+        self.peer_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
 
         if !any_success && !peers.is_empty() {
             self.metrics

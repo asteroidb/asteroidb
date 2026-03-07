@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use crate::hlc::HlcTimestamp;
 use crate::network::peer::PeerRegistry;
@@ -86,16 +88,20 @@ pub struct DeltaSyncResponse {
 ///
 /// Periodically pushes all local CRDT values to every known peer.
 /// Uses HTTP POST to `/api/internal/sync` on each peer.
+///
+/// Holds a shared reference to the [`PeerRegistry`] so that peers
+/// added or removed at runtime (via `/api/internal/join` or
+/// `/api/internal/leave`) are automatically picked up by the sync loop.
 pub struct SyncClient {
-    peer_registry: PeerRegistry,
+    peer_registry: Arc<Mutex<PeerRegistry>>,
     http_client: reqwest::Client,
     /// Optional Bearer token added to all outbound requests for internal API auth.
     auth_token: Option<String>,
 }
 
 impl SyncClient {
-    /// Create a new `SyncClient` for the given peer registry.
-    pub fn new(peer_registry: PeerRegistry) -> Self {
+    /// Create a new `SyncClient` with a shared peer registry.
+    pub fn new(peer_registry: Arc<Mutex<PeerRegistry>>) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -108,7 +114,7 @@ impl SyncClient {
     }
 
     /// Create a `SyncClient` that attaches a Bearer token to all requests.
-    pub fn with_token(peer_registry: PeerRegistry, token: String) -> Self {
+    pub fn with_token(peer_registry: Arc<Mutex<PeerRegistry>>, token: String) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -121,7 +127,10 @@ impl SyncClient {
     }
 
     /// Create a `SyncClient` with a custom reqwest client (for testing).
-    pub fn with_client(peer_registry: PeerRegistry, http_client: reqwest::Client) -> Self {
+    pub fn with_client(
+        peer_registry: Arc<Mutex<PeerRegistry>>,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             peer_registry,
             http_client,
@@ -170,7 +179,8 @@ impl SyncClient {
 
         let mut success_count = 0;
 
-        for peer in self.peer_registry.all_peers() {
+        let peers = self.peer_registry.lock().await.all_peers_owned();
+        for peer in &peers {
             let url = format!("http://{}/api/internal/sync", peer.addr);
 
             match self.authorized_post(&url).json(&request).send().await {
@@ -241,8 +251,8 @@ impl SyncClient {
         }
     }
 
-    /// Return a reference to the peer registry.
-    pub fn peer_registry(&self) -> &PeerRegistry {
+    /// Return a shared reference to the peer registry.
+    pub fn peer_registry(&self) -> &Arc<Mutex<PeerRegistry>> {
         &self.peer_registry
     }
 
@@ -405,31 +415,27 @@ mod tests {
         assert!(resp.frontier.is_none());
     }
 
-    #[test]
-    fn sync_client_creation() {
-        let registry = PeerRegistry::new(
-            nid("node-1"),
-            vec![PeerConfig {
-                node_id: nid("node-2"),
-                addr: "127.0.0.1:8001".to_string(),
-            }],
-        )
-        .unwrap();
+    fn shared_registry(peers: Vec<PeerConfig>) -> Arc<Mutex<PeerRegistry>> {
+        Arc::new(Mutex::new(PeerRegistry::new(nid("node-1"), peers).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn sync_client_creation() {
+        let registry = shared_registry(vec![PeerConfig {
+            node_id: nid("node-2"),
+            addr: "127.0.0.1:8001".to_string(),
+        }]);
 
         let client = SyncClient::new(registry);
-        assert_eq!(client.peer_registry().peer_count(), 1);
+        assert_eq!(client.peer_registry().lock().await.peer_count(), 1);
     }
 
     #[tokio::test]
     async fn push_all_keys_empty_entries_returns_zero() {
-        let registry = PeerRegistry::new(
-            nid("node-1"),
-            vec![PeerConfig {
-                node_id: nid("node-2"),
-                addr: "127.0.0.1:8001".to_string(),
-            }],
-        )
-        .unwrap();
+        let registry = shared_registry(vec![PeerConfig {
+            node_id: nid("node-2"),
+            addr: "127.0.0.1:8001".to_string(),
+        }]);
 
         let client = SyncClient::new(registry);
         let result = client.push_all_keys(HashMap::new(), "node-1").await;
@@ -438,15 +444,11 @@ mod tests {
 
     #[tokio::test]
     async fn push_all_keys_to_unreachable_peer_returns_zero() {
-        let registry = PeerRegistry::new(
-            nid("node-1"),
-            vec![PeerConfig {
-                node_id: nid("node-2"),
-                // Unreachable address.
-                addr: "127.0.0.1:1".to_string(),
-            }],
-        )
-        .unwrap();
+        let registry = shared_registry(vec![PeerConfig {
+            node_id: nid("node-2"),
+            // Unreachable address.
+            addr: "127.0.0.1:1".to_string(),
+        }]);
 
         // Use a short timeout to speed up the test.
         let http_client = reqwest::Client::builder()
@@ -466,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_all_keys_from_unreachable_peer_returns_none() {
-        let registry = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        let registry = shared_registry(vec![]);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(100))
@@ -476,6 +478,46 @@ mod tests {
 
         let result = client.pull_all_keys("127.0.0.1:1").await;
         assert!(result.is_none());
+    }
+
+    /// Verify that peers added after `SyncClient` creation are visible to sync.
+    #[tokio::test]
+    async fn sync_client_sees_dynamically_added_peers() {
+        let registry = shared_registry(vec![]);
+        let client = SyncClient::new(Arc::clone(&registry));
+
+        // Initially no peers.
+        assert_eq!(client.peer_registry().lock().await.peer_count(), 0);
+
+        // Simulate a dynamic join.
+        registry
+            .lock()
+            .await
+            .add_peer(PeerConfig {
+                node_id: nid("node-2"),
+                addr: "127.0.0.1:8001".to_string(),
+            })
+            .unwrap();
+
+        // SyncClient now sees the new peer.
+        assert_eq!(client.peer_registry().lock().await.peer_count(), 1);
+    }
+
+    /// Verify that peers removed after `SyncClient` creation are no longer synced.
+    #[tokio::test]
+    async fn sync_client_sees_dynamically_removed_peers() {
+        let registry = shared_registry(vec![PeerConfig {
+            node_id: nid("node-2"),
+            addr: "127.0.0.1:8001".to_string(),
+        }]);
+        let client = SyncClient::new(Arc::clone(&registry));
+
+        assert_eq!(client.peer_registry().lock().await.peer_count(), 1);
+
+        // Simulate a dynamic leave.
+        registry.lock().await.remove_peer(&nid("node-2")).unwrap();
+
+        assert_eq!(client.peer_registry().lock().await.peer_count(), 0);
     }
 
     // ---------------------------------------------------------------
@@ -543,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_delta_from_unreachable_peer_returns_none() {
-        let registry = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        let registry = shared_registry(vec![]);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(100))
@@ -559,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_delta_empty_entries_returns_true() {
-        let registry = PeerRegistry::new(nid("node-1"), vec![]).unwrap();
+        let registry = shared_registry(vec![]);
         let client = SyncClient::new(registry);
 
         let result = client
