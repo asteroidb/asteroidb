@@ -67,7 +67,7 @@ impl LatencySamples {
         let avg = sum / self.values.len() as f64;
 
         let mut sorted = self.values.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p99_idx = ((0.99 * sorted.len() as f64).ceil() as usize)
             .min(sorted.len())
             .saturating_sub(1);
