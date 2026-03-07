@@ -161,11 +161,11 @@ mod tests {
         assert_eq!(topo.total_nodes, 3);
         assert_eq!(topo.regions.len(), 2);
 
-        let us = topo.regions.iter().find(|r| r.name == "eu-west").unwrap();
-        assert_eq!(us.node_count, 1);
+        let us = topo.regions.iter().find(|r| r.name == "us-east").unwrap();
+        assert_eq!(us.node_count, 2);
 
-        let eu = topo.regions.iter().find(|r| r.name == "us-east").unwrap();
-        assert_eq!(eu.node_count, 2);
+        let eu = topo.regions.iter().find(|r| r.name == "eu-west").unwrap();
+        assert_eq!(eu.node_count, 1);
     }
 
     #[test]

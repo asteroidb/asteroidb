@@ -14,10 +14,6 @@ pub enum PeerError {
     #[error("duplicate node_id: {0}")]
     DuplicateNodeId(String),
 
-    /// A peer address could not be parsed as a valid [`SocketAddr`].
-    #[error("invalid address for node {node_id}: {reason}")]
-    InvalidAddress { node_id: String, reason: String },
-
     /// The local node's own ID appears in the peer list.
     #[error("self_id {0} must not appear in the peer list")]
     SelfInPeerList(String),
@@ -700,12 +696,6 @@ mod tests {
     fn peer_error_display() {
         let err = PeerError::DuplicateNodeId("node-x".into());
         assert_eq!(err.to_string(), "duplicate node_id: node-x");
-
-        let err = PeerError::InvalidAddress {
-            node_id: "node-y".into(),
-            reason: "bad port".into(),
-        };
-        assert_eq!(err.to_string(), "invalid address for node node-y: bad port");
 
         let err = PeerError::SelfInPeerList("node-z".into());
         assert_eq!(
