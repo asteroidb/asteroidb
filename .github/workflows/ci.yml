@@ -111,6 +111,21 @@ jobs:
       - name: Check for API document drift
         run: bash scripts/check-doc-drift.sh
 
+  netem-light:
+    name: Lightweight Netem Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # python3 is pre-installed on ubuntu-latest and required by scripts/netem/lib.sh
+      - name: Run lightweight netem tests
+        run: bash scripts/test-netem-light.sh
+
+      - name: Ensure cluster is stopped
+        if: always()
+        run: docker compose -f docker-compose.yml down --timeout 5 || true
+
   build:
     name: Release Build
     runs-on: ubuntu-latest
