@@ -15,6 +15,46 @@
       "nodes": 3,
       "timeout_seconds": 120,
       "tags": ["delay", "convergence"]
+    },
+    {
+      "name": "crash-recovery",
+      "description": "Stop a container, wait, restart, verify CRDT convergence",
+      "script": "../fault-inject/scenario-crash-recovery.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["crash", "recovery", "convergence"]
+    },
+    {
+      "name": "asymmetric-partition",
+      "description": "Block A->B but allow B->A using tc rules, verify consistency",
+      "script": "../fault-inject/scenario-asymmetric-partition.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["partition", "asymmetric", "convergence"]
+    },
+    {
+      "name": "jitter-latency",
+      "description": "Add 50ms +/- 30ms jitter, verify operations complete",
+      "script": "../fault-inject/scenario-jitter-latency.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["delay", "jitter", "convergence"]
+    },
+    {
+      "name": "rolling-partition",
+      "description": "Sequentially isolate each node, then heal all, verify convergence",
+      "script": "../fault-inject/scenario-rolling-partition.sh",
+      "nodes": 3,
+      "timeout_seconds": 180,
+      "tags": ["partition", "rolling", "convergence"]
+    },
+    {
+      "name": "node-rejoin",
+      "description": "Stop node, write to remaining, restart stopped node, verify sync",
+      "script": "../fault-inject/scenario-node-rejoin.sh",
+      "nodes": 3,
+      "timeout_seconds": 120,
+      "tags": ["crash", "rejoin", "convergence"]
     }
   ]
 }
