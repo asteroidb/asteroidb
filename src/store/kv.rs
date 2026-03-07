@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,20 @@ use crate::crdt::or_set::OrSet;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
+use crate::store::migration;
+
+/// Current persistence format version written by this code.
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
+
+/// Versioned envelope for persisted store data.
+///
+/// All snapshots written by this code include a `format_version` field.
+/// On load, the version is checked and migrations are applied as needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStore {
+    format_version: u32,
+    store: serde_json::Value,
+}
 
 /// A CRDT value stored in the KVS.
 ///
@@ -107,30 +123,104 @@ impl Store {
         self.data.iter()
     }
 
-    /// Save the store as a JSON snapshot to the given path.
+    /// Save the store as a versioned JSON snapshot to the given path.
+    ///
+    /// Uses atomic write (write to `.tmp` then rename) to prevent corruption
+    /// on crash. The snapshot includes a `format_version` field for forward
+    /// compatibility.
     pub fn save_snapshot(&self, path: &Path) -> io::Result<()> {
-        let json = serde_json::to_string(self)
+        let store_value = serde_json::to_value(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let envelope = PersistedStore {
+            format_version: CURRENT_FORMAT_VERSION,
+            store: store_value,
+        };
+        let json = serde_json::to_string(&envelope)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, json)
+
+        // Atomic write: write to temp file, fsync, then rename.
+        let tmp_path = path.with_extension("tmp");
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
     }
 
-    /// Load a store from a JSON snapshot at the given path.
+    /// Load a store from a versioned JSON snapshot at the given path.
     ///
-    /// Returns an `io::Error` if the file cannot be read or parsed.
+    /// Detects the format version and applies migrations if the data was
+    /// written by an older version. Returns an error if the data version
+    /// is newer than what this code supports (forward incompatibility).
     pub fn load_snapshot(path: &Path) -> io::Result<Self> {
-        let data = std::fs::read_to_string(path)?;
-        serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let raw = std::fs::read_to_string(path)?;
+        Self::deserialize_snapshot(&raw)
     }
 
-    /// Load a store from a snapshot, falling back to an empty store on any error.
+    /// Deserialize a snapshot from a JSON string, applying migrations as needed.
+    fn deserialize_snapshot(raw: &str) -> io::Result<Self> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Detect version: if format_version is missing, treat as v1 (legacy).
+        let data_version = parsed
+            .get("format_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(1);
+
+        if data_version > CURRENT_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                CrdtError::IncompatibleVersion {
+                    data_version,
+                    code_version: CURRENT_FORMAT_VERSION,
+                },
+            ));
+        }
+
+        // Extract the store data from the envelope.
+        let store_data = if parsed.get("format_version").is_some() {
+            if let Some(store_field) = parsed.get("store") {
+                // New versioned format: store data is in the "store" field.
+                store_field.clone()
+            } else {
+                // Legacy versioned format (flatten): strip format_version to get raw store data.
+                let mut obj = parsed;
+                if let Some(map) = obj.as_object_mut() {
+                    map.remove("format_version");
+                }
+                obj
+            }
+        } else {
+            // Legacy format (v1): the entire JSON is the store.
+            parsed
+        };
+
+        // Apply migrations if needed.
+        let registry = migration::default_registry();
+        let migrated = registry
+            .apply_migrations(store_data, data_version, CURRENT_FORMAT_VERSION)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        serde_json::from_value(migrated).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Load a store from a snapshot, falling back to an empty store only when
+    /// the file is missing.
     ///
-    /// This is the recommended way to load at startup: if the snapshot file
-    /// is missing or corrupted, the store starts fresh.
-    pub fn load_snapshot_or_default(path: &Path) -> Self {
-        Self::load_snapshot(path).unwrap_or_default()
+    /// Returns an error for incompatible versions or other I/O failures to
+    /// prevent silent data loss.
+    pub fn load_snapshot_or_default(path: &Path) -> io::Result<Self> {
+        match Self::load_snapshot(path) {
+            Ok(store) => Ok(store),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Merge a CRDT value into an existing entry.
@@ -757,18 +847,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
 
-        let store = Store::load_snapshot_or_default(&path);
+        let store = Store::load_snapshot_or_default(&path).unwrap();
         assert!(store.is_empty());
     }
 
     #[test]
-    fn load_snapshot_or_default_corrupt_file() {
+    fn load_snapshot_or_default_corrupt_file_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.json");
         std::fs::write(&path, "not valid json {{{").unwrap();
 
-        let store = Store::load_snapshot_or_default(&path);
-        assert!(store.is_empty());
+        let result = Store::load_snapshot_or_default(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_snapshot_or_default_incompatible_version_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.json");
+
+        let json = serde_json::json!({
+            "format_version": 99,
+            "store": { "data": {}, "timestamps": {} }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = Store::load_snapshot_or_default(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("incompatible"));
     }
 
     #[test]
@@ -941,5 +1049,131 @@ mod tests {
 
         assert_eq!(loaded.timestamp_for("k"), Some(&ts(100, 0, "N1")));
         assert_eq!(loaded.current_frontier(), Some(ts(100, 0, "N1")));
+    }
+
+    // ---------------------------------------------------------------
+    // Versioned persistence format
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn save_writes_format_version_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        let store = Store::new();
+        store.save_snapshot(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.get("format_version").and_then(|v| v.as_u64()),
+            Some(super::CURRENT_FORMAT_VERSION as u64)
+        );
+    }
+
+    #[test]
+    fn versioned_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        let mut store = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        store.put("key".into(), CrdtValue::Counter(counter));
+
+        store.save_snapshot(&path).unwrap();
+        let loaded = Store::load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        match loaded.get("key") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_legacy_v1_format_without_version_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.json");
+
+        // Write a legacy format (no format_version) — just a raw Store.
+        let mut store = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        store.put("k".into(), CrdtValue::Counter(counter));
+
+        let json = serde_json::to_string(&store).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match loaded.get("k") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_future_version_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.json");
+
+        let json = serde_json::json!({
+            "format_version": 99,
+            "data": {},
+            "timestamps": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = Store::load_snapshot(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn atomic_write_no_tmp_file_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+        let tmp_path = dir.path().join("store.tmp");
+
+        let store = Store::new();
+        store.save_snapshot(&path).unwrap();
+
+        assert!(path.exists(), "final file should exist");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should not persist on success"
+        );
+    }
+
+    #[test]
+    fn migration_chain_v1_to_current_applied_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.json");
+
+        // Write a v1-format file (with explicit version 1).
+        let mut store = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("X"));
+        store.put("test".into(), CrdtValue::Counter(counter));
+
+        let mut value = serde_json::to_value(&store).unwrap();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "format_version".to_string(),
+                serde_json::Value::Number(1.into()),
+            );
+        }
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        // Loading should apply migration v1->v2 and succeed.
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match loaded.get("test") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter, got {:?}", other),
+        }
     }
 }

@@ -732,17 +732,17 @@ fn timeout_detection_works_on_recovered_pending() {
 fn store_load_snapshot_or_default_missing_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nonexistent.json");
-    let store = Store::load_snapshot_or_default(&path);
+    let store = Store::load_snapshot_or_default(&path).unwrap();
     assert!(store.is_empty());
 }
 
 #[test]
-fn store_load_snapshot_or_default_corrupt_file() {
+fn store_load_snapshot_or_default_corrupt_file_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("corrupt.json");
     std::fs::write(&path, "not valid json {{{").unwrap();
-    let store = Store::load_snapshot_or_default(&path);
-    assert!(store.is_empty());
+    let result = Store::load_snapshot_or_default(&path);
+    assert!(result.is_err());
 }
 
 #[test]

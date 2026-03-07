@@ -24,6 +24,15 @@ pub enum CrdtError {
     #[error("timeout")]
     Timeout,
 
+    #[error("incompatible format version: data={data_version}, code={code_version}")]
+    IncompatibleVersion {
+        data_version: u32,
+        code_version: u32,
+    },
+
+    #[error("migration failed from v{from} to v{to}: {reason}")]
+    MigrationFailed { from: u32, to: u32, reason: String },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
