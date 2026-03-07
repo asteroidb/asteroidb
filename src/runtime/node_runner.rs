@@ -652,10 +652,10 @@ impl NodeRunner {
             self.metrics
                 .record_rebalance_progress(prefix, migrated, failed);
 
-            // Advance the offset.
-            let batch_len = batch.len();
+            // Advance the offset only by successfully migrated keys.
+            let advanced = migrated as usize;
             if let Some(rebalance) = self.active_rebalance_plans.get_mut(prefix) {
-                rebalance.additions_offset += batch_len;
+                rebalance.additions_offset += advanced;
 
                 // Check if we just finished.
                 if rebalance.additions_offset >= rebalance.plan.additions.len() {
