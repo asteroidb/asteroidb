@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
@@ -99,6 +100,29 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Cached proof for a key that has achieved `Certified` status.
+///
+/// This entry survives cleanup of `pending_writes`, ensuring that
+/// `get_certified` and `get_certification_status` continue to return
+/// `Certified` with proof data even after the pending write has been removed.
+#[derive(Debug, Clone)]
+pub struct CertifiedCacheEntry {
+    /// The key range this certification covers.
+    pub key_range: KeyRange,
+    /// The majority frontier HLC at the time of certification.
+    pub frontier_hlc: HlcTimestamp,
+    /// The policy version in effect when the proof was generated.
+    pub policy_version: PolicyVersion,
+    /// The authority node IDs that contributed to certification.
+    pub contributing_authorities: Vec<NodeId>,
+    /// The total number of authorities in the authority set.
+    pub total_authorities: usize,
+    /// The majority certificate, if available.
+    pub certificate: Option<MajorityCertificate>,
+    /// The HLC timestamp of the write that was certified.
+    pub write_timestamp: HlcTimestamp,
+}
+
 /// Certified consistency API (FR-002, FR-004).
 ///
 /// Provides `get_certified` and `certified_write` operations that integrate
@@ -114,6 +138,13 @@ pub struct CertifiedApi {
     retention: RetentionPolicy,
     /// Cumulative count of pending writes evicted due to `max_entries` pressure.
     evicted_count: u64,
+    /// Cache of certified proofs that survives `pending_writes` cleanup.
+    ///
+    /// When a write transitions to `Certified`, its proof info is stored here
+    /// so that subsequent reads still return `Certified` with proof even after
+    /// the pending write entry has been removed by cleanup or retention eviction.
+    /// For a given key, only the latest certified entry is kept.
+    certified_cache: HashMap<String, CertifiedCacheEntry>,
 }
 
 impl CertifiedApi {
@@ -130,6 +161,7 @@ impl CertifiedApi {
             pending_writes: Vec::new(),
             retention: RetentionPolicy::default(),
             evicted_count: 0,
+            certified_cache: HashMap::new(),
         }
     }
 
@@ -147,6 +179,7 @@ impl CertifiedApi {
             pending_writes: Vec::new(),
             retention,
             evicted_count: 0,
+            certified_cache: HashMap::new(),
         }
     }
 
@@ -172,12 +205,49 @@ impl CertifiedApi {
         Ok((key_range, policy_version, total))
     }
 
+    /// Record a certified write in the proof cache.
+    ///
+    /// Captures the frontier state at certification time so that later reads
+    /// can still return `Certified` with a valid proof bundle even after the
+    /// pending write has been cleaned up.
+    fn cache_certified_proof(&mut self, pw: &PendingWrite) {
+        let scoped_frontiers = self
+            .frontiers
+            .all_for_scope(&pw.key_range, &pw.policy_version);
+        let contributing_authorities: Vec<NodeId> = scoped_frontiers
+            .iter()
+            .map(|f| f.authority_id.clone())
+            .collect();
+
+        let frontier_hlc = self
+            .frontiers
+            .majority_frontier_for_scope(&pw.key_range, &pw.policy_version, pw.total_authorities)
+            .unwrap_or_else(|| pw.timestamp.clone());
+
+        self.certified_cache.insert(
+            pw.key.clone(),
+            CertifiedCacheEntry {
+                key_range: pw.key_range.clone(),
+                frontier_hlc,
+                policy_version: pw.policy_version,
+                contributing_authorities,
+                total_authorities: pw.total_authorities,
+                certificate: None,
+                write_timestamp: pw.timestamp.clone(),
+            },
+        );
+    }
+
     /// Read a key with certification status (FR-002).
     ///
     /// Returns the value (if present), its certification status based on
     /// the latest pending write for that key, the scoped majority frontier
     /// for the key's authority range, and a verifiable proof bundle when
     /// the status is `Certified`.
+    ///
+    /// If no pending write exists for the key but the certified proof cache
+    /// contains an entry, the cached `Certified` status and proof are returned.
+    /// This ensures certification stability after cleanup or retention eviction.
     pub fn get_certified(&self, key: &str) -> CertifiedRead<'_> {
         let value = self.store.get(key);
 
@@ -187,34 +257,53 @@ impl CertifiedApi {
             .as_ref()
             .and_then(|(kr, pv, total)| self.frontiers.majority_frontier_for_scope(kr, pv, *total));
 
-        let status = self
+        // Look up status from pending_writes first; fall back to certified_cache.
+        let pending_status = self
             .pending_writes
             .iter()
             .rev()
             .find(|pw| pw.key == key)
-            .map(|pw| pw.status)
-            .unwrap_or(CertificationStatus::Pending);
+            .map(|pw| pw.status);
 
-        let proof = if status == CertificationStatus::Certified {
-            scope_info.as_ref().and_then(|(kr, pv, total)| {
-                let frontier_hlc = frontier.clone()?;
-                let scoped_frontiers = self.frontiers.all_for_scope(kr, pv);
-                let contributing_authorities: Vec<NodeId> = scoped_frontiers
-                    .iter()
-                    .map(|f| f.authority_id.clone())
-                    .collect();
+        let (status, proof) = match pending_status {
+            Some(CertificationStatus::Certified) => {
+                // Build proof from live frontier data.
+                let proof = scope_info.as_ref().and_then(|(kr, pv, total)| {
+                    let frontier_hlc = frontier.clone()?;
+                    let scoped_frontiers = self.frontiers.all_for_scope(kr, pv);
+                    let contributing_authorities: Vec<NodeId> = scoped_frontiers
+                        .iter()
+                        .map(|f| f.authority_id.clone())
+                        .collect();
 
-                Some(ProofBundle {
-                    key_range: kr.clone(),
-                    frontier_hlc,
-                    policy_version: *pv,
-                    contributing_authorities,
-                    total_authorities: *total,
-                    certificate: None,
-                })
-            })
-        } else {
-            None
+                    Some(ProofBundle {
+                        key_range: kr.clone(),
+                        frontier_hlc,
+                        policy_version: *pv,
+                        contributing_authorities,
+                        total_authorities: *total,
+                        certificate: None,
+                    })
+                });
+                (CertificationStatus::Certified, proof)
+            }
+            Some(other_status) => (other_status, None),
+            None => {
+                // No pending write — check the certified cache.
+                if let Some(cached) = self.certified_cache.get(key) {
+                    let proof = ProofBundle {
+                        key_range: cached.key_range.clone(),
+                        frontier_hlc: cached.frontier_hlc.clone(),
+                        policy_version: cached.policy_version,
+                        contributing_authorities: cached.contributing_authorities.clone(),
+                        total_authorities: cached.total_authorities,
+                        certificate: cached.certificate.clone(),
+                    };
+                    (CertificationStatus::Certified, Some(proof))
+                } else {
+                    (CertificationStatus::Pending, None)
+                }
+            }
         };
 
         CertifiedRead {
@@ -304,7 +393,7 @@ impl CertifiedApi {
             CertificationStatus::Pending
         };
 
-        self.pending_writes.push(PendingWrite {
+        let pw = PendingWrite {
             key,
             value,
             timestamp,
@@ -312,7 +401,13 @@ impl CertifiedApi {
             key_range,
             policy_version,
             total_authorities,
-        });
+        };
+
+        if already_certified {
+            self.cache_certified_proof(&pw);
+        }
+
+        self.pending_writes.push(pw);
 
         if already_certified {
             return Ok(CertificationStatus::Certified);
@@ -326,14 +421,21 @@ impl CertifiedApi {
 
     /// Check the certification status of the latest write for a key.
     ///
-    /// Returns `CertificationStatus::Pending` if no tracked write exists.
+    /// Returns `CertificationStatus::Pending` if no tracked write exists
+    /// and the key is not in the certified proof cache.
     pub fn get_certification_status(&self, key: &str) -> CertificationStatus {
         self.pending_writes
             .iter()
             .rev()
             .find(|pw| pw.key == key)
             .map(|pw| pw.status)
-            .unwrap_or(CertificationStatus::Pending)
+            .unwrap_or_else(|| {
+                if self.certified_cache.contains_key(key) {
+                    CertificationStatus::Certified
+                } else {
+                    CertificationStatus::Pending
+                }
+            })
     }
 
     /// Update an Authority's ack frontier.
@@ -349,8 +451,10 @@ impl CertifiedApi {
     ///
     /// Each write is checked against the scoped majority frontier for its
     /// resolved key range. Writes whose timestamps are at or below the
-    /// scoped majority frontier are promoted to `Certified`.
+    /// scoped majority frontier are promoted to `Certified` and their proof
+    /// is cached for stability across cleanup cycles.
     pub fn process_certifications(&mut self) {
+        let mut newly_certified = Vec::new();
         for pw in &mut self.pending_writes {
             if pw.status == CertificationStatus::Pending
                 && self.frontiers.is_certified_at_for_scope(
@@ -361,7 +465,11 @@ impl CertifiedApi {
                 )
             {
                 pw.status = CertificationStatus::Certified;
+                newly_certified.push(pw.clone());
             }
+        }
+        for pw in &newly_certified {
+            self.cache_certified_proof(pw);
         }
     }
 
@@ -369,12 +477,13 @@ impl CertifiedApi {
     ///
     /// Combines the logic of [`process_certifications`](Self::process_certifications)
     /// and timeout detection: pending writes whose timestamps are at or below
-    /// the scoped majority frontier are promoted to `Certified`, while those
-    /// older than `max_age_ms` are marked as `Timeout`.
+    /// the scoped majority frontier are promoted to `Certified` (and cached),
+    /// while those older than `max_age_ms` are marked as `Timeout`.
     ///
     /// Returns the number of writes that transitioned (certified + timed out).
     pub fn process_certifications_with_timeout(&mut self, now_physical_ms: u64) -> usize {
         let mut transitions = 0;
+        let mut newly_certified = Vec::new();
         for pw in &mut self.pending_writes {
             if pw.status != CertificationStatus::Pending {
                 continue;
@@ -386,6 +495,7 @@ impl CertifiedApi {
                 pw.total_authorities,
             ) {
                 pw.status = CertificationStatus::Certified;
+                newly_certified.push(pw.clone());
                 transitions += 1;
             } else if now_physical_ms.saturating_sub(pw.timestamp.physical)
                 >= self.retention.max_age_ms
@@ -393,6 +503,9 @@ impl CertifiedApi {
                 pw.status = CertificationStatus::Timeout;
                 transitions += 1;
             }
+        }
+        for pw in &newly_certified {
+            self.cache_certified_proof(pw);
         }
         transitions
     }
@@ -465,6 +578,11 @@ impl CertifiedApi {
     /// `cleanup_completed` alone could not bring the size below `max_entries`.
     pub fn evicted_count(&self) -> u64 {
         self.evicted_count
+    }
+
+    /// Return the number of entries in the certified proof cache.
+    pub fn certified_cache_len(&self) -> usize {
+        self.certified_cache.len()
     }
 
     /// Return a reference to the shared system namespace.
@@ -1613,5 +1731,243 @@ mod tests {
         assert!(verification.signatures_valid.is_none());
         assert_eq!(verification.contributing_count, 2);
         assert_eq!(verification.required_count, 2); // 3/2+1 = 2
+    }
+
+    // ---------------------------------------------------------------
+    // Certified status stability after cleanup (#203)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn certified_status_stable_after_cleanup_completed() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(5), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Advance majority of authorities to certify.
+        api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+        api.process_certifications();
+
+        // Verify certified before cleanup.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+        assert_eq!(api.certified_cache_len(), 1);
+
+        // Cleanup removes all non-pending entries from pending_writes.
+        api.cleanup_completed();
+        assert_eq!(api.pending_writes().len(), 0);
+
+        // Status must remain Certified after cleanup.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified,
+            "status must remain Certified after cleanup_completed"
+        );
+
+        // get_certified must still return Certified with proof.
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.value.is_some());
+        assert!(
+            result.proof.is_some(),
+            "proof must be present from cache after cleanup"
+        );
+
+        let proof = result.proof.unwrap();
+        assert_eq!(proof.key_range, kr(""));
+        assert!(proof.frontier_hlc.physical > 0);
+        assert_eq!(proof.total_authorities, 3);
+    }
+
+    #[test]
+    fn certified_status_stable_after_cleanup_expired() {
+        let policy = RetentionPolicy {
+            max_age_ms: 5_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        api.certified_write("key1".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Certify.
+        api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+
+        // Expire + cleanup — well past max_age_ms.
+        api.cleanup_expired(write_ts + 100_000);
+        assert_eq!(api.pending_writes().len(), 0);
+
+        // Status must remain Certified.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified,
+            "status must remain Certified after cleanup_expired"
+        );
+
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.proof.is_some());
+    }
+
+    #[test]
+    fn multiple_writes_same_key_latest_certified_wins() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        // First write.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+
+        // Certify first write.
+        api.update_frontier(make_frontier("auth-1", ts1 + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts1 + 200, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(api.certified_cache_len(), 1);
+
+        // Second write to the same key (replaces value in store).
+        api.certified_write("key1".into(), counter_value(10), OnTimeout::Pending)
+            .unwrap();
+        let ts2 = api.pending_writes().last().unwrap().timestamp.physical;
+
+        // Certify second write as well.
+        api.update_frontier(make_frontier("auth-1", ts2 + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts2 + 200, 0, ""));
+        api.process_certifications();
+
+        // Cache should still have 1 entry (overwritten for same key).
+        assert_eq!(api.certified_cache_len(), 1);
+
+        // Cleanup everything.
+        api.cleanup_completed();
+        assert_eq!(api.pending_writes().len(), 0);
+
+        // The cached entry should reflect the latest certification.
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.proof.is_some());
+
+        let proof = result.proof.unwrap();
+        // The cached frontier should be from the second certification round.
+        assert!(proof.frontier_hlc.physical >= ts2);
+    }
+
+    #[test]
+    fn certified_status_stable_after_full_cleanup() {
+        let policy = RetentionPolicy {
+            max_age_ms: 10_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        api.certified_write("key1".into(), counter_value(7), OnTimeout::Pending)
+            .unwrap();
+        let ts = api.pending_writes()[0].timestamp.physical;
+
+        // Certify.
+        api.update_frontier(make_frontier("auth-1", ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts + 200, 0, ""));
+        api.process_certifications();
+
+        // Full cleanup (the recommended periodic method).
+        api.cleanup(ts + 100_000);
+        assert_eq!(api.pending_writes().len(), 0);
+
+        // Must still be Certified.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.proof.is_some());
+    }
+
+    #[test]
+    fn certified_cache_populated_by_process_with_timeout() {
+        let policy = RetentionPolicy {
+            max_age_ms: 5_000,
+            max_entries: 10_000,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts = api.pending_writes()[0].timestamp.physical;
+
+        // Certify via process_certifications_with_timeout.
+        api.update_frontier(make_frontier("auth-1", ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts + 200, 0, ""));
+        let transitions = api.process_certifications_with_timeout(ts + 100);
+        assert_eq!(transitions, 1);
+        assert_eq!(api.certified_cache_len(), 1);
+
+        // Cleanup.
+        api.cleanup_completed();
+        assert_eq!(api.pending_writes().len(), 0);
+
+        // Still certified from cache.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.proof.is_some());
+    }
+
+    #[test]
+    fn certified_status_stable_after_retention_eviction() {
+        let policy = RetentionPolicy {
+            max_age_ms: 60_000,
+            max_entries: 2,
+        };
+        let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+
+        // Write and certify key1.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let ts1 = api.pending_writes()[0].timestamp.physical;
+
+        api.update_frontier(make_frontier("auth-1", ts1 + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", ts1 + 200, 0, ""));
+        api.process_certifications();
+
+        // Write key2 — now at capacity (2).
+        api.certified_write("key2".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+
+        // Write key3 — triggers auto-cleanup which removes certified key1.
+        api.certified_write("key3".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        // key1 should have been cleaned up from pending_writes.
+        assert!(
+            !api.pending_writes().iter().any(|pw| pw.key == "key1"),
+            "key1 should have been removed from pending_writes by auto-cleanup"
+        );
+
+        // But key1 should still be Certified via the cache.
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified,
+            "key1 status must remain Certified after retention eviction"
+        );
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        assert!(result.proof.is_some());
     }
 }
