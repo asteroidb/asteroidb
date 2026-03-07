@@ -452,7 +452,7 @@ curl -X POST http://localhost:3003/api/eventual/write \
   -d '{"type":"set_add","key":"users","element":"alice"}'
 ```
 
-> **注**: 現時点ではノード間のデータ同期 (レプリケーション) は docker compose 構成では未接続です。各ノードは独立した HTTP API サーバとして動作します。ノード間通信の統合は今後の Issue で対応予定です。
+各ノードは `configs/node-{1,2,3}.json` の設定ファイルを通じてピア情報を持ち、anti-entropy sync によってノード間でデータが自動的にレプリケーションされます。node-1 に書き込んだデータは、数秒以内に node-2, node-3 へ伝播し CRDT マージにより収束します。
 
 ### クラスタの停止
 
@@ -481,7 +481,7 @@ docker compose logs -f node-1
 - `configs/node-2.json` - node-2 の NodeConfig
 - `configs/node-3.json` - node-3 の NodeConfig
 
-これらは `NodeConfig::load()` で読み込み可能な JSON 形式です。将来的にノード起動時に設定ファイルを指定する機能が追加される予定です。
+これらは `NodeConfig::load()` で読み込み可能な JSON 形式です。`ASTEROIDB_CONFIG` 環境変数で設定ファイルのパスを指定して起動すると、ノード ID・バインドアドレス・ピア情報がすべて設定ファイルから読み込まれ、ピアが定義されている場合は anti-entropy sync が自動的に有効化されます。
 
 ## 6. デモシナリオ
 
