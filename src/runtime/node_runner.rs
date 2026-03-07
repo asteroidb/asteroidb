@@ -333,14 +333,25 @@ impl NodeRunner {
         // Collect version changes: (prefix, old_version, new_version).
         let mut changes: Vec<(String, PolicyVersion, PolicyVersion)> = Vec::new();
         for (prefix, new_version) in &current_versions {
-            if let Some(old_version) = self.tracked_policy_versions.get(prefix)
-                && old_version != new_version
-            {
-                changes.push((prefix.clone(), *old_version, *new_version));
+            if let Some(old_version) = self.tracked_policy_versions.get(prefix) {
+                if old_version != new_version {
+                    changes.push((prefix.clone(), *old_version, *new_version));
+                }
+            } else {
+                // New policy: not previously tracked.
+                changes.push((prefix.clone(), PolicyVersion(0), *new_version));
             }
         }
 
-        if changes.is_empty() {
+        // Detect deleted policies: tracked but no longer in current.
+        let mut deleted_prefixes: Vec<(String, PolicyVersion)> = Vec::new();
+        for (prefix, old_version) in &self.tracked_policy_versions {
+            if !current_versions.contains_key(prefix) {
+                deleted_prefixes.push((prefix.clone(), *old_version));
+            }
+        }
+
+        if changes.is_empty() && deleted_prefixes.is_empty() {
             return;
         }
 
@@ -348,10 +359,27 @@ impl NodeRunner {
         {
             let mut api = self.certified_api.lock().await;
             for (prefix, old_version, _new_version) in &changes {
+                if old_version.0 > 0 {
+                    let key_range = KeyRange {
+                        prefix: prefix.clone(),
+                    };
+                    api.fence_version(&key_range, *old_version);
+                }
+            }
+
+            // Fence deleted policies.
+            for (prefix, old_version) in &deleted_prefixes {
                 let key_range = KeyRange {
                     prefix: prefix.clone(),
                 };
                 api.fence_version(&key_range, *old_version);
+            }
+
+            // Recalculate authorities when any policy change is detected.
+            let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+            {
+                let mut ns = api.namespace().write().unwrap();
+                ns.recalculate_authorities(&nodes);
             }
 
             // Refresh the frontier reporter scopes.
@@ -1599,6 +1627,237 @@ mod tests {
         assert!(
             !def.authority_nodes.contains(&node_id("n3")),
             "n3 should no longer be in authority set after leaving"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Policy version change detection tests (#160, #161)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn detect_version_changes_picks_up_new_policy() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Start with an empty namespace (no policies).
+        let ns = SystemNamespace::new();
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // No authority definition initially.
+        {
+            let api_lock = api.lock().await;
+            let ns = api_lock.namespace().read().unwrap();
+            assert!(ns.get_authority_definition("data/").is_none());
+        }
+
+        // Add a new certified policy while the runner is alive.
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock.namespace().write().unwrap();
+            ns.set_placement_policy(
+                PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
+                    .with_certified(true)
+                    .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+            );
+        }
+
+        let handle = runner.shutdown_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        // After detection, the new policy should have triggered authority creation.
+        let api_lock = api.lock().await;
+        let ns = api_lock.namespace().read().unwrap();
+        let def = ns.get_authority_definition("data/");
+        assert!(
+            def.is_some(),
+            "new policy addition should trigger recalculate_authorities"
+        );
+        assert_eq!(def.unwrap().authority_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn detect_version_changes_handles_deleted_policy() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Start with one certified policy.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
+                .with_certified(true)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        // First run: let it pick up the initial policy.
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config.clone(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        let handle = runner.shutdown_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        // Verify initial tracked state has the data/ policy.
+        assert!(runner.tracked_policy_versions.contains_key("data/"));
+
+        // Now remove the policy from the namespace.
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock.namespace().write().unwrap();
+            ns.remove_placement_policy("data/");
+        }
+
+        // Call detect_version_changes directly to check deletion detection.
+        runner.detect_version_changes().await;
+
+        // After detection, the deleted prefix should no longer be tracked.
+        assert!(
+            !runner.tracked_policy_versions.contains_key("data/"),
+            "deleted policy should be removed from tracked versions"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_version_changes_recalculates_authorities_on_version_bump() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Start with a certified policy.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2)
+                .with_certified(true)
+                .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+        );
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+        };
+
+        // First run to establish baseline.
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config.clone(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        let handle = runner.shutdown_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        // Authority should exist with replica_count=2.
+        {
+            let api_lock = api.lock().await;
+            let ns = api_lock.namespace().read().unwrap();
+            let def = ns.get_authority_definition("user/");
+            assert!(def.is_some(), "authority definition should exist initially");
+        }
+
+        // Bump the policy version with new replica_count=3.
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock.namespace().write().unwrap();
+            ns.set_placement_policy(
+                PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
+                    .with_certified(true)
+                    .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
+            );
+        }
+
+        // Call detect_version_changes directly.
+        runner.detect_version_changes().await;
+
+        // The tracked version should be updated to v2.
+        assert_eq!(
+            runner.tracked_policy_versions.get("user/"),
+            Some(&PolicyVersion(2)),
+            "tracked version should be updated after version bump"
+        );
+
+        // Authority should have been recalculated (3 nodes match the new replica_count=3).
+        let api_lock = api.lock().await;
+        let ns = api_lock.namespace().read().unwrap();
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(
+            def.authority_nodes.len(),
+            3,
+            "authority should be recalculated after version bump"
         );
     }
 }
