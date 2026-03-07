@@ -99,6 +99,7 @@ fn fast_config() -> NodeRunnerConfig {
         compaction_check_interval: Duration::from_secs(60),
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
+        ping_interval: None,
     }
 }
 
@@ -1230,6 +1231,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         compaction_check_interval: Duration::from_secs(60),
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: Some(Duration::from_millis(20)),
+        ping_interval: None,
     };
 
     let metrics = Arc::new(RuntimeMetrics::default());

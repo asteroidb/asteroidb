@@ -9,6 +9,7 @@ use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::network::membership::MembershipClient;
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{NodeConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
@@ -167,8 +168,33 @@ async fn main() {
     } else {
         SyncClient::new(Arc::clone(&shared_peers))
     };
+    // Build membership client for fan-out join/leave and periodic ping.
+    let membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(
+            node_id.clone(),
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+        )
+    };
+
+    // Fan-out join: announce this node's presence to all known peers.
+    // This runs after the seed join has populated the peer registry,
+    // ensuring all peers learn about this node without relying solely
+    // on the seed.
+    let fan_out_count = membership_client.fan_out_join().await;
+    if fan_out_count > 0 {
+        println!("Fan-out join announced to {fan_out_count} peers");
+    }
+
     let mut runner = NodeRunner::with_sync(
-        node_id,
+        node_id.clone(),
         Arc::clone(&certified_api),
         engine,
         NodeRunnerConfig::default(),
@@ -177,6 +203,22 @@ async fn main() {
         Arc::clone(&metrics),
     )
     .await;
+
+    // Build a second membership client for the runner's periodic ping loop.
+    // (The first one was consumed by fan_out_join above; the runner needs
+    // its own instance to avoid ownership issues.)
+    let runner_membership_client = if let Some(ref token) = internal_token {
+        MembershipClient::with_token(
+            node_id,
+            advertise_addr.clone(),
+            Arc::clone(&shared_peers),
+            token.clone(),
+        )
+    } else {
+        MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
+    };
+    runner.set_membership_client(runner_membership_client);
+
     let shutdown_handle = runner.shutdown_handle();
 
     // Bind the TCP listener.

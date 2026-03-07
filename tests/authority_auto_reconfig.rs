@@ -76,6 +76,7 @@ fn fast_config() -> NodeRunnerConfig {
         compaction_check_interval: Duration::from_secs(60),
         frontier_report_interval: Duration::from_millis(10),
         sync_interval: None,
+        ping_interval: None,
     }
 }
 

@@ -12,6 +12,7 @@ use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::hlc::{Hlc, HlcTimestamp};
+use crate::network::membership::MembershipClient;
 use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
@@ -32,6 +33,10 @@ pub struct NodeRunnerConfig {
     /// How often to run anti-entropy sync with peers.
     /// Set to `None` to disable sync (e.g. when no peers are configured).
     pub sync_interval: Option<Duration>,
+    /// How often to exchange peer lists with known peers (membership gossip).
+    /// Set to `None` to disable periodic ping.
+    /// Default: 10 seconds.
+    pub ping_interval: Option<Duration>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -42,6 +47,7 @@ impl Default for NodeRunnerConfig {
             compaction_check_interval: Duration::from_secs(10),
             frontier_report_interval: Duration::from_secs(1),
             sync_interval: Some(Duration::from_secs(2)),
+            ping_interval: Some(Duration::from_secs(10)),
         }
     }
 }
@@ -95,6 +101,8 @@ pub struct NodeRunner {
     /// Computed from sorted node IDs so that same-size replacements
     /// (e.g. 1 leave + 1 join) are detected correctly.
     tracked_cluster_generation: u64,
+    /// Optional membership client for periodic peer list exchange (ping).
+    membership_client: Option<MembershipClient>,
 }
 
 /// Counters returned after the run loop exits, useful for testing and observability.
@@ -110,6 +118,8 @@ pub struct RunLoopStats {
     pub frontier_report_ticks: u64,
     /// Number of anti-entropy sync ticks executed.
     pub sync_ticks: u64,
+    /// Number of membership ping ticks executed.
+    pub ping_ticks: u64,
 }
 
 impl NodeRunner {
@@ -180,6 +190,7 @@ impl NodeRunner {
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
+            membership_client: None,
         }
     }
 
@@ -228,7 +239,13 @@ impl NodeRunner {
             peer_backoffs: HashMap::new(),
             cluster_nodes,
             tracked_cluster_generation: 0,
+            membership_client: None,
         }
+    }
+
+    /// Set the membership client for periodic peer list exchange (ping).
+    pub fn set_membership_client(&mut self, client: MembershipClient) {
+        self.membership_client = Some(client);
     }
 
     /// Return a shutdown handle that can be used to signal graceful shutdown.
@@ -497,6 +514,14 @@ impl NodeRunner {
             && self.eventual_api.is_some();
         let mut sync_interval = tokio::time::interval_at(start + sync_duration, sync_duration);
 
+        // Ping interval: only create if membership client is configured.
+        let ping_duration = self
+            .config
+            .ping_interval
+            .unwrap_or(Duration::from_secs(3600));
+        let ping_enabled = self.config.ping_interval.is_some() && self.membership_client.is_some();
+        let mut ping_interval = tokio::time::interval_at(start + ping_duration, ping_duration);
+
         let mut stats = RunLoopStats::default();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -527,6 +552,10 @@ impl NodeRunner {
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
                     stats.sync_ticks += 1;
+                }
+                _ = ping_interval.tick(), if ping_enabled => {
+                    self.run_ping().await;
+                    stats.ping_ticks += 1;
                 }
             }
         }
@@ -916,6 +945,25 @@ impl NodeRunner {
         );
     }
 
+    /// Run one cycle of peer list exchange (membership gossip).
+    async fn run_ping(&self) {
+        if let Some(membership_client) = &self.membership_client {
+            let discovered = membership_client.ping_all().await;
+            if discovered > 0 {
+                tracing::info!(
+                    node = %self.node_id.0,
+                    discovered,
+                    "peer list exchange discovered new peers"
+                );
+            } else {
+                tracing::debug!(
+                    node = %self.node_id.0,
+                    "peer list exchange completed, no new peers"
+                );
+            }
+        }
+    }
+
     async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
@@ -1031,6 +1079,7 @@ mod tests {
             compaction_check_interval: Duration::from_millis(100),
             frontier_report_interval: Duration::from_millis(100),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner =
@@ -1079,6 +1128,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1130,6 +1180,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1184,6 +1235,7 @@ mod tests {
             compaction_check_interval: Duration::from_millis(10),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner =
@@ -1272,6 +1324,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner =
@@ -1339,6 +1392,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1396,6 +1450,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1459,6 +1514,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1522,6 +1578,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_millis(10),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::new(
@@ -1589,6 +1646,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -1688,6 +1746,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -1789,6 +1848,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -1865,6 +1925,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         // First run: let it pick up the initial policy.
@@ -1933,6 +1994,7 @@ mod tests {
             compaction_check_interval: Duration::from_secs(60),
             frontier_report_interval: Duration::from_secs(60),
             sync_interval: None,
+            ping_interval: None,
         };
 
         // First run to establish baseline.

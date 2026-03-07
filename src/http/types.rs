@@ -304,6 +304,59 @@ pub struct LeaveResponse {
 }
 
 // ---------------------------------------------------------------
+// Internal announce request/response types
+// ---------------------------------------------------------------
+
+/// Request body for `POST /api/internal/announce`.
+///
+/// Sent by a joining node to all peers to announce its presence.
+/// Also used by a leaving node to announce its departure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnounceRequest {
+    /// Unique identifier of the announcing node.
+    pub node_id: String,
+    /// Socket address (ip:port) the announcing node is listening on.
+    pub address: String,
+    /// Whether the node is joining (`true`) or leaving (`false`).
+    pub joining: bool,
+}
+
+/// Response for `POST /api/internal/announce`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AnnounceResponse {
+    /// Whether the announcement was accepted.
+    pub accepted: bool,
+}
+
+// ---------------------------------------------------------------
+// Internal ping request/response types
+// ---------------------------------------------------------------
+
+/// Request body for `POST /api/internal/ping`.
+///
+/// Used for lightweight gossip-based peer list exchange.
+/// Sends a digest (sorted list of known peer node IDs) so the
+/// receiver can detect differences without transferring full state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingRequest {
+    /// Node ID of the sender.
+    pub sender_id: String,
+    /// Socket address (ip:port) the sender is listening on.
+    pub sender_addr: String,
+    /// Sorted list of known peer node IDs (digest).
+    pub known_peers: Vec<PeerInfo>,
+}
+
+/// Response for `POST /api/internal/ping`.
+///
+/// Returns the receiver's known peers so the sender can reconcile.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PingResponse {
+    /// Sorted list of known peer node IDs from the receiver.
+    pub known_peers: Vec<PeerInfo>,
+}
+
+// ---------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------
 
