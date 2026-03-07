@@ -33,7 +33,11 @@ impl WriteRateBucket {
     /// unbounded growth when called per-operation (e.g. via `record_op_at`).
     fn record(&mut self, timestamp_ms: u64, count: u64, window_ms: u64) {
         self.evict_expired(timestamp_ms, window_ms);
-        if let Some((ts, existing)) = self.entries.back_mut().filter(|(ts, _)| *ts == timestamp_ms) {
+        if let Some((ts, existing)) = self
+            .entries
+            .back_mut()
+            .filter(|(ts, _)| *ts == timestamp_ms)
+        {
             *existing += count;
             let _ = ts;
             return;

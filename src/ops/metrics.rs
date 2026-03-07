@@ -276,6 +276,15 @@ pub struct RuntimeMetrics {
     /// Sum of rebalance durations in microseconds.
     pub rebalance_duration_sum_us: AtomicU64,
 
+    /// Cumulative count of key rotations performed.
+    pub key_rotation_total: AtomicU64,
+
+    /// Last rotation keyset version (0 if none).
+    pub key_rotation_last_version: AtomicU64,
+
+    /// Timestamp (ms) of the last key rotation (0 if none).
+    pub key_rotation_last_time_ms: AtomicU64,
+
     /// Per-peer sync statistics (peer_id -> stats).
     peer_sync_stats: Mutex<HashMap<String, PeerSyncStats>>,
 
@@ -302,6 +311,9 @@ impl Default for RuntimeMetrics {
             rebalance_keys_failed: AtomicU64::default(),
             rebalance_complete_total: AtomicU64::default(),
             rebalance_duration_sum_us: AtomicU64::default(),
+            key_rotation_total: AtomicU64::default(),
+            key_rotation_last_version: AtomicU64::default(),
+            key_rotation_last_time_ms: AtomicU64::default(),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
             window_duration: Duration::from_secs(WINDOW_SECS),
@@ -400,6 +412,24 @@ impl RuntimeMetrics {
             .fetch_add(keys_failed, Ordering::Relaxed);
     }
 
+    /// Record a key rotation event.
+    pub fn record_key_rotation(&self, version: u64) {
+        self.key_rotation_total.fetch_add(1, Ordering::Relaxed);
+        self.key_rotation_last_version
+            .store(version, Ordering::Relaxed);
+        // Use a simple monotonic-ish timestamp; callers can also set
+        // `key_rotation_last_time_ms` directly for precise wall-clock time.
+    }
+
+    /// Record a key rotation event with an explicit timestamp.
+    pub fn record_key_rotation_at(&self, version: u64, time_ms: u64) {
+        self.key_rotation_total.fetch_add(1, Ordering::Relaxed);
+        self.key_rotation_last_version
+            .store(version, Ordering::Relaxed);
+        self.key_rotation_last_time_ms
+            .store(time_ms, Ordering::Relaxed);
+    }
+
     /// Record the completion of a rebalance operation.
     pub fn record_rebalance_complete(&self, _key_range: &str, duration: Duration) {
         self.rebalance_complete_total
@@ -448,6 +478,9 @@ impl RuntimeMetrics {
             rebalance_keys_failed: self.rebalance_keys_failed.load(Ordering::Relaxed),
             rebalance_complete_total: self.rebalance_complete_total.load(Ordering::Relaxed),
             rebalance_duration_sum_us: self.rebalance_duration_sum_us.load(Ordering::Relaxed),
+            key_rotation_total: self.key_rotation_total.load(Ordering::Relaxed),
+            key_rotation_last_version: self.key_rotation_last_version.load(Ordering::Relaxed),
+            key_rotation_last_time_ms: self.key_rotation_last_time_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -507,6 +540,12 @@ pub struct MetricsSnapshot {
     pub rebalance_complete_total: u64,
     /// Sum of rebalance durations in microseconds.
     pub rebalance_duration_sum_us: u64,
+    /// Cumulative count of key rotations performed.
+    pub key_rotation_total: u64,
+    /// Last rotation keyset version (0 if none).
+    pub key_rotation_last_version: u64,
+    /// Timestamp (ms) of the last key rotation (0 if none).
+    pub key_rotation_last_time_ms: u64,
 }
 
 #[cfg(test)]
