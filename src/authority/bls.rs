@@ -292,7 +292,7 @@ mod tests {
         let kp = make_keypair(60);
         let msg = b"single aggregate";
         let sig = sign_message(kp.secret_key(), msg);
-        let agg = aggregate_signatures(&[sig.clone()]);
+        let agg = aggregate_signatures(std::slice::from_ref(&sig));
 
         // Aggregating a single signature should produce a valid aggregate.
         assert!(aggregate_verify(&[kp.public_key], msg, &agg));
