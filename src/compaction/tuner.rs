@@ -271,11 +271,13 @@ impl AdaptiveCompactionConfig {
             .sum();
 
         // Adjust ops_threshold based on write rate.
-        let new_ops = if aggregate_rate > 500.0 {
+        // Dead zone: only adjust when rate is well outside the band (>750 or <30)
+        // to prevent oscillation at boundaries.
+        let new_ops = if aggregate_rate > 750.0 {
             // High write rate: halve ops threshold (min 1,000).
             let halved = self.effective.ops_threshold / 2;
             halved.max(1_000)
-        } else if aggregate_rate < 50.0 {
+        } else if aggregate_rate < 30.0 {
             // Low write rate: double ops threshold (max 50,000).
             let doubled = self.effective.ops_threshold.saturating_mul(2);
             doubled.min(50_000)
@@ -289,13 +291,15 @@ impl AdaptiveCompactionConfig {
         }
 
         // Adjust time_threshold based on frontier lag.
+        // Dead zone: only adjust when lag is well outside the band (>15s or <1s)
+        // to prevent oscillation at boundaries.
         if let Some(lag_ms) = avg_frontier_lag_ms {
-            let new_time = if lag_ms > 10_000 {
+            let new_time = if lag_ms > 15_000 {
                 // High lag: increase time threshold by 50% (max 120s).
                 let increased =
                     self.effective.time_threshold_ms + self.effective.time_threshold_ms / 2;
                 increased.min(120_000)
-            } else if lag_ms < 2_000 {
+            } else if lag_ms < 1_000 {
                 // Low lag: decrease time threshold by 25% (min 10s).
                 let decreased =
                     self.effective.time_threshold_ms - self.effective.time_threshold_ms / 4;
@@ -408,8 +412,8 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
         adaptive.set_tuning_interval_ms(0); // Tune on every call.
 
-        // Simulate high write rate: 600 ops in 1 second > 500 ops/sec
-        adaptive.record_ops("user/", 1_000, 600);
+        // Simulate high write rate: 800 ops in 1 second > 750 ops/sec (dead zone boundary)
+        adaptive.record_ops("user/", 1_000, 800);
 
         let changed = adaptive.tune(2_000, None);
         assert!(changed);
@@ -425,7 +429,7 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
         adaptive.set_tuning_interval_ms(0);
 
-        adaptive.record_ops("user/", 1_000, 600);
+        adaptive.record_ops("user/", 1_000, 800);
 
         // First tune: 1500 / 2 = 750, but min is 1000
         let changed = adaptive.tune(2_000, None);
@@ -433,7 +437,7 @@ mod tests {
         assert_eq!(adaptive.effective().ops_threshold, 1_000);
 
         // Second tune: already at 1000, halving would give 500, clamped to 1000
-        adaptive.record_ops("user/", 3_000, 600);
+        adaptive.record_ops("user/", 3_000, 800);
         let changed = adaptive.tune(4_000, None);
         assert!(!changed); // No change since already at minimum
     }
@@ -481,8 +485,8 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::new(base);
         adaptive.set_tuning_interval_ms(0);
 
-        // avg lag > 10s
-        let changed = adaptive.tune(1_000, Some(15_000));
+        // avg lag > 15s (dead zone boundary)
+        let changed = adaptive.tune(1_000, Some(16_000));
         assert!(changed);
         // 30000 + 15000 = 45000
         assert_eq!(adaptive.effective().time_threshold_ms, 45_000);
@@ -498,7 +502,7 @@ mod tests {
         adaptive.set_tuning_interval_ms(0);
 
         // 100000 + 50000 = 150000, clamped to 120000
-        let changed = adaptive.tune(1_000, Some(15_000));
+        let changed = adaptive.tune(1_000, Some(16_000));
         assert!(changed);
         assert_eq!(adaptive.effective().time_threshold_ms, 120_000);
     }
@@ -512,8 +516,8 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::new(base);
         adaptive.set_tuning_interval_ms(0);
 
-        // avg lag < 2s
-        let changed = adaptive.tune(1_000, Some(1_000));
+        // avg lag < 1s (dead zone boundary)
+        let changed = adaptive.tune(1_000, Some(900));
         assert!(changed);
         // 30000 - 7500 = 22500
         assert_eq!(adaptive.effective().time_threshold_ms, 22_500);
@@ -543,14 +547,14 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::new(base);
         // Default 30s interval
 
-        adaptive.record_ops("user/", 1_000, 600);
+        adaptive.record_ops("user/", 1_000, 800);
 
         // First tune at t=0 should work (last_tuning_ms starts at 0).
         let changed = adaptive.tune(31_000, None);
         assert!(changed);
 
         // Second tune at t=31001 should be skipped (< 30s since last).
-        adaptive.record_ops("user/", 31_001, 600);
+        adaptive.record_ops("user/", 31_001, 800);
         let changed = adaptive.tune(31_001, None);
         assert!(!changed);
     }
@@ -566,7 +570,7 @@ mod tests {
 
         // Pin the only prefix — should skip tuning.
         adaptive.pin_prefix("user/");
-        adaptive.record_ops("user/", 1_000, 600);
+        adaptive.record_ops("user/", 1_000, 800);
 
         let changed = adaptive.tune(2_000, None);
         assert!(!changed);
@@ -586,11 +590,11 @@ mod tests {
         adaptive.pin_prefix("system/");
         // system/ has high rate but is pinned; user/ has high rate and is not pinned
         adaptive.record_ops("system/", 1_000, 1_000);
-        adaptive.record_ops("user/", 1_000, 600);
+        adaptive.record_ops("user/", 1_000, 800);
 
         let changed = adaptive.tune(2_000, None);
         assert!(changed);
-        // Only user/ rate (600 ops/sec > 500) drives halving.
+        // Only user/ rate (800 ops/sec > 750) drives halving.
         assert_eq!(adaptive.effective().ops_threshold, 5_000);
     }
 
@@ -622,7 +626,7 @@ mod tests {
         adaptive.set_tuning_interval_ms(0);
 
         adaptive.pin_prefix("user/");
-        adaptive.record_ops("user/", 1_000, 600);
+        adaptive.record_ops("user/", 1_000, 800);
 
         // Pinned — no tuning.
         assert!(!adaptive.tune(2_000, None));
@@ -630,10 +634,96 @@ mod tests {
 
         // Unpin and record fresh high-rate ops, then tune.
         adaptive.unpin_prefix("user/");
-        adaptive.record_ops("user/", 3_000, 600);
-        // Rate at t=3500: entries at 1000 (600) and 3000 (600) => 1200 ops over 2.5s = 480.
-        // Actually let's query at 3100: 1200 ops over 2.1s = 571 > 500
+        adaptive.record_ops("user/", 3_000, 800);
+        // Rate at t=3100: entries at 1000 (800) and 3000 (800) => 1600 ops over 2.1s = 762 > 750
         assert!(adaptive.tune(3_100, None));
         assert_eq!(adaptive.effective().ops_threshold, 5_000);
+    }
+
+    // ---------------------------------------------------------------
+    // Dead zone hysteresis tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn dead_zone_ops_rate_in_band_no_adjustment() {
+        // Rates between 30 and 750 ops/sec should NOT trigger any adjustment.
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        // 500 ops in 1 second = 500 ops/sec — inside the dead zone [30, 750]
+        adaptive.record_ops("user/", 1_000, 500);
+        let changed = adaptive.tune(2_000, None);
+        assert!(!changed);
+        assert_eq!(adaptive.effective().ops_threshold, 10_000);
+    }
+
+    #[test]
+    fn dead_zone_prevents_oscillation_at_old_boundary() {
+        // At 500 ops/sec (the old threshold), the system should NOT oscillate.
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        // Repeatedly tune at exactly 500 ops/sec — no adjustment should happen.
+        for i in 0..5 {
+            let t_base = 1_000 + i * 2_000;
+            adaptive.record_ops("user/", t_base, 500);
+            let changed = adaptive.tune(t_base + 1_000, None);
+            assert!(!changed, "iteration {i} should not change threshold");
+        }
+        assert_eq!(adaptive.effective().ops_threshold, 10_000);
+    }
+
+    #[test]
+    fn dead_zone_lag_in_band_no_adjustment() {
+        // Lag between 1s and 15s should NOT trigger any time threshold adjustment.
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 60_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        // Record moderate write rate (inside ops dead zone) to avoid ops adjustment
+        adaptive.record_ops("user/", 500, 100);
+
+        // Lag at 5s — inside the dead zone [1000, 15000]
+        let changed = adaptive.tune(1_000, Some(5_000));
+        assert!(!changed);
+        assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
+    }
+
+    #[test]
+    fn dead_zone_lag_at_old_boundary_no_adjustment() {
+        // At lag=2000ms (old boundary), no adjustment should occur.
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 60_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        // Record moderate write rate (inside ops dead zone) to avoid ops adjustment
+        adaptive.record_ops("user/", 500, 100);
+
+        let changed = adaptive.tune(1_000, Some(2_000));
+        assert!(!changed);
+        assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
+
+        // Also at lag=10000 (old high boundary)
+        // Record enough ops to keep rate in the dead zone (between 30 and 750).
+        // Window is 60s, entries at (500,100) and (31500,2000).
+        // At t=32000: total=2100, span=31.5s, rate=66.7 ops/sec — in dead zone.
+        adaptive.record_ops("user/", 31_500, 2_000);
+        let changed = adaptive.tune(32_000, Some(10_000));
+        assert!(!changed);
+        assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
     }
 }

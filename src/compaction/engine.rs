@@ -147,8 +147,27 @@ impl CompactionEngine {
     }
 
     /// Record an operation for the given key range, incrementing its ops counter.
+    ///
+    /// Uses the system clock to feed the adaptive write rate tracker (if enabled).
+    /// Prefer [`record_op_at`] when an explicit timestamp is available for
+    /// deterministic testing.
     pub fn record_op(&mut self, key_range: &KeyRange) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.record_op_at(key_range, now_ms);
+    }
+
+    /// Record an operation for the given key range at a specific timestamp.
+    ///
+    /// Increments the ops counter and feeds the adaptive write rate tracker
+    /// (if enabled) so that `tune()` can observe real write rates.
+    pub fn record_op_at(&mut self, key_range: &KeyRange, now_ms: u64) {
         *self.ops_count.entry(key_range.prefix.clone()).or_insert(0) += 1;
+        if let Some(ref mut adaptive) = self.adaptive_config {
+            adaptive.record_ops(&key_range.prefix, now_ms, 1);
+        }
     }
 
     /// Check whether a checkpoint should be created for the given key range.
@@ -811,9 +830,9 @@ mod tests {
 
         let mut engine = CompactionEngine::with_adaptive(adaptive);
 
-        // Record high write rate.
+        // Record high write rate (> 750 ops/sec dead zone boundary).
         if let Some(ac) = engine.adaptive_config_mut() {
-            ac.record_ops("user/", 1_000, 600);
+            ac.record_ops("user/", 1_000, 800);
         }
 
         let changed = engine.tune(2_000, None);
@@ -846,5 +865,67 @@ mod tests {
         let snap = snap.unwrap();
         assert_eq!(snap.effective_ops_threshold, 10_000);
         assert_eq!(snap.effective_time_threshold_ms, 30_000);
+    }
+
+    // ---------------------------------------------------------------
+    // record_op feeds adaptive write rate tracker
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn record_op_at_feeds_write_rate_tracker() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+        let kr = make_key_range("user/");
+
+        // Record 100 ops at known timestamps via record_op_at
+        for i in 0..100 {
+            engine.record_op_at(&kr, 1_000 + i * 10);
+        }
+
+        // The write rate tracker should now have data
+        let ac = engine.adaptive_config().unwrap();
+        let rate = ac.write_rate("user/", 2_000);
+        assert!(rate > 0.0, "write rate should be positive, got {rate}");
+    }
+
+    #[test]
+    fn record_op_at_does_not_feed_tracker_without_adaptive() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        // Should not panic even without adaptive config
+        engine.record_op_at(&kr, 1_000);
+        assert_eq!(engine.ops_count.get("user/"), Some(&1));
+    }
+
+    #[test]
+    fn record_op_at_drives_tuning() {
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        let mut engine = CompactionEngine::with_adaptive(adaptive);
+        let kr = make_key_range("user/");
+
+        // Record enough ops via record_op_at to push rate above 750 ops/sec.
+        // 800 ops in 1 second = 800 ops/sec > 750.
+        for i in 0..800 {
+            engine.record_op_at(&kr, 1_000 + i);
+        }
+
+        // Tune should detect the high rate and halve ops_threshold.
+        let changed = engine.tune(2_000, None);
+        assert!(changed);
+        assert_eq!(
+            engine.adaptive_config().unwrap().effective().ops_threshold,
+            5_000
+        );
     }
 }
