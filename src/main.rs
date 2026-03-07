@@ -155,6 +155,7 @@ async fn main() {
         self_addr: Some(advertise_addr.clone()),
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     let app = router(state);

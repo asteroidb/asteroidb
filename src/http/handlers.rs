@@ -12,6 +12,7 @@ use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespac
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
+use crate::ops::slo::{SloSnapshot, SloTracker};
 use crate::placement::PlacementPolicy;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
@@ -61,6 +62,8 @@ pub struct AppState {
     /// Known cluster nodes for topology view.
     /// `None` when topology tracking is not configured.
     pub cluster_nodes: Option<Arc<std::sync::RwLock<Vec<crate::node::Node>>>>,
+    /// SLO tracker for budget monitoring.
+    pub slo_tracker: Arc<SloTracker>,
 }
 
 // ---------------------------------------------------------------
@@ -955,6 +958,13 @@ pub async fn get_topology(State(state): State<Arc<AppState>>) -> Json<TopologyVi
 /// certification latency, frontier skew, sync failure rate).
 pub async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsSnapshot> {
     Json(state.metrics.snapshot())
+}
+
+/// `GET /api/slo`
+///
+/// Returns a snapshot of all SLO budgets for operational monitoring.
+pub async fn get_slo(State(state): State<Arc<AppState>>) -> Json<SloSnapshot> {
+    Json(state.slo_tracker.snapshot())
 }
 
 // ---------------------------------------------------------------

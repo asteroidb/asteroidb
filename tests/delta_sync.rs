@@ -63,6 +63,7 @@ fn test_state() -> Arc<AppState> {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     })
 }
 

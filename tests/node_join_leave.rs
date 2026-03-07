@@ -79,6 +79,7 @@ async fn spawn_node_with_peers(
         self_addr: Some(addr.to_string()),
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     let app = router(state.clone());

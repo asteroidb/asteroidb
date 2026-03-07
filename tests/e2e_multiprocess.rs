@@ -67,6 +67,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     let app = router(state.clone());

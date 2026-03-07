@@ -153,6 +153,7 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     })
 }
 
@@ -1181,6 +1182,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         self_addr: None,
         latency_model: None,
         cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
     });
 
     // Write data to the legacy peer.
