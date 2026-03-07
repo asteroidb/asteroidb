@@ -69,6 +69,8 @@ async fn two_node_anti_entropy_convergence() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     // Build state for node 2.
@@ -87,6 +89,8 @@ async fn two_node_anti_entropy_convergence() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     // Write some data to node 1.
@@ -271,6 +275,8 @@ async fn pull_based_sync() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     {
@@ -332,6 +338,8 @@ async fn sync_endpoint_partial_failure() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     // Pre-populate with a counter at "k".
@@ -428,6 +436,8 @@ async fn three_node_convergence_via_sync() {
             internal_token: None,
             self_node_id: None,
             self_addr: None,
+            latency_model: None,
+            cluster_nodes: None,
         });
         states.push(state);
     }
@@ -540,6 +550,8 @@ async fn internal_keys_endpoint() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     {
@@ -610,6 +622,8 @@ async fn full_sync_records_remote_frontier_not_local() {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     // Write data to the remote node.

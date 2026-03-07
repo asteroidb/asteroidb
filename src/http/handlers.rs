@@ -13,6 +13,8 @@ use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
 use crate::placement::PlacementPolicy;
+use crate::placement::latency::LatencyModel;
+use crate::placement::topology::TopologyView;
 use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -53,6 +55,12 @@ pub struct AppState {
     pub self_node_id: Option<NodeId>,
     /// This node's own advertised address, used to include the seed in join responses.
     pub self_addr: Option<String>,
+    /// Latency model for multi-region placement optimization.
+    /// `None` when latency tracking is not configured.
+    pub latency_model: Option<Arc<std::sync::RwLock<LatencyModel>>>,
+    /// Known cluster nodes for topology view.
+    /// `None` when topology tracking is not configured.
+    pub cluster_nodes: Option<Arc<std::sync::RwLock<Vec<crate::node::Node>>>>,
 }
 
 // ---------------------------------------------------------------
@@ -911,6 +919,30 @@ pub async fn internal_ping(
     Ok(Json(PingResponse {
         known_peers: my_peers,
     }))
+}
+
+// ---------------------------------------------------------------
+// Topology handler
+// ---------------------------------------------------------------
+
+/// `GET /api/topology`
+///
+/// Returns the cluster topology view grouped by region, including
+/// inter-region latency information.
+pub async fn get_topology(State(state): State<Arc<AppState>>) -> Json<TopologyView> {
+    let nodes = state
+        .cluster_nodes
+        .as_ref()
+        .map(|n| n.read().unwrap().clone())
+        .unwrap_or_default();
+
+    let latency_model = state
+        .latency_model
+        .as_ref()
+        .map(|m| m.read().unwrap().clone())
+        .unwrap_or_default();
+
+    Json(TopologyView::build(&nodes, &latency_model))
 }
 
 // ---------------------------------------------------------------

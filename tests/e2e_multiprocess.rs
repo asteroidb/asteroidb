@@ -65,6 +65,8 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         internal_token: None,
         self_node_id: None,
         self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     let app = router(state.clone());

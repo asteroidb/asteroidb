@@ -77,6 +77,8 @@ async fn spawn_node_with_peers(
         internal_token: None,
         self_node_id: Some(nid),
         self_addr: Some(addr.to_string()),
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     let app = router(state.clone());

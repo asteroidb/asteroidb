@@ -153,6 +153,8 @@ async fn main() {
         internal_token: internal_token.clone(),
         self_node_id: Some(node_id.clone()),
         self_addr: Some(advertise_addr.clone()),
+        latency_model: None,
+        cluster_nodes: None,
     });
 
     let app = router(state);
