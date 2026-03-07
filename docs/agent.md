@@ -1,4 +1,7 @@
-# AsteroidDB - Claude Code Guide
+# AsteroidDB - Agent Guide
+
+This document is the **Single Source of Truth** for AI agents (Claude Code, Codex, etc.) working on this project.
+Tool-specific config files (`CLAUDE.md`, `AGENTS.md`) should reference this file rather than duplicating its content.
 
 ## Project Overview
 
@@ -162,15 +165,24 @@ fix/#<issue-number>-<short-desc>
 3. 依存が解決済みの Issue を選んで着手
 4. **作業開始時に必ず worktree を作成して、その中で作業すること**:
    ```bash
-   # worktree 作成（メインの作業ツリーを汚さない）
    git worktree add .claude/worktrees/<branch-name> -b <branch-name> main
    cd .claude/worktrees/<branch-name>
    ```
 5. worktree 内でブランチ `feat/#<number>-<desc>` を使い、実装 + テストを書く
 6. worktree 内で CI gate を通して push
-7. push 後に PR を作成（`Closes #<number>`）
+7. push 後にレビュー（Claude + Codex の両方で独立レビュー）
+8. レビュー指摘を修正してから PR を作成（`Closes #<number>`）
 
 **重要**: メインの作業ツリー（プロジェクトルート）のブランチを直接切り替えたり、そこでコミットしたりしないこと。複数エージェントが並行作業する場合、メインツリーを共有すると git 操作が競合する。必ず worktree を使って隔離すること。
+
+### Review Workflow
+
+PR 作成前に以下の独立レビューを並行実行する:
+
+1. **Claude review** — Agent tool でコードレビュー（型安全性、ロジック整合性、API設計）
+2. **Codex review** — `codex review --base origin/main` でレビュー（ランタイム挙動、エッジケース）
+3. 両方の指摘を統合し、修正が必要なものを対応
+4. 修正完了後に PR を作成
 
 ### Parallelizable Areas
 
@@ -193,7 +205,7 @@ fix/#<issue-number>-<short-desc>
 
 ### What to Read Before Starting
 
-1. この `CLAUDE.md`
+1. この `docs/agent.md`
 2. `docs/vision.md` - プロジェクトの Why
 3. `docs/requirements.md` - MVP 詳細要件
 4. 担当 Issue の本文と依存関係
