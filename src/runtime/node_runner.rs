@@ -643,7 +643,7 @@ impl NodeRunner {
             .sync_attempt_total
             .fetch_add(1, Ordering::Relaxed);
 
-        let peers: Vec<_> = sync_client.peer_registry().all_peers().to_vec();
+        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
 
         for peer in &peers {

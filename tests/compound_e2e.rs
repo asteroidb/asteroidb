@@ -1213,7 +1213,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
     )
     .unwrap();
 
-    let sync_client = SyncClient::new(peer_registry);
+    let sync_client = SyncClient::new(Arc::new(Mutex::new(peer_registry)));
 
     let config = NodeRunnerConfig {
         certification_interval: Duration::from_millis(10),

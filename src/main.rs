@@ -151,11 +151,10 @@ async fn main() {
     let engine = CompactionEngine::with_defaults();
     let mut runner = if has_peers {
         // Config file provided peers — enable anti-entropy sync.
-        let sync_registry = shared_peers.lock().await.clone();
         let sync_client = if let Some(ref token) = internal_token {
-            SyncClient::with_token(sync_registry, token.clone())
+            SyncClient::with_token(Arc::clone(&shared_peers), token.clone())
         } else {
-            SyncClient::new(sync_registry)
+            SyncClient::new(Arc::clone(&shared_peers))
         };
         NodeRunner::with_sync(
             node_id,
