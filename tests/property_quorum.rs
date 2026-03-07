@@ -83,24 +83,49 @@ proptest! {
     #[test]
     fn two_majorities_intersect(
         n in 3..10usize,
-        // Generate two random subsets represented as bit vectors
-        bits_a in prop::collection::vec(prop::bool::ANY, 9),
-        bits_b in prop::collection::vec(prop::bool::ANY, 9)
+        indices_a in prop::collection::vec(any::<usize>(), 1..10),
+        indices_b in prop::collection::vec(any::<usize>(), 1..10),
     ) {
         let threshold = majority(n);
 
-        let set_a: HashSet<usize> = (0..n).filter(|&i| bits_a[i]).collect();
-        let set_b: HashSet<usize> = (0..n).filter(|&i| bits_b[i]).collect();
-
-        // Only test when both actually have majority
-        if set_a.len() >= threshold && set_b.len() >= threshold {
-            let intersection: HashSet<&usize> = set_a.intersection(&set_b).collect();
-            prop_assert!(
-                !intersection.is_empty(),
-                "Two majority subsets must intersect: n={}, |A|={}, |B|={}, threshold={}",
-                n, set_a.len(), set_b.len(), threshold
-            );
+        // Build majority subsets deterministically from random indices
+        let mut set_a: Vec<usize> = indices_a.iter()
+            .map(|i| i % n)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        // Pad to majority if needed
+        let mut next = 0;
+        while set_a.len() < threshold {
+            if !set_a.contains(&next) {
+                set_a.push(next);
+            }
+            next += 1;
         }
+        let set_a: HashSet<usize> = set_a.into_iter().collect();
+
+        let mut set_b: Vec<usize> = indices_b.iter()
+            .map(|i| i % n)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut next = 0;
+        while set_b.len() < threshold {
+            if !set_b.contains(&next) {
+                set_b.push(next);
+            }
+            next += 1;
+        }
+        let set_b: HashSet<usize> = set_b.into_iter().collect();
+
+        // Both are guaranteed majority — property must hold
+        prop_assert!(set_a.len() >= threshold);
+        prop_assert!(set_b.len() >= threshold);
+        prop_assert!(
+            !set_a.is_disjoint(&set_b),
+            "Two majority subsets must intersect: n={}, A={:?}, B={:?}, threshold={}",
+            n, set_a, set_b, threshold
+        );
     }
 
     /// Two valid MajorityCertificates for the same key_range and policy_version
@@ -108,69 +133,81 @@ proptest! {
     #[test]
     fn majority_certificate_signer_overlap(
         n in 3..10usize,
-        signers_a_bits in prop::collection::vec(prop::bool::ANY, 9),
-        signers_b_bits in prop::collection::vec(prop::bool::ANY, 9)
+        indices_a in prop::collection::vec(any::<usize>(), 1..10),
+        indices_b in prop::collection::vec(any::<usize>(), 1..10),
     ) {
         let threshold = majority(n);
         let all_nodes: Vec<String> = (0..n).map(|i| format!("auth-{i}")).collect();
 
-        // Build signer sets
-        let signers_a: Vec<&str> = all_nodes.iter()
-            .take(n)
-            .enumerate()
-            .filter(|&(i, _)| signers_a_bits[i])
-            .map(|(_, s)| s.as_str())
+        // Build guaranteed-majority signer sets from random indices
+        let mut picks_a: Vec<usize> = indices_a.iter()
+            .map(|i| i % n)
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
-
-        let signers_b: Vec<&str> = all_nodes.iter()
-            .take(n)
-            .enumerate()
-            .filter(|&(i, _)| signers_b_bits[i])
-            .map(|(_, s)| s.as_str())
-            .collect();
-
-        // Only check when both reach majority
-        if signers_a.len() >= threshold && signers_b.len() >= threshold {
-            let range = KeyRange { prefix: "test/".into() };
-            let policy = PolicyVersion(1);
-
-            let mut cert_a = MajorityCertificate::new(
-                range.clone(),
-                ts(100, 0, "coord"),
-                policy,
-                KeysetVersion(1),
-            );
-            for s in &signers_a {
-                cert_a.add_signature(dummy_sig(s));
+        let mut next = 0;
+        while picks_a.len() < threshold {
+            if !picks_a.contains(&next) {
+                picks_a.push(next);
             }
-
-            let mut cert_b = MajorityCertificate::new(
-                range,
-                ts(200, 0, "coord"),
-                policy,
-                KeysetVersion(1),
-            );
-            for s in &signers_b {
-                cert_b.add_signature(dummy_sig(s));
-            }
-
-            prop_assert!(cert_a.has_majority(n), "cert_a should have majority");
-            prop_assert!(cert_b.has_majority(n), "cert_b should have majority");
-
-            // Extract signer sets and check intersection
-            let ids_a: HashSet<String> = cert_a.signatures.iter()
-                .map(|s| s.authority_id.0.clone())
-                .collect();
-            let ids_b: HashSet<String> = cert_b.signatures.iter()
-                .map(|s| s.authority_id.0.clone())
-                .collect();
-
-            let common: HashSet<&String> = ids_a.intersection(&ids_b).collect();
-            prop_assert!(
-                !common.is_empty(),
-                "Two majority certs must share a signer: n={}, |A|={}, |B|={}",
-                n, ids_a.len(), ids_b.len()
-            );
+            next += 1;
         }
+        let signers_a: Vec<&str> = picks_a.iter().map(|&i| all_nodes[i].as_str()).collect();
+
+        let mut picks_b: Vec<usize> = indices_b.iter()
+            .map(|i| i % n)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut next = 0;
+        while picks_b.len() < threshold {
+            if !picks_b.contains(&next) {
+                picks_b.push(next);
+            }
+            next += 1;
+        }
+        let signers_b: Vec<&str> = picks_b.iter().map(|&i| all_nodes[i].as_str()).collect();
+
+        // Both signer sets are guaranteed to have majority
+        let range = KeyRange { prefix: "test/".into() };
+        let policy = PolicyVersion(1);
+
+        let mut cert_a = MajorityCertificate::new(
+            range.clone(),
+            ts(100, 0, "coord"),
+            policy,
+            KeysetVersion(1),
+        );
+        for s in &signers_a {
+            cert_a.add_signature(dummy_sig(s));
+        }
+
+        let mut cert_b = MajorityCertificate::new(
+            range,
+            ts(200, 0, "coord"),
+            policy,
+            KeysetVersion(1),
+        );
+        for s in &signers_b {
+            cert_b.add_signature(dummy_sig(s));
+        }
+
+        prop_assert!(cert_a.has_majority(n), "cert_a should have majority");
+        prop_assert!(cert_b.has_majority(n), "cert_b should have majority");
+
+        // Extract signer sets and check intersection
+        let ids_a: HashSet<String> = cert_a.signatures.iter()
+            .map(|s| s.authority_id.0.clone())
+            .collect();
+        let ids_b: HashSet<String> = cert_b.signatures.iter()
+            .map(|s| s.authority_id.0.clone())
+            .collect();
+
+        let common: HashSet<&String> = ids_a.intersection(&ids_b).collect();
+        prop_assert!(
+            !common.is_empty(),
+            "Two majority certs must share a signer: n={}, |A|={}, |B|={}",
+            n, ids_a.len(), ids_b.len()
+        );
     }
 }

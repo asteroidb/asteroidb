@@ -83,8 +83,6 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tests
-        env:
-          PROPTEST_CASES: "100"
         run: set -o pipefail; cargo test 2>&1 | tee test-output.txt
 
       - name: Generate test summary
