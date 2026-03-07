@@ -118,15 +118,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install host dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
-
+      # python3 is pre-installed on ubuntu-latest and required by scripts/netem/lib.sh
       - name: Run lightweight netem tests
         run: bash scripts/test-netem-light.sh
 
       - name: Ensure cluster is stopped
         if: always()
-        run: docker compose down --timeout 5 || true
+        run: docker compose -f docker-compose.yml down --timeout 5 || true
 
   build:
     name: Release Build

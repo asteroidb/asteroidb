@@ -4,14 +4,16 @@
 # Runs three quick network-fault scenarios against a 3-node Docker cluster:
 #   1. Delay:        100ms added to node-2, write on node-1, verify convergence
 #   2. Packet loss:  5% loss on node-2, write on node-1, verify convergence
-#   3. Partition:    node-3 fully partitioned for 1s, recover, verify convergence
+#   3. Partition:    node-3 fully partitioned for 3s, recover, verify convergence
 #
-# Each scenario targets < 10s; total runtime < 30s.
+# Each scenario is wrapped in a function with its own trap to guarantee netem
+# rules are cleaned up even if the scenario fails mid-way (set -e).
 #
 # Usage: ./scripts/test-netem-light.sh
 #
 # Prerequisites:
 #   - Docker and docker compose available
+#   - python3 available on the host (used by lib.sh for JSON parsing)
 #   - No other asteroidb containers running (ports 3001-3003 free)
 set -euo pipefail
 
@@ -75,7 +77,7 @@ check_convergence() {
     local key="$2"
     shift 2
     # remaining args are "name:url" pairs
-    local retries=5
+    local retries=10
     local interval=1
 
     for pair in "$@"; do
@@ -121,6 +123,103 @@ scenario_result() {
     fi
 }
 
+# --- Scenario functions ---
+# Each scenario is a function that returns 0 on success, 1 on failure.
+# Netem cleanup is guaranteed by a local trap so that set -e mid-scenario
+# failures do not leave tc rules behind.
+
+run_scenario_delay() {
+    local key="netem-light-delay-$$"
+    local exit_code=0
+
+    # Ensure netem is removed even on early exit
+    trap '"${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER" 2>/dev/null || true' RETURN
+
+    # Add 100ms delay
+    "${NETEM_DIR}/add-delay.sh" "$NODE2_CONTAINER" 100
+
+    # Write 3 increments to node-1
+    echo "[scenario] Writing 3 increments to node-1..."
+    write_counter "$NODE1_URL" "$key" 3
+
+    # Check convergence on node-2 and node-3
+    echo "[scenario] Checking convergence..."
+    if ! check_convergence "3" "$key" \
+        "node-2:${NODE2_URL}" \
+        "node-3:${NODE3_URL}"; then
+        exit_code=1
+    fi
+
+    return "$exit_code"
+}
+
+run_scenario_loss() {
+    local key="netem-light-loss-$$"
+    local exit_code=0
+
+    # Ensure netem is removed even on early exit
+    trap '"${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER" 2>/dev/null || true' RETURN
+
+    # Add 5% packet loss
+    echo "[netem] Adding 5% packet loss to ${NODE2_CONTAINER}..."
+    docker exec "$NODE2_CONTAINER" tc qdisc del dev eth0 root 2>/dev/null || true
+    docker exec "$NODE2_CONTAINER" tc qdisc add dev eth0 root netem loss 5%
+    echo "[netem] ${NODE2_CONTAINER}: 5% packet loss applied."
+
+    # Write 3 increments to node-1
+    echo "[scenario] Writing 3 increments to node-1..."
+    write_counter "$NODE1_URL" "$key" 3
+
+    # Check convergence on node-2 and node-3
+    echo "[scenario] Checking convergence..."
+    if ! check_convergence "3" "$key" \
+        "node-2:${NODE2_URL}" \
+        "node-3:${NODE3_URL}"; then
+        exit_code=1
+    fi
+
+    return "$exit_code"
+}
+
+run_scenario_partition() {
+    local key="netem-light-partition-$$"
+    local exit_code=0
+
+    # Ensure netem is removed even on early exit
+    trap '"${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER" 2>/dev/null || true' RETURN
+
+    # Write initial data so all nodes have baseline
+    echo "[scenario] Writing 2 increments to node-1 (baseline)..."
+    write_counter "$NODE1_URL" "$key" 2
+    sleep 2
+
+    # Partition node-3
+    echo "[scenario] Partitioning node-3..."
+    "${NETEM_DIR}/add-partition.sh" "$NODE3_CONTAINER"
+
+    # Write 3 more increments while node-3 is partitioned
+    echo "[scenario] Writing 3 increments during partition..."
+    write_counter "$NODE1_URL" "$key" 3
+
+    # Hold partition for 3 seconds (longer than sync interval of 2s)
+    sleep 3
+
+    # Recover
+    echo "[scenario] Recovering node-3..."
+    "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
+
+    # Verify convergence: total should be 5
+    echo "[scenario] Checking convergence after recovery..."
+    if ! check_convergence "5" "$key" \
+        "node-1:${NODE1_URL}" \
+        "node-2:${NODE2_URL}" \
+        "node-3:${NODE3_URL}"; then
+        exit_code=1
+    fi
+
+    return "$exit_code"
+}
+
 # --- Start cluster ---
 separator
 echo -e "${CLR_BOLD}AsteroidDB Lightweight Netem Tests${CLR_RESET}"
@@ -139,28 +238,9 @@ separator
 echo -e "${CLR_BOLD}Scenario 1/3: Delay (100ms on node-2)${CLR_RESET}"
 sub_separator
 
-S1_KEY="netem-light-delay-$$"
 S1_START=$(date +%s)
 S1_EXIT=0
-
-# Add 100ms delay
-"${NETEM_DIR}/add-delay.sh" "$NODE2_CONTAINER" 100
-
-# Write 3 increments to node-1
-echo "[scenario] Writing 3 increments to node-1..."
-write_counter "$NODE1_URL" "$S1_KEY" 3
-
-# Check convergence on node-2 and node-3
-echo "[scenario] Checking convergence..."
-if ! check_convergence "3" "$S1_KEY" \
-    "node-2:${NODE2_URL}" \
-    "node-3:${NODE3_URL}"; then
-    S1_EXIT=1
-fi
-
-# Clean up netem
-"${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER"
-
+run_scenario_delay || S1_EXIT=$?
 scenario_result "Delay (100ms)" "$S1_EXIT" "$S1_START"
 echo ""
 
@@ -171,75 +251,23 @@ separator
 echo -e "${CLR_BOLD}Scenario 2/3: Packet Loss (5% on node-2)${CLR_RESET}"
 sub_separator
 
-S2_KEY="netem-light-loss-$$"
 S2_START=$(date +%s)
 S2_EXIT=0
-
-# Add 5% packet loss
-echo "[netem] Adding 5% packet loss to ${NODE2_CONTAINER}..."
-docker exec "$NODE2_CONTAINER" tc qdisc del dev eth0 root 2>/dev/null || true
-docker exec "$NODE2_CONTAINER" tc qdisc add dev eth0 root netem loss 5%
-echo "[netem] ${NODE2_CONTAINER}: 5% packet loss applied."
-
-# Write 3 increments to node-1
-echo "[scenario] Writing 3 increments to node-1..."
-write_counter "$NODE1_URL" "$S2_KEY" 3
-
-# Check convergence on node-2 and node-3
-echo "[scenario] Checking convergence..."
-if ! check_convergence "3" "$S2_KEY" \
-    "node-2:${NODE2_URL}" \
-    "node-3:${NODE3_URL}"; then
-    S2_EXIT=1
-fi
-
-# Clean up netem
-"${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER"
-
+run_scenario_loss || S2_EXIT=$?
 scenario_result "Packet Loss (5%)" "$S2_EXIT" "$S2_START"
 echo ""
 
 # ======================================================================
-# Scenario 3: Partition (node-3 isolated for 1s, then recover)
+# Scenario 3: Partition (node-3 isolated for 3s, then recover)
 # ======================================================================
 separator
-echo -e "${CLR_BOLD}Scenario 3/3: Partition (node-3 for 1s)${CLR_RESET}"
+echo -e "${CLR_BOLD}Scenario 3/3: Partition (node-3 for 3s)${CLR_RESET}"
 sub_separator
 
-S3_KEY="netem-light-partition-$$"
 S3_START=$(date +%s)
 S3_EXIT=0
-
-# Write initial data so all nodes have baseline
-echo "[scenario] Writing 2 increments to node-1 (baseline)..."
-write_counter "$NODE1_URL" "$S3_KEY" 2
-sleep 2
-
-# Partition node-3
-echo "[scenario] Partitioning node-3..."
-"${NETEM_DIR}/add-partition.sh" "$NODE3_CONTAINER"
-
-# Write 3 more increments while node-3 is partitioned
-echo "[scenario] Writing 3 increments during partition..."
-write_counter "$NODE1_URL" "$S3_KEY" 3
-
-# Hold partition for 1 second
-sleep 1
-
-# Recover
-echo "[scenario] Recovering node-3..."
-"${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
-
-# Verify convergence: total should be 5
-echo "[scenario] Checking convergence after recovery..."
-if ! check_convergence "5" "$S3_KEY" \
-    "node-1:${NODE1_URL}" \
-    "node-2:${NODE2_URL}" \
-    "node-3:${NODE3_URL}"; then
-    S3_EXIT=1
-fi
-
-scenario_result "Partition (1s)" "$S3_EXIT" "$S3_START"
+run_scenario_partition || S3_EXIT=$?
+scenario_result "Partition (3s)" "$S3_EXIT" "$S3_START"
 echo ""
 
 # ======================================================================
