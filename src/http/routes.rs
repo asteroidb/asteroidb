@@ -128,6 +128,8 @@ mod tests {
                 ]),
             )),
             internal_token: token,
+            self_node_id: None,
+            self_addr: None,
         })
     }
 

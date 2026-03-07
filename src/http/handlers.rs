@@ -49,6 +49,10 @@ pub struct AppState {
     /// When `Some`, all `/api/internal/*` routes require a matching
     /// `Authorization: Bearer <token>` header.
     pub internal_token: Option<String>,
+    /// This node's own ID, used to include the seed in join responses.
+    pub self_node_id: Option<NodeId>,
+    /// This node's own advertised address, used to include the seed in join responses.
+    pub self_addr: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -629,6 +633,18 @@ pub async fn internal_join(
                 address: p.addr.clone(),
             })
             .collect();
+
+        // Include the seed node (self) so the joiner has a complete peer view.
+        if let (Some(self_id), Some(self_addr)) = (&state.self_node_id, &state.self_addr) {
+            let already_present = list.iter().any(|p| p.node_id == self_id.0);
+            if !already_present {
+                list.push(PeerInfo {
+                    node_id: self_id.0.clone(),
+                    address: self_addr.clone(),
+                });
+            }
+        }
+
         list.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
         (list, snapshot)

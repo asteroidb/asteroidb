@@ -66,6 +66,8 @@ async fn two_node_anti_entropy_convergence() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     // Build state for node 2.
@@ -82,6 +84,8 @@ async fn two_node_anti_entropy_convergence() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     // Write some data to node 1.
@@ -264,6 +268,8 @@ async fn pull_based_sync() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     {
@@ -323,6 +329,8 @@ async fn sync_endpoint_partial_failure() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     // Pre-populate with a counter at "k".
@@ -417,6 +425,8 @@ async fn three_node_convergence_via_sync() {
             peer_persist_path: None,
             consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
             internal_token: None,
+            self_node_id: None,
+            self_addr: None,
         });
         states.push(state);
     }
@@ -527,6 +537,8 @@ async fn internal_keys_endpoint() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     {
@@ -595,6 +607,8 @@ async fn full_sync_records_remote_frontier_not_local() {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     });
 
     // Write data to the remote node.

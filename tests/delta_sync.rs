@@ -58,6 +58,8 @@ fn test_state() -> Arc<AppState> {
         peer_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
+        self_node_id: None,
+        self_addr: None,
     })
 }
 
