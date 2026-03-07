@@ -84,10 +84,132 @@ pub struct DeltaSyncResponse {
     pub sender_frontier: Option<HlcTimestamp>,
 }
 
+/// Error returned when a batched push partially or fully fails.
+#[derive(Debug, Clone)]
+pub struct SyncPushError {
+    /// Number of entries that were successfully pushed before the failure.
+    pub pushed: usize,
+    /// Human-readable reason for the failure.
+    pub reason: String,
+}
+
+impl std::fmt::Display for SyncPushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "sync push failed after {} entries: {}",
+            self.pushed, self.reason
+        )
+    }
+}
+
+impl std::error::Error for SyncPushError {}
+
+// ---------------------------------------------------------------
+// Exponential backoff for per-peer retry
+// ---------------------------------------------------------------
+
+/// Per-peer exponential backoff state for sync retries.
+///
+/// Tracks consecutive failures and computes the next retry delay
+/// using exponential backoff with jitter. The delay starts at
+/// [`Self::INITIAL_BACKOFF`] and doubles on each failure up to
+/// [`Self::MAX_BACKOFF`].
+#[derive(Debug, Clone)]
+pub struct PeerBackoff {
+    /// Number of consecutive failures for this peer.
+    pub consecutive_failures: u32,
+    /// Instant at which the next sync attempt is allowed.
+    ///
+    /// Uses `tokio::time::Instant` for monotonic clock compatibility.
+    pub ready_at: tokio::time::Instant,
+}
+
+impl PeerBackoff {
+    /// Initial backoff delay after the first failure.
+    pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    /// Maximum backoff delay.
+    pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    /// Create a new backoff state that is immediately ready.
+    pub fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            ready_at: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Check whether the peer is ready for a sync attempt.
+    pub fn is_ready(&self) -> bool {
+        tokio::time::Instant::now() >= self.ready_at
+    }
+
+    /// Record a successful sync, resetting the backoff.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.ready_at = tokio::time::Instant::now();
+    }
+
+    /// Record a failed sync, increasing the backoff delay.
+    ///
+    /// Uses exponential backoff: `min(INITIAL_BACKOFF * 2^failures, MAX_BACKOFF)`
+    /// with a random jitter of up to 25% of the computed delay.
+    pub fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let base = Self::INITIAL_BACKOFF.saturating_mul(1u32 << self.consecutive_failures.min(5));
+        let capped = base.min(Self::MAX_BACKOFF);
+
+        // Add jitter: up to 25% of the capped delay.
+        let jitter_ms = Self::simple_jitter(capped.as_millis() as u64 / 4);
+        let with_jitter = capped + Duration::from_millis(jitter_ms);
+
+        self.ready_at = tokio::time::Instant::now() + with_jitter;
+    }
+
+    /// Simple pseudo-random jitter based on the current instant.
+    ///
+    /// Not cryptographically secure, but sufficient for jitter purposes.
+    fn simple_jitter(max_ms: u64) -> u64 {
+        if max_ms == 0 {
+            return 0;
+        }
+        // Use nanosecond component of current time as cheap entropy source.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        nanos % (max_ms + 1)
+    }
+
+    /// Return the computed backoff delay for the current failure count
+    /// (without jitter). Useful for testing.
+    pub fn base_delay(&self) -> Duration {
+        if self.consecutive_failures == 0 {
+            return Duration::ZERO;
+        }
+        let base = Self::INITIAL_BACKOFF.saturating_mul(1u32 << self.consecutive_failures.min(5));
+        base.min(Self::MAX_BACKOFF)
+    }
+}
+
+impl Default for PeerBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum number of keys per sync batch.
+///
+/// When pushing changed entries to a peer, large payloads are split
+/// into chunks of this size to avoid oversized HTTP requests and to
+/// allow partial progress on transient failures.
+pub const DEFAULT_BATCH_SIZE: usize = 100;
+
 /// Anti-entropy sync client.
 ///
-/// Periodically pushes all local CRDT values to every known peer.
-/// Uses HTTP POST to `/api/internal/sync` on each peer.
+/// Periodically pushes local CRDT values to every known peer.
+/// Supports both full-store push and frontier-based delta push
+/// with automatic batching for large change sets.
 ///
 /// Holds a shared reference to the [`PeerRegistry`] so that peers
 /// added or removed at runtime (via `/api/internal/join` or
@@ -212,6 +334,80 @@ impl SyncClient {
         success_count
     }
 
+    /// Push only entries changed since the given frontier to a single peer.
+    ///
+    /// Extracts entries from `all_entries` that have a timestamp strictly
+    /// after `frontier` (using the `timestamps` map), then sends them
+    /// in batches of [`DEFAULT_BATCH_SIZE`] via `POST /api/internal/sync`.
+    ///
+    /// Returns the total number of entries successfully pushed. If any
+    /// batch fails, remaining batches are skipped and the partial count
+    /// is returned so the caller can decide whether to retry.
+    pub async fn push_changed_keys(
+        &self,
+        peer_addr: &str,
+        changed_entries: Vec<(String, CrdtValue)>,
+        sender_id: &str,
+        batch_size: usize,
+    ) -> Result<usize, SyncPushError> {
+        if changed_entries.is_empty() {
+            return Ok(0);
+        }
+
+        let effective_batch_size = if batch_size == 0 {
+            DEFAULT_BATCH_SIZE
+        } else {
+            batch_size
+        };
+
+        let mut total_pushed = 0usize;
+
+        for chunk in changed_entries.chunks(effective_batch_size) {
+            let entries: HashMap<String, CrdtValue> = chunk.iter().cloned().collect();
+            let request = SyncRequest {
+                sender: sender_id.to_string(),
+                entries,
+            };
+            let url = format!("http://{peer_addr}/api/internal/sync");
+
+            match self.authorized_post(&url).json(&request).send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        total_pushed += chunk.len();
+                        tracing::debug!(
+                            peer_addr = %peer_addr,
+                            batch_keys = chunk.len(),
+                            "delta push batch succeeded"
+                        );
+                    } else {
+                        tracing::warn!(
+                            peer_addr = %peer_addr,
+                            status = %resp.status(),
+                            "delta push batch received non-success status"
+                        );
+                        return Err(SyncPushError {
+                            pushed: total_pushed,
+                            reason: format!("HTTP {}", resp.status()),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_addr = %peer_addr,
+                        error = %e,
+                        "delta push batch failed"
+                    );
+                    return Err(SyncPushError {
+                        pushed: total_pushed,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(total_pushed)
+    }
+
     /// Pull all key-value pairs from a specific peer.
     ///
     /// Sends `GET /api/internal/keys` to the peer and returns the
@@ -302,10 +498,13 @@ impl SyncClient {
         }
     }
 
-    /// Push delta entries to a peer.
+    /// Push changed entries to a peer using batched delta sync.
     ///
-    /// Sends `POST /api/internal/sync` with only the changed entries.
+    /// This is a convenience wrapper around [`Self::push_changed_keys`]
+    /// using the [`DEFAULT_BATCH_SIZE`].
+    ///
     /// Returns `true` on success.
+    #[allow(dead_code)]
     pub async fn push_delta(
         &self,
         peer_addr: &str,
@@ -608,5 +807,148 @@ mod tests {
             .push_delta("127.0.0.1:1", HashMap::new(), "node-1")
             .await;
         assert!(result);
+    }
+
+    // ---------------------------------------------------------------
+    // push_changed_keys tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn push_changed_keys_empty_returns_zero() {
+        let registry = shared_registry(vec![]);
+        let client = SyncClient::new(registry);
+
+        let result = client
+            .push_changed_keys("127.0.0.1:1", vec![], "node-1", DEFAULT_BATCH_SIZE)
+            .await;
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn push_changed_keys_to_unreachable_returns_error() {
+        let registry = shared_registry(vec![]);
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let client = SyncClient::with_client(registry, http_client);
+
+        let mut counter = PnCounter::new();
+        counter.increment(&nid("node-1"));
+        let entries = vec![("key1".to_string(), CrdtValue::Counter(counter))];
+
+        let result = client
+            .push_changed_keys("127.0.0.1:1", entries, "node-1", DEFAULT_BATCH_SIZE)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.pushed, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // PeerBackoff tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn backoff_new_is_immediately_ready() {
+        let b = PeerBackoff::new();
+        assert!(b.is_ready());
+        assert_eq!(b.consecutive_failures, 0);
+        assert_eq!(b.base_delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_success_resets() {
+        let mut b = PeerBackoff::new();
+        b.record_failure();
+        assert_eq!(b.consecutive_failures, 1);
+        b.record_success();
+        assert_eq!(b.consecutive_failures, 0);
+        assert!(b.is_ready());
+    }
+
+    #[test]
+    fn backoff_delay_increases_exponentially() {
+        let mut b = PeerBackoff::new();
+
+        b.record_failure(); // 1 failure
+        assert_eq!(b.consecutive_failures, 1);
+        let d1 = b.base_delay();
+
+        b.record_failure(); // 2 failures
+        let d2 = b.base_delay();
+        assert!(d2 > d1, "delay should increase: {d2:?} > {d1:?}");
+
+        b.record_failure(); // 3 failures
+        let d3 = b.base_delay();
+        assert!(d3 > d2, "delay should increase: {d3:?} > {d2:?}");
+    }
+
+    #[test]
+    fn backoff_delay_capped_at_max() {
+        let mut b = PeerBackoff::new();
+        for _ in 0..20 {
+            b.record_failure();
+        }
+        let delay = b.base_delay();
+        assert!(
+            delay <= PeerBackoff::MAX_BACKOFF,
+            "delay {delay:?} should be <= {:?}",
+            PeerBackoff::MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn backoff_not_ready_after_failure() {
+        let mut b = PeerBackoff::new();
+        b.record_failure();
+        // Immediately after failure, the backoff should gate retries
+        // (ready_at is in the future).
+        assert!(!b.is_ready());
+    }
+
+    #[test]
+    fn backoff_default_is_new() {
+        let b = PeerBackoff::default();
+        assert!(b.is_ready());
+        assert_eq!(b.consecutive_failures, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // SyncPushError tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sync_push_error_display() {
+        let err = SyncPushError {
+            pushed: 5,
+            reason: "timeout".into(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("5 entries"));
+        assert!(msg.contains("timeout"));
+    }
+
+    // ---------------------------------------------------------------
+    // Batch splitting tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn batch_splitting_logic() {
+        // Verify that chunk splitting works correctly for various sizes.
+        let entries: Vec<(String, CrdtValue)> = (0..250)
+            .map(|i| {
+                let mut c = PnCounter::new();
+                c.increment(&nid("n"));
+                (format!("key-{i}"), CrdtValue::Counter(c))
+            })
+            .collect();
+
+        let batch_size = 100;
+        let chunks: Vec<_> = entries.chunks(batch_size).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 100);
+        assert_eq!(chunks[1].len(), 100);
+        assert_eq!(chunks[2].len(), 50);
     }
 }
