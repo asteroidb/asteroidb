@@ -4,7 +4,6 @@
 //! inspection, and SLO budget monitoring.
 
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
 
 /// AsteroidDB command-line interface.
 #[derive(Parser)]
@@ -141,13 +140,7 @@ fn cmd_get(client: &reqwest::blocking::Client, base: &str, key: &str) {
 
 fn cmd_put(client: &reqwest::blocking::Client, base: &str, key: &str, value: &str) {
     let url = format!("{base}/api/eventual/write");
-    let mut body = HashMap::new();
-    body.insert("RegisterSet", {
-        let mut inner = HashMap::new();
-        inner.insert("key", key);
-        inner.insert("value", value);
-        inner
-    });
+    let body = put_body(key, value);
 
     match client.post(&url).json(&body).send() {
         Ok(resp) => {
@@ -185,6 +178,18 @@ fn cmd_metrics(client: &reqwest::blocking::Client, base: &str) {
             std::process::exit(1);
         }
     }
+}
+
+/// Build the JSON body for the `put` command.
+///
+/// Produces the internally-tagged format expected by `EventualWriteRequest`:
+/// `{"type":"register_set","key":"...","value":"..."}`.
+fn put_body(key: &str, value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "register_set",
+        "key": key,
+        "value": value,
+    })
 }
 
 fn cmd_slo(client: &reqwest::blocking::Client, base: &str) {
@@ -248,5 +253,46 @@ fn cmd_slo(client: &reqwest::blocking::Client, base: &str) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_body_produces_tagged_json() {
+        let body = put_body("mykey", "myvalue");
+        let obj = body.as_object().expect("should be a JSON object");
+        assert_eq!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("register_set")
+        );
+        assert_eq!(obj.get("key").and_then(|v| v.as_str()), Some("mykey"));
+        assert_eq!(obj.get("value").and_then(|v| v.as_str()), Some("myvalue"));
+        assert_eq!(obj.len(), 3, "should have exactly 3 fields");
+    }
+
+    #[test]
+    fn put_body_roundtrips_through_eventual_write_request() {
+        // Verify the JSON produced by put_body can be deserialized as EventualWriteRequest.
+        let body = put_body("sensor-1", "42.5");
+        let json_str = serde_json::to_string(&body).unwrap();
+        let req: asteroidb_poc::http::types::EventualWriteRequest =
+            serde_json::from_str(&json_str).unwrap();
+        match req {
+            asteroidb_poc::http::types::EventualWriteRequest::RegisterSet { key, value } => {
+                assert_eq!(key, "sensor-1");
+                assert_eq!(value, "42.5");
+            }
+            other => panic!("expected RegisterSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn base_url_adds_scheme() {
+        assert_eq!(base_url("127.0.0.1:3000"), "http://127.0.0.1:3000");
+        assert_eq!(base_url("http://localhost:3000"), "http://localhost:3000");
+        assert_eq!(base_url("https://example.com"), "https://example.com");
     }
 }
