@@ -16,6 +16,22 @@ use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
 
+/// Parse authority node IDs from `ASTEROIDB_AUTHORITY_NODES` env var (comma-separated),
+/// falling back to the default `["auth-1", "auth-2", "auth-3"]`.
+fn authority_nodes() -> Vec<NodeId> {
+    match std::env::var("ASTEROIDB_AUTHORITY_NODES") {
+        Ok(val) if !val.trim().is_empty() => val
+            .split(',')
+            .map(|s| NodeId(s.trim().to_string()))
+            .collect(),
+        _ => vec![
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into()),
+        ],
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Load configuration: either from a config file or from individual env vars.
@@ -53,16 +69,14 @@ async fn main() {
 
     println!("AsteroidDB starting... (node_id={})", node_id.0);
 
+    let auth_nodes = authority_nodes();
+
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: KeyRange {
             prefix: String::new(),
         },
-        authority_nodes: vec![
-            NodeId("auth-1".into()),
-            NodeId("auth-2".into()),
-            NodeId("auth-3".into()),
-        ],
+        authority_nodes: auth_nodes.clone(),
         auto_generated: false,
     });
 
@@ -132,11 +146,7 @@ async fn main() {
     };
 
     // Build control-plane consensus with the same authority nodes (FR-009).
-    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![
-        NodeId("auth-1".into()),
-        NodeId("auth-2".into()),
-        NodeId("auth-3".into()),
-    ])));
+    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(auth_nodes)));
 
     // Optional shared token for authenticating internal API requests.
     let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN").ok();
@@ -184,10 +194,10 @@ async fn main() {
     // Parse optional BLS key seed from environment variable.
     // When set, the node generates a BLS keypair and enables BLS certificate mode.
     let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
-        let bytes: Vec<u8> = (0..hex_seed.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(hex_seed.get(i..i + 2).unwrap_or(""), 16).ok())
-            .collect();
+        let bytes = hex::decode(&hex_seed).unwrap_or_else(|e| {
+            eprintln!("error: ASTEROIDB_BLS_SEED contains invalid hex: {e}");
+            std::process::exit(1);
+        });
         let mut seed = [0u8; 32];
         let len = bytes.len().min(32);
         seed[..len].copy_from_slice(&bytes[..len]);
