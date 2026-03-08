@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::authority::ack_frontier::AckFrontier;
+use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 
 /// Request body for pushing frontiers to a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,47 +81,83 @@ impl FrontierSyncClient {
         builder
     }
 
+    /// Send a POST request with bincode-encoded body and Accept header.
+    ///
+    /// Falls back to JSON encoding if bincode serialization fails.
+    fn bincode_post<T: Serialize>(
+        &self,
+        url: &str,
+        data: &T,
+    ) -> Result<reqwest::RequestBuilder, codec::SerializationError> {
+        let (bytes, content_type) = serialize_internal(data, Some(CONTENT_TYPE_BINCODE))?;
+        Ok(self
+            .authorized_post(url)
+            .header("content-type", content_type)
+            .header("accept", CONTENT_TYPE_BINCODE)
+            .body(bytes))
+    }
+
+    /// Deserialize a response body based on the response's Content-Type header.
+    async fn decode_response<T: for<'de> Deserialize<'de>>(
+        resp: reqwest::Response,
+    ) -> Result<T, String> {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        deserialize_internal(&bytes, content_type.as_deref()).map_err(|e| e.to_string())
+    }
+
     /// Push frontier updates to a remote peer.
     ///
     /// Sends a POST request to `http://{peer_addr}/api/internal/frontiers`
-    /// with the given frontiers serialised as JSON. The peer will apply
-    /// each frontier via `AckFrontierSet::update()`, which handles
-    /// monotonicity and deduplication.
+    /// with the given frontiers serialised as bincode (with JSON fallback).
+    /// The peer will apply each frontier via `AckFrontierSet::update()`,
+    /// which handles monotonicity and deduplication.
     ///
     /// Returns the number of frontiers accepted by the peer.
     pub async fn push_frontiers(
         &self,
         peer_addr: &str,
         frontiers: Vec<AckFrontier>,
-    ) -> Result<FrontierPushResponse, reqwest::Error> {
+    ) -> Result<FrontierPushResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
         let body = FrontierPushRequest { frontiers };
 
-        self.authorized_post(&url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<FrontierPushResponse>()
+        let req_builder = match self.bincode_post(&url, &body) {
+            Ok(b) => b,
+            Err(_) => self.authorized_post(&url).json(&body),
+        };
+
+        let resp = req_builder.send().await?.error_for_status()?;
+        Self::decode_response::<FrontierPushResponse>(resp)
             .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 
     /// Pull all frontiers from a remote peer.
     ///
-    /// Sends a GET request to `http://{peer_addr}/api/internal/frontiers`.
-    /// The returned frontiers can be applied locally via `AckFrontierSet::update()`.
+    /// Sends a GET request to `http://{peer_addr}/api/internal/frontiers`
+    /// with Accept: application/octet-stream to request bincode responses.
+    /// Falls back to JSON if the peer responds with JSON.
     pub async fn pull_frontiers(
         &self,
         peer_addr: &str,
-    ) -> Result<FrontierPullResponse, reqwest::Error> {
+    ) -> Result<FrontierPullResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
 
-        self.authorized_get(&url)
+        let resp = self
+            .authorized_get(&url)
+            .header("accept", CONTENT_TYPE_BINCODE)
             .send()
             .await?
-            .error_for_status()?
-            .json::<FrontierPullResponse>()
+            .error_for_status()?;
+
+        Self::decode_response::<FrontierPullResponse>(resp)
             .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 }
 

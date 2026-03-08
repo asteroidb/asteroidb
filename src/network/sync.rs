@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::hlc::HlcTimestamp;
+use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 use crate::network::peer::PeerRegistry;
 use crate::store::kv::CrdtValue;
 
@@ -389,6 +390,38 @@ impl SyncClient {
         builder
     }
 
+    /// Send a POST request with bincode-encoded body and Accept header.
+    ///
+    /// Falls back to JSON encoding if bincode serialization fails.
+    fn bincode_post<T: Serialize>(
+        &self,
+        url: &str,
+        data: &T,
+    ) -> Result<reqwest::RequestBuilder, codec::SerializationError> {
+        let (bytes, content_type) = serialize_internal(data, Some(CONTENT_TYPE_BINCODE))?;
+        Ok(self
+            .authorized_post(url)
+            .header("content-type", content_type)
+            .header("accept", CONTENT_TYPE_BINCODE)
+            .body(bytes))
+    }
+
+    /// Deserialize a response body based on the response's Content-Type header.
+    ///
+    /// Supports both bincode (`application/octet-stream`) and JSON responses
+    /// for backward compatibility with older peers.
+    async fn decode_response<T: for<'de> Deserialize<'de>>(
+        resp: reqwest::Response,
+    ) -> Result<T, String> {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        deserialize_internal(&bytes, content_type.as_deref()).map_err(|e| e.to_string())
+    }
+
     /// Push all key-value pairs from the local store to every peer.
     ///
     /// For each peer, sends a `POST /api/internal/sync` request with
@@ -416,7 +449,15 @@ impl SyncClient {
         for peer in &peers {
             let url = format!("http://{}/api/internal/sync", peer.addr);
 
-            match self.authorized_post(&url).json(&request).send().await {
+            let req_builder = match self.bincode_post(&url, &request) {
+                Ok(b) => b,
+                Err(_) => {
+                    // Fallback to JSON if bincode encoding fails.
+                    self.authorized_post(&url).json(&request)
+                }
+            };
+
+            match req_builder.send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         success_count += 1;
@@ -481,13 +522,18 @@ impl SyncClient {
             };
             let url = format!("http://{peer_addr}/api/internal/sync");
 
-            match self.authorized_post(&url).json(&request).send().await {
+            let req_builder = match self.bincode_post(&url, &request) {
+                Ok(b) => b,
+                Err(_) => self.authorized_post(&url).json(&request),
+            };
+
+            match req_builder.send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         // Parse the response body to check for per-key merge
                         // errors. Only count entries that were actually merged.
                         let sync_resp: Option<SyncResponse> =
-                            resp.json::<SyncResponse>().await.ok();
+                            Self::decode_response(resp).await.ok();
                         let error_count = sync_resp.as_ref().map(|r| r.errors.len()).unwrap_or(0);
                         let actually_pushed = chunk.len().saturating_sub(error_count);
                         if error_count > 0 {
@@ -551,10 +597,15 @@ impl SyncClient {
     pub async fn pull_all_keys(&self, peer_addr: &str) -> Option<KeyDumpResponse> {
         let url = format!("http://{}/api/internal/keys", peer_addr);
 
-        match self.authorized_get(&url).send().await {
+        match self
+            .authorized_get(&url)
+            .header("accept", CONTENT_TYPE_BINCODE)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<KeyDumpResponse>().await {
+                    match Self::decode_response::<KeyDumpResponse>(resp).await {
                         Ok(dump) => Some(dump),
                         Err(e) => {
                             tracing::warn!(
@@ -608,10 +659,15 @@ impl SyncClient {
             frontier: frontier.clone(),
         };
 
-        match self.authorized_post(&url).json(&req).send().await {
+        let req_builder = match self.bincode_post(&url, &req) {
+            Ok(b) => b,
+            Err(_) => self.authorized_post(&url).json(&req),
+        };
+
+        match req_builder.send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<DeltaSyncResponse>().await {
+                    match Self::decode_response::<DeltaSyncResponse>(resp).await {
                         Ok(delta) => Some(delta),
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to parse delta sync response");

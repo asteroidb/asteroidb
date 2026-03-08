@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 subtle = "2"
 hex = "0.4"
 redb = "2"
+bincode = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
