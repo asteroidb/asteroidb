@@ -236,7 +236,7 @@ async fn main() {
         )
     };
 
-    let mut runner = NodeRunner::with_sync(
+    let mut runner = NodeRunner::with_sync_and_cluster_nodes(
         node_id.clone(),
         Arc::clone(&certified_api),
         engine,
@@ -244,6 +244,7 @@ async fn main() {
         sync_client,
         Arc::clone(&eventual_api),
         Arc::clone(&metrics),
+        Arc::clone(&shared_cluster_nodes),
     )
     .await;
 

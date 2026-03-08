@@ -325,6 +325,34 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::new()));
+        Self::with_sync_and_cluster_nodes(
+            node_id,
+            certified_api,
+            compaction_engine,
+            config,
+            sync_client,
+            eventual_api,
+            metrics,
+            cluster_nodes,
+        )
+        .await
+    }
+
+    /// Create a `NodeRunner` with anti-entropy sync and a shared cluster node list.
+    ///
+    /// This variant accepts an external `cluster_nodes` so that HTTP handlers
+    /// (via `AppState`) and the runner share the same node list.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_sync_and_cluster_nodes(
+        node_id: NodeId,
+        certified_api: Arc<Mutex<CertifiedApi>>,
+        compaction_engine: CompactionEngine,
+        config: NodeRunnerConfig,
+        sync_client: SyncClient,
+        eventual_api: Arc<Mutex<EventualApi>>,
+        metrics: Arc<RuntimeMetrics>,
+        cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
+    ) -> Self {
         let (reporter, tracked_versions, tracked_policies) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap();

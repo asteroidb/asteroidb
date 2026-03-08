@@ -396,6 +396,11 @@ impl CertifiedApi {
                 .retain(|pw| pw.status != CertificationStatus::Timeout);
         }
 
+        // Invalidate any stale certified cache entry for this key so that
+        // subsequent reads trigger fresh certification instead of returning
+        // a proof that corresponds to the old value.
+        self.certified_cache.remove(&key);
+
         let timestamp = self.clock.now();
 
         // Write to the local store (eventual consistency path).

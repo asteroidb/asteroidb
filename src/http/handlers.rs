@@ -127,6 +127,7 @@ pub async fn get_eventual(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<EventualReadResponse> {
+    let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let start = Instant::now();
     let api = state.eventual.lock().await;
     let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
@@ -176,6 +177,7 @@ pub async fn get_certified(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<CertifiedReadResponse> {
+    let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let start = Instant::now();
     let api = state.certified.lock().await;
     let read = api.get_certified(&key);
@@ -257,6 +259,7 @@ pub async fn get_certification_status(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Json<StatusResponse> {
+    let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let api = state.certified.lock().await;
     let status = api.get_certification_status(&key);
 
