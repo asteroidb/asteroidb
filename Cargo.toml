@@ -2,6 +2,12 @@
 name = "asteroidb-poc"
 version = "0.1.0"
 edition = "2024"
+description = "Distributed key-value store with CRDT-based eventual consistency and authority-based certified consistency"
+license = "MIT"
+authors = ["AsteroidDB Contributors"]
+repository = "https://github.com/asteroidb/asteroidb"
+keywords = ["database", "distributed", "crdt", "key-value"]
+categories = ["database-implementations"]
 
 [dependencies]
 thiserror = "2"
