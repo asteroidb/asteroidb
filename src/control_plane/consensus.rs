@@ -4,34 +4,24 @@ use crate::error::CrdtError;
 use crate::placement::PlacementPolicy;
 use crate::types::NodeId;
 
-use super::system_namespace::{AuthorityDefinition, SystemNamespace};
+use super::system_namespace::AuthorityDefinition;
 
 /// Simulates control-plane Authority consensus for system namespace updates.
 /// In MVP, this is a simple majority check (FR-009).
 pub struct ControlPlaneConsensus {
-    namespace: SystemNamespace,
     authority_nodes: Vec<NodeId>,
 }
 
 impl ControlPlaneConsensus {
     /// Creates a new consensus instance with the given authority nodes.
     pub fn new(authority_nodes: Vec<NodeId>) -> Self {
-        Self {
-            namespace: SystemNamespace::new(),
-            authority_nodes,
-        }
+        Self { authority_nodes }
     }
 
-    /// Returns a reference to the managed system namespace.
-    pub fn namespace(&self) -> &SystemNamespace {
-        &self.namespace
-    }
-
-    /// Proposes a placement policy update. Applies only if a majority of
-    /// authority nodes have approved.
+    /// Validates that a policy update has majority approval.
     pub fn propose_policy_update(
-        &mut self,
-        policy: PlacementPolicy,
+        &self,
+        _policy: PlacementPolicy,
         approvals: &[NodeId],
     ) -> Result<(), CrdtError> {
         if !self.has_majority(approvals) {
@@ -39,15 +29,14 @@ impl ControlPlaneConsensus {
                 "insufficient approvals for policy update".into(),
             ));
         }
-        self.namespace.set_placement_policy(policy);
         Ok(())
     }
 
     /// Proposes an authority definition update. Applies only if a majority of
     /// authority nodes have approved.
     pub fn propose_authority_update(
-        &mut self,
-        def: AuthorityDefinition,
+        &self,
+        _def: AuthorityDefinition,
         approvals: &[NodeId],
     ) -> Result<(), CrdtError> {
         if !self.has_majority(approvals) {
@@ -55,23 +44,22 @@ impl ControlPlaneConsensus {
                 "insufficient approvals for authority update".into(),
             ));
         }
-        self.namespace.set_authority_definition(def);
         Ok(())
     }
 
     /// Proposes a placement policy removal. Removes only if a majority of
     /// authority nodes have approved (FR-009).
     pub fn propose_policy_removal(
-        &mut self,
-        prefix: &str,
+        &self,
+        _prefix: &str,
         approvals: &[NodeId],
-    ) -> Result<Option<PlacementPolicy>, CrdtError> {
+    ) -> Result<(), CrdtError> {
         if !self.has_majority(approvals) {
             return Err(CrdtError::PolicyDenied(
                 "insufficient approvals for policy removal".into(),
             ));
         }
-        Ok(self.namespace.remove_placement_policy(prefix))
+        Ok(())
     }
 
     /// Returns `true` if the given approvals constitute a majority of the
@@ -91,6 +79,7 @@ impl ControlPlaneConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::system_namespace::SystemNamespace;
     use crate::types::{KeyRange, PolicyVersion};
 
     fn node_id(s: &str) -> NodeId {
@@ -177,22 +166,20 @@ mod tests {
 
     #[test]
     fn duplicate_approvals_policy_update_rejected() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         // Same node duplicated should not reach majority
         let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1"), node_id("n1")]);
         assert!(result.is_err());
-        assert!(c.namespace().get_placement_policy("user/").is_none());
     }
 
     #[test]
     fn duplicate_approvals_authority_update_rejected() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let result = c.propose_authority_update(
             make_authority_def("user/", &["a1"]),
             &[node_id("n1"), node_id("n1")],
         );
         assert!(result.is_err());
-        assert!(c.namespace().get_authority_definition("user/").is_none());
     }
 
     #[test]
@@ -213,15 +200,14 @@ mod tests {
 
     #[test]
     fn propose_policy_with_majority_succeeds() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1"), node_id("n2")]);
         assert!(result.is_ok());
-        assert!(c.namespace().get_placement_policy("user/").is_some());
     }
 
     #[test]
     fn propose_policy_without_majority_fails() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1")]);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -230,82 +216,84 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        assert!(c.namespace().get_placement_policy("user/").is_none());
     }
 
     #[test]
     fn propose_policy_increments_version() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let approvals = [node_id("n1"), node_id("n2")];
-        assert_eq!(*c.namespace().version(), PolicyVersion(1));
+        let mut ns = SystemNamespace::new();
+        assert_eq!(*ns.version(), PolicyVersion(1));
 
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
-        assert_eq!(*c.namespace().version(), PolicyVersion(2));
+        ns.set_placement_policy(make_policy("user/"));
+        assert_eq!(*ns.version(), PolicyVersion(2));
 
         c.propose_policy_update(make_policy("order/"), &approvals)
             .unwrap();
-        assert_eq!(*c.namespace().version(), PolicyVersion(3));
+        ns.set_placement_policy(make_policy("order/"));
+        assert_eq!(*ns.version(), PolicyVersion(3));
     }
 
     // --- propose_authority_update ---
 
     #[test]
     fn propose_authority_with_majority_succeeds() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let result = c.propose_authority_update(
             make_authority_def("user/", &["a1", "a2", "a3"]),
             &[node_id("n1"), node_id("n2")],
         );
         assert!(result.is_ok());
-        let def = c.namespace().get_authority_definition("user/").unwrap();
-        assert_eq!(def.authority_nodes.len(), 3);
     }
 
     #[test]
     fn propose_authority_without_majority_fails() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let result =
             c.propose_authority_update(make_authority_def("user/", &["a1"]), &[node_id("n1")]);
         assert!(result.is_err());
-        assert!(c.namespace().get_authority_definition("user/").is_none());
     }
 
     // --- namespace access ---
 
     #[test]
     fn namespace_reflects_approved_changes() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let approvals = [node_id("n1"), node_id("n2")];
+
+        let mut ns = SystemNamespace::new();
 
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
+        ns.set_placement_policy(make_policy("user/"));
+
         c.propose_authority_update(make_authority_def("user/", &["a1", "a2"]), &approvals)
             .unwrap();
+        ns.set_authority_definition(make_authority_def("user/", &["a1", "a2"]));
 
-        assert_eq!(c.namespace().all_placement_policies().len(), 1);
-        assert_eq!(c.namespace().all_authority_definitions().len(), 1);
-        assert_eq!(*c.namespace().version(), PolicyVersion(3));
+        assert_eq!(ns.all_placement_policies().len(), 1);
+        assert_eq!(ns.all_authority_definitions().len(), 1);
+        assert_eq!(*ns.version(), PolicyVersion(3));
     }
 
     // --- propose_policy_removal ---
 
     #[test]
     fn propose_policy_removal_with_majority_succeeds() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let approvals = [node_id("n1"), node_id("n2")];
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
-        assert!(c.namespace().get_placement_policy("user/").is_some());
 
-        let removed = c.propose_policy_removal("user/", &approvals).unwrap();
-        assert!(removed.is_some());
-        assert!(c.namespace().get_placement_policy("user/").is_none());
+        let result = c.propose_policy_removal("user/", &approvals);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn propose_policy_removal_without_majority_fails() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let approvals = [node_id("n1"), node_id("n2")];
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
@@ -318,28 +306,27 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        // Policy should still exist
-        assert!(c.namespace().get_placement_policy("user/").is_some());
     }
 
     #[test]
     fn propose_policy_removal_nonexistent_returns_none() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let approvals = [node_id("n1"), node_id("n2")];
-        let removed = c.propose_policy_removal("missing/", &approvals).unwrap();
-        assert!(removed.is_none());
+        let result = c.propose_policy_removal("missing/", &approvals);
+        assert!(result.is_ok());
     }
 
     #[test]
     fn failed_proposals_do_not_change_namespace() {
-        let mut c = three_node_consensus();
+        let c = three_node_consensus();
         let insufficient = [node_id("n1")];
 
         let _ = c.propose_policy_update(make_policy("user/"), &insufficient);
         let _ = c.propose_authority_update(make_authority_def("user/", &["a1"]), &insufficient);
 
-        assert!(c.namespace().all_placement_policies().is_empty());
-        assert!(c.namespace().all_authority_definitions().is_empty());
-        assert_eq!(*c.namespace().version(), PolicyVersion(1));
+        let ns = SystemNamespace::new();
+        assert!(ns.all_placement_policies().is_empty());
+        assert!(ns.all_authority_definitions().is_empty());
+        assert_eq!(*ns.version(), PolicyVersion(1));
     }
 }

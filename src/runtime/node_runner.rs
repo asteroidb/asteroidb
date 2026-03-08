@@ -1481,11 +1481,8 @@ impl NodeRunner {
         self.peer_backoffs
             .retain(|addr, _| active_addrs.contains(addr));
 
-        if !any_success && !peers.is_empty() {
-            self.metrics
-                .sync_failure_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        // NOTE: sync_failure_total is incremented per-peer on failure above,
+        // so we do not add another increment here to avoid double-counting.
 
         // Rebuild topology view with fresh latency data.
         if any_success {

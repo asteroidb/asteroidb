@@ -290,9 +290,16 @@ impl CompactionEngine {
         }
     }
 
+    /// Maximum number of revalidation log entries to retain.
+    const MAX_REVALIDATION_LOG: usize = 1000;
+
     /// Log a revalidation event with the given trigger and timestamp.
     pub fn trigger_revalidation(&mut self, trigger: RevalidationTrigger, now: HlcTimestamp) {
         self.revalidation_log.push((now, trigger));
+        if self.revalidation_log.len() > Self::MAX_REVALIDATION_LOG {
+            self.revalidation_log
+                .drain(..self.revalidation_log.len() - Self::MAX_REVALIDATION_LOG);
+        }
     }
 
     /// Get the full revalidation log.

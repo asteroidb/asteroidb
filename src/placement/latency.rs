@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ pub struct LatencyStats {
 #[derive(Debug, Clone)]
 struct LatencySamples {
     /// Ring buffer of RTT samples in milliseconds.
-    values: Vec<f64>,
+    values: VecDeque<f64>,
     /// Total number of samples ever recorded (may exceed buffer capacity).
     total_samples: u64,
     /// Timestamp of last update (unix epoch milliseconds).
@@ -36,7 +36,7 @@ struct LatencySamples {
 impl LatencySamples {
     fn new(max_samples: usize) -> Self {
         Self {
-            values: Vec::with_capacity(max_samples),
+            values: VecDeque::with_capacity(max_samples),
             total_samples: 0,
             last_updated_ms: 0,
             max_samples,
@@ -46,9 +46,9 @@ impl LatencySamples {
     fn add(&mut self, rtt_ms: f64, now_ms: u64) {
         if self.values.len() >= self.max_samples {
             // Remove oldest sample (FIFO).
-            self.values.remove(0);
+            self.values.pop_front();
         }
-        self.values.push(rtt_ms);
+        self.values.push_back(rtt_ms);
         self.total_samples += 1;
         self.last_updated_ms = now_ms;
     }
@@ -66,7 +66,7 @@ impl LatencySamples {
         let sum: f64 = self.values.iter().sum();
         let avg = sum / self.values.len() as f64;
 
-        let mut sorted = self.values.clone();
+        let mut sorted: Vec<f64> = self.values.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p99_idx = ((0.99 * sorted.len() as f64).ceil() as usize)
             .min(sorted.len())
