@@ -37,11 +37,21 @@ pub struct BenchmarkResult {
 /// Returns a [`BenchmarkResult`] with the given name, populated with
 /// mean, p50, p95, p99, min, and max latencies in microseconds.
 ///
-/// # Panics
-///
-/// Panics if `durations` is empty.
+/// If `durations` is empty, returns a zero-valued [`BenchmarkResult`]
+/// instead of panicking, so the metrics collection path never crashes.
 pub fn collect_latencies(name: &str, durations: &[Duration]) -> BenchmarkResult {
-    assert!(!durations.is_empty(), "durations must not be empty");
+    if durations.is_empty() {
+        return BenchmarkResult {
+            name: name.to_string(),
+            iterations: 0,
+            mean_us: 0.0,
+            p50_us: 0.0,
+            p95_us: 0.0,
+            p99_us: 0.0,
+            min_us: 0.0,
+            max_us: 0.0,
+        };
+    }
 
     let mut us_values: Vec<f64> = durations
         .iter()
@@ -622,9 +632,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "durations must not be empty")]
-    fn collect_empty_panics() {
-        collect_latencies("empty", &[]);
+    fn collect_empty_returns_zero() {
+        let result = collect_latencies("empty", &[]);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.mean_us, 0.0);
+        assert_eq!(result.p50_us, 0.0);
+        assert_eq!(result.p95_us, 0.0);
+        assert_eq!(result.p99_us, 0.0);
+        assert_eq!(result.min_us, 0.0);
+        assert_eq!(result.max_us, 0.0);
     }
 
     // ---------------------------------------------------------------
