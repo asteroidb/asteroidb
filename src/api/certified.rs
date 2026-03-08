@@ -625,6 +625,14 @@ impl CertifiedApi {
         self.frontiers.all()
     }
 
+    /// Return a reference to the underlying `AckFrontierSet`.
+    ///
+    /// Useful for runtime components that need to query frontier state
+    /// (e.g., compaction eligibility, GC version floor derivation).
+    pub fn frontier_set(&self) -> &AckFrontierSet {
+        &self.frontiers
+    }
+
     /// Fence a (key_range, policy_version) pair in the frontier set.
     ///
     /// After fencing, all subsequent frontier updates for this combination

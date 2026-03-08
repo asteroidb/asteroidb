@@ -225,6 +225,39 @@ where
         });
     }
 
+    /// Remove tombstone dots from `deferred` that satisfy **both** the local
+    /// counter check and a cross-replica version floor check.
+    ///
+    /// See [`OrSet::compact_deferred_with_floor`] for detailed semantics.
+    pub fn compact_deferred_with_floor(
+        &mut self,
+        version_floor: &std::collections::HashMap<crate::types::NodeId, u64>,
+        global_floor: Option<u64>,
+    ) {
+        let live_dots: HashSet<&Dot> = self
+            .entries
+            .values()
+            .flat_map(|(dots, _)| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if live_dots.contains(d) {
+                return true;
+            }
+            let locally_dominated = match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter < max_counter,
+                None => false,
+            };
+            if !locally_dominated {
+                return true;
+            }
+            let effective_floor = version_floor.get(&d.node_id).copied().or(global_floor);
+            match effective_floor {
+                Some(floor) => d.counter >= floor,
+                None => true,
+            }
+        });
+    }
+
     /// Return the number of present keys.
     pub fn len(&self) -> usize {
         self.entries
