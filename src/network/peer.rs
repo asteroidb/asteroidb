@@ -125,6 +125,21 @@ impl PeerRegistry {
         Ok(())
     }
 
+    /// Update the address of an existing peer.
+    ///
+    /// Returns `true` if the address was changed, `false` if the peer was
+    /// not found or the address was already up-to-date.
+    pub fn update_address(&mut self, node_id: &NodeId, new_addr: &str) -> bool {
+        if let Some(peer) = self.peers.get_mut(node_id)
+            && peer.addr != new_addr
+        {
+            peer.addr = new_addr.to_string();
+            self.generation += 1;
+            return true;
+        }
+        false
+    }
+
     /// Remove a peer from the registry by its node ID.
     ///
     /// Returns the removed [`PeerConfig`] if it existed, or `None` if it

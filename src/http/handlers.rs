@@ -431,6 +431,12 @@ pub async fn set_placement_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetPlacementPolicyRequest>,
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
+    if req.replica_count < 1 {
+        return Err(ApiError(CrdtError::InvalidArgument(
+            "replica_count must be at least 1".to_string(),
+        )));
+    }
+
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
     // Build the policy template without a version; the actual version is
@@ -778,16 +784,24 @@ pub async fn internal_join(
 
     let joining_node_id = NodeId(req.node_id.clone());
 
-    // Add the joining node and snapshot peer list under one lock acquisition,
-    // then release the lock before performing blocking I/O.
+    // Add the joining node (or update its address if already known) and
+    // snapshot peer list under one lock acquisition, then release the lock
+    // before performing blocking I/O.
     let (peer_list, persist_snapshot) = {
         let mut registry = peers_registry.lock().await;
-        registry
-            .add_peer(PeerConfig {
-                node_id: joining_node_id.clone(),
-                addr: req.address.clone(),
-            })
-            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+
+        // If the peer already exists, update its address in case it restarted
+        // with a new IP.
+        if registry.get_peer(&joining_node_id).is_some() {
+            registry.update_address(&joining_node_id, &req.address);
+        } else {
+            registry
+                .add_peer(PeerConfig {
+                    node_id: joining_node_id.clone(),
+                    addr: req.address.clone(),
+                })
+                .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+        }
 
         // Snapshot the serialised state while we hold the lock.
         let snapshot = state
@@ -924,8 +938,23 @@ pub async fn internal_announce(
 
     let (result, persist_snapshot) = if req.joining {
         let mut registry = peers_registry.lock().await;
-        // Silently accept if the peer is already known (idempotent).
+        // If the peer is already known, update its address in case it
+        // restarted with a new IP, then return success.
         if registry.get_peer(&announcing_node_id).is_some() {
+            registry.update_address(&announcing_node_id, &req.address);
+            let snapshot = state
+                .peer_persist_path
+                .as_ref()
+                .and_then(|_| serde_json::to_string_pretty(&*registry).ok());
+            drop(registry);
+            // Persist outside the lock if the address changed.
+            if let Some(path) = &state.peer_persist_path
+                && let Some(json) = snapshot
+            {
+                let path = path.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes())).await;
+            }
             return Ok(Json(AnnounceResponse { accepted: true }));
         }
         let result = match registry.add_peer(PeerConfig {
@@ -997,37 +1026,60 @@ pub async fn internal_ping(
         ))
     })?;
 
-    // Reconcile: add any peers from the sender that we don't know about.
+    // Maximum number of new peers that can be added from a single ping
+    // exchange to limit peer-list poisoning.
+    const MAX_NEW_PEERS_PER_PING: usize = 10;
+
+    // Only reconcile peers from the sender's list if the sender is already
+    // a known peer (or is self). This prevents unauthenticated nodes from
+    // injecting arbitrary peers via ping.
+    let sender_nid = NodeId(req.sender_id.clone());
     let peers_changed = {
         let mut registry = peers_registry.lock().await;
         let mut changed = false;
-        for peer_info in &req.known_peers {
-            let peer_nid = NodeId(peer_info.node_id.clone());
-            if registry.get_peer(&peer_nid).is_none() {
-                // Ignore errors (e.g. self-in-peer-list, duplicates).
-                if registry
-                    .add_peer(PeerConfig {
-                        node_id: peer_nid,
-                        addr: peer_info.address.clone(),
-                    })
-                    .is_ok()
-                {
-                    changed = true;
-                }
-            }
-        }
 
-        // Also ensure the sender itself is registered.
-        let sender_nid = NodeId(req.sender_id.clone());
-        if registry.get_peer(&sender_nid).is_none()
-            && registry
-                .add_peer(PeerConfig {
-                    node_id: sender_nid,
-                    addr: req.sender_addr.clone(),
-                })
-                .is_ok()
+        let sender_is_known = registry.get_peer(&sender_nid).is_some()
+            || state.self_node_id.as_ref() == Some(&sender_nid);
+
+        // Always update the sender's address if it changed.
+        if registry.get_peer(&sender_nid).is_some() {
+            if registry.update_address(&sender_nid, &req.sender_addr) {
+                changed = true;
+            }
+        } else if registry
+            .add_peer(PeerConfig {
+                node_id: sender_nid.clone(),
+                addr: req.sender_addr.clone(),
+            })
+            .is_ok()
         {
             changed = true;
+        }
+
+        // Only accept peer list from known senders.
+        if sender_is_known {
+            let mut new_peers_added: usize = 0;
+            for peer_info in &req.known_peers {
+                let peer_nid = NodeId(peer_info.node_id.clone());
+                if registry.get_peer(&peer_nid).is_some() {
+                    // Update address if it changed.
+                    if registry.update_address(&peer_nid, &peer_info.address) {
+                        changed = true;
+                    }
+                } else if new_peers_added < MAX_NEW_PEERS_PER_PING {
+                    // Ignore errors (e.g. self-in-peer-list, duplicates).
+                    if registry
+                        .add_peer(PeerConfig {
+                            node_id: peer_nid,
+                            addr: peer_info.address.clone(),
+                        })
+                        .is_ok()
+                    {
+                        changed = true;
+                        new_peers_added += 1;
+                    }
+                }
+            }
         }
 
         changed

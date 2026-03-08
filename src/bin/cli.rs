@@ -225,11 +225,17 @@ fn cmd_slo(client: &reqwest::blocking::Client, base: &str) {
                         .get("violations")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    let remaining = if total == 0 {
-                        100.0
-                    } else {
-                        (1.0 - violations as f64 / total as f64) * 100.0
-                    };
+                    let remaining = budget
+                        .get("budget_remaining")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or_else(|| {
+                            // Fallback: compute success rate if server omits budget_remaining.
+                            if total == 0 {
+                                100.0
+                            } else {
+                                (1.0 - violations as f64 / total as f64) * 100.0
+                            }
+                        });
                     let status = if remaining < 20.0 {
                         "CRITICAL"
                     } else if remaining < 50.0 {
