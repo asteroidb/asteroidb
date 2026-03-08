@@ -251,6 +251,9 @@ impl EventualApi {
     /// Merge a CRDT value received from a remote node with a pre-assigned HLC.
     ///
     /// Used by delta sync to preserve the original modification timestamp.
+    /// Only updates the change timestamp if the incoming HLC is newer than
+    /// the existing one for that key, preventing an older remote timestamp
+    /// from overwriting a newer local one.
     pub fn merge_remote_with_hlc(
         &mut self,
         key: String,
@@ -259,7 +262,13 @@ impl EventualApi {
     ) -> Result<(), CrdtError> {
         self.clock.update(&hlc);
         self.store.merge_value(key.clone(), remote_value)?;
-        self.store.record_change(&key, hlc);
+        let should_record = match self.store.timestamp_for(&key) {
+            Some(existing) => hlc > *existing,
+            None => true,
+        };
+        if should_record {
+            self.store.record_change(&key, hlc);
+        }
         Ok(())
     }
 

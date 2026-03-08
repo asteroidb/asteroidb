@@ -123,6 +123,9 @@ pub struct CertifiedCacheEntry {
     pub write_timestamp: HlcTimestamp,
 }
 
+/// Maximum number of entries in the certified proof cache before eviction.
+const MAX_CERTIFIED_CACHE: usize = 10_000;
+
 /// Certified consistency API (FR-002, FR-004).
 ///
 /// Provides `get_certified` and `certified_write` operations that integrate
@@ -241,6 +244,20 @@ impl CertifiedApi {
                 write_timestamp: pw.timestamp.clone(),
             },
         );
+
+        // Evict oldest entries when the cache exceeds the size limit.
+        if self.certified_cache.len() > MAX_CERTIFIED_CACHE {
+            let evict_count = self.certified_cache.len() - MAX_CERTIFIED_CACHE;
+            let mut entries: Vec<(String, HlcTimestamp)> = self
+                .certified_cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.write_timestamp.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            for (key, _) in entries.into_iter().take(evict_count) {
+                self.certified_cache.remove(&key);
+            }
+        }
     }
 
     /// Read a key with certification status (FR-002).

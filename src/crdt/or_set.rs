@@ -157,6 +157,37 @@ where
         // Merge deferred (tombstone) sets.
         self.deferred.extend(other.deferred.iter().cloned());
     }
+
+    /// Remove tombstone dots from `deferred` that are already absent from
+    /// all element dot sets AND whose counter is dominated by the known
+    /// counter for that node.
+    ///
+    /// Call this periodically (e.g., after a full sync round completes) to
+    /// bound the growth of the deferred set. A dot `(node_id, counter)` is
+    /// safe to remove when no element references it AND `counter` is below
+    /// the maximum counter we track for that node — meaning any future dot
+    /// for that node will have a strictly higher counter and cannot collide.
+    ///
+    /// **Do not** call this in the middle of a partial sync round; wait
+    /// until all replicas have exchanged state to avoid prematurely
+    /// discarding tombstones that a not-yet-merged replica still needs.
+    pub fn compact_deferred(&mut self) {
+        let live_dots: HashSet<&Dot> = self
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if live_dots.contains(d) {
+                return true;
+            }
+            // Only remove if counter is dominated by the known max for this node.
+            match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter >= max_counter,
+                None => true, // unknown node — keep to be safe
+            }
+        });
+    }
 }
 
 impl<T: Eq + Hash + Clone + Serialize + DeserializeOwned> Default for OrSet<T> {
