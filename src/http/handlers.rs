@@ -433,13 +433,13 @@ pub async fn set_placement_policy(
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    // Read current version from shared namespace.
-    let policy = {
-        let ns = state.namespace.read().unwrap();
-        let current_version = ns.version().0;
-
+    // Build the policy template without a version; the actual version is
+    // assigned atomically inside the namespace write lock below to prevent
+    // concurrent requests from stamping different policies with the same
+    // version number.
+    let build_policy = |version: PolicyVersion| {
         let mut policy = PlacementPolicy::new(
-            PolicyVersion(current_version + 1),
+            version,
             KeyRange {
                 prefix: req.key_range_prefix.clone(),
             },
@@ -467,6 +467,25 @@ pub async fn set_placement_policy(
         policy
     };
 
+    // Validate majority consensus (FR-009) with a provisional version.
+    // The consensus check only validates authority approval, not the version
+    // number, so using a placeholder is safe here.
+    {
+        let provisional = build_policy(PolicyVersion(0));
+        let mut consensus = state.consensus.lock().await;
+        consensus.propose_policy_update(provisional, &approvals)?;
+    }
+
+    // Atomically read the current version, create the policy, and apply it
+    // inside a single write-lock scope to prevent version collisions.
+    let policy = {
+        let mut ns = state.namespace.write().unwrap();
+        let current_version = ns.version().0;
+        let policy = build_policy(PolicyVersion(current_version + 1));
+        ns.set_placement_policy(policy.clone());
+        policy
+    };
+
     let resp = PlacementPolicyResponse {
         key_range_prefix: policy.key_range.prefix.clone(),
         version: policy.version.0,
@@ -476,18 +495,6 @@ pub async fn set_placement_policy(
         allow_local_write_on_partition: policy.allow_local_write_on_partition,
         certified: policy.certified,
     };
-
-    // Validate majority consensus (FR-009).
-    {
-        let mut consensus = state.consensus.lock().await;
-        consensus.propose_policy_update(policy.clone(), &approvals)?;
-    }
-
-    // Apply to shared namespace for read handlers and CertifiedApi.
-    {
-        let mut ns = state.namespace.write().unwrap();
-        ns.set_placement_policy(policy);
-    }
 
     Ok(Json(resp))
 }
@@ -1112,20 +1119,40 @@ pub async fn get_slo(State(state): State<Arc<AppState>>) -> Json<SloSnapshot> {
 // Helpers
 // ---------------------------------------------------------------
 
-/// Write `data` to `path` atomically: write to a sibling `.tmp` file, then
-/// rename. Cleans up the temp file on failure.
+/// Write `data` to `path` atomically: write to a uniquely-named sibling temp
+/// file, fsync, then rename. The unique suffix (pid + counter) avoids temp
+/// file contention when multiple handlers persist concurrently.
 fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let tmp_path = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, data) {
-        return Err(e.to_string());
-    }
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        ".tmp.{}.{}.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        seq,
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+    file.write_all(data).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         // Clean up stranded temp file on rename failure.
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.to_string());
+    }
+    // Fsync the parent directory so the rename is durable.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
