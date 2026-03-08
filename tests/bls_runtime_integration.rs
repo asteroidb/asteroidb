@@ -92,6 +92,7 @@ fn fast_config() -> NodeRunnerConfig {
         gc_interval: Duration::from_secs(60),
         epoch_config: EpochConfig::default(),
         bls_config: None,
+        ..Default::default()
     }
 }
 
@@ -430,6 +431,7 @@ async fn epoch_check_tick_fires_in_run_loop() {
             grace_epochs: 7,
         },
         bls_config: None,
+        ..Default::default()
     };
 
     let mut runner = NodeRunner::new(

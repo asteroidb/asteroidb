@@ -71,6 +71,16 @@ pub struct NodeRunnerConfig {
     /// keypair and registers it in the keyset registry, enabling BLS
     /// certificate mode. When `None`, only Ed25519 certificates are used.
     pub bls_config: Option<BlsConfig>,
+    /// How often to run ack-frontier GC (remove stale entries).
+    /// Default: 60 seconds.
+    pub frontier_gc_interval: Duration,
+    /// Maximum number of old policy versions to retain in the frontier set.
+    /// Entries older than `current_version - max_retained_versions` are
+    /// eligible for GC. Default: 2.
+    pub frontier_gc_max_retained_versions: u64,
+    /// Grace period in seconds after fencing before entries become eligible
+    /// for GC. Default: 300 seconds (5 minutes).
+    pub frontier_gc_grace_period_secs: u64,
 }
 
 impl Default for NodeRunnerConfig {
@@ -86,6 +96,9 @@ impl Default for NodeRunnerConfig {
             gc_interval: Duration::from_secs(60),
             epoch_config: EpochConfig::default(),
             bls_config: None,
+            frontier_gc_interval: Duration::from_secs(60),
+            frontier_gc_max_retained_versions: 2,
+            frontier_gc_grace_period_secs: 300,
         }
     }
 }
@@ -214,6 +227,8 @@ pub struct RunLoopStats {
     pub epoch_check_ticks: u64,
     /// Number of tombstone GC ticks executed.
     pub gc_ticks: u64,
+    /// Number of ack-frontier GC ticks executed.
+    pub frontier_gc_ticks: u64,
 }
 
 impl NodeRunner {
@@ -1039,6 +1054,10 @@ impl NodeRunner {
         );
         let mut gc_interval =
             tokio::time::interval_at(start + self.config.gc_interval, self.config.gc_interval);
+        let mut frontier_gc_interval = tokio::time::interval_at(
+            start + self.config.frontier_gc_interval,
+            self.config.frontier_gc_interval,
+        );
 
         // Sync interval: only create if sync is configured.
         let sync_duration = self
@@ -1092,6 +1111,10 @@ impl NodeRunner {
                 _ = gc_interval.tick() => {
                     self.run_gc().await;
                     stats.gc_ticks += 1;
+                }
+                _ = frontier_gc_interval.tick() => {
+                    self.run_frontier_gc().await;
+                    stats.frontier_gc_ticks += 1;
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
@@ -1724,6 +1747,49 @@ impl NodeRunner {
                     "tombstone GC completed"
                 );
             }
+        }
+    }
+
+    /// Run garbage collection on stale ack-frontier entries.
+    ///
+    /// Determines the maximum current policy version across all authority
+    /// definitions and delegates to [`CertifiedApi::gc_frontier_entries`].
+    async fn run_frontier_gc(&mut self) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut api = self.certified_api.lock().await;
+
+        // Find the maximum policy version across all authority definitions.
+        let max_version = {
+            let ns = api.namespace().read().unwrap();
+            ns.all_authority_definitions()
+                .into_iter()
+                .filter_map(|def| {
+                    ns.get_placement_policy(&def.key_range.prefix)
+                        .map(|p| p.version)
+                })
+                .max()
+                .unwrap_or(PolicyVersion(0))
+        };
+
+        let removed = api.gc_frontier_entries(
+            max_version,
+            self.config.frontier_gc_max_retained_versions,
+            self.config.frontier_gc_grace_period_secs,
+            now_secs,
+        );
+
+        if removed > 0 {
+            tracing::info!(
+                node_id = %self.node_id.0,
+                removed,
+                remaining = api.frontier_count(),
+                current_policy_version = max_version.0,
+                "ack-frontier GC completed"
+            );
         }
     }
 }
