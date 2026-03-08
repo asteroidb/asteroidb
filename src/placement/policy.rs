@@ -105,12 +105,14 @@ impl PlacementPolicy {
 
     /// Returns nodes from the given slice that match this policy, up to
     /// `replica_count`. If fewer eligible nodes exist, returns all of them.
+    ///
+    /// Candidates are sorted by `node_id` before applying the limit so
+    /// that selection is deterministic regardless of input order.
     pub fn select_nodes<'a>(&self, nodes: &'a [Node]) -> Vec<&'a Node> {
-        nodes
-            .iter()
-            .filter(|n| self.matches_node(n))
-            .take(self.replica_count)
-            .collect()
+        let mut candidates: Vec<&Node> = nodes.iter().filter(|n| self.matches_node(n)).collect();
+        candidates.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        candidates.truncate(self.replica_count);
+        candidates
     }
 
     /// Returns `true` if the number of matching nodes is at least

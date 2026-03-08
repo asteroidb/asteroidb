@@ -303,14 +303,21 @@ impl MembershipClient {
 
     /// Reconcile a received peer list with the local registry.
     ///
+    /// Updates addresses of known peers if changed, and adds unknown peers
+    /// up to a limit of 10 per call to prevent peer-list poisoning.
+    ///
     /// Returns the number of newly added peers.
     async fn reconcile_peers(&self, remote_peers: &[PeerInfo]) -> usize {
+        const MAX_NEW_PEERS: usize = 10;
         let mut registry = self.peer_registry.lock().await;
         let mut added = 0;
 
         for peer_info in remote_peers {
             let peer_nid = NodeId(peer_info.node_id.clone());
-            if registry.get_peer(&peer_nid).is_none()
+            if registry.get_peer(&peer_nid).is_some() {
+                // Update address if it changed (e.g. peer restarted with new IP).
+                registry.update_address(&peer_nid, &peer_info.address);
+            } else if added < MAX_NEW_PEERS
                 && registry
                     .add_peer(PeerConfig {
                         node_id: peer_nid,
