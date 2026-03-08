@@ -262,13 +262,15 @@ impl EventualApi {
     ) -> Result<(), CrdtError> {
         self.clock.update(&hlc);
         self.store.merge_value(key.clone(), remote_value)?;
-        let should_record = match self.store.timestamp_for(&key) {
-            Some(existing) => hlc > *existing,
-            None => true,
+        // Always record the change using the maximum of the incoming HLC
+        // and any existing timestamp for this key. This ensures that
+        // merges are never silently dropped from the change log, which
+        // would cause delta-sync peers to miss updates.
+        let record_hlc = match self.store.timestamp_for(&key) {
+            Some(existing) if *existing > hlc => existing.clone(),
+            _ => hlc,
         };
-        if should_record {
-            self.store.record_change(&key, hlc);
-        }
+        self.store.record_change(&key, record_hlc);
         Ok(())
     }
 
