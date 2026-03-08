@@ -86,6 +86,7 @@ async fn spawn_node_with_latency(
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: Some(peer_registry),
         peer_persist_path: None,
+        namespace_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
         self_node_id: Some(node_id(name)),

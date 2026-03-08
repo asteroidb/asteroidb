@@ -71,7 +71,27 @@ async fn main() {
 
     let auth_nodes = authority_nodes();
 
-    let mut ns = SystemNamespace::new();
+    // Determine persistence directory (used for peer registry, store snapshots,
+    // and system namespace persistence).
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("ASTEROIDB_DATA_DIR").unwrap_or_else(|_| "./data".into()),
+    );
+
+    let ns_persist_path = data_dir.join("system_namespace.json");
+    let mut ns = match SystemNamespace::load(&ns_persist_path) {
+        Ok(Some(loaded)) => {
+            println!("Loaded system namespace from {}", ns_persist_path.display(),);
+            loaded
+        }
+        Ok(None) => SystemNamespace::new(),
+        Err(e) => {
+            eprintln!(
+                "warning: failed to load system namespace from {}: {e}; starting fresh",
+                ns_persist_path.display(),
+            );
+            SystemNamespace::new()
+        }
+    };
     ns.set_authority_definition(AuthorityDefinition {
         key_range: KeyRange {
             prefix: String::new(),
@@ -91,11 +111,6 @@ async fn main() {
         node_id.clone(),
         Arc::clone(&namespace),
     )));
-
-    // Determine persistence directory for peer registry.
-    let data_dir = std::path::PathBuf::from(
-        std::env::var("ASTEROIDB_DATA_DIR").unwrap_or_else(|_| "./data".into()),
-    );
     let peer_persist_path = PeerRegistry::persist_path(&data_dir);
 
     // Share a single EventualApi between HTTP handlers and NodeRunner
@@ -177,6 +192,7 @@ async fn main() {
         metrics: Arc::clone(&metrics),
         peers: Some(Arc::clone(&shared_peers)),
         peer_persist_path: Some(peer_persist_path),
+        namespace_persist_path: Some(ns_persist_path.clone()),
         consensus,
         internal_token: internal_token.clone(),
         self_node_id: Some(node_id.clone()),
@@ -319,6 +335,15 @@ async fn main() {
             let leave_count = shutdown_membership_client.fan_out_leave().await;
             if leave_count > 0 {
                 println!("Fan-out leave acknowledged by {leave_count} peers");
+            }
+            // Persist system namespace before stopping.
+            {
+                let ns = namespace.read().unwrap();
+                if let Err(e) = ns.save(&ns_persist_path) {
+                    eprintln!("warning: failed to save system namespace on shutdown: {e}");
+                } else {
+                    println!("System namespace saved to {}", ns_persist_path.display());
+                }
             }
             let _ = shutdown_handle.send(true);
         }

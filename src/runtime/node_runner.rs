@@ -928,12 +928,20 @@ impl NodeRunner {
     /// a different value.
     fn cluster_fingerprint(nodes: &[Node]) -> u64 {
         use std::collections::hash_map::DefaultHasher;
-        let mut ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
-        ids.sort_unstable();
+        let mut sorted: Vec<&Node> = nodes.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
         let mut hasher = DefaultHasher::new();
-        ids.len().hash(&mut hasher);
-        for id in ids {
-            id.hash(&mut hasher);
+        sorted.len().hash(&mut hasher);
+        for node in sorted {
+            node.id.0.hash(&mut hasher);
+            node.mode.hash(&mut hasher);
+            // Sort tags for deterministic hashing regardless of HashSet order.
+            let mut tags: Vec<&str> = node.tags.iter().map(|t| t.0.as_str()).collect();
+            tags.sort_unstable();
+            tags.len().hash(&mut hasher);
+            for tag in tags {
+                tag.hash(&mut hasher);
+            }
         }
         hasher.finish()
     }
@@ -1182,6 +1190,8 @@ impl NodeRunner {
                 cleaned = event.cleaned_versions.len(),
                 "epoch rotation completed"
             );
+            self.metrics
+                .record_key_rotation_at(event.new_version.0, now_ms);
         }
     }
 

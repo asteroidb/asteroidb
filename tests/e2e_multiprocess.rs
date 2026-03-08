@@ -69,6 +69,7 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         metrics: Arc::new(RuntimeMetrics::default()),
         peers: None,
         peer_persist_path: None,
+        namespace_persist_path: None,
         consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
         internal_token: None,
         self_node_id: None,
