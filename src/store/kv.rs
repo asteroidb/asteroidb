@@ -280,7 +280,7 @@ impl Store {
                     .map(|v| (key.clone(), v.clone(), ts.clone()))
             })
             .collect();
-        result.sort_by(|a, b| a.2.cmp(&b.2));
+        result.sort_unstable_by(|a, b| a.2.cmp(&b.2));
         result
     }
 

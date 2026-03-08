@@ -127,11 +127,12 @@ where
             let dots = self.elements.entry(elem.clone()).or_default();
 
             // Add dots from other that we haven't tombstoned.
-            for dot in other_dots {
-                if !self.deferred.contains(dot) {
-                    dots.insert(dot.clone());
-                }
-            }
+            dots.extend(
+                other_dots
+                    .iter()
+                    .filter(|dot| !self.deferred.contains(dot))
+                    .cloned(),
+            );
 
             // Remove our dots that the other has tombstoned.
             dots.retain(|dot| !other.deferred.contains(dot));
@@ -150,15 +151,11 @@ where
         // Merge counters so future dots stay globally unique.
         for (node_id, &other_counter) in &other.counters {
             let counter = self.counters.entry(node_id.clone()).or_insert(0);
-            if other_counter > *counter {
-                *counter = other_counter;
-            }
+            *counter = (*counter).max(other_counter);
         }
 
         // Merge deferred (tombstone) sets.
-        for dot in &other.deferred {
-            self.deferred.insert(dot.clone());
-        }
+        self.deferred.extend(other.deferred.iter().cloned());
     }
 }
 

@@ -174,10 +174,9 @@ impl AckFrontierSet {
 
     /// Check whether a (key_range, policy_version) pair has been fenced.
     pub fn is_version_fenced(&self, range: &KeyRange, version: &PolicyVersion) -> bool {
-        self.fenced_versions.contains(&FencedVersion {
-            key_range: range.clone(),
-            policy_version: *version,
-        })
+        self.fenced_versions
+            .iter()
+            .any(|fv| fv.key_range == *range && fv.policy_version == *version)
     }
 
     /// Get the frontier for a specific authority by `NodeId`.
