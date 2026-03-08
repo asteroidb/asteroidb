@@ -21,6 +21,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "asteroidb-cli"
@@ -28,4 +29,16 @@ path = "src/bin/cli.rs"
 
 [[bench]]
 name = "sync_benchmark"
+harness = false
+
+[[bench]]
+name = "crdt_bench"
+harness = false
+
+[[bench]]
+name = "store_bench"
+harness = false
+
+[[bench]]
+name = "certified_bench"
 harness = false
