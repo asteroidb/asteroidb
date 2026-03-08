@@ -216,6 +216,30 @@ pub const DEFAULT_BATCH_SIZE: usize = 100;
 /// the bandwidth savings.
 pub const MAX_DELTA_PAYLOAD_BYTES: usize = 512 * 1024; // 512 KiB
 
+/// Default change rate threshold for triggering full sync fallback.
+///
+/// When the ratio `changed_keys / total_keys` exceeds this value during
+/// delta sync, the delta payload is nearly as large as a full dump, so
+/// the system falls back to pushing the full state instead.
+pub const DEFAULT_FULL_SYNC_THRESHOLD: f64 = 0.5;
+
+/// Check whether the change rate exceeds the threshold for full sync fallback.
+///
+/// Returns `true` when `changed_keys / total_keys > threshold`, indicating
+/// that delta sync loses its advantage and full sync should be used.
+/// Returns `false` when `total_keys` is zero (empty store, no fallback needed).
+pub fn should_fallback_to_full_sync(
+    changed_keys: usize,
+    total_keys: usize,
+    threshold: f64,
+) -> bool {
+    if total_keys == 0 {
+        return false;
+    }
+    let rate = changed_keys as f64 / total_keys as f64;
+    rate > threshold
+}
+
 /// Tracks per-peer delta frontiers for efficient delta sync.
 ///
 /// Maintains the last-acknowledged HLC frontier for each peer, enabling
@@ -1100,5 +1124,64 @@ mod tests {
     fn frontier_tracker_default() {
         let tracker = PeerFrontierTracker::default();
         assert_eq!(tracker.peer_count(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Full sync fallback threshold tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fallback_low_change_rate_returns_false() {
+        // 10 changed out of 100 total = 10% < 50% threshold
+        assert!(!super::should_fallback_to_full_sync(10, 100, 0.5));
+    }
+
+    #[test]
+    fn fallback_at_threshold_returns_false() {
+        // Exactly at 50% threshold should NOT trigger fallback (> not >=)
+        assert!(!super::should_fallback_to_full_sync(50, 100, 0.5));
+    }
+
+    #[test]
+    fn fallback_above_threshold_returns_true() {
+        // 51 changed out of 100 total = 51% > 50% threshold
+        assert!(super::should_fallback_to_full_sync(51, 100, 0.5));
+    }
+
+    #[test]
+    fn fallback_all_keys_changed_returns_true() {
+        // 100% change rate > any threshold < 1.0
+        assert!(super::should_fallback_to_full_sync(100, 100, 0.5));
+    }
+
+    #[test]
+    fn fallback_empty_store_returns_false() {
+        // Empty store should never trigger fallback
+        assert!(!super::should_fallback_to_full_sync(0, 0, 0.5));
+    }
+
+    #[test]
+    fn fallback_zero_changes_returns_false() {
+        // No changes should never trigger fallback
+        assert!(!super::should_fallback_to_full_sync(0, 100, 0.5));
+    }
+
+    #[test]
+    fn fallback_custom_threshold_low() {
+        // With a 20% threshold, 25 out of 100 should trigger
+        assert!(super::should_fallback_to_full_sync(25, 100, 0.2));
+        assert!(!super::should_fallback_to_full_sync(15, 100, 0.2));
+    }
+
+    #[test]
+    fn fallback_custom_threshold_high() {
+        // With a 90% threshold, only very high rates should trigger
+        assert!(!super::should_fallback_to_full_sync(89, 100, 0.9));
+        assert!(super::should_fallback_to_full_sync(91, 100, 0.9));
+    }
+
+    #[test]
+    fn fallback_default_threshold_constant() {
+        assert!((super::DEFAULT_FULL_SYNC_THRESHOLD - 0.5).abs() < f64::EPSILON);
     }
 }

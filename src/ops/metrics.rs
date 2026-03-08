@@ -271,6 +271,15 @@ pub struct RuntimeMetrics {
     /// Cumulative count of delta-fail -> full-sync fallback events.
     pub sync_fallback_total: AtomicU64,
 
+    /// Cumulative number of delta syncs performed (push phase).
+    pub delta_sync_count: AtomicU64,
+
+    /// Cumulative number of full sync fallbacks triggered by high change rate.
+    ///
+    /// When the ratio of changed keys to total keys exceeds the configured
+    /// threshold, delta sync is skipped and full state is pushed instead.
+    pub full_sync_fallback_count: AtomicU64,
+
     /// Cumulative number of rebalance operations started.
     pub rebalance_start_total: AtomicU64,
 
@@ -322,6 +331,8 @@ impl Default for RuntimeMetrics {
             sync_failure_total: AtomicU64::default(),
             sync_attempt_total: AtomicU64::default(),
             sync_fallback_total: AtomicU64::default(),
+            delta_sync_count: AtomicU64::default(),
+            full_sync_fallback_count: AtomicU64::default(),
             rebalance_start_total: AtomicU64::default(),
             rebalance_keys_migrated: AtomicU64::default(),
             rebalance_keys_failed: AtomicU64::default(),
@@ -365,6 +376,19 @@ impl RuntimeMetrics {
         }
         let failures = self.sync_failure_total.load(Ordering::Relaxed);
         failures as f64 / attempts as f64
+    }
+
+    /// Get the ratio of full sync fallbacks to total delta syncs (0.0 to 1.0).
+    ///
+    /// Returns 0.0 when no syncs have been performed yet.
+    pub fn full_sync_fallback_ratio(&self) -> f64 {
+        let delta = self.delta_sync_count.load(Ordering::Relaxed);
+        let full = self.full_sync_fallback_count.load(Ordering::Relaxed);
+        let total = delta + full;
+        if total == 0 {
+            return 0.0;
+        }
+        full as f64 / total as f64
     }
 
     /// Record a successful sync operation for a specific peer.
@@ -499,6 +523,9 @@ impl RuntimeMetrics {
             key_rotation_last_version: self.key_rotation_last_version.load(Ordering::Relaxed),
             key_rotation_last_time_ms: self.key_rotation_last_time_ms.load(Ordering::Relaxed),
             write_ops_total: self.write_ops_total.load(Ordering::Relaxed),
+            delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
+            full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
+            full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
         }
     }
 }
@@ -566,6 +593,12 @@ pub struct MetricsSnapshot {
     pub key_rotation_last_time_ms: u64,
     /// Cumulative write operations (eventual + certified) for compaction tracking.
     pub write_ops_total: u64,
+    /// Cumulative number of delta syncs performed (push phase).
+    pub delta_sync_count: u64,
+    /// Cumulative number of full sync fallbacks triggered by high change rate.
+    pub full_sync_fallback_count: u64,
+    /// Ratio of full sync fallbacks to total syncs (0.0 to 1.0).
+    pub full_sync_fallback_ratio: f64,
 }
 
 #[cfg(test)]
@@ -917,5 +950,63 @@ mod tests {
         assert!(json.contains("\"node-1\""));
         assert!(json.contains("\"certification_latency_window\""));
         assert!(json.contains("\"sample_count\":1"));
+    }
+
+    // ---------------------------------------------------------------
+    // Delta/full sync fallback metrics tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn full_sync_fallback_ratio_zero_when_no_syncs() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.full_sync_fallback_ratio(), 0.0);
+    }
+
+    #[test]
+    fn full_sync_fallback_ratio_all_delta() {
+        let m = RuntimeMetrics::default();
+        m.delta_sync_count.store(10, Ordering::Relaxed);
+        m.full_sync_fallback_count.store(0, Ordering::Relaxed);
+        assert_eq!(m.full_sync_fallback_ratio(), 0.0);
+    }
+
+    #[test]
+    fn full_sync_fallback_ratio_all_full() {
+        let m = RuntimeMetrics::default();
+        m.delta_sync_count.store(0, Ordering::Relaxed);
+        m.full_sync_fallback_count.store(5, Ordering::Relaxed);
+        assert_eq!(m.full_sync_fallback_ratio(), 1.0);
+    }
+
+    #[test]
+    fn full_sync_fallback_ratio_mixed() {
+        let m = RuntimeMetrics::default();
+        m.delta_sync_count.store(7, Ordering::Relaxed);
+        m.full_sync_fallback_count.store(3, Ordering::Relaxed);
+        assert!((m.full_sync_fallback_ratio() - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_includes_delta_full_sync_counts() {
+        let m = RuntimeMetrics::default();
+        m.delta_sync_count.store(42, Ordering::Relaxed);
+        m.full_sync_fallback_count.store(8, Ordering::Relaxed);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.delta_sync_count, 42);
+        assert_eq!(snap.full_sync_fallback_count, 8);
+        assert!((snap.full_sync_fallback_ratio - 0.16).abs() < 0.01);
+
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"delta_sync_count\":42"));
+        assert!(json.contains("\"full_sync_fallback_count\":8"));
+        assert!(json.contains("\"full_sync_fallback_ratio\":"));
+    }
+
+    #[test]
+    fn delta_sync_count_defaults_to_zero() {
+        let m = RuntimeMetrics::default();
+        assert_eq!(m.delta_sync_count.load(Ordering::Relaxed), 0);
+        assert_eq!(m.full_sync_fallback_count.load(Ordering::Relaxed), 0);
     }
 }
