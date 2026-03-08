@@ -78,9 +78,19 @@ pub struct CompactionEngine {
     revalidation_log: Vec<(HlcTimestamp, RevalidationTrigger)>,
     /// Optional adaptive tuning configuration.
     adaptive_config: Option<AdaptiveCompactionConfig>,
+    /// Timestamp (ms since epoch) when this engine was created, used as the
+    /// base for the time threshold when no prior checkpoint exists.
+    created_at_ms: u64,
 }
 
 impl CompactionEngine {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     /// Create a new compaction engine with the given configuration.
     pub fn new(config: CompactionConfig) -> Self {
         Self {
@@ -90,6 +100,7 @@ impl CompactionEngine {
             ops_count: HashMap::new(),
             revalidation_log: Vec::new(),
             adaptive_config: None,
+            created_at_ms: Self::now_ms(),
         }
     }
 
@@ -108,6 +119,7 @@ impl CompactionEngine {
             ops_count: HashMap::new(),
             revalidation_log: Vec::new(),
             adaptive_config: Some(adaptive),
+            created_at_ms: Self::now_ms(),
         }
     }
 
@@ -174,6 +186,10 @@ impl CompactionEngine {
     ///
     /// Returns `true` if either the operations count threshold or the time
     /// threshold has been reached since the last checkpoint.
+    ///
+    /// When no prior checkpoint exists and at least one operation has been
+    /// recorded, the time threshold is evaluated against the engine's
+    /// creation time to ensure the first checkpoint is eventually created.
     pub fn should_checkpoint(&self, key_range: &KeyRange, now: &HlcTimestamp) -> bool {
         let prefix = &key_range.prefix;
 
@@ -186,6 +202,14 @@ impl CompactionEngine {
         // Check time threshold
         if let Some(cp) = self.checkpoints.get(prefix) {
             let elapsed = now.physical.saturating_sub(cp.timestamp.physical);
+            if elapsed >= self.config.time_threshold_ms {
+                return true;
+            }
+        } else if ops > 0 {
+            // No prior checkpoint exists but there are pending ops.
+            // Use the engine creation time as the base so the first
+            // checkpoint is created once the time threshold elapses.
+            let elapsed = now.physical.saturating_sub(self.created_at_ms);
             if elapsed >= self.config.time_threshold_ms {
                 return true;
             }

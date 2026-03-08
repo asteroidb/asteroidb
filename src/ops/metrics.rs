@@ -295,6 +295,12 @@ pub struct RuntimeMetrics {
     /// Timestamp (ms) of the last key rotation (0 if none).
     pub key_rotation_last_time_ms: AtomicU64,
 
+    /// Cumulative write operations (eventual + certified) for compaction tracking.
+    ///
+    /// Incremented in HTTP write handlers and drained by the compaction engine
+    /// during periodic checkpoint checks.
+    pub write_ops_total: AtomicU64,
+
     /// Per-peer sync statistics (peer_id -> stats).
     peer_sync_stats: Mutex<HashMap<String, PeerSyncStats>>,
 
@@ -324,6 +330,7 @@ impl Default for RuntimeMetrics {
             key_rotation_total: AtomicU64::default(),
             key_rotation_last_version: AtomicU64::default(),
             key_rotation_last_time_ms: AtomicU64::default(),
+            write_ops_total: AtomicU64::default(),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
             window_duration: Duration::from_secs(WINDOW_SECS),
@@ -491,6 +498,7 @@ impl RuntimeMetrics {
             key_rotation_total: self.key_rotation_total.load(Ordering::Relaxed),
             key_rotation_last_version: self.key_rotation_last_version.load(Ordering::Relaxed),
             key_rotation_last_time_ms: self.key_rotation_last_time_ms.load(Ordering::Relaxed),
+            write_ops_total: self.write_ops_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -556,6 +564,8 @@ pub struct MetricsSnapshot {
     pub key_rotation_last_version: u64,
     /// Timestamp (ms) of the last key rotation (0 if none).
     pub key_rotation_last_time_ms: u64,
+    /// Cumulative write operations (eventual + certified) for compaction tracking.
+    pub write_ops_total: u64,
 }
 
 #[cfg(test)]

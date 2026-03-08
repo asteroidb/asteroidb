@@ -380,12 +380,12 @@ async fn node_leave_removes_from_registry() {
 }
 
 // ===========================================================================
-// Test 3: Duplicate join is rejected
+// Test 3: Duplicate join updates address (idempotent)
 // ===========================================================================
 
-/// Attempting to join with the same node_id twice should fail.
+/// Joining with the same node_id twice should succeed and update the address.
 #[tokio::test]
-async fn duplicate_join_is_rejected() {
+async fn duplicate_join_updates_address() {
     let (_state1, addr1, server1) = spawn_node_with_peers("dup-node-1", vec![]).await;
     let (_state2, addr2, server2) = spawn_node_with_peers("dup-node-2", vec![]).await;
 
@@ -409,18 +409,38 @@ async fn duplicate_join_is_rejected() {
         .unwrap();
     assert!(resp.status().is_success(), "first join should succeed");
 
-    // Second join with same node_id: should fail.
+    // Second join with same node_id but a different address: should succeed
+    // (idempotent) and update the address.
+    let new_address = "127.0.0.1:19999".to_string();
+    let join_req2 = JoinRequest {
+        node_id: "dup-node-2".to_string(),
+        address: new_address.clone(),
+        tags: vec![],
+    };
+
     let resp = client
         .post(format!("http://{}/api/internal/join", addr1))
         .header("content-type", "application/json")
-        .json(&join_req)
+        .json(&join_req2)
         .send()
         .await
         .unwrap();
     assert!(
-        resp.status().is_client_error(),
-        "duplicate join should fail: {}",
+        resp.status().is_success(),
+        "duplicate join should succeed (idempotent): {}",
         resp.status()
+    );
+
+    let join_resp: JoinResponse = resp.json().await.unwrap();
+    // Verify the peer list contains dup-node-2 with the updated address.
+    let dup_peer = join_resp
+        .peers
+        .iter()
+        .find(|p| p.node_id == "dup-node-2")
+        .expect("dup-node-2 should be in peer list");
+    assert_eq!(
+        dup_peer.address, new_address,
+        "address should be updated to the new value"
     );
 
     // Clean up.

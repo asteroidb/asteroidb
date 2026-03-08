@@ -61,7 +61,13 @@ impl Hlc {
             self.physical = wall;
             self.logical = 0;
         } else {
-            self.logical += 1;
+            self.logical = self.logical.saturating_add(1);
+            // If the logical counter saturated, advance the physical
+            // timestamp by 1 ms and reset logical to preserve monotonicity.
+            if self.logical == u32::MAX {
+                self.physical = self.physical.saturating_add(1);
+                self.logical = 0;
+            }
         }
 
         HlcTimestamp {
@@ -75,25 +81,37 @@ impl Hlc {
     ///
     /// Takes the maximum of the local physical time, the received physical time,
     /// and the current wall clock, then adjusts the logical counter accordingly.
+    ///
+    /// Uses saturating arithmetic to prevent overflow when a peer sends
+    /// `logical: u32::MAX`. When saturation is detected the physical
+    /// timestamp is advanced by 1 ms and the logical counter is reset to 0,
+    /// preserving strict monotonicity.
     pub fn update(&mut self, received: &HlcTimestamp) {
         let wall = physical_ms();
         let max_physical = wall.max(self.physical).max(received.physical);
 
         if max_physical == self.physical && max_physical == received.physical {
             // All three equal (or wall <= both): advance logical beyond both.
-            self.logical = self.logical.max(received.logical) + 1;
+            self.logical = self.logical.max(received.logical).saturating_add(1);
         } else if max_physical == self.physical {
             // Local physical is ahead: just bump logical.
-            self.logical += 1;
+            self.logical = self.logical.saturating_add(1);
         } else if max_physical == received.physical {
             // Received physical is ahead: adopt its logical + 1.
-            self.logical = received.logical + 1;
+            self.logical = received.logical.saturating_add(1);
         } else {
             // Wall clock is ahead of both: reset logical.
             self.logical = 0;
         }
 
         self.physical = max_physical;
+
+        // If the logical counter saturated, advance the physical timestamp
+        // by 1 ms and reset logical to preserve strict monotonicity.
+        if self.logical == u32::MAX {
+            self.physical = self.physical.saturating_add(1);
+            self.logical = 0;
+        }
     }
 }
 

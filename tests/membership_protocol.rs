@@ -414,12 +414,28 @@ async fn announce_join_is_idempotent() {
 }
 
 /// Test ping endpoint directly: sender provides peers, receiver returns its list.
+///
+/// The ping handler only reconciles peers from known senders, so node-2
+/// must be pre-registered as a peer of node-1 before the ping request.
 #[tokio::test]
 async fn ping_endpoint_exchanges_peer_lists() {
     let (state1, addr1, _h1) = spawn_node("node-1", vec![]).await;
 
     // node-1 has no peers initially.
     assert_eq!(peer_count(&state1).await, 0);
+
+    // Pre-register node-2 as a known peer of node-1 so the ping handler
+    // treats it as a trusted sender and reconciles the peer list.
+    {
+        let mut registry = state1.peers.as_ref().unwrap().lock().await;
+        registry
+            .add_peer(PeerConfig {
+                node_id: node_id("node-2"),
+                addr: "127.0.0.1:4001".into(),
+            })
+            .unwrap();
+    }
+    assert_eq!(peer_count(&state1).await, 1);
 
     let client = reqwest::Client::new();
 
@@ -449,7 +465,7 @@ async fn ping_endpoint_exchanges_peer_lists() {
     // node-1's response should include the sender and any newly learned peers.
     assert!(!ping_resp.known_peers.is_empty());
 
-    // Verify node-1 learned about node-2 and node-3.
+    // Verify node-1 learned about node-3 from node-2's peer list.
     let ids = peer_ids(&state1).await;
     assert!(ids.contains(&"node-2".to_string()), "should know node-2");
     assert!(ids.contains(&"node-3".to_string()), "should know node-3");
