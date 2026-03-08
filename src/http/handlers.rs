@@ -120,6 +120,11 @@ pub async fn eventual_write(
         }
     }
 
+    state
+        .metrics
+        .write_ops_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     Ok(Json(WriteResponse { ok: true }))
 }
 
@@ -169,6 +174,11 @@ pub async fn certified_write(
 
     let mut api = state.certified.lock().await;
     let status = api.certified_write(req.key, crdt_value, on_timeout)?;
+
+    state
+        .metrics
+        .write_ops_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     Ok(Json(CertifiedWriteResponse { status }))
 }

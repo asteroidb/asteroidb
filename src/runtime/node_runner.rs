@@ -1627,6 +1627,11 @@ impl NodeRunner {
     async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
+        // Drain write ops recorded by HTTP handlers and feed them into the
+        // compaction engine so that the ops-based checkpoint threshold works
+        // in production.
+        let pending_ops = self.metrics.write_ops_total.swap(0, Ordering::Relaxed);
+
         let api = self.certified_api.lock().await;
         let ns = api.namespace().read().unwrap();
 
@@ -1636,6 +1641,20 @@ impl NodeRunner {
             .into_iter()
             .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
             .collect();
+
+        // Distribute drained write ops across key ranges. With a single
+        // key range (common case) all ops go to it; with multiple ranges
+        // each gets an equal share (approximation).
+        if pending_ops > 0 && !defs.is_empty() {
+            let ops_per_range = pending_ops / defs.len() as u64;
+            let remainder = pending_ops % defs.len() as u64;
+            for (i, (key_range, _)) in defs.iter().enumerate() {
+                let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
+                for _ in 0..ops {
+                    self.compaction_engine.record_op(key_range);
+                }
+            }
+        }
 
         for (key_range, _total_authorities) in &defs {
             if self.compaction_engine.should_checkpoint(key_range, &now) {
