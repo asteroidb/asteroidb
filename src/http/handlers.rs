@@ -3,8 +3,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::response::Response;
 use tokio::sync::Mutex;
+
+use super::codec::{deserialize_internal, internal_response};
 
 use crate::api::certified::{CertifiedApi, OnTimeout};
 use crate::api::eventual::EventualApi;
@@ -289,8 +294,15 @@ pub async fn get_certification_status(
 /// `AckFrontierSet`. Monotonicity is enforced by `AckFrontierSet::update()`.
 pub async fn post_internal_frontiers(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<crate::network::frontier_sync::FrontierPushRequest>,
-) -> Json<crate::network::frontier_sync::FrontierPushResponse> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: crate::network::frontier_sync::FrontierPushRequest =
+        deserialize_internal(&body, content_type)?;
+
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for frontier in req.frontiers {
@@ -298,7 +310,8 @@ pub async fn post_internal_frontiers(
             accepted += 1;
         }
     }
-    Json(crate::network::frontier_sync::FrontierPushResponse { accepted })
+    let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
+    internal_response(&resp, accept)
 }
 
 /// `GET /api/internal/frontiers`
@@ -306,10 +319,14 @@ pub async fn post_internal_frontiers(
 /// Returns all frontiers currently tracked by this node.
 pub async fn get_internal_frontiers(
     State(state): State<Arc<AppState>>,
-) -> Json<crate::network::frontier_sync::FrontierPullResponse> {
+    headers: HeaderMap,
+) -> Result<Response, super::codec::SerializationError> {
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
     let api = state.certified.lock().await;
     let frontiers = api.all_frontiers().into_iter().cloned().collect();
-    Json(crate::network::frontier_sync::FrontierPullResponse { frontiers })
+    let resp = crate::network::frontier_sync::FrontierPullResponse { frontiers };
+    internal_response(&resp, accept)
 }
 
 // ---------------------------------------------------------------
@@ -704,8 +721,14 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
 /// local eventual store using `merge_remote`.
 pub async fn internal_sync(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SyncRequest>,
-) -> Json<SyncResponse> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: SyncRequest = deserialize_internal(&body, content_type)?;
+
     let mut api = state.eventual.lock().await;
     let mut merged = 0;
     let mut errors = Vec::new();
@@ -722,7 +745,8 @@ pub async fn internal_sync(
         }
     }
 
-    Json(SyncResponse { merged, errors })
+    let resp = SyncResponse { merged, errors };
+    internal_response(&resp, accept)
 }
 
 /// `GET /api/internal/keys`
@@ -731,7 +755,12 @@ pub async fn internal_sync(
 /// store's current frontier HLC. Used by remote peers for pull-based
 /// anti-entropy sync. The frontier allows the requester to correctly
 /// initialise its peer frontier tracking after a full sync.
-pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpResponse> {
+pub async fn internal_keys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, super::codec::SerializationError> {
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
     let api = state.eventual.lock().await;
     let store = api.store();
     let mut entries = std::collections::HashMap::new();
@@ -750,11 +779,12 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
     }
     let frontier = store.current_frontier();
 
-    Json(KeyDumpResponse {
+    let resp = KeyDumpResponse {
         entries,
         frontier,
         timestamps,
-    })
+    };
+    internal_response(&resp, accept)
 }
 
 /// `POST /api/internal/sync/delta`
@@ -764,8 +794,14 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
 /// anti-entropy sync.
 pub async fn internal_delta_sync(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<DeltaSyncRequest>,
-) -> Json<DeltaSyncResponse> {
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: DeltaSyncRequest = deserialize_internal(&body, content_type)?;
+
     let api = state.eventual.lock().await;
     let store = api.store();
 
@@ -777,10 +813,11 @@ pub async fn internal_delta_sync(
 
     let sender_frontier = store.current_frontier();
 
-    Json(DeltaSyncResponse {
+    let resp = DeltaSyncResponse {
         entries,
         sender_frontier,
-    })
+    };
+    internal_response(&resp, accept)
 }
 
 // ---------------------------------------------------------------
