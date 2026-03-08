@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -246,9 +247,34 @@ impl CertificationTracker {
     }
 
     /// Save the tracker to a file as JSON.
+    ///
+    /// Uses atomic write (temp file + fsync + rename + dir fsync) to ensure
+    /// crash safety. Matches the pattern in `SystemNamespace::save`.
     pub fn save(&self, path: &Path) -> Result<(), io::Error> {
+        let parent = path.parent();
+        if let Some(p) = parent {
+            std::fs::create_dir_all(p)?;
+        }
+
+        let tmp = path.with_file_name(format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+        ));
         let json = self.to_json()?;
-        std::fs::write(path, json)
+
+        let mut file = File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+
+        if let Some(p) = parent
+            && let Ok(dir) = File::open(p)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     /// Load a tracker from a JSON file.
