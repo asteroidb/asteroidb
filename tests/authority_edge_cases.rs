@@ -606,3 +606,213 @@ async fn concurrent_add_with_runner_frontier() {
     let writes = api_lock.pending_writes();
     assert!(!writes.is_empty());
 }
+
+// ===========================================================================
+// Test 10: Partition during authority change and subsequent convergence
+// ===========================================================================
+
+#[tokio::test]
+async fn partition_during_authority_change_then_converge() {
+    // 3 authorities: auth-1, auth-2, auth-3
+    // Simulate partition: auth-3 cannot communicate (no frontier acks from auth-3).
+    // During partition, change authority set (add auth-4, remove auth-3).
+    // Resolve partition and verify convergence.
+
+    let mut ns = SystemNamespace::new();
+    let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
+    ns.set_placement_policy(policy);
+    ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-3"]));
+
+    let shared_ns = wrap_ns(ns);
+
+    // Create separate CertifiedApi instances simulating separate nodes.
+    let mut api_1 = CertifiedApi::new(node_id("auth-1"), shared_ns.clone());
+    let mut api_2 = CertifiedApi::new(node_id("auth-2"), shared_ns.clone());
+    let mut api_3 = CertifiedApi::new(node_id("auth-3"), shared_ns.clone());
+
+    // Phase 1: Write under the original 3-node authority set.
+    api_1
+        .certified_write(
+            "partition-key-1".into(),
+            counter_value(1),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+    api_2
+        .certified_write(
+            "partition-key-2".into(),
+            counter_value(2),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+    api_3
+        .certified_write(
+            "partition-key-3".into(),
+            counter_value(3),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+
+    // All writes should be pending initially.
+    assert_eq!(api_1.pending_writes().len(), 1);
+    assert_eq!(api_2.pending_writes().len(), 1);
+    assert_eq!(api_3.pending_writes().len(), 1);
+
+    // Phase 2: Simulate partition — auth-1 and auth-2 can communicate,
+    // but auth-3 is isolated. Feed frontier acks only from auth-1 and auth-2.
+    let far_hlc = ts(u64::MAX - 1, u32::MAX, "zzz");
+    let placement_pv = PolicyVersion(1);
+
+    // auth-1 hears from auth-1 and auth-2 (but NOT auth-3)
+    for auth in &["auth-1", "auth-2"] {
+        api_1.update_frontier(AckFrontier {
+            authority_id: node_id(auth),
+            frontier_hlc: far_hlc.clone(),
+            key_range: kr(""),
+            policy_version: placement_pv,
+            digest_hash: String::new(),
+        });
+    }
+    // auth-2 hears from auth-1 and auth-2
+    for auth in &["auth-1", "auth-2"] {
+        api_2.update_frontier(AckFrontier {
+            authority_id: node_id(auth),
+            frontier_hlc: far_hlc.clone(),
+            key_range: kr(""),
+            policy_version: placement_pv,
+            digest_hash: String::new(),
+        });
+    }
+    // auth-3 is partitioned — only hears from itself
+    api_3.update_frontier(AckFrontier {
+        authority_id: node_id("auth-3"),
+        frontier_hlc: far_hlc.clone(),
+        key_range: kr(""),
+        policy_version: placement_pv,
+        digest_hash: String::new(),
+    });
+
+    // Process certifications: auth-1 and auth-2 have majority (2 of 3),
+    // auth-3 does not (1 of 3).
+    api_1.process_certifications();
+    api_2.process_certifications();
+    api_3.process_certifications();
+
+    let certified_1 = api_1
+        .pending_writes()
+        .iter()
+        .filter(|pw| pw.status == CertificationStatus::Certified)
+        .count();
+    let certified_2 = api_2
+        .pending_writes()
+        .iter()
+        .filter(|pw| pw.status == CertificationStatus::Certified)
+        .count();
+    let certified_3 = api_3
+        .pending_writes()
+        .iter()
+        .filter(|pw| pw.status == CertificationStatus::Certified)
+        .count();
+
+    assert_eq!(
+        certified_1, 1,
+        "auth-1 should certify with majority (2 of 3)"
+    );
+    assert_eq!(
+        certified_2, 1,
+        "auth-2 should certify with majority (2 of 3)"
+    );
+    assert_eq!(
+        certified_3, 0,
+        "auth-3 (partitioned) should NOT certify with only 1 of 3"
+    );
+
+    // Phase 3: During partition, change the authority set — add auth-4, remove auth-3.
+    {
+        let mut ns = shared_ns.write().unwrap();
+        ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-4"]));
+    }
+
+    // Phase 4: Resolve the partition — auth-3 now gets frontier from the
+    // majority under the new authority set. Create a new API for auth-4.
+    let mut api_4 = CertifiedApi::new(node_id("auth-4"), shared_ns.clone());
+
+    // Write under the new authority set from auth-4.
+    api_4
+        .certified_write(
+            "post-partition-key".into(),
+            counter_value(4),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+
+    // Feed frontier acks from all new authorities (auth-1, auth-2, auth-4).
+    // The new write was issued under the current namespace which now has
+    // auth-1, auth-2, auth-4 as authorities (total=3).
+    for auth in &["auth-1", "auth-2", "auth-4"] {
+        api_4.update_frontier(AckFrontier {
+            authority_id: node_id(auth),
+            frontier_hlc: far_hlc.clone(),
+            key_range: kr(""),
+            policy_version: placement_pv,
+            digest_hash: String::new(),
+        });
+    }
+    api_4.process_certifications();
+
+    let certified_4 = api_4
+        .pending_writes()
+        .iter()
+        .filter(|pw| pw.status == CertificationStatus::Certified)
+        .count();
+    assert_eq!(
+        certified_4, 1,
+        "auth-4's write should be certified under the new authority set"
+    );
+
+    // Phase 5: After partition heals, auth-3's pending write should also be
+    // certifiable once it receives enough frontier acks (2 of 3 from original set).
+    // Feed the missing frontier acks to auth-3.
+    for auth in &["auth-1", "auth-2"] {
+        api_3.update_frontier(AckFrontier {
+            authority_id: node_id(auth),
+            frontier_hlc: far_hlc.clone(),
+            key_range: kr(""),
+            policy_version: placement_pv,
+            digest_hash: String::new(),
+        });
+    }
+    api_3.process_certifications();
+
+    let certified_3_after = api_3
+        .pending_writes()
+        .iter()
+        .filter(|pw| pw.status == CertificationStatus::Certified)
+        .count();
+    assert_eq!(
+        certified_3_after, 1,
+        "auth-3's pre-partition write should certify once partition heals (2 of 3 from original set)"
+    );
+
+    // Verify convergence: all original writes are certified, new authority
+    // set write is certified, and the system is in a consistent state.
+    // The key invariant: no write is in an inconsistent or error state.
+    for (label, api) in [("api_1", &api_1), ("api_2", &api_2), ("api_3", &api_3)] {
+        for pw in api.pending_writes() {
+            assert!(
+                pw.status == CertificationStatus::Certified
+                    || pw.status == CertificationStatus::Pending,
+                "{label}: write status must be Certified or Pending, got {:?}",
+                pw.status
+            );
+        }
+    }
+    for pw in api_4.pending_writes() {
+        assert!(
+            pw.status == CertificationStatus::Certified
+                || pw.status == CertificationStatus::Pending,
+            "api_4: write status must be Certified or Pending, got {:?}",
+            pw.status
+        );
+    }
+}

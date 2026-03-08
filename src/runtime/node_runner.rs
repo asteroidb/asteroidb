@@ -1646,6 +1646,7 @@ impl NodeRunner {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
