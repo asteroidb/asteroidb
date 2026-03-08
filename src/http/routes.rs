@@ -160,6 +160,11 @@ mod tests {
             latency_model: None,
             cluster_nodes: None,
             slo_tracker: Arc::new(crate::ops::slo::SloTracker::new()),
+            keyset_registry: Some(Arc::new(RwLock::new(
+                crate::authority::certificate::KeysetRegistry::new(),
+            ))),
+            epoch_config: crate::authority::certificate::EpochConfig::default(),
+            current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1328,7 +1333,9 @@ mod tests {
 
     #[tokio::test]
     async fn verify_proof_valid() {
-        use crate::authority::certificate::{create_certificate_message, sign_message};
+        use crate::authority::certificate::{
+            KeysetVersion, create_certificate_message, sign_message,
+        };
         use crate::http::types::VerifyProofResponse;
         use crate::types::PolicyVersion;
         use ed25519_dalek::SigningKey;
@@ -1348,12 +1355,14 @@ mod tests {
 
         let auth_ids = ["auth-1", "auth-2", "auth-3"];
         let mut sigs_json = Vec::new();
+        let mut registry_keys = Vec::new();
         for auth_id in &auth_ids {
             let sk = SigningKey::generate(&mut OsRng);
             let vk = sk.verifying_key();
             let sig = sign_message(&sk, &message);
             let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
             let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            registry_keys.push((NodeId(auth_id.to_string()), vk));
             sigs_json.push(serde_json::json!({
                 "authority_id": auth_id,
                 "public_key": pk_hex,
@@ -1374,7 +1383,15 @@ mod tests {
             }
         });
 
+        // Build state with a keyset registry containing the test keys.
         let state = test_state();
+        {
+            let registry_lock = state.keyset_registry.as_ref().unwrap();
+            let mut registry = registry_lock.write().unwrap();
+            registry
+                .register_keyset(KeysetVersion(1), 0, registry_keys)
+                .unwrap();
+        }
         let app = router(state);
 
         let req = Request::builder()

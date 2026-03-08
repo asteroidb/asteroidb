@@ -38,27 +38,34 @@ pub struct VerificationResult {
 pub fn verify_proof(bundle: &ProofBundle) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
 
-    // Deduplicate contributing authorities before counting.
-    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
-        bundle.contributing_authorities.iter().collect();
-    let contributing_count = unique_authorities.len();
-
-    let has_majority = contributing_count >= required;
-
     // A proof without a certificate is always invalid — a caller could
     // fabricate a "valid" proof by simply listing enough authority IDs.
-    let signatures_valid = match bundle.certificate.as_ref() {
+    let (contributing_count, signatures_valid) = match bundle.certificate.as_ref() {
         Some(cert) => {
             let message = create_certificate_message(
                 &bundle.key_range,
                 &bundle.frontier_hlc,
                 &bundle.policy_version,
             );
-            Some(cert.verify_signatures(&message).is_ok())
+            match cert.verify_signatures(&message) {
+                Ok(verified_signers) => (verified_signers.len(), Some(true)),
+                Err(_) => {
+                    // Derive count from the unsigned list only as a fallback
+                    // for the response; the proof is invalid regardless.
+                    let unique: std::collections::HashSet<&crate::types::NodeId> =
+                        bundle.contributing_authorities.iter().collect();
+                    (unique.len(), Some(false))
+                }
+            }
         }
-        None => None,
+        None => {
+            let unique: std::collections::HashSet<&crate::types::NodeId> =
+                bundle.contributing_authorities.iter().collect();
+            (unique.len(), None)
+        }
     };
 
+    let has_majority = contributing_count >= required;
     let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
@@ -88,34 +95,36 @@ pub fn verify_proof_with_registry(
 ) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
 
-    // Deduplicate contributing authorities before counting.
-    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
-        bundle.contributing_authorities.iter().collect();
-    let contributing_count = unique_authorities.len();
-
-    let has_majority = contributing_count >= required;
-
     // A proof without a certificate is always invalid.
-    let signatures_valid = match bundle.certificate.as_ref() {
+    let (contributing_count, signatures_valid) = match bundle.certificate.as_ref() {
         Some(cert) => {
             let message = create_certificate_message(
                 &bundle.key_range,
                 &bundle.frontier_hlc,
                 &bundle.policy_version,
             );
-            Some(
-                cert.verify_signatures_with_registry(
-                    &message,
-                    registry,
-                    current_epoch,
-                    epoch_config,
-                )
-                .is_ok(),
-            )
+            match cert.verify_signatures_with_registry(
+                &message,
+                registry,
+                current_epoch,
+                epoch_config,
+            ) {
+                Ok(verified_signers) => (verified_signers.len(), Some(true)),
+                Err(_) => {
+                    let unique: std::collections::HashSet<&crate::types::NodeId> =
+                        bundle.contributing_authorities.iter().collect();
+                    (unique.len(), Some(false))
+                }
+            }
         }
-        None => None,
+        None => {
+            let unique: std::collections::HashSet<&crate::types::NodeId> =
+                bundle.contributing_authorities.iter().collect();
+            (unique.len(), None)
+        }
     };
 
+    let has_majority = contributing_count >= required;
     let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
@@ -140,14 +149,7 @@ pub fn verify_proof_with_registry_detailed(
 ) -> Result<VerificationResult, CertError> {
     let required = bundle.total_authorities / 2 + 1;
 
-    // Deduplicate contributing authorities before counting.
-    let unique_authorities: std::collections::HashSet<&crate::types::NodeId> =
-        bundle.contributing_authorities.iter().collect();
-    let contributing_count = unique_authorities.len();
-
-    let has_majority = contributing_count >= required;
-
-    let signatures_valid = if let Some(cert) = &bundle.certificate {
+    let (contributing_count, signatures_valid) = if let Some(cert) = &bundle.certificate {
         let message = create_certificate_message(
             &bundle.key_range,
             &bundle.frontier_hlc,
@@ -156,13 +158,16 @@ pub fn verify_proof_with_registry_detailed(
         let result =
             cert.verify_signatures_with_registry(&message, registry, current_epoch, epoch_config);
         match result {
-            Ok(_) => Some(true),
+            Ok(verified_signers) => (verified_signers.len(), Some(true)),
             Err(e) => return Err(e),
         }
     } else {
-        None
+        let unique: std::collections::HashSet<&crate::types::NodeId> =
+            bundle.contributing_authorities.iter().collect();
+        (unique.len(), None)
     };
 
+    let has_majority = contributing_count >= required;
     let valid = has_majority && signatures_valid == Some(true);
 
     Ok(VerificationResult {

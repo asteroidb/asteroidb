@@ -3,6 +3,7 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use subtle::ConstantTimeEq;
 
 /// Axum middleware that validates Bearer token authentication.
 ///
@@ -22,7 +23,9 @@ pub async fn require_bearer_token(
 
     match auth_header {
         Some(header) => match header.strip_prefix("Bearer ") {
-            Some(token) if token == expected_token => next.run(request).await,
+            Some(token) if token.as_bytes().ct_eq(expected_token.as_bytes()).into() => {
+                next.run(request).await
+            }
             _ => StatusCode::UNAUTHORIZED.into_response(),
         },
         None => StatusCode::UNAUTHORIZED.into_response(),
