@@ -281,7 +281,8 @@ fn authority_set_reconstruction_after_policy_change() {
     ];
 
     // Initial policy: require dc:tokyo, version 1
-    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 2)
+    // replica_count=3 so all matching nodes are selected (n1, n2, n4).
+    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 3)
         .with_required_tags(tags(&["dc:tokyo"]))
         .with_certified(true);
 
@@ -338,7 +339,7 @@ fn policy_change_adds_tag_requirement_shrinks_authority_set() {
     ];
 
     // v1: only dc:tokyo required → all 3 match
-    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 2)
+    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 3)
         .with_required_tags(tags(&["dc:tokyo"]));
     assert_eq!(policy_v1.select_nodes(&nodes).len(), 3);
     assert!(policy_v1.is_satisfied(&nodes));
@@ -645,7 +646,7 @@ fn forbidden_tags_dynamically_added_excludes_node() {
     ];
 
     // v1: no forbidden tags → all 3 selected
-    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 2)
+    let policy_v1 = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 3)
         .with_required_tags(tags(&["dc:tokyo"]));
     assert_eq!(policy_v1.select_nodes(&nodes).len(), 3);
 
