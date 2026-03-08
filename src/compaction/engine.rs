@@ -335,6 +335,46 @@ impl CompactionEngine {
     pub fn request_manual_revalidation(&mut self, now: HlcTimestamp) {
         self.trigger_revalidation(RevalidationTrigger::Manual, now);
     }
+
+    /// Run a full compaction cycle for a key range:
+    /// 1. Create a checkpoint (if the threshold is met).
+    /// 2. Check compaction eligibility (majority of authorities past the checkpoint).
+    /// 3. Prune old operation-log timestamps from the store.
+    ///
+    /// Returns the number of timestamp entries pruned, or 0 if compaction
+    /// was not eligible or no checkpoint existed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_compaction(
+        &mut self,
+        key_range: &KeyRange,
+        now: HlcTimestamp,
+        digest_hash: String,
+        policy_version: PolicyVersion,
+        frontiers: &AckFrontierSet,
+        total_authorities: usize,
+        store: &mut crate::store::kv::Store,
+    ) -> usize {
+        let prefix = &key_range.prefix;
+
+        // Step 1: create checkpoint if threshold is reached.
+        if self.should_checkpoint(key_range, &now) {
+            self.create_checkpoint(key_range.clone(), now.clone(), digest_hash, policy_version);
+        }
+
+        // Step 2: check if compaction is safe (majority of authorities are past
+        // the checkpoint frontier).
+        if !self.is_compactable(prefix, frontiers, total_authorities) {
+            return 0;
+        }
+
+        // Step 3: prune old timestamps from the store up to the checkpoint frontier.
+        let checkpoint = match self.checkpoints.get(prefix) {
+            Some(cp) => cp.clone(),
+            None => return 0,
+        };
+
+        store.prune_timestamps_before(prefix, &checkpoint.timestamp)
+    }
 }
 
 #[cfg(test)]
@@ -958,5 +998,120 @@ mod tests {
             engine.adaptive_config().unwrap().effective().ops_threshold,
             5_000
         );
+    }
+
+    // ---------------------------------------------------------------
+    // run_compaction tests (#253)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn run_compaction_creates_checkpoint_and_prunes() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 3,
+        });
+        let kr = make_key_range("user/");
+
+        // Record enough ops to trigger checkpoint.
+        for _ in 0..5 {
+            engine.record_op(&kr);
+        }
+
+        // Build a store with timestamps.
+        let mut store = crate::store::kv::Store::new();
+        let counter = crate::crdt::pn_counter::PnCounter::new();
+        store.put(
+            "user/a".into(),
+            crate::store::kv::CrdtValue::Counter(counter.clone()),
+        );
+        store.record_change("user/a", make_ts(50, 0, "n"));
+        store.put(
+            "user/b".into(),
+            crate::store::kv::CrdtValue::Counter(counter.clone()),
+        );
+        store.record_change("user/b", make_ts(200, 0, "n"));
+
+        // Build frontiers: all 3 authorities past t=100.
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 200, "user/"));
+        frontiers.update(make_frontier("auth-2", 300, "user/"));
+        frontiers.update(make_frontier("auth-3", 150, "user/"));
+
+        let pruned = engine.run_compaction(
+            &kr,
+            make_ts(100, 0, "node-a"),
+            "digest-100".into(),
+            PolicyVersion(1),
+            &frontiers,
+            3,
+            &mut store,
+        );
+
+        // Checkpoint at t=100; user/a (ts=50) should be pruned, user/b (ts=200) kept.
+        assert_eq!(pruned, 1);
+        assert!(engine.get_checkpoint("user/").is_some());
+    }
+
+    #[test]
+    fn run_compaction_not_eligible_returns_zero() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 3,
+        });
+        let kr = make_key_range("user/");
+
+        for _ in 0..5 {
+            engine.record_op(&kr);
+        }
+
+        let mut store = crate::store::kv::Store::new();
+        let counter = crate::crdt::pn_counter::PnCounter::new();
+        store.put(
+            "user/a".into(),
+            crate::store::kv::CrdtValue::Counter(counter),
+        );
+        store.record_change("user/a", make_ts(50, 0, "n"));
+
+        // Frontiers behind the checkpoint — not eligible.
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 10, "user/"));
+        frontiers.update(make_frontier("auth-2", 20, "user/"));
+        frontiers.update(make_frontier("auth-3", 30, "user/"));
+
+        let pruned = engine.run_compaction(
+            &kr,
+            make_ts(100, 0, "node-a"),
+            "digest-100".into(),
+            PolicyVersion(1),
+            &frontiers,
+            3,
+            &mut store,
+        );
+
+        assert_eq!(pruned, 0);
+        // Checkpoint should still have been created.
+        assert!(engine.get_checkpoint("user/").is_some());
+    }
+
+    #[test]
+    fn run_compaction_no_checkpoint_returns_zero() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        let mut store = crate::store::kv::Store::new();
+        let frontiers = AckFrontierSet::new();
+
+        // No ops recorded, no checkpoint => 0.
+        let pruned = engine.run_compaction(
+            &kr,
+            make_ts(100, 0, "node-a"),
+            "digest-100".into(),
+            PolicyVersion(1),
+            &frontiers,
+            3,
+            &mut store,
+        );
+
+        assert_eq!(pruned, 0);
     }
 }

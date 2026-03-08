@@ -13,6 +13,7 @@ use crate::authority::certificate::{EpochConfig, EpochManager};
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
+use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
@@ -60,6 +61,9 @@ pub struct NodeRunnerConfig {
     /// How often to check for epoch boundaries and perform key rotation.
     /// Default: 60 seconds.
     pub epoch_check_interval: Duration,
+    /// How often to run tombstone GC on CRDT deferred sets.
+    /// Default: 60 seconds.
+    pub gc_interval: Duration,
     /// Epoch configuration for key rotation (FR-008).
     /// Default: 24h epoch duration, 7 grace epochs.
     pub epoch_config: EpochConfig,
@@ -79,6 +83,7 @@ impl Default for NodeRunnerConfig {
             sync_interval: Some(Duration::from_secs(2)),
             ping_interval: Some(Duration::from_secs(10)),
             epoch_check_interval: Duration::from_secs(60),
+            gc_interval: Duration::from_secs(60),
             epoch_config: EpochConfig::default(),
             bls_config: None,
         }
@@ -162,6 +167,11 @@ pub struct NodeRunner {
     /// produce BLS signatures and enable `DualModeCertificate` with
     /// `CertificateMode::Bls` instead of Ed25519-only certificates.
     bls_keypair: Option<BlsKeypair>,
+    /// Tombstone garbage collector for CRDT deferred sets.
+    ///
+    /// Periodically removes safely-reclaimable tombstone dots from
+    /// `OrSet` and `OrMap` values in the store, bounding memory growth.
+    tombstone_gc: TombstoneGc,
     /// Shared latency model for recording RTT measurements to peers.
     ///
     /// Updated after every successful sync or ping interaction. The same
@@ -202,6 +212,8 @@ pub struct RunLoopStats {
     pub ping_ticks: u64,
     /// Number of epoch check ticks executed.
     pub epoch_check_ticks: u64,
+    /// Number of tombstone GC ticks executed.
+    pub gc_ticks: u64,
 }
 
 impl NodeRunner {
@@ -281,6 +293,7 @@ impl NodeRunner {
             None
         };
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
+        let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -306,6 +319,7 @@ impl NodeRunner {
             tracked_policies,
             epoch_manager,
             bls_keypair,
+            tombstone_gc,
             latency_model: None,
             topology_view: None,
         }
@@ -368,6 +382,7 @@ impl NodeRunner {
         };
 
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
+        let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             clock: Hlc::new(node_id.0.clone()),
@@ -394,6 +409,7 @@ impl NodeRunner {
             tracked_policies,
             epoch_manager,
             bls_keypair,
+            tombstone_gc,
             latency_model: None,
             topology_view: None,
         }
@@ -1021,6 +1037,8 @@ impl NodeRunner {
             start + self.config.epoch_check_interval,
             self.config.epoch_check_interval,
         );
+        let mut gc_interval =
+            tokio::time::interval_at(start + self.config.gc_interval, self.config.gc_interval);
 
         // Sync interval: only create if sync is configured.
         let sync_duration = self
@@ -1070,6 +1088,10 @@ impl NodeRunner {
                 _ = epoch_interval.tick() => {
                     self.check_epoch_rotation();
                     stats.epoch_check_ticks += 1;
+                }
+                _ = gc_interval.tick() => {
+                    self.run_gc().await;
+                    stats.gc_ticks += 1;
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
@@ -1672,6 +1694,34 @@ impl NodeRunner {
                     now.clone(),
                     digest,
                     policy_version,
+                );
+            }
+        }
+    }
+
+    /// Run tombstone GC on the eventual store (if available).
+    ///
+    /// Acquires the store lock, runs `gc_tombstones()` on all CRDT values,
+    /// and logs the number of tombstones collected.
+    async fn run_gc(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if !self.tombstone_gc.should_run(now_ms) {
+            return;
+        }
+
+        if let Some(ref eventual_api) = self.eventual_api {
+            let mut api = eventual_api.lock().await;
+            let collected = self.tombstone_gc.gc_tombstones(api.store_mut(), now_ms);
+            if collected > 0 {
+                tracing::info!(
+                    node_id = %self.node_id.0,
+                    collected,
+                    total = self.tombstone_gc.total_collected(),
+                    "tombstone GC completed"
                 );
             }
         }

@@ -291,6 +291,14 @@ impl EventualApi {
     pub fn store(&self) -> &Store {
         &self.store
     }
+
+    /// Return a mutable reference to the underlying `Store`.
+    ///
+    /// Needed by tombstone GC and compaction to modify CRDT deferred sets
+    /// and prune change-tracking timestamps in-place.
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
 }
 
 #[cfg(test)]
