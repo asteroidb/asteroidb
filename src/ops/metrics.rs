@@ -57,7 +57,7 @@ pub fn collect_latencies(name: &str, durations: &[Duration]) -> BenchmarkResult 
         .iter()
         .map(|d| d.as_secs_f64() * 1_000_000.0)
         .collect();
-    us_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    us_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let n = us_values.len();
     let sum: f64 = us_values.iter().sum();
@@ -167,7 +167,7 @@ impl PeerSyncStats {
             let sum: f64 = active.iter().sum();
             let mean = sum / active.len() as f64;
             let mut sorted = active;
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let p99 = percentile(&sorted, 99.0);
             (mean, p99)
         };
@@ -228,7 +228,7 @@ impl CertificationLatencyWindow {
         let sum: f64 = active.iter().sum();
         let mean = sum / active.len() as f64;
         let mut sorted = active.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p99 = percentile(&sorted, 99.0);
 
         CertificationLatencySnapshot {
