@@ -949,10 +949,17 @@ pub fn create_certificate_message(
     policy_version: &PolicyVersion,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(key_range.prefix.as_bytes());
+    // Length-prefix variable-length fields to ensure canonical encoding.
+    let prefix_bytes = key_range.prefix.as_bytes();
+    buf.extend_from_slice(&(prefix_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(prefix_bytes);
+    // Fixed-size fields need no length prefix.
     buf.extend_from_slice(&frontier_hlc.physical.to_be_bytes());
     buf.extend_from_slice(&frontier_hlc.logical.to_be_bytes());
-    buf.extend_from_slice(frontier_hlc.node_id.as_bytes());
+    // Length-prefix the variable-length node_id.
+    let node_id_bytes = frontier_hlc.node_id.as_bytes();
+    buf.extend_from_slice(&(node_id_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(node_id_bytes);
     buf.extend_from_slice(&policy_version.0.to_be_bytes());
     buf
 }

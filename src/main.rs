@@ -174,6 +174,9 @@ async fn main() {
         latency_model: Some(Arc::clone(&shared_latency_model)),
         cluster_nodes: Some(Arc::clone(&shared_cluster_nodes)),
         slo_tracker: Arc::clone(&slo_tracker),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     let app = router(state);

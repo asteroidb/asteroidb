@@ -72,6 +72,9 @@ async fn two_node_anti_entropy_convergence() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Build state for node 2.
@@ -93,6 +96,9 @@ async fn two_node_anti_entropy_convergence() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Write some data to node 1.
@@ -280,6 +286,9 @@ async fn pull_based_sync() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     {
@@ -344,6 +353,9 @@ async fn sync_endpoint_partial_failure() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Pre-populate with a counter at "k".
@@ -443,6 +455,9 @@ async fn three_node_convergence_via_sync() {
             latency_model: None,
             cluster_nodes: None,
             slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+            keyset_registry: None,
+            epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+            current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         states.push(state);
     }
@@ -558,6 +573,9 @@ async fn internal_keys_endpoint() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     {
@@ -631,6 +649,9 @@ async fn full_sync_records_remote_frontier_not_local() {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Write data to the remote node.

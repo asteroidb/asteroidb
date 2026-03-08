@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::api::certified::{CertifiedApi, OnTimeout};
 use crate::api::eventual::EventualApi;
+use crate::authority::certificate::{EpochConfig, KeysetRegistry};
 use crate::control_plane::consensus::ControlPlaneConsensus;
 use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use crate::crdt::pn_counter::PnCounter;
@@ -65,6 +66,14 @@ pub struct AppState {
     pub cluster_nodes: Option<Arc<std::sync::RwLock<Vec<crate::node::Node>>>>,
     /// SLO tracker for budget monitoring.
     pub slo_tracker: Arc<SloTracker>,
+    /// Keyset registry for registry-based proof verification.
+    /// When `Some`, the `/api/certified/verify` endpoint uses
+    /// registry-based verification instead of trusting caller-supplied keys.
+    pub keyset_registry: Option<Arc<std::sync::RwLock<KeysetRegistry>>>,
+    /// Epoch configuration for keyset expiry checks.
+    pub epoch_config: EpochConfig,
+    /// Current epoch, used for keyset expiry checks during verification.
+    pub current_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ---------------------------------------------------------------
@@ -545,12 +554,21 @@ pub async fn get_version_history(
 /// Accepts a proof bundle and returns the verification result.
 /// External clients can use this to independently verify that a
 /// proof bundle represents genuine Authority consensus.
-pub async fn verify_proof(Json(req): Json<VerifyProofRequest>) -> Json<VerifyProofResponse> {
+pub async fn verify_proof(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerifyProofRequest>,
+) -> Result<Json<VerifyProofResponse>, (axum::http::StatusCode, String)> {
     use crate::api::certified::ProofBundle;
     use crate::authority::certificate::{AuthoritySignature, KeysetVersion, MajorityCertificate};
     use crate::authority::verifier;
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+    // Registry-based verification is required; reject if no registry is configured.
+    let registry_lock = state.keyset_registry.as_ref().ok_or((
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "keyset registry not configured; cannot verify proofs".to_string(),
+    ))?;
 
     let key_range = KeyRange {
         prefix: req.key_range_prefix,
@@ -598,14 +616,23 @@ pub async fn verify_proof(Json(req): Json<VerifyProofRequest>) -> Json<VerifyPro
         certificate,
     };
 
-    let result = verifier::verify_proof(&bundle);
+    let registry = registry_lock.read().unwrap();
+    let current_epoch = state
+        .current_epoch
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let result = verifier::verify_proof_with_registry(
+        &bundle,
+        &registry,
+        current_epoch,
+        &state.epoch_config,
+    );
 
-    Json(VerifyProofResponse {
+    Ok(Json(VerifyProofResponse {
         valid: result.valid,
         has_majority: result.has_majority,
         contributing_count: result.contributing_count,
         required_count: result.required_count,
-    })
+    }))
 }
 
 /// Decode a hex string into a 32-byte array. Returns `None` on failure.
