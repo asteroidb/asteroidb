@@ -156,6 +156,8 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/certified/{key}` | Certified read (ステータス付き) |
 | `GET` | `/api/status/{key}` | 認証ステータス確認 |
 | `GET` | `/api/metrics` | ランタイムメトリクス取得 |
+| `GET` | `/api/slo` | SLO ステータス取得 |
+| `GET` | `/api/topology` | クラスタトポロジービュー取得 |
 | `PUT` | `/api/control-plane/authorities` | Authority 定義の設定 (要過半数承認) |
 | `GET` | `/api/control-plane/authorities` | Authority 定義の一覧 |
 | `GET` | `/api/control-plane/authorities/{prefix}` | Authority 定義の取得 |
@@ -177,6 +179,8 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/internal/keys` | キー一覧取得 |
 | `POST` | `/api/internal/join` | ノード参加 |
 | `POST` | `/api/internal/leave` | ノード離脱 |
+| `POST` | `/api/internal/announce` | ノードアナウンス |
+| `POST` | `/api/internal/ping` | ヘルスチェック + ピアディスカバリ |
 
 #### Control Plane API
 
@@ -196,6 +200,8 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | メソッド | パス | 説明 |
 |---------|------|------|
 | `GET` | `/api/metrics` | メトリクス取得 |
+| `GET` | `/api/slo` | SLO ステータス取得 |
+| `GET` | `/api/topology` | クラスタトポロジービュー取得 |
 
 ### 3.1 Eventual Read/Write
 

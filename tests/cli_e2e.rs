@@ -98,10 +98,9 @@ async fn spawn_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
             .timeout(Duration::from_millis(200))
             .send()
             .await
+            && resp.status().is_success()
         {
-            if resp.status().is_success() {
-                break;
-            }
+            break;
         }
         if tokio::time::Instant::now() > deadline {
             panic!("server at {addr} did not become ready within 5 s");
