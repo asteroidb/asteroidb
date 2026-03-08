@@ -13,6 +13,13 @@ const DEFAULT_TUNING_INTERVAL_MS: u64 = 30_000;
 /// Default maximum checkpoint history per key range.
 const DEFAULT_MAX_CHECKPOINT_HISTORY: usize = 10;
 
+/// Minimum span (in milliseconds) required for a meaningful rate calculation.
+///
+/// If the actual time span between the oldest in-window entry and `now` is
+/// less than this value, `ops_per_sec` returns 0.0 to avoid wildly inflated
+/// rates from sub-second bursts.
+const MIN_RATE_SPAN_MS: u64 = 1_000;
+
 /// Tracks write operations in a sliding window for a single key range prefix.
 #[derive(Debug, Clone)]
 struct WriteRateBucket {
@@ -76,7 +83,13 @@ impl WriteRateBucket {
 
         match oldest {
             Some(oldest_ts) => {
-                let span_ms = now_ms.saturating_sub(oldest_ts).max(1);
+                let span_ms = now_ms.saturating_sub(oldest_ts);
+                // Avoid inflated rates from very short spans (e.g. single
+                // burst within 1 ms).  Return 0.0 until enough time has
+                // elapsed for a meaningful measurement.
+                if span_ms < MIN_RATE_SPAN_MS {
+                    return 0.0;
+                }
                 let span_secs = span_ms as f64 / 1000.0;
                 total_ops as f64 / span_secs
             }
@@ -703,11 +716,12 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 60_000);
         adaptive.set_tuning_interval_ms(0);
 
-        // Record moderate write rate (inside ops dead zone) to avoid ops adjustment
-        adaptive.record_ops("user/", 500, 100);
+        // Record moderate write rate (inside ops dead zone) with >= 1s span
+        // so the rate is not suppressed by MIN_RATE_SPAN_MS.
+        adaptive.record_ops("user/", 1_000, 100);
 
         // Lag at 5s — inside the dead zone [1000, 15000]
-        let changed = adaptive.tune(1_000, Some(5_000));
+        let changed = adaptive.tune(2_000, Some(5_000));
         assert!(!changed);
         assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
     }
@@ -722,17 +736,18 @@ mod tests {
         let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 60_000);
         adaptive.set_tuning_interval_ms(0);
 
-        // Record moderate write rate (inside ops dead zone) to avoid ops adjustment
-        adaptive.record_ops("user/", 500, 100);
+        // Record moderate write rate (inside ops dead zone) with >= 1s span
+        // so the rate is not suppressed by MIN_RATE_SPAN_MS.
+        adaptive.record_ops("user/", 1_000, 100);
 
-        let changed = adaptive.tune(1_000, Some(2_000));
+        let changed = adaptive.tune(2_000, Some(2_000));
         assert!(!changed);
         assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
 
         // Also at lag=10000 (old high boundary)
         // Record enough ops to keep rate in the dead zone (between 30 and 750).
-        // Window is 60s, entries at (500,100) and (31500,2000).
-        // At t=32000: total=2100, span=31.5s, rate=66.7 ops/sec — in dead zone.
+        // Window is 60s, entries at (1000,100) and (31500,2000).
+        // At t=32000: total=2100, span=31.0s, rate=67.7 ops/sec — in dead zone.
         adaptive.record_ops("user/", 31_500, 2_000);
         let changed = adaptive.tune(32_000, Some(10_000));
         assert!(!changed);

@@ -182,12 +182,42 @@ impl AckFrontierSet {
 
     /// Get the frontier for a specific authority by `NodeId`.
     ///
-    /// Searches all scopes and returns the first match. Suitable for
-    /// single-scope sets or when the authority appears in only one scope.
+    /// Searches all scopes and returns the first match. **Only correct when
+    /// the authority appears in at most one scope.** In multi-scope sets the
+    /// result is non-deterministic because `HashMap::values()` iteration
+    /// order is arbitrary. Prefer [`get_for_scope`] when the scope is known,
+    /// or [`get_scoped`] for a fully-qualified lookup.
+    ///
+    /// A `debug_assert` fires when more than one scope matches in debug
+    /// builds so that callers notice the ambiguity during development.
     pub fn get(&self, authority_id: &NodeId) -> Option<&AckFrontier> {
-        self.frontiers
+        let matches: Vec<&AckFrontier> = self
+            .frontiers
             .values()
-            .find(|f| &f.authority_id == authority_id)
+            .filter(|f| &f.authority_id == authority_id)
+            .collect();
+        debug_assert!(
+            matches.len() <= 1,
+            "get() is ambiguous: authority {:?} appears in {} scopes — use get_for_scope() instead",
+            authority_id,
+            matches.len(),
+        );
+        matches.into_iter().next()
+    }
+
+    /// Get the frontier for an authority within a specific scope defined by
+    /// `key_range` and `policy_version`.
+    ///
+    /// This is the recommended accessor when the set may contain entries for
+    /// multiple scopes.
+    pub fn get_for_scope(
+        &self,
+        key_range: &KeyRange,
+        policy_version: &PolicyVersion,
+        authority_id: &NodeId,
+    ) -> Option<&AckFrontier> {
+        let scope = FrontierScope::new(key_range.clone(), *policy_version, authority_id.clone());
+        self.frontiers.get(&scope)
     }
 
     /// Get the frontier for a fully-scoped key.
@@ -236,7 +266,26 @@ impl AckFrontierSet {
     /// authorities have a frontier `>= t`.
     ///
     /// Returns `None` if fewer than a majority of authorities have reported.
+    ///
+    /// **Warning:** When entries span multiple scopes (key ranges / policy
+    /// versions) the result mixes authority sets and may not be meaningful.
+    /// A `debug_assert` fires in debug builds when more than one distinct
+    /// scope is present. Prefer [`majority_frontier_for_scope`] in
+    /// multi-scope scenarios.
     pub fn majority_frontier(&self, total_authorities: usize) -> Option<&HlcTimestamp> {
+        // Guard: mixing scopes silently produces incorrect majorities.
+        let distinct_scopes: HashSet<(&KeyRange, &PolicyVersion)> = self
+            .frontiers
+            .keys()
+            .map(|s| (&s.key_range, &s.policy_version))
+            .collect();
+        debug_assert!(
+            distinct_scopes.len() <= 1,
+            "majority_frontier() called on multi-scope set ({} scopes) — \
+             use majority_frontier_for_scope() instead",
+            distinct_scopes.len(),
+        );
+
         let majority = total_authorities / 2 + 1;
         if self.frontiers.len() < majority {
             return None;
@@ -860,30 +909,49 @@ mod tests {
     }
 
     #[test]
-    fn get_by_authority_returns_first_match_across_scopes() {
+    fn get_for_scope_returns_correct_entry() {
         let mut set = AckFrontierSet::new();
 
         set.update(make_frontier("auth-1", 100, 0, "user/"));
         set.update(make_frontier("auth-1", 500, 0, "order/"));
 
-        // get() returns some entry for auth-1 (implementation-defined which one)
-        let got = set.get(&NodeId("auth-1".into()));
-        assert!(got.is_some());
-        let got = got.unwrap();
-        assert_eq!(got.authority_id, NodeId("auth-1".into()));
+        // get_for_scope() returns the exact scope's entry
+        let user_f = set
+            .get_for_scope(&kr("user/"), &pv(1), &NodeId("auth-1".into()))
+            .unwrap();
+        assert_eq!(user_f.frontier_hlc.physical, 100);
+
+        let order_f = set
+            .get_for_scope(&kr("order/"), &pv(1), &NodeId("auth-1".into()))
+            .unwrap();
+        assert_eq!(order_f.frontier_hlc.physical, 500);
+
+        // Missing scope returns None
+        assert!(
+            set.get_for_scope(&kr("data/"), &pv(1), &NodeId("auth-1".into()))
+                .is_none()
+        );
     }
 
     #[test]
-    fn mixed_scopes_global_majority_counts_all_entries() {
+    fn mixed_scopes_use_scoped_majority() {
         let mut set = AckFrontierSet::new();
 
-        // 2 entries: auth-1 in user/, auth-1 in order/
+        // 2 entries in separate scopes — use scoped majority instead of
+        // the unscoped variant which now asserts single-scope.
         set.update(make_frontier("auth-1", 100, 0, "user/"));
         set.update(make_frontier("auth-1", 200, 0, "order/"));
 
-        // Global: 2 entries, majority=2 for total=2 → 100
-        let mf = set.majority_frontier(2).unwrap();
-        assert_eq!(mf.physical, 100);
+        // Each scope has 1 entry; majority for total=1 is 1
+        let mf_user = set
+            .majority_frontier_for_scope(&kr("user/"), &pv(1), 1)
+            .unwrap();
+        assert_eq!(mf_user.physical, 100);
+
+        let mf_order = set
+            .majority_frontier_for_scope(&kr("order/"), &pv(1), 1)
+            .unwrap();
+        assert_eq!(mf_order.physical, 200);
     }
 
     #[test]
