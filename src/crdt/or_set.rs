@@ -158,6 +158,13 @@ where
         self.deferred.extend(other.deferred.iter().cloned());
     }
 
+    /// Return the number of dots currently in the tombstone (deferred) set.
+    ///
+    /// Useful for monitoring GC effectiveness.
+    pub fn deferred_len(&self) -> usize {
+        self.deferred.len()
+    }
+
     /// Remove tombstone dots from `deferred` that are already absent from
     /// all element dot sets AND whose counter is dominated by the known
     /// counter for that node.

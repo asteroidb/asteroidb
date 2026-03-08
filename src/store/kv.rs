@@ -355,6 +355,35 @@ impl Store {
     pub fn timestamp_for(&self, key: &str) -> Option<&HlcTimestamp> {
         self.timestamps.get(key)
     }
+
+    /// Remove change-tracking timestamps that are at or before the given
+    /// frontier for keys matching the given prefix.
+    ///
+    /// This is the "log deletion" step of compaction: once a checkpoint has
+    /// been created and confirmed by a majority of authorities, the
+    /// per-key timestamps used for delta sync are no longer needed for
+    /// entries older than the checkpoint. Removing them bounds the memory
+    /// used by the change-tracking metadata.
+    ///
+    /// Returns the number of timestamp entries pruned.
+    pub fn prune_timestamps_before(&mut self, prefix: &str, frontier: &HlcTimestamp) -> usize {
+        let keys_to_prune: Vec<String> = self
+            .timestamps
+            .iter()
+            .filter(|(key, ts)| key.starts_with(prefix) && *ts <= frontier)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let count = keys_to_prune.len();
+        for key in keys_to_prune {
+            self.timestamps.remove(&key);
+        }
+        count
+    }
+
+    /// Return the number of change-tracking timestamps currently stored.
+    pub fn timestamp_count(&self) -> usize {
+        self.timestamps.len()
+    }
 }
 
 impl Default for Store {
@@ -1453,5 +1482,79 @@ mod tests {
 
         let keys = store.keys_with_prefix("abc");
         assert_eq!(keys, vec!["abc", "abcdef"]);
+    }
+
+    // ---------------------------------------------------------------
+    // prune_timestamps_before (#253)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn prune_timestamps_removes_old_entries() {
+        let mut store = Store::new();
+        store.put("user/a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("user/b".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("user/c".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("order/x".into(), CrdtValue::Counter(PnCounter::new()));
+
+        store.record_change("user/a", ts(50, 0, "n"));
+        store.record_change("user/b", ts(100, 0, "n"));
+        store.record_change("user/c", ts(200, 0, "n"));
+        store.record_change("order/x", ts(50, 0, "n"));
+
+        assert_eq!(store.timestamp_count(), 4);
+
+        // Prune user/ entries at or before ts=100.
+        let pruned = store.prune_timestamps_before("user/", &ts(100, 0, "n"));
+        assert_eq!(pruned, 2); // user/a (50) and user/b (100)
+        assert_eq!(store.timestamp_count(), 2); // user/c and order/x remain
+        assert!(store.timestamp_for("user/a").is_none());
+        assert!(store.timestamp_for("user/b").is_none());
+        assert!(store.timestamp_for("user/c").is_some());
+        assert!(store.timestamp_for("order/x").is_some());
+    }
+
+    #[test]
+    fn prune_timestamps_respects_prefix() {
+        let mut store = Store::new();
+        store.put("user/a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("order/a".into(), CrdtValue::Counter(PnCounter::new()));
+
+        store.record_change("user/a", ts(50, 0, "n"));
+        store.record_change("order/a", ts(50, 0, "n"));
+
+        // Only prune "order/" prefix.
+        let pruned = store.prune_timestamps_before("order/", &ts(100, 0, "n"));
+        assert_eq!(pruned, 1);
+        assert!(store.timestamp_for("user/a").is_some());
+        assert!(store.timestamp_for("order/a").is_none());
+    }
+
+    #[test]
+    fn prune_timestamps_empty_store() {
+        let mut store = Store::new();
+        let pruned = store.prune_timestamps_before("user/", &ts(100, 0, "n"));
+        assert_eq!(pruned, 0);
+    }
+
+    #[test]
+    fn prune_timestamps_nothing_to_prune() {
+        let mut store = Store::new();
+        store.put("user/a".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("user/a", ts(200, 0, "n"));
+
+        // Frontier is before the only entry.
+        let pruned = store.prune_timestamps_before("user/", &ts(100, 0, "n"));
+        assert_eq!(pruned, 0);
+        assert_eq!(store.timestamp_count(), 1);
+    }
+
+    #[test]
+    fn timestamp_count_reflects_state() {
+        let mut store = Store::new();
+        assert_eq!(store.timestamp_count(), 0);
+
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "n"));
+        assert_eq!(store.timestamp_count(), 1);
     }
 }

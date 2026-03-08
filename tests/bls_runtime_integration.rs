@@ -89,6 +89,7 @@ fn fast_config() -> NodeRunnerConfig {
         sync_interval: None,
         ping_interval: None,
         epoch_check_interval: Duration::from_millis(10),
+        gc_interval: Duration::from_secs(60),
         epoch_config: EpochConfig::default(),
         bls_config: None,
     }
@@ -423,6 +424,7 @@ async fn epoch_check_tick_fires_in_run_loop() {
         sync_interval: None,
         ping_interval: None,
         epoch_check_interval: Duration::from_millis(10),
+        gc_interval: Duration::from_secs(60),
         epoch_config: EpochConfig {
             duration_secs: 86400,
             grace_epochs: 7,
