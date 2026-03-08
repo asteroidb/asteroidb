@@ -5,5 +5,8 @@ pub mod frontier_reporter;
 pub mod verifier;
 
 pub use ack_frontier::{AckFrontier, AckFrontierSet, FrontierScope};
-pub use certificate::{EpochConfig, EpochManager, KeysetRegistry, KeysetVersion};
+pub use certificate::{
+    CURRENT_FORMAT_VERSION, EpochConfig, EpochManager, FormatVersionConfig, KeysetRegistry,
+    KeysetVersion, SignatureAlgorithm,
+};
 pub use frontier_reporter::FrontierReporter;
