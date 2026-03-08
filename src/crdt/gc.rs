@@ -156,10 +156,7 @@ impl TombstoneGc {
                     CrdtValue::Set(set) => {
                         let before = set.deferred_len();
                         if has_floor {
-                            set.compact_deferred_with_floor(
-                                &self.version_floor,
-                                self.global_floor,
-                            );
+                            set.compact_deferred_with_floor(&self.version_floor, self.global_floor);
                         } else {
                             set.compact_deferred();
                         }
@@ -169,10 +166,7 @@ impl TombstoneGc {
                     CrdtValue::Map(map) => {
                         let before = map.deferred_len();
                         if has_floor {
-                            map.compact_deferred_with_floor(
-                                &self.version_floor,
-                                self.global_floor,
-                            );
+                            map.compact_deferred_with_floor(&self.version_floor, self.global_floor);
                         } else {
                             map.compact_deferred();
                         }

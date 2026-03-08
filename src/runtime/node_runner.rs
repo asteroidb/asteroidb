@@ -16,7 +16,9 @@ use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::membership::MembershipClient;
-use crate::network::sync::{DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient};
+use crate::network::sync::{
+    DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient, should_fallback_to_full_sync,
+};
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
 use crate::ops::slo::{SLO_AUTHORITY_AVAILABILITY, SLO_REPLICATION_CONVERGENCE, SloTracker};
@@ -81,6 +83,13 @@ pub struct NodeRunnerConfig {
     /// Grace period in seconds after fencing before entries become eligible
     /// for GC. Default: 300 seconds (5 minutes).
     pub frontier_gc_grace_period_secs: u64,
+    /// Change rate threshold for falling back to full sync.
+    ///
+    /// When the ratio `changed_keys / total_keys` exceeds this threshold
+    /// during the push phase, delta sync is skipped and the full state is
+    /// pushed to the peer instead, because the delta payload is nearly as
+    /// large as a full dump. Default: 0.5 (50%).
+    pub full_sync_threshold: f64,
 }
 
 impl Default for NodeRunnerConfig {
@@ -99,6 +108,7 @@ impl Default for NodeRunnerConfig {
             frontier_gc_interval: Duration::from_secs(60),
             frontier_gc_max_retained_versions: 2,
             frontier_gc_grace_period_secs: 300,
+            full_sync_threshold: 0.5,
         }
     }
 }
@@ -1329,8 +1339,12 @@ impl NodeRunner {
             }
 
             // --- Push phase: send only changed local keys to peer ---
+            // When the change rate is too high (changed_keys / total_keys > threshold),
+            // delta sync payload approaches full-state size and loses its advantage.
+            // In that case, skip delta and push the full state directly.
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
                 let api = eventual_api.lock().await;
+                let total_keys = api.store().len();
                 // entries_since returns entries sorted by HLC; split into
                 // (key, value) pairs for push and a parallel HLC vec for
                 // frontier tracking, avoiding a second clone of every entry.
@@ -1339,80 +1353,141 @@ impl NodeRunner {
                     crate::store::kv::CrdtValue,
                     crate::hlc::HlcTimestamp,
                 )> = api.store().entries_since(frontier);
-                drop(api);
-
                 let changed_count = entries_with_hlc.len();
-                // Separate HLCs (cheap Copy-like fields) from owned key-value
-                // pairs so push_changed_keys can take ownership without an
-                // extra clone of every CrdtValue.
-                let hlc_vec: Vec<crate::hlc::HlcTimestamp> = entries_with_hlc
-                    .iter()
-                    .map(|(_, _, hlc)| hlc.clone())
-                    .collect();
-                let changed: Vec<(String, crate::store::kv::CrdtValue)> = entries_with_hlc
-                    .into_iter()
-                    .map(|(key, value, _hlc)| (key, value))
-                    .collect();
 
-                if !changed.is_empty() {
-                    let push_result = sync_client
-                        .push_changed_keys(&peer.addr, changed, &self.node_id.0, DEFAULT_BATCH_SIZE)
+                // Compute change rate and decide whether to use delta or full sync.
+                let change_rate = if total_keys > 0 {
+                    changed_count as f64 / total_keys as f64
+                } else {
+                    0.0
+                };
+
+                if should_fallback_to_full_sync(
+                    changed_count,
+                    total_keys,
+                    self.config.full_sync_threshold,
+                ) {
+                    // High change rate: fall back to full state push.
+                    let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                        .store()
+                        .all_entries()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    drop(api);
+
+                    tracing::info!(
+                        peer = %peer.node_id.0,
+                        change_rate = %format!("{:.2}", change_rate),
+                        threshold = %format!("{:.2}", self.config.full_sync_threshold),
+                        changed_keys = changed_count,
+                        total_keys = total_keys,
+                        "change rate exceeds threshold, falling back to full sync push"
+                    );
+
+                    self.metrics
+                        .full_sync_fallback_count
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    let push_count = sync_client
+                        .push_all_keys(all_entries, &self.node_id.0)
                         .await;
 
-                    match push_result {
-                        Ok(pushed) => {
-                            tracing::debug!(
-                                peer = %peer.node_id.0,
-                                pushed_keys = pushed,
-                                total_changed = changed_count,
-                                "delta push succeeded"
-                            );
-                            // Record replication convergence SLO: time from
-                            // entry write (HLC physical) to push completion.
-                            if let Some(slo) = &self.slo_tracker {
-                                let now_ms = self.clock.now().physical;
-                                for hlc in hlc_vec.iter().take(pushed) {
-                                    let convergence_ms = now_ms.saturating_sub(hlc.physical) as f64;
-                                    slo.record_observation(
-                                        SLO_REPLICATION_CONVERGENCE,
-                                        convergence_ms,
-                                    );
+                    if push_count > 0 {
+                        // After a successful full push, advance the frontier to
+                        // the local store's current frontier so the next delta
+                        // sync starts from the right point.
+                        let api = eventual_api.lock().await;
+                        if let Some(current) = api.store().current_frontier() {
+                            self.peer_frontiers.insert(peer_key.clone(), current);
+                        }
+                        drop(api);
+                    }
+                } else {
+                    drop(api);
+
+                    // Normal delta push path.
+                    // Separate HLCs (cheap Copy-like fields) from owned key-value
+                    // pairs so push_changed_keys can take ownership without an
+                    // extra clone of every CrdtValue.
+                    let hlc_vec: Vec<crate::hlc::HlcTimestamp> = entries_with_hlc
+                        .iter()
+                        .map(|(_, _, hlc)| hlc.clone())
+                        .collect();
+                    let changed: Vec<(String, crate::store::kv::CrdtValue)> = entries_with_hlc
+                        .into_iter()
+                        .map(|(key, value, _hlc)| (key, value))
+                        .collect();
+
+                    if !changed.is_empty() {
+                        self.metrics
+                            .delta_sync_count
+                            .fetch_add(1, Ordering::Relaxed);
+
+                        let push_result = sync_client
+                            .push_changed_keys(
+                                &peer.addr,
+                                changed,
+                                &self.node_id.0,
+                                DEFAULT_BATCH_SIZE,
+                            )
+                            .await;
+
+                        match push_result {
+                            Ok(pushed) => {
+                                tracing::debug!(
+                                    peer = %peer.node_id.0,
+                                    pushed_keys = pushed,
+                                    total_changed = changed_count,
+                                    "delta push succeeded"
+                                );
+                                // Record replication convergence SLO: time from
+                                // entry write (HLC physical) to push completion.
+                                if let Some(slo) = &self.slo_tracker {
+                                    let now_ms = self.clock.now().physical;
+                                    for hlc in hlc_vec.iter().take(pushed) {
+                                        let convergence_ms =
+                                            now_ms.saturating_sub(hlc.physical) as f64;
+                                        slo.record_observation(
+                                            SLO_REPLICATION_CONVERGENCE,
+                                            convergence_ms,
+                                        );
+                                    }
+                                }
+                                // Advance peer frontier to the max HLC of the
+                                // pushed batch — NOT current_frontier(), which may
+                                // have advanced past unpushed concurrent writes.
+                                if let Some(max_hlc) = hlc_vec.last() {
+                                    self.peer_frontiers
+                                        .insert(peer_key.clone(), max_hlc.clone());
                                 }
                             }
-                            // Advance peer frontier to the max HLC of the
-                            // pushed batch — NOT current_frontier(), which may
-                            // have advanced past unpushed concurrent writes.
-                            if let Some(max_hlc) = hlc_vec.last() {
-                                self.peer_frontiers
-                                    .insert(peer_key.clone(), max_hlc.clone());
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    error = %e,
+                                    pushed = e.pushed,
+                                    "delta push failed"
+                                );
+                                // On partial failure, advance the frontier only to
+                                // the HLC of the last successfully pushed entry.
+                                // hlc_vec is sorted by HLC, so index
+                                // `pushed - 1` is the last entry that was sent.
+                                if e.pushed > 0
+                                    && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
+                                {
+                                    self.peer_frontiers
+                                        .insert(peer_key.clone(), last_pushed_hlc.clone());
+                                }
+                                // Record failure and move to next peer.
+                                self.peer_backoffs
+                                    .entry(peer_key.clone())
+                                    .or_default()
+                                    .record_failure();
+                                self.metrics
+                                    .sync_failure_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                peer = %peer.node_id.0,
-                                error = %e,
-                                pushed = e.pushed,
-                                "delta push failed"
-                            );
-                            // On partial failure, advance the frontier only to
-                            // the HLC of the last successfully pushed entry.
-                            // hlc_vec is sorted by HLC, so index
-                            // `pushed - 1` is the last entry that was sent.
-                            if e.pushed > 0
-                                && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
-                            {
-                                self.peer_frontiers
-                                    .insert(peer_key.clone(), last_pushed_hlc.clone());
-                            }
-                            // Record failure and move to next peer.
-                            self.peer_backoffs
-                                .entry(peer_key.clone())
-                                .or_default()
-                                .record_failure();
-                            self.metrics
-                                .sync_failure_total
-                                .fetch_add(1, Ordering::Relaxed);
-                            continue;
                         }
                     }
                 }
