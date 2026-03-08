@@ -360,7 +360,7 @@ pub async fn set_authority_definition(
 
     // Validate majority consensus (FR-009).
     {
-        let mut consensus = state.consensus.lock().await;
+        let consensus = state.consensus.lock().await;
         consensus.propose_authority_update(def.clone(), &approvals)?;
     }
 
@@ -478,7 +478,7 @@ pub async fn set_placement_policy(
     // number, so using a placeholder is safe here.
     {
         let provisional = build_policy(PolicyVersion(0));
-        let mut consensus = state.consensus.lock().await;
+        let consensus = state.consensus.lock().await;
         consensus.propose_policy_update(provisional, &approvals)?;
     }
 
@@ -517,9 +517,15 @@ pub async fn remove_policy(
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
     // Validate majority consensus (FR-009).
+    {
+        let consensus = state.consensus.lock().await;
+        consensus.propose_policy_removal(&prefix, &approvals)?;
+    }
+
+    // Apply to shared namespace for read handlers and CertifiedApi.
     let removed = {
-        let mut consensus = state.consensus.lock().await;
-        consensus.propose_policy_removal(&prefix, &approvals)?
+        let mut ns = state.namespace.write().unwrap();
+        ns.remove_placement_policy(&prefix)
     };
 
     let removed = removed.ok_or_else(|| {
@@ -527,12 +533,6 @@ pub async fn remove_policy(
             "placement policy: {prefix}"
         )))
     })?;
-
-    // Apply to shared namespace for read handlers and CertifiedApi.
-    {
-        let mut ns = state.namespace.write().unwrap();
-        ns.remove_placement_policy(&prefix);
-    }
 
     Ok(Json(PlacementPolicyResponse {
         key_range_prefix: removed.key_range.prefix.clone(),

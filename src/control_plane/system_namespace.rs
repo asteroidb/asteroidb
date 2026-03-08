@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -204,13 +206,26 @@ impl SystemNamespace {
     /// Writes to a temporary file first, then atomically renames to ensure
     /// crash safety. If the parent directory does not exist, it is created.
     pub fn save(&self, path: &Path) -> Result<(), PersistError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = path.parent();
+        if let Some(p) = parent {
+            std::fs::create_dir_all(p)?;
         }
         let tmp = path.with_extension("tmp");
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, json)?;
+
+        // Atomic write: write to temp file, fsync, then rename.
+        let mut file = File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, path)?;
+
+        // Fsync the parent directory so the rename is durable.
+        if let Some(p) = parent
+            && let Ok(dir) = File::open(p)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
