@@ -48,6 +48,9 @@ pub struct AppState {
     /// File path to persist the peer registry to on join/leave.
     /// `None` disables persistence (e.g. unit tests).
     pub peer_persist_path: Option<PathBuf>,
+    /// File path to persist the system namespace after control-plane mutations.
+    /// `None` disables persistence (e.g. unit tests).
+    pub namespace_persist_path: Option<PathBuf>,
     /// Control-plane consensus for gating namespace updates (FR-009).
     pub consensus: Arc<Mutex<ControlPlaneConsensus>>,
     /// Optional shared token for authenticating internal API requests.
@@ -371,6 +374,9 @@ pub async fn set_authority_definition(
         ns.set_authority_definition(def);
     }
 
+    // Persist namespace after mutation.
+    persist_namespace(&state).await;
+
     Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: req.key_range_prefix,
         authority_nodes: req.authority_nodes,
@@ -491,6 +497,9 @@ pub async fn set_placement_policy(
         policy
     };
 
+    // Persist namespace after mutation.
+    persist_namespace(&state).await;
+
     let resp = PlacementPolicyResponse {
         key_range_prefix: policy.key_range.prefix.clone(),
         version: policy.version.0,
@@ -530,6 +539,9 @@ pub async fn remove_policy(
             "placement policy: {prefix}"
         )))
     })?;
+
+    // Persist namespace after mutation.
+    persist_namespace(&state).await;
 
     Ok(Json(PlacementPolicyResponse {
         key_range_prefix: removed.key_range.prefix.clone(),
@@ -773,6 +785,9 @@ pub async fn internal_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     use crate::network::PeerConfig;
 
+    // Validate the caller-supplied address to prevent SSRF.
+    validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
             "peer registry not configured".to_string(),
@@ -925,6 +940,9 @@ pub async fn internal_announce(
 ) -> Result<Json<AnnounceResponse>, ApiError> {
     use crate::network::PeerConfig;
 
+    // Validate the caller-supplied address to prevent SSRF.
+    validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
             "peer registry not configured".to_string(),
@@ -1016,6 +1034,15 @@ pub async fn internal_ping(
     Json(req): Json<PingRequest>,
 ) -> Result<Json<PingResponse>, ApiError> {
     use crate::network::PeerConfig;
+
+    // Validate the sender's address to prevent SSRF.
+    validate_peer_address(&req.sender_addr).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+
+    // Validate all peer addresses in the known_peers list.
+    for peer in &req.known_peers {
+        validate_peer_address(&peer.address)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1228,6 +1255,82 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// Validate that `addr` is a bare host:port address.
+///
+/// Rejects addresses containing schemes (`http://`, `ftp://`), paths, or query
+/// strings. Only `host:port` or `ip:port` format is accepted. This prevents
+/// SSRF via caller-supplied addresses in join/leave/announce/ping requests.
+fn validate_peer_address(addr: &str) -> Result<(), String> {
+    // Must not contain scheme indicators.
+    if addr.contains("://") {
+        return Err(format!("address must not contain a scheme: {addr}"));
+    }
+    // Must not contain path or query components.
+    if addr.contains('/') || addr.contains('?') || addr.contains('#') {
+        return Err(format!(
+            "address must not contain path or query components: {addr}"
+        ));
+    }
+    // Must contain at least one ':' separating host from port.
+    // For IPv6, the port section follows the last colon after ']'.
+    let port_sep = if addr.starts_with('[') {
+        // IPv6 bracket notation: [::1]:3000
+        addr.rfind("]:")
+            .map(|i| i + 1)
+            .ok_or_else(|| format!("invalid IPv6 bracket address: {addr}"))?
+    } else {
+        addr.rfind(':')
+            .ok_or_else(|| format!("address must be host:port format: {addr}"))?
+    };
+
+    let port_str = &addr[port_sep + 1..];
+    if port_str.is_empty() {
+        return Err(format!("address must include a port number: {addr}"));
+    }
+    port_str
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port number in address: {addr}"))?;
+
+    // Host part must not be empty.
+    let host = &addr[..port_sep];
+    if host.is_empty() {
+        return Err(format!("address must include a host: {addr}"));
+    }
+    // Must not contain whitespace.
+    if addr.chars().any(|c| c.is_whitespace()) {
+        return Err(format!("address must not contain whitespace: {addr}"));
+    }
+
+    Ok(())
+}
+
+/// Persist the system namespace to disk (if a path is configured).
+///
+/// Serialises the namespace under a read-lock, then writes atomically via
+/// `write_atomic` on a blocking thread. Errors are logged but not propagated
+/// because namespace persistence is best-effort.
+async fn persist_namespace(state: &AppState) {
+    if let Some(path) = &state.namespace_persist_path {
+        let json = {
+            let ns = state.namespace.read().unwrap();
+            match serde_json::to_string_pretty(&*ns) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("warning: failed to serialise system namespace: {e}");
+                    return;
+                }
+            }
+        };
+        let path = path.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+        {
+            eprintln!("warning: failed to persist system namespace: {e}");
+        }
+    }
 }
 
 /// Maximum allowed absolute value for counter initialization via HTTP API.

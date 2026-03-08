@@ -147,6 +147,7 @@ mod tests {
             metrics: Arc::new(RuntimeMetrics::default()),
             peers: None,
             peer_persist_path: None,
+            namespace_persist_path: None,
             consensus: Arc::new(Mutex::new(
                 crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
                     NodeId("auth-1".into()),
