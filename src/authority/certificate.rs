@@ -114,6 +114,9 @@ pub enum CertError {
 
     #[error("authority {0} not found in keyset registry")]
     AuthorityNotInRegistry(String),
+
+    #[error("expired certificate format version {version} (grace period elapsed)")]
+    ExpiredFormatVersion { version: u32 },
 }
 
 /// Certificate signature mode: Ed25519 (individual signatures) or BLS (aggregated).
@@ -125,6 +128,77 @@ pub enum CertificateMode {
     Ed25519,
     /// Aggregated BLS12-381 signature (single signature for N signers).
     Bls,
+}
+
+/// The cryptographic algorithm used to produce a certificate's signatures.
+///
+/// Recorded explicitly so that verifiers can select the correct verification
+/// path without inspecting the raw signature bytes. Old certificates that
+/// were serialized before this field existed will default to `Ed25519`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignatureAlgorithm {
+    /// Ed25519 individual signatures.
+    Ed25519,
+    /// BLS12-381 aggregated signatures.
+    Bls12_381,
+}
+
+/// The current certificate format version.
+///
+/// Bumped when the wire format changes in a backward-incompatible way.
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
+
+/// Default grace period (in seconds) during which old-format certificates
+/// are still accepted after a format version upgrade.
+///
+/// 7 days = 604800 seconds. This gives operators time to roll out new
+/// software across all nodes.
+pub const DEFAULT_FORMAT_GRACE_PERIOD_SECS: u64 = 604_800;
+
+/// Configuration for certificate format version grace period.
+#[derive(Debug, Clone)]
+pub struct FormatVersionConfig {
+    /// Duration (in seconds) for which old-format certificates remain valid
+    /// after the current node has upgraded to a newer format version.
+    pub grace_period_secs: u64,
+}
+
+impl Default for FormatVersionConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_secs: DEFAULT_FORMAT_GRACE_PERIOD_SECS,
+        }
+    }
+}
+
+impl FormatVersionConfig {
+    /// Check whether a certificate with `cert_version` is acceptable given
+    /// the current format version and the time elapsed since the version
+    /// was superseded.
+    ///
+    /// - The current format version is always accepted.
+    /// - Older versions are accepted if `elapsed_since_upgrade_secs` is
+    ///   within `grace_period_secs`.
+    /// - Format versions newer than `CURRENT_FORMAT_VERSION` are always
+    ///   accepted (forward compatibility for rolling upgrades).
+    pub fn is_version_acceptable(
+        &self,
+        cert_version: u32,
+        elapsed_since_upgrade_secs: u64,
+    ) -> bool {
+        if cert_version >= CURRENT_FORMAT_VERSION {
+            return true;
+        }
+        elapsed_since_upgrade_secs <= self.grace_period_secs
+    }
+}
+
+fn default_format_version() -> u32 {
+    1
+}
+
+fn default_signature_algorithm() -> SignatureAlgorithm {
+    SignatureAlgorithm::Ed25519
 }
 
 /// Event emitted when a key rotation occurs.
@@ -544,6 +618,14 @@ fn default_keyset_version() -> KeysetVersion {
 /// a strict majority of the authority set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MajorityCertificate {
+    /// Certificate format version.  Old certificates without this field
+    /// deserialize with `format_version = 1`.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+    /// The signature algorithm used for this certificate's signatures.
+    /// Old certificates without this field default to `Ed25519`.
+    #[serde(default = "default_signature_algorithm")]
+    pub signature_algorithm: SignatureAlgorithm,
     /// The key range this certificate covers.
     pub key_range: KeyRange,
     /// The HLC frontier timestamp at the time of certification.
@@ -565,6 +647,8 @@ impl MajorityCertificate {
         keyset_version: KeysetVersion,
     ) -> Self {
         Self {
+            format_version: CURRENT_FORMAT_VERSION,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
             key_range,
             frontier_hlc,
             policy_version,
@@ -678,6 +762,14 @@ impl MajorityCertificate {
 /// Ed25519 verification. New nodes can use the compact BLS aggregated signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DualModeCertificate {
+    /// Certificate format version.  Old certificates without this field
+    /// deserialize with `format_version = 1`.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+    /// The signature algorithm used for this certificate.
+    /// Old certificates without this field default to `Ed25519`.
+    #[serde(default = "default_signature_algorithm")]
+    pub signature_algorithm: SignatureAlgorithm,
     /// The signature mode used for this certificate.
     pub mode: CertificateMode,
     /// The key range this certificate covers.
@@ -710,6 +802,8 @@ impl DualModeCertificate {
         keyset_version: KeysetVersion,
     ) -> Self {
         Self {
+            format_version: CURRENT_FORMAT_VERSION,
+            signature_algorithm: SignatureAlgorithm::Ed25519,
             mode: CertificateMode::Ed25519,
             key_range,
             frontier_hlc,
@@ -730,6 +824,8 @@ impl DualModeCertificate {
         keyset_version: KeysetVersion,
     ) -> Self {
         Self {
+            format_version: CURRENT_FORMAT_VERSION,
+            signature_algorithm: SignatureAlgorithm::Bls12_381,
             mode: CertificateMode::Bls,
             key_range,
             frontier_hlc,
@@ -793,62 +889,87 @@ impl DualModeCertificate {
 
     /// Verify the certificate against the given message bytes.
     ///
-    /// Dispatches to Ed25519 or BLS verification based on the mode.
+    /// Dispatches to Ed25519 or BLS verification based on the `signature_algorithm`
+    /// field.  For backward compatibility, certificates with `signature_algorithm`
+    /// defaulting to `Ed25519` (format v1) still verify via the Ed25519 path.
     pub fn verify(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
-        match self.mode {
-            CertificateMode::Ed25519 => {
-                let mut valid_signers = Vec::new();
-                for sig in &self.ed25519_signatures {
-                    sig.public_key
-                        .verify(message, &sig.signature)
-                        .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
-                    valid_signers.push(sig.authority_id.clone());
-                }
-                Ok(valid_signers)
-            }
-            CertificateMode::Bls => {
-                // P1-1: Validate signer ID / public key count match.
-                if self.bls_signer_ids.len() != self.bls_public_keys.len() {
-                    return Err(CertError::InvalidSignature(
-                        "signer ID / public key count mismatch".into(),
-                    ));
-                }
+        match self.signature_algorithm {
+            SignatureAlgorithm::Ed25519 => self.verify_ed25519(message),
+            SignatureAlgorithm::Bls12_381 => self.verify_bls(message),
+        }
+    }
 
-                // P1-2: Reject duplicate signer IDs.
-                let unique_signers: HashSet<&str> =
-                    self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
-                if unique_signers.len() != self.bls_signer_ids.len() {
-                    return Err(CertError::InvalidSignature(
-                        "duplicate BLS signer IDs".into(),
-                    ));
-                }
+    /// Verify the certificate against the given message bytes, also checking
+    /// that the format version is acceptable under the provided config.
+    ///
+    /// `elapsed_since_upgrade_secs` is the wall-clock time since the node
+    /// upgraded to the current format version.  Old-format certificates are
+    /// rejected once the grace period expires.
+    pub fn verify_with_format_check(
+        &self,
+        message: &[u8],
+        format_config: &FormatVersionConfig,
+        elapsed_since_upgrade_secs: u64,
+    ) -> Result<Vec<NodeId>, CertError> {
+        if !format_config.is_version_acceptable(self.format_version, elapsed_since_upgrade_secs) {
+            return Err(CertError::ExpiredFormatVersion {
+                version: self.format_version,
+            });
+        }
+        self.verify(message)
+    }
 
-                let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
-                    CertError::InvalidSignature("missing BLS aggregated signature".into())
-                })?;
+    /// Ed25519 verification path.
+    fn verify_ed25519(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        let mut valid_signers = Vec::new();
+        for sig in &self.ed25519_signatures {
+            sig.public_key
+                .verify(message, &sig.signature)
+                .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
+            valid_signers.push(sig.authority_id.clone());
+        }
+        Ok(valid_signers)
+    }
 
-                if self.bls_public_keys.is_empty() {
-                    return Err(CertError::InvalidSignature("no BLS public keys".into()));
-                }
+    /// BLS verification path.
+    fn verify_bls(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        // P1-1: Validate signer ID / public key count match.
+        if self.bls_signer_ids.len() != self.bls_public_keys.len() {
+            return Err(CertError::InvalidSignature(
+                "signer ID / public key count mismatch".into(),
+            ));
+        }
 
-                if bls::aggregate_verify(&self.bls_public_keys, message, agg_sig) {
-                    Ok(self.bls_signer_ids.clone())
-                } else {
-                    Err(CertError::InvalidSignature(
-                        "BLS aggregate verification failed".into(),
-                    ))
-                }
-            }
+        // P1-2: Reject duplicate signer IDs.
+        let unique_signers: HashSet<&str> =
+            self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
+        if unique_signers.len() != self.bls_signer_ids.len() {
+            return Err(CertError::InvalidSignature(
+                "duplicate BLS signer IDs".into(),
+            ));
+        }
+
+        let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
+            CertError::InvalidSignature("missing BLS aggregated signature".into())
+        })?;
+
+        if self.bls_public_keys.is_empty() {
+            return Err(CertError::InvalidSignature("no BLS public keys".into()));
+        }
+
+        if bls::aggregate_verify(&self.bls_public_keys, message, agg_sig) {
+            Ok(self.bls_signer_ids.clone())
+        } else {
+            Err(CertError::InvalidSignature(
+                "BLS aggregate verification failed".into(),
+            ))
         }
     }
 
     /// Verify the certificate using a keyset registry for key validation.
     ///
-    /// For Ed25519 mode: builds a temporary `MajorityCertificate` and delegates
-    /// to `verify_signatures_with_registry`.
-    ///
-    /// For BLS mode: validates each signer ID against the registry's BLS keys,
-    /// then performs aggregate signature verification using registry-trusted keys.
+    /// Dispatches to the appropriate verification path based on
+    /// `signature_algorithm`.
     pub fn verify_with_registry(
         &self,
         message: &[u8],
@@ -869,8 +990,8 @@ impl DualModeCertificate {
             });
         }
 
-        match self.mode {
-            CertificateMode::Ed25519 => {
+        match self.signature_algorithm {
+            SignatureAlgorithm::Ed25519 => {
                 // Delegate to existing Ed25519 registry verification via
                 // MajorityCertificate.
                 let mut cert = MajorityCertificate::new(
@@ -884,7 +1005,7 @@ impl DualModeCertificate {
                 }
                 cert.verify_signatures_with_registry(message, registry, current_epoch, epoch_config)
             }
-            CertificateMode::Bls => {
+            SignatureAlgorithm::Bls12_381 => {
                 // P1-1: Validate signer ID / public key count match.
                 if self.bls_signer_ids.len() != self.bls_public_keys.len() {
                     return Err(CertError::InvalidSignature(
@@ -2233,5 +2354,290 @@ mod tests {
         assert_eq!(signers.len(), 2);
         assert_eq!(signers[0], NodeId("auth-a".into()));
         assert_eq!(signers[1], NodeId("auth-b".into()));
+    }
+
+    // ---------------------------------------------------------------
+    // Format version and signature algorithm tests (#264)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn new_majority_certificate_includes_version_and_algorithm() {
+        let cert = MajorityCertificate::new(
+            sample_key_range(),
+            sample_hlc(),
+            sample_policy_version(),
+            KeysetVersion(1),
+        );
+
+        assert_eq!(cert.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(cert.signature_algorithm, SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn new_dual_mode_ed25519_includes_version_and_algorithm() {
+        let cert = DualModeCertificate::new_ed25519(
+            sample_key_range(),
+            sample_hlc(),
+            sample_policy_version(),
+            KeysetVersion(1),
+        );
+
+        assert_eq!(cert.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(cert.signature_algorithm, SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn new_dual_mode_bls_includes_version_and_algorithm() {
+        let cert = DualModeCertificate::new_bls(
+            sample_key_range(),
+            sample_hlc(),
+            sample_policy_version(),
+            KeysetVersion(1),
+        );
+
+        assert_eq!(cert.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(cert.signature_algorithm, SignatureAlgorithm::Bls12_381);
+    }
+
+    #[test]
+    fn old_majority_certificate_deserializes_with_defaults() {
+        // Simulate a v1 certificate (before format_version / signature_algorithm
+        // fields existed) by serializing a JSON object without those fields.
+        let json = r#"{
+            "key_range": {"prefix": "user/"},
+            "frontier_hlc": {"physical": 1700000000000, "logical": 42, "node_id": "node-1"},
+            "policy_version": 1,
+            "keyset_version": 1,
+            "signatures": []
+        }"#;
+
+        let cert: MajorityCertificate = serde_json::from_str(json).unwrap();
+        assert_eq!(cert.format_version, 1);
+        assert_eq!(cert.signature_algorithm, SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn old_dual_mode_certificate_deserializes_with_defaults() {
+        // Simulate a v1 DualModeCertificate without format_version/signature_algorithm.
+        let json = r#"{
+            "mode": "Ed25519",
+            "key_range": {"prefix": "user/"},
+            "frontier_hlc": {"physical": 1700000000000, "logical": 42, "node_id": "node-1"},
+            "policy_version": 1,
+            "keyset_version": 1,
+            "bls_aggregated_signature": null
+        }"#;
+
+        let cert: DualModeCertificate = serde_json::from_str(json).unwrap();
+        assert_eq!(cert.format_version, 1);
+        assert_eq!(cert.signature_algorithm, SignatureAlgorithm::Ed25519);
+    }
+
+    #[test]
+    fn new_certificate_roundtrips_version_and_algorithm() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_ed25519_signature(make_auth_sig(NodeId("a".into()), vk, sig));
+
+        let json = serde_json::to_string(&cert).unwrap();
+        let restored: DualModeCertificate = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(restored.signature_algorithm, SignatureAlgorithm::Ed25519);
+        assert!(restored.verify(&message).is_ok());
+    }
+
+    #[test]
+    fn bls_certificate_roundtrips_algorithm_bls12_381() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+
+        let kp = make_bls_keypair(90);
+        let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]).unwrap();
+        cert.set_bls_aggregate(vec![(NodeId("b".into()), kp.public_key.clone())], agg);
+
+        let json = serde_json::to_string(&cert).unwrap();
+        let restored: DualModeCertificate = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(restored.signature_algorithm, SignatureAlgorithm::Bls12_381);
+        assert!(restored.verify(&message).is_ok());
+    }
+
+    #[test]
+    fn verify_dispatches_based_on_signature_algorithm() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        // Ed25519 path via signature_algorithm.
+        let mut ed_cert =
+            DualModeCertificate::new_ed25519(kr.clone(), hlc.clone(), pv, KeysetVersion(1));
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        ed_cert.add_ed25519_signature(make_auth_sig(NodeId("ed".into()), vk, sig));
+        assert!(ed_cert.verify(&message).is_ok());
+
+        // BLS path via signature_algorithm.
+        let mut bls_cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+        let kp = make_bls_keypair(91);
+        let bls_sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[bls_sig]).unwrap();
+        bls_cert.set_bls_aggregate(vec![(NodeId("bls".into()), kp.public_key.clone())], agg);
+        assert!(bls_cert.verify(&message).is_ok());
+    }
+
+    #[test]
+    fn signature_algorithm_serde_roundtrip() {
+        let ed = SignatureAlgorithm::Ed25519;
+        let bls_alg = SignatureAlgorithm::Bls12_381;
+
+        let ed_json = serde_json::to_string(&ed).unwrap();
+        let bls_json = serde_json::to_string(&bls_alg).unwrap();
+
+        let ed_back: SignatureAlgorithm = serde_json::from_str(&ed_json).unwrap();
+        let bls_back: SignatureAlgorithm = serde_json::from_str(&bls_json).unwrap();
+
+        assert_eq!(ed, ed_back);
+        assert_eq!(bls_alg, bls_back);
+    }
+
+    // ---------------------------------------------------------------
+    // Format version grace period tests (#264)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn format_version_config_default_grace_period() {
+        let config = FormatVersionConfig::default();
+        assert_eq!(config.grace_period_secs, DEFAULT_FORMAT_GRACE_PERIOD_SECS);
+    }
+
+    #[test]
+    fn format_version_current_always_accepted() {
+        let config = FormatVersionConfig {
+            grace_period_secs: 0,
+        };
+        assert!(config.is_version_acceptable(CURRENT_FORMAT_VERSION, 999_999));
+    }
+
+    #[test]
+    fn format_version_old_within_grace_accepted() {
+        let config = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+        // Version 1 with only 50s elapsed -> within grace.
+        assert!(config.is_version_acceptable(1, 50));
+    }
+
+    #[test]
+    fn format_version_old_beyond_grace_rejected() {
+        let config = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+        // Version 1 with 101s elapsed -> beyond grace.
+        assert!(!config.is_version_acceptable(1, 101));
+    }
+
+    #[test]
+    fn format_version_future_always_accepted() {
+        let config = FormatVersionConfig {
+            grace_period_secs: 0,
+        };
+        // A format version newer than current is accepted (forward compat).
+        assert!(config.is_version_acceptable(CURRENT_FORMAT_VERSION + 1, 999_999));
+    }
+
+    #[test]
+    fn verify_with_format_check_accepts_current_version() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_ed25519_signature(make_auth_sig(NodeId("a".into()), vk, sig));
+
+        let config = FormatVersionConfig {
+            grace_period_secs: 0,
+        };
+        // Current format version -> always accepted.
+        assert!(
+            cert.verify_with_format_check(&message, &config, 999_999)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_with_format_check_rejects_expired_old_version() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        // Manually set to old format version.
+        cert.format_version = 1;
+
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        cert.add_ed25519_signature(make_auth_sig(NodeId("a".into()), vk, sig));
+
+        let config = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+        // Within grace -> OK.
+        assert!(cert.verify_with_format_check(&message, &config, 50).is_ok());
+        // Beyond grace -> rejected.
+        let err = cert
+            .verify_with_format_check(&message, &config, 101)
+            .unwrap_err();
+        assert!(
+            matches!(err, CertError::ExpiredFormatVersion { version: 1 }),
+            "expected ExpiredFormatVersion, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_with_format_check_old_bls_cert_within_grace() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+        cert.format_version = 1; // simulate old format
+
+        let kp = make_bls_keypair(92);
+        let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]).unwrap();
+        cert.set_bls_aggregate(vec![(NodeId("b".into()), kp.public_key.clone())], agg);
+
+        let config = FormatVersionConfig {
+            grace_period_secs: 200,
+        };
+        // Within grace period.
+        assert!(
+            cert.verify_with_format_check(&message, &config, 100)
+                .is_ok()
+        );
+        // Beyond grace period.
+        assert!(
+            cert.verify_with_format_check(&message, &config, 201)
+                .is_err()
+        );
     }
 }
