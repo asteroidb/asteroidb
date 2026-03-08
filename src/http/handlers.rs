@@ -709,13 +709,24 @@ pub async fn internal_sync(
 pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpResponse> {
     let api = state.eventual.lock().await;
     let store = api.store();
-    let entries = store
-        .all_entries()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut entries = std::collections::HashMap::new();
+    let mut timestamps = std::collections::HashMap::new();
+    for (k, v, hlc) in store.all_entries_with_hlc() {
+        entries.insert(k.clone(), v.clone());
+        timestamps.insert(k.clone(), hlc.clone());
+    }
+    // Include entries without tracked timestamps (rare, but possible for
+    // stores migrated from older versions).
+    for (k, v) in store.all_entries() {
+        entries.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     let frontier = store.current_frontier();
 
-    Json(KeyDumpResponse { entries, frontier })
+    Json(KeyDumpResponse {
+        entries,
+        frontier,
+        timestamps,
+    })
 }
 
 /// `POST /api/internal/sync/delta`

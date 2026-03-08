@@ -1425,7 +1425,13 @@ impl NodeRunner {
             if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
                 let mut api = eventual_api.lock().await;
                 for (key, value) in &dump.entries {
-                    let _ = api.merge_remote(key.clone(), value);
+                    // Preserve original HLC timestamps when available to avoid
+                    // retimestamping imported entries with a local clock tick.
+                    if let Some(hlc) = dump.timestamps.get(key) {
+                        let _ = api.merge_remote_with_hlc(key.clone(), value, hlc.clone());
+                    } else {
+                        let _ = api.merge_remote(key.clone(), value);
+                    }
                 }
                 drop(api);
 

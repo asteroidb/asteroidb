@@ -103,9 +103,14 @@ impl PlacementPolicy {
         true
     }
 
-    /// Returns all nodes from the given slice that match this policy.
+    /// Returns nodes from the given slice that match this policy, up to
+    /// `replica_count`. If fewer eligible nodes exist, returns all of them.
     pub fn select_nodes<'a>(&self, nodes: &'a [Node]) -> Vec<&'a Node> {
-        nodes.iter().filter(|n| self.matches_node(n)).collect()
+        nodes
+            .iter()
+            .filter(|n| self.matches_node(n))
+            .take(self.replica_count)
+            .collect()
     }
 
     /// Returns `true` if the number of matching nodes is at least
@@ -191,7 +196,11 @@ impl PlacementPolicy {
                 .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        candidates.into_iter().map(|(n, _, _)| n).collect()
+        candidates
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .take(self.replica_count)
+            .collect()
     }
 }
 

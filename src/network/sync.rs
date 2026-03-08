@@ -48,6 +48,10 @@ pub struct KeyDumpResponse {
     /// frontier would cause subsequent delta pulls to miss remote updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier: Option<HlcTimestamp>,
+    /// Per-key HLC timestamps for preserving original modification times
+    /// during full-sync import.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub timestamps: HashMap<String, HlcTimestamp>,
 }
 
 // ---------------------------------------------------------------
@@ -559,12 +563,14 @@ mod tests {
         let resp = KeyDumpResponse {
             entries,
             frontier: Some(hlc(500, 0, "node-1")),
+            timestamps: HashMap::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: KeyDumpResponse = serde_json::from_str(&json).unwrap();
 
         assert!(deserialized.entries.contains_key("hits"));
         assert_eq!(deserialized.frontier.unwrap().physical, 500);
+        assert!(deserialized.timestamps.is_empty());
     }
 
     #[test]
