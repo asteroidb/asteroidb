@@ -225,11 +225,11 @@ Example policy:
 
 ```json
 {
-  "prefix": "telemetry/",
+  "key_range": {"prefix": "telemetry/"},
   "replica_count": 3,
   "required_tags": ["region:us-west"],
   "forbidden_tags": ["decommissioning"],
-  "allow_partition_write": true,
+  "allow_local_write_on_partition": true,
   "certified": false
 }
 ```

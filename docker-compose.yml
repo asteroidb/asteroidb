@@ -11,6 +11,7 @@ services:
       ASTEROIDB_NODE_ID: "node-1"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
     volumes:
       - ./configs/node-1.json:/etc/asteroidb/config.json:ro
     networks:
@@ -28,6 +29,7 @@ services:
       ASTEROIDB_NODE_ID: "node-2"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
     volumes:
       - ./configs/node-2.json:/etc/asteroidb/config.json:ro
     networks:
@@ -45,6 +47,7 @@ services:
       ASTEROIDB_NODE_ID: "node-3"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
     volumes:
       - ./configs/node-3.json:/etc/asteroidb/config.json:ro
     networks:

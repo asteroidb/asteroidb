@@ -91,6 +91,7 @@ Environment variables:
 | `ASTEROIDB_DATA_DIR` | `./data` | Persistence directory |
 | `ASTEROIDB_CONFIG` | *(none)* | Path to JSON config file |
 | `ASTEROIDB_BLS_SEED` | *(none)* | Hex-encoded 32-byte BLS key seed |
+| `ASTEROIDB_AUTHORITY_NODES` | `auth-1,auth-2,auth-3` | Comma-separated list of authority node IDs |
 
 ### Run a 3-node cluster with Docker Compose
 
@@ -290,6 +291,10 @@ src/
   compaction/             # Log compaction engine
     engine.rs             #   Compaction with adaptive tuning
     tuner.rs              #   Write-rate tracker
+  api/                    # Client API logic
+    certified.rs          #   Certified read/write
+    eventual.rs           #   Eventual read/write
+    status.rs             #   Certification status
   http/                   # HTTP API layer (Axum)
     routes.rs             #   Route definitions
     handlers.rs           #   Request handlers
@@ -311,6 +316,9 @@ tests/                    # Integration / E2E tests
 | Document | Description |
 |----------|-------------|
 | [Architecture](docs/architecture.md) | Component design, data flows, and sequence diagrams |
+| [Getting Started](docs/getting-started.md) | Build, run, and verify AsteroidDB |
+| [Benchmark](docs/benchmark.md) | Performance benchmarks and profiling |
+| [Netem Testing](docs/netem-testing.md) | Network emulation test scenarios |
 | [Security](SECURITY.md) | Threat model, trust boundaries, and cryptographic primitives |
 | [Vision](docs/vision.md) | Project goals and scope |
 | [Requirements](docs/requirements.md) | MVP functional and non-functional requirements |

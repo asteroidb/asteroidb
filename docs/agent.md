@@ -9,7 +9,7 @@ AsteroidDB は「整合性レベルの異なるワークロードを単一クラ
 地上 DC から衛星コンステレーションまで、同一 control-plane で扱える設計を目指す。
 Rust で実装し、MVP は CRDT ベース KVS + Authority 合意による Certified 状態の提供。
 
-**Repository**: `anditdb/asteroids` (GitHub, private)
+**Repository**: `asteroidb/asteroidb` (GitHub, private)
 **Status**: Implementation phase. Tasks are tracked as GitHub Issues.
 
 ## Architecture Overview
@@ -38,7 +38,7 @@ Rust で実装し、MVP は CRDT ベース KVS + Authority 合意による Certi
 | **Certified** | Authority ノード群の過半数合意で確定。証明付きで取得可能 |
 | **Authority ノード群** | キー範囲単位で定義される確定判断ノード集合。MVP は majority |
 | **ack_frontier** | 各 Authority が取り込んだ更新の HLC 到達境界。圧縮後も追跡可能 |
-| **majority_certificate** | Ed25519 個別署名集約。将来 BLS Threshold へ拡張予定 |
+| **majority_certificate** | Ed25519 / BLS12-381 デュアルモード対応 |
 | **配置ポリシー** | タグベース。レプリカ数/必須タグ/禁止タグ/分断時挙動を制御 |
 | **system namespace** | control-plane 管理領域。配置ポリシーと Authority 定義を格納 |
 | **CRDT** | PN-Counter, OR-Set, OR-Map + LWW-Register (MVP) |
@@ -75,18 +75,53 @@ cargo fmt --check              # フォーマット確認
 src/
 ├── lib.rs              # ライブラリルート
 ├── main.rs             # バイナリエントリポイント
+├── bin/cli.rs          # asteroidb-cli バイナリ
 ├── crdt/               # CRDT 実装
 │   ├── mod.rs
 │   ├── pn_counter.rs
 │   ├── or_set.rs
 │   ├── or_map.rs
 │   └── lww_register.rs
-├── store/              # KVS ストレージレイヤ
+├── store/              # KVS ストレージレイヤ (versioned persistence)
+│   ├── kv.rs
+│   └── migration.rs
 ├── authority/          # Authority 合意・証明
 │   ├── ack_frontier.rs
-│   └── certificate.rs
+│   ├── certificate.rs  # Ed25519 / BLS デュアルモード, EpochManager
+│   ├── bls.rs          # BLS12-381 threshold signatures
+│   ├── frontier_reporter.rs
+│   └── verifier.rs
 ├── placement/          # 配置ポリシー・タグ管理
-├── api/                # クライアント API
+│   ├── policy.rs
+│   ├── latency.rs
+│   ├── topology.rs
+│   └── rebalance.rs
+├── control_plane/      # System Namespace・合意
+│   ├── system_namespace.rs
+│   └── consensus.rs
+├── api/                # クライアント API ロジック
+│   ├── certified.rs
+│   ├── eventual.rs
+│   └── status.rs
+├── http/               # HTTP API レイヤ (Axum)
+│   ├── routes.rs
+│   ├── handlers.rs
+│   ├── types.rs
+│   └── auth.rs
+├── network/            # ピア管理・デルタ同期
+│   ├── membership.rs
+│   ├── sync.rs
+│   ├── frontier_sync.rs
+│   └── peer.rs
+├── ops/                # 運用ツーリング
+│   ├── metrics.rs
+│   ├── slo.rs
+│   └── diagnostics.rs
+├── compaction/         # ログ圧縮エンジン
+│   ├── engine.rs
+│   └── tuner.rs
+├── runtime/            # NodeRunner バックグラウンドループ
+│   └── node_runner.rs
 ├── hlc.rs              # Hybrid Logical Clock
 ├── node.rs             # ノード定義
 ├── error.rs            # 共通エラー型
@@ -154,7 +189,7 @@ fix/#<issue-number>-<short-desc>
 
 ### Task Management
 
-- 全タスクは GitHub Issue で管理: `gh issue list --repo anditdb/asteroids`
+- 全タスクは GitHub Issue で管理: `gh issue list --repo asteroidb/asteroidb`
 - Issue にはフェーズラベル (`phase:foundation` / `phase:core` / `phase:integration`) とモジュールラベル (`mod:crdt` 等) が付与されている
 - 要件トレーサビリティは `FR-0xx` / `NFR-0xx` ラベルで確保
 
@@ -216,16 +251,23 @@ PR 作成前に以下の独立レビューを並行実行する:
 - 合意条件: majority 固定 (FR-003)
 - `certified_write` タイムアウト: `on_timeout=error|pending` (FR-004)
 - Compaction: 過半数 Authority 取込済のみ圧縮可、チェックポイント 30s or 10,000 ops (FR-010)
-- 署名: Ed25519, keyset_version=1 から単調増加, epoch=24h, 過去7 epoch許容 (FR-008)
+- 署名: Ed25519 / BLS12-381 デュアルモード, keyset_version=1 から単調増加, epoch=24h, 過去7 epoch許容 (FR-008)
 - ノードモード: `store` / `subscribe` / `both` (FR-006)
 
-## Dependencies (Planned)
+## Dependencies
 
 ```toml
 thiserror = "2"          # エラー型
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"         # シリアライゼーション
 ed25519-dalek = "2"      # Ed25519 署名
-uuid = { version = "1", features = ["v4"] }  # 一意識別子
+blst = "0.3"             # BLS12-381 aggregate signatures
+rand = "0.8"             # 乱数生成
 tokio = { version = "1", features = ["full"] }  # async runtime
+axum = "0.8"             # HTTP フレームワーク
+reqwest = { version = "0.12", features = ["json", "blocking"] }  # HTTP クライアント
+clap = { version = "4", features = ["derive", "env"] }  # CLI パーサー
+tracing = "0.1"          # 構造化ロギング
+subtle = "2"             # constant-time 比較
+hex = "0.4"              # hex エンコーディング
 ```
