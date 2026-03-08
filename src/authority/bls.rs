@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::CrdtError;
+
 /// Domain separation tag for BLS signatures (required by blst).
 const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
@@ -136,16 +138,18 @@ pub fn verify_signature(
 
 /// Aggregate multiple BLS signatures into a single signature.
 ///
-/// # Panics
-///
-/// Panics if `signatures` is empty.
-pub fn aggregate_signatures(signatures: &[BlsSignature]) -> BlsSignature {
-    assert!(!signatures.is_empty(), "cannot aggregate zero signatures");
+/// Returns an error if `signatures` is empty.
+pub fn aggregate_signatures(signatures: &[BlsSignature]) -> Result<BlsSignature, CrdtError> {
+    if signatures.is_empty() {
+        return Err(CrdtError::InvalidArgument(
+            "cannot aggregate zero signatures".into(),
+        ));
+    }
 
     let refs: Vec<&blst::min_pk::Signature> = signatures.iter().map(|s| &s.0).collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&refs, true)
         .expect("signature aggregation should not fail for valid inputs");
-    BlsSignature(agg.to_signature())
+    Ok(BlsSignature(agg.to_signature()))
 }
 
 /// Verify an aggregated BLS signature against the corresponding set of
@@ -214,7 +218,7 @@ mod tests {
             .map(|kp| sign_message(kp.secret_key(), msg))
             .collect();
 
-        let agg = aggregate_signatures(&sigs);
+        let agg = aggregate_signatures(&sigs).unwrap();
 
         let pks: Vec<BlsPublicKey> = keypairs.iter().map(|kp| kp.public_key.clone()).collect();
         assert!(aggregate_verify(&pks, msg, &agg));
@@ -230,7 +234,7 @@ mod tests {
             .map(|kp| sign_message(kp.secret_key(), msg))
             .collect();
 
-        let agg = aggregate_signatures(&sigs);
+        let agg = aggregate_signatures(&sigs).unwrap();
         let pks: Vec<BlsPublicKey> = keypairs.iter().map(|kp| kp.public_key.clone()).collect();
 
         assert!(!aggregate_verify(&pks, b"tampered", &agg));
@@ -246,7 +250,7 @@ mod tests {
             .map(|kp| sign_message(kp.secret_key(), msg))
             .collect();
 
-        let agg = aggregate_signatures(&sigs);
+        let agg = aggregate_signatures(&sigs).unwrap();
 
         // Only use first 3 public keys (missing the 4th signer).
         let pks: Vec<BlsPublicKey> = keypairs[..3]
@@ -260,14 +264,20 @@ mod tests {
     fn aggregate_verify_empty_keys_returns_false() {
         let kp = make_keypair(40);
         let sig = sign_message(kp.secret_key(), b"x");
-        let agg = aggregate_signatures(&[sig]);
+        let agg = aggregate_signatures(&[sig]).unwrap();
         assert!(!aggregate_verify(&[], b"x", &agg));
     }
 
     #[test]
-    #[should_panic(expected = "cannot aggregate zero signatures")]
-    fn aggregate_empty_panics() {
-        aggregate_signatures(&[]);
+    fn aggregate_empty_returns_error() {
+        let result = aggregate_signatures(&[]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot aggregate zero signatures")
+        );
     }
 
     #[test]
@@ -292,7 +302,7 @@ mod tests {
         let kp = make_keypair(60);
         let msg = b"single aggregate";
         let sig = sign_message(kp.secret_key(), msg);
-        let agg = aggregate_signatures(std::slice::from_ref(&sig));
+        let agg = aggregate_signatures(std::slice::from_ref(&sig)).unwrap();
 
         // Aggregating a single signature should produce a valid aggregate.
         assert!(aggregate_verify(&[kp.public_key], msg, &agg));

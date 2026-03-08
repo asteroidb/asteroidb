@@ -101,7 +101,7 @@ impl Hlc {
 fn physical_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
+        .unwrap_or_default()
         .as_millis() as u64
 }
 

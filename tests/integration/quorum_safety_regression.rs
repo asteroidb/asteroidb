@@ -101,6 +101,7 @@ fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), key_range(""), 3));
     wrap_ns(ns)
 }
 

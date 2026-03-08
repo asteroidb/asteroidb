@@ -18,6 +18,7 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::error::CrdtError;
 use asteroidb_poc::hlc::HlcTimestamp;
+use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
@@ -65,6 +66,11 @@ fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        KeyRange { prefix: "".into() },
+        3,
+    ));
     wrap_ns(ns)
 }
 

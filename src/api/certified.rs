@@ -200,7 +200,12 @@ impl CertifiedApi {
         let policy_version = ns
             .get_placement_policy(&key_range.prefix)
             .map(|p| p.version)
-            .unwrap_or(PolicyVersion(1));
+            .ok_or_else(|| {
+                CrdtError::InvalidArgument(format!(
+                    "no placement policy for prefix: {}",
+                    key_range.prefix
+                ))
+            })?;
 
         Ok((key_range, policy_version, total))
     }
@@ -697,6 +702,11 @@ mod tests {
             authority_nodes: authorities.iter().map(|a| node(a)).collect(),
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            kr(prefix),
+            authorities.len(),
+        ));
         wrap_ns(ns)
     }
 
@@ -1232,6 +1242,8 @@ mod tests {
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("order/"), 3));
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -1292,6 +1304,8 @@ mod tests {
             authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("order/"), 3));
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -1379,6 +1393,8 @@ mod tests {
             authority_nodes: vec![node("auth-v1"), node("auth-v2")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/vip/"), 2));
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -1454,6 +1470,8 @@ mod tests {
             authority_nodes: vec![node("auth-s1"), node("auth-s2"), node("auth-s3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("cert/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("stale/"), 3));
 
         let policy = RetentionPolicy {
             max_age_ms: 5_000,
@@ -1680,6 +1698,7 @@ mod tests {
             authority_nodes: vec![node("auth-a"), node("auth-b"), node("auth-c")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
 
         let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
         api.certified_write("data/x".into(), counter_value(1), OnTimeout::Pending)

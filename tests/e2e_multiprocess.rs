@@ -22,6 +22,7 @@ use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -45,6 +46,13 @@ fn default_namespace() -> SystemNamespace {
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        KeyRange {
+            prefix: String::new(),
+        },
+        3,
+    ));
     ns
 }
 

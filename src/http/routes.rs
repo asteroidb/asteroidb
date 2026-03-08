@@ -99,7 +99,8 @@ mod tests {
         WriteResponse,
     };
     use crate::ops::metrics::RuntimeMetrics;
-    use crate::types::{CertificationStatus, KeyRange, NodeId};
+    use crate::placement::PlacementPolicy;
+    use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -126,6 +127,13 @@ mod tests {
             ],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            KeyRange {
+                prefix: String::new(),
+            },
+            3,
+        ));
 
         let namespace = Arc::new(RwLock::new(ns));
 
@@ -744,7 +752,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_plane_list_policies_empty() {
+    async fn control_plane_list_policies_has_default() {
         let state = test_state();
         let app = router(state);
 
@@ -758,7 +766,7 @@ mod tests {
 
         let body = body_string(resp.into_body()).await;
         let policies: Vec<PlacementPolicyResponse> = serde_json::from_str(&body).unwrap();
-        assert!(policies.is_empty());
+        assert_eq!(policies.len(), 1, "expected default placement policy");
     }
 
     #[tokio::test]
@@ -827,7 +835,7 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Initial version history (namespace had 1 authority set -> version 2)
+        // Initial version history (namespace had 1 authority set + 1 placement policy -> version 3)
         let req = Request::builder()
             .uri("/api/control-plane/versions")
             .body(Body::empty())
@@ -838,8 +846,8 @@ mod tests {
 
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 2);
-        assert_eq!(versions.history, vec![1, 2]);
+        assert_eq!(versions.current_version, 3);
+        assert_eq!(versions.history, vec![1, 2, 3]);
 
         // Set a policy -> version should increment
         let req = Request::builder()
@@ -861,8 +869,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 3);
-        assert_eq!(versions.history, vec![1, 2, 3]);
+        assert_eq!(versions.current_version, 4);
+        assert_eq!(versions.history, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
@@ -892,9 +900,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        // initial(1) + auth_def(2) + policy_set(3) + policy_set(4)
-        assert_eq!(versions.current_version, 4);
-        assert_eq!(versions.history.len(), 4);
+        // initial(1) + auth_def(2) + default_policy(3) + policy_set(4) + policy_set(5)
+        assert_eq!(versions.current_version, 5);
+        assert_eq!(versions.history.len(), 5);
     }
 
     // ---------------------------------------------------------------

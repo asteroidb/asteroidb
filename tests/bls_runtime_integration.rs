@@ -21,6 +21,7 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
@@ -71,6 +72,7 @@ fn three_authority_namespace() -> SystemNamespace {
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
     ns
 }
 
@@ -234,7 +236,7 @@ fn bls_certificate_mode_when_keys_registered() {
     let sig2 = asteroidb_poc::authority::bls::sign_message(kp2.secret_key(), msg);
     let sig3 = asteroidb_poc::authority::bls::sign_message(kp3.secret_key(), msg);
 
-    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&[sig1, sig2, sig3]);
+    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&[sig1, sig2, sig3]).unwrap();
 
     cert.set_bls_aggregate(
         vec![
@@ -304,7 +306,7 @@ fn bls_certificate_with_registry_verification() {
     let mut cert = DualModeCertificate::new_bls(kr.clone(), hlc.clone(), pv, version.clone());
     let sig1 = asteroidb_poc::authority::bls::sign_message(kp1.secret_key(), msg);
     let sig2 = asteroidb_poc::authority::bls::sign_message(kp2.secret_key(), msg);
-    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&[sig1, sig2]);
+    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&[sig1, sig2]).unwrap();
     cert.set_bls_aggregate(
         vec![
             (node_id("auth-1"), kp1.public_key.clone()),
@@ -574,7 +576,7 @@ fn bls_majority_threshold_with_5_authorities() {
         .iter()
         .map(|kp| asteroidb_poc::authority::bls::sign_message(kp.secret_key(), msg))
         .collect();
-    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&sigs);
+    let agg = asteroidb_poc::authority::bls::aggregate_signatures(&sigs).unwrap();
 
     let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
     let signers: Vec<_> = (0..3)

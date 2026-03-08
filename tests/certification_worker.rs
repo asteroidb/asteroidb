@@ -24,6 +24,7 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
@@ -75,6 +76,7 @@ fn three_authority_namespace() -> SystemNamespace {
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
     ns
 }
 
@@ -232,6 +234,7 @@ async fn single_authority_self_certification() {
         authority_nodes: vec![node_id("auth-1")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1));
 
     let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
     api.certified_write("key1".into(), counter_value(10), OnTimeout::Pending)
@@ -548,6 +551,9 @@ async fn mixed_outcomes_all_observable() {
         authority_nodes: vec![node_id("auth-r1"), node_id("auth-r2"), node_id("auth-r3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("cert/"), 3));
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("stale/"), 3));
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("rej/"), 3));
 
     let retention = RetentionPolicy {
         max_age_ms: 5_000,
@@ -611,6 +617,8 @@ async fn cleanup_after_auto_certification() {
         authority_nodes: vec![node_id("auth-b1"), node_id("auth-b2"), node_id("auth-b3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("a/"), 3));
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("b/"), 3));
 
     let mut api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));
 

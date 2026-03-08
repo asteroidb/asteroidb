@@ -1611,6 +1611,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
         wrap_ns(ns)
     }
 
@@ -2080,6 +2081,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1));
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
