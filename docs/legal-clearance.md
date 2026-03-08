@@ -144,92 +144,107 @@ HLC フロンティアを用いた差分同期は学術論文に基づき、Cass
 
 ## 5. 商標クリアランス —「AsteroidDB」
 
-### USPTO 検索
+### USPTO TESS 実検索結果（2026年3月8日取得）
 
-USPTO の商標データベース（TESS）での「ASTEROIDDB」「ASTEROID DB」の登録商標・出願は確認されなかった。
+「ASTEROID」全件（64件）の検索結果を分析した。**「ASTEROIDDB」「ASTEROID DB」の登録・出願はゼロ件**（完全クリア）。
 
-> ⚠️ **ただし**: USPTO TESS は JavaScript ベースの動的データベースのため、Web クロールによる完全な確認に限界がある。正確な調査には USPTO TESS（https://tmsearch.uspto.gov）での直接検索が必要。
+「ASTEROID」単体・複合語でソフトウェア・データベース関連クラスに絞った結果は以下のとおり。
 
-### 競合するブランドの全体像（追加調査結果）
+#### Class 009（コンピュータソフトウェア製品）
 
-追加調査の結果、「ASTEROID」ブランドを使用するソフトウェア関連エンティティが複数判明した。リスクの高い順に整理する。
+| Serial# | 商標 | 状態 | 内容 | 権利者 | 登録年 |
+|---------|------|------|------|--------|--------|
+| 85718972 | ASTEROID | **Dead** | ゲームアプリ | Dancing Penguins LLC | 2012 |
+| 77916702 | ASTEROID-Z: FS5 | **Dead** | ゲームソフト | Flipside5 Inc. | 2010 |
+| 86193145 | ASTEROID RUN-TIME ENVIRONMENT | **Dead** | 半導体チップ/ソフトウェア | Mediatek, Inc. | 2014 |
+| **76026190** | **ROY MORGAN ASTEROID** | **Dead** | **Database management software（データベース管理ソフト）** | Roy Morgan International | **2002** |
+| 90740089 | MISSION ASTEROID | **Live** | ダウンロード型ビデオゲーム | MMMera, Inc. | 2023 |
+| 97751358 | ASTEROID | **Live** | ギター用サウンドエフェクトペダル | McBride, Cole | 2023 |
+
+> 📌 **注目**: Serial #76026190「ROY MORGAN ASTEROID」は 2002 年登録の **Database management software（IC 009）** — まさに同分野での先例だが **Dead（失効）**。
+
+#### Class 042（SaaS・ソフトウェアサービス）
+
+| Serial# | 商標 | 状態 | 内容 | 権利者 | 登録日 |
+|---------|------|------|------|--------|--------|
+| 86650278 | ASTEROID | **Dead** | 臨床試験情報提供 | Acorda Therapeutics | 2015出願 |
+| 88440171 | ASTEROID | **Dead** | 臨床試験情報提供 | Acorda Therapeutics | 2019出願 |
+| 97625707 | ASTEROID | **Dead** | 臨床試験情報提供 | Acorda Therapeutics | 2022出願 |
+| 90603364 | ASTEROID INSTITUTE | **Dead** | 物理・科学研究 | B612 Foundation | 2021出願 |
+| **97705794** | **ASTEROID INSTITUTE** | **🟡 Live** | **ソフトウェア設計・開発・実装；小惑星追跡分野のオンライン検索可能データベース提供** | **B612 Foundation** | **2024-08-27** |
+| 97160029 | ASTEROID THERAPEUTICS | **Dead** | がん治療薬開発 | Asteroid Therapeutics, Inc. | 2021出願 |
+| 86851619 | LONELY ASTEROID STUDIOS | **Dead** | ビデオゲーム設計・開発 | Lonely Asteroid Studios | 2015出願 |
 
 ---
 
-#### [リスク高] Asteroid (YC W25) — `asteroid.ai`
+### 分析：個別エンティティのリスク評価
 
-> **これが最も重要な競合リスク**
+#### [最重要] ASTEROID INSTITUTE（B612 Foundation）— Class 042 Live 登録あり
 
 | 項目 | 内容 |
 |------|------|
-| 名称 | **Asteroid** |
-| ドメイン | **asteroid.ai** |
-| 設立 | 2024年（YC W25 採択: 2025年1月〜3月） |
-| 創業者 | Joe Hewett, David Mlčoch（CEO） |
-| 資金調達 | Y Combinator（$500K確認済み、追加調達見込みあり） |
-| 製品 | **AI ブラウザエージェント**（企業のバックオフィス業務自動化） |
-| 対象顧客 | 保険・医療・サプライチェーン等の規制業種エンタープライズ |
-| 商標登録 | **不明**（TESS 直接確認が必要） |
+| Serial # | **97705794** |
+| 状態 | **Live（登録済み、2024年8月27日）** |
+| 権利者 | B612 Foundation（カリフォルニア州非営利法人） |
+| カバー範囲 | IC 042: "Design, development and implementation of software; Monitoring of asteroids; Scientific research in the field of asteroid discovery; **Providing an on-line searchable database** in the field of space object discovery and tracking" |
+| ソース | https://tsdr.uspto.gov/#caseNumber=97705794 |
+
+**分析**:
+- "Design, development and implementation of software" および "Providing an on-line searchable database" という広い文言を含む
+- ただし商品・サービスの説明に **"in the field of space object discovery and tracking"** という分野限定がある
+- AsteroidDB（分散 KV ストア）とは **分野が明確に異なる**
+- "ASTEROID INSTITUTE" vs "AsteroidDB" は語句構成も異なり、混同可能性は低い
+- **リスク評価**: 🟢 低（分野限定により直接競合しない）
+
+#### [修正] Asteroid (YC W25) — `asteroid.ai`
+
+| 項目 | 内容 |
+|------|------|
+| 名称 | Asteroid |
+| TESS 登録状況 | **出願・登録ともに確認されず**（2026年3月時点） |
+| 事業活動開始 | 2024年末〜2025年初頭 |
+| 製品 | AI ブラウザエージェント（バックオフィス業務自動化） |
 | ソース | https://www.ycombinator.com/companies/asteroid |
 
-**コモンロー商標権の発生状況**:
-- 2024年12月時点で X（Twitter）アカウント（`@asteroid_inc`）が存在
-- Product Hunt でのローンチ記録あり
-- YC Demo Day（2025年3月12日）で公式発表
-- → 米国コモンロー上の「ASTEROID」商標権を **2024年末〜2025年初頭から保有**している可能性が高い
+**コモンロー商標権**: 2024年末から商用利用実績あり（X アカウント、Product Hunt、YC Demo Day）。ただし **USPTO 出願なし** = 登録商標権は未発生。
 
-**混同可能性の分析**:
-- 両者とも「ソフトウェアサービス」（Class 042）に該当しうる
-- 「Asteroid」vs「AsteroidDB」は親子関係のような見え方になるため、混同可能性があると判断されるリスクがある
-- 消費者・投資家・メディアが混同する現実的な可能性がある（どちらもエンタープライズ向けソフトウェア）
+**重要な更新**: 前回評価では「最重要リスク」としたが、TESS 実検索で出願なしが確認された。コモンロー権は存在するが、**今すぐ「ASTEROIDDB」を出願すれば先願優位を確保できる**状況。
 
----
+**分析**:
+- 製品の本質が異なる（AI ブラウザ操作 vs. 分散データベース）
+- 「ASTEROID」vs「ASTEROIDDB」— サフィックス「DB」による差別化
+- **リスク評価**: 🟡 中（コモンロー権は存在するが、出願で防御可能）
 
-#### [リスク中] AsteroidOS — スマートウォッチ向けオープンソース OS
+#### AsteroidOS — スマートウォッチ向けオープンソース OS
 
-| 項目 | 内容 |
-|------|------|
-| 名称 | **AsteroidOS** |
-| ドメイン | asteroidos.org |
-| 開始 | 2018年（Florent Revest が開発開始） |
-| 製品 | Linux ベースのスマートウォッチ向け OS |
-| 現状 | **活発に開発中**（2026年2月に v2.0 リリース） |
-| 商標登録 | **不明**（TESS 直接確認が必要） |
-| ソース | https://asteroidos.org |
+- TESS に**登録・出願なし**（確認）
+- 用途が全く異なる（スマートウォッチ OS vs. 分散データベース）
+- **リスク評価**: 🟢 低
 
-混同可能性は低い（スマートウォッチ OS vs. 分散データベース）が、「ASTEROID」ブランドの先行使用者として存在感がある。
+#### AsteroidDB (Kodular/Yusuf Cihan) — 廃止済み
+
+- TESS に**登録・出願なし**（確認）
+- GitHub リポジトリ削除済み、完全廃止
+- **リスク評価**: 🟢 非常に低
 
 ---
 
-#### [リスク低] AsteroidDB (Kodular/Yusuf Cihan) — 廃止済み
-
-| 項目 | 内容 |
-|------|------|
-| 名称 | AsteroidDB |
-| 初出 | 2019年9月〜12月（Kodular Community フォーラム） |
-| 現状 | **GitHub リポジトリ削除済み、完全に開発停止** |
-| 商標登録 | **なし** |
-| 混同可能性 | 極めて低い（個人開発・MIT App Inventor 向け・廃止済み） |
-
-リポジトリが削除されており実質的に先行使用も終了しているため、コモンロー商標権の維持も困難な状況。リスクは低い。
-
----
-
-### 総合リスク評価
+### 総合リスク評価（TESS 実データ反映後・修正版）
 
 | 競合 | リスクレベル | 主な懸念 |
 |------|-------------|---------|
-| **Asteroid (YC W25)** | 🔴 **高** | 同業種（ソフトウェア）、活発に事業活動中、YC バックで資金力あり |
-| **AsteroidOS** | 🟡 **中** | 先行使用は古く活発だが用途が異なる |
-| **AsteroidDB (Kodular)** | 🟢 **低** | 廃止済み、削除済み |
+| **ASTEROID INSTITUTE (B612)** | 🟢 **低** | Live 登録だが分野が「小惑星追跡研究」に限定 |
+| **Asteroid (YC W25)** | 🟡 **中** | コモンロー権あり。ただし出願未了 → 先願で防御可能 |
+| **AsteroidOS** | 🟢 **低** | 登録なし、用途別 |
+| **AsteroidDB (Kodular)** | 🟢 **非常に低** | 廃止・削除済み |
+| **「ASTEROIDDB」の空き状況** | 🟢 **クリア** | 完全に空き。今すぐ出願可能 |
 
-### 推奨アクション（更新版）
+### 推奨アクション（TESS 実データ反映後・最終版）
 
-1. **最優先**: [tmsearch.uspto.gov](https://tmsearch.uspto.gov) で「ASTEROID」を Class 009・042 で直接確認（Asteroid (YC W25) が出願済みか確認）
-2. **最優先**: 知財専門弁護士に「Asteroid (YC W25) との混同可能性」を緊急評価依頼
-3. **戦略検討**: 名称の差別化（サブブランド化・セグメント明示）or リネームの経営判断
-4. **登録推奨**: 使用継続の場合は速やかに USPTO Class 009/042 で商標出願（先願主義）
-5. **監視**: Asteroid (YC W25) の商標出願動向を USPTO で定期監視
+1. **★★★ 今すぐ**: 知財弁護士と協議し「ASTEROIDDB」を **Class 009（ダウンロード可能ソフトウェア）および Class 042（SaaS）で USPTO 出願**。Asteroid YC W25 が出願前に先願を確保できる絶好の機会。
+2. **★★★ 今すぐ**: ASTEROID INSTITUTE (B612、Serial #97705794) の登録範囲を弁護士に精査依頼 — "software design/development" の文言が広いため影響範囲を確認
+3. **★★☆ 近期**: Asteroid (YC W25) の USPTO 出願動向を月次で監視（先に出願された場合の対応策を事前に検討）
+4. **★☆☆ 継続**: `cargo license` を CI に組み込み依存ライセンスの継続監視
 
 ---
 
@@ -261,21 +276,21 @@ GPL 汚染のリスクは現時点では確認されない。
 | CRDT アルゴリズム | 🟢 **低リスク** | 学術先行技術 + Basho IP 開放 |
 | HLC | 🟢 **リスクなし** | 学術論文のみ、特許出願なし |
 | Delta Sync | 🟢 **リスクなし** | 学術論文のみ、広範な先行技術 |
-| 商標「AsteroidDB」 | 🔴 **要対応** | Asteroid (YC W25) との競合リスク高（最優先で弁護士確認） |
+| 商標「AsteroidDB」 | 🟡 **要出願** | TESS 実検索で完全クリア。Asteroid YC W25 が出願前に先願を取るべき |
 | 依存ライセンス | 🟢 **良好** | 全て寛容ライセンス |
 
 ---
 
-## 8. 推奨アクションリスト（優先度順）
+## 8. 推奨アクションリスト（最終版・TESS 実データ反映）
 
-| 優先度 | アクション | 担当 |
-|--------|-----------|------|
-| ★★★ | USPTO TESS で「ASTEROID」を Class 009/042 で直接確認（Asteroid YC W25 の出願状況） | チーム |
-| ★★★ | 知財弁護士に Asteroid (YC W25) との混同可能性を**緊急評価**依頼 | 外部弁護士 |
-| ★★★ | 名称継続 or リネームの経営判断（弁護士評価結果を受けて） | 経営陣 |
-| ★★☆ | 使用継続の場合: USPTO Class 009/042 で速やかに商標出願（先願主義） | 外部弁護士 |
-| ★☆☆ | `cargo license` を CI に組み込み依存ライセンスを継続監視 | エンジニア |
-| ★☆☆ | 継続特許の有無を USPTO で年次確認（BLS 関連） | チーム |
+| 優先度 | アクション | 担当 | 期限目安 |
+|--------|-----------|------|---------|
+| ★★★ | 知財弁護士と協議し「ASTEROIDDB」を Class 009/042 で **USPTO 出願**（先願確保） | 外部弁護士 | 今すぐ |
+| ★★★ | ASTEROID INSTITUTE (B612, Serial #97705794) の登録範囲が AsteroidDB に及ぶか精査 | 外部弁護士 | 今すぐ |
+| ★★☆ | Asteroid (YC W25) の USPTO 出願動向を月次監視（先に出願されたら即対応） | チーム | 継続 |
+| ★★☆ | 名称継続の経営判断を確定（TESS はクリアなので継続が合理的） | 経営陣 | 近期 |
+| ★☆☆ | `cargo license` を CI に組み込み依存ライセンスを継続監視 | エンジニア | 近期 |
+| ★☆☆ | 継続特許の有無を USPTO で年次確認（BLS 関連） | チーム | 年次 |
 
 ---
 
