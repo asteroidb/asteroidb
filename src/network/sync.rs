@@ -379,10 +379,34 @@ impl SyncClient {
             match self.authorized_post(&url).json(&request).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
-                        total_pushed += chunk.len();
+                        // Parse the response body to check for per-key merge
+                        // errors. Only count entries that were actually merged.
+                        let sync_resp: Option<SyncResponse> =
+                            resp.json::<SyncResponse>().await.ok();
+                        let error_count = sync_resp.as_ref().map(|r| r.errors.len()).unwrap_or(0);
+                        let actually_pushed = chunk.len().saturating_sub(error_count);
+                        if error_count > 0 {
+                            let error_keys: Vec<&str> = sync_resp
+                                .as_ref()
+                                .map(|r| r.errors.iter().map(|e| e.key.as_str()).collect())
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                peer_addr = %peer_addr,
+                                error_count = error_count,
+                                error_keys = ?error_keys,
+                                "delta push batch had merge errors on remote"
+                            );
+                            // Partial success: return error so the caller can
+                            // advance the frontier only up to what succeeded.
+                            return Err(SyncPushError {
+                                pushed: total_pushed + actually_pushed,
+                                reason: format!("{error_count} keys failed to merge on remote"),
+                            });
+                        }
+                        total_pushed += actually_pushed;
                         tracing::debug!(
                             peer_addr = %peer_addr,
-                            batch_keys = chunk.len(),
+                            batch_keys = actually_pushed,
                             "delta push batch succeeded"
                         );
                     } else {

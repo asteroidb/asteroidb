@@ -1038,19 +1038,32 @@ pub async fn internal_ping(
         let sender_is_known = registry.get_peer(&sender_nid).is_some()
             || state.self_node_id.as_ref() == Some(&sender_nid);
 
-        // Always update the sender's address if it changed.
+        // Update or add the sender. Only add an unknown sender if the
+        // request passed bearer-token authentication (i.e. internal_token
+        // is configured and was validated by the middleware). Without auth,
+        // unknown nodes must not be able to inject themselves into the
+        // registry via a bare ping.
         if registry.get_peer(&sender_nid).is_some() {
             if registry.update_address(&sender_nid, &req.sender_addr) {
                 changed = true;
             }
-        } else if registry
-            .add_peer(PeerConfig {
-                node_id: sender_nid.clone(),
-                addr: req.sender_addr.clone(),
-            })
-            .is_ok()
-        {
-            changed = true;
+        } else if state.internal_token.is_some() {
+            // The request reached us through the auth middleware, so the
+            // sender has a valid token — safe to add as a new peer.
+            if registry
+                .add_peer(PeerConfig {
+                    node_id: sender_nid.clone(),
+                    addr: req.sender_addr.clone(),
+                })
+                .is_ok()
+            {
+                changed = true;
+            }
+        } else {
+            tracing::warn!(
+                sender = %req.sender_id,
+                "ping from unknown sender rejected: no auth configured"
+            );
         }
 
         // Only accept peer list from known senders.

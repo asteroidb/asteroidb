@@ -1370,20 +1370,44 @@ impl NodeRunner {
                     .await;
 
                 if let Some(delta_resp) = delta_result {
-                    // Apply delta entries.
+                    // Apply delta entries, tracking merge errors.
+                    // Only advance the frontier to the HLC of the last
+                    // successfully merged entry so failed entries are retried.
                     let mut api = eventual_api.lock().await;
+                    let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
+                    let mut merge_failed = false;
                     for entry in &delta_resp.entries {
-                        let _ = api.merge_remote_with_hlc(
+                        match api.merge_remote_with_hlc(
                             entry.key.clone(),
                             &entry.value,
                             entry.hlc.clone(),
-                        );
+                        ) {
+                            Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    key = %entry.key,
+                                    error = %e,
+                                    "delta pull merge failed, stopping frontier advance"
+                                );
+                                merge_failed = true;
+                                break;
+                            }
+                        }
                     }
                     drop(api);
 
-                    // Update peer frontier.
-                    if let Some(new_frontier) = delta_resp.sender_frontier {
+                    // Update peer frontier only to the last successfully
+                    // merged entry's HLC. If all entries succeeded and the
+                    // sender provided a frontier, use that instead.
+                    if merge_failed {
+                        if let Some(hlc) = last_success_hlc {
+                            self.peer_frontiers.insert(peer_key.clone(), hlc);
+                        }
+                    } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
+                    } else if let Some(hlc) = last_success_hlc {
+                        self.peer_frontiers.insert(peer_key.clone(), hlc);
                     }
 
                     any_success = true;
@@ -1410,17 +1434,37 @@ impl NodeRunner {
 
                 if let Some(delta_resp) = retry_result {
                     let mut api = eventual_api.lock().await;
+                    let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
+                    let mut merge_failed = false;
                     for entry in &delta_resp.entries {
-                        let _ = api.merge_remote_with_hlc(
+                        match api.merge_remote_with_hlc(
                             entry.key.clone(),
                             &entry.value,
                             entry.hlc.clone(),
-                        );
+                        ) {
+                            Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    key = %entry.key,
+                                    error = %e,
+                                    "delta pull retry merge failed, stopping frontier advance"
+                                );
+                                merge_failed = true;
+                                break;
+                            }
+                        }
                     }
                     drop(api);
 
-                    if let Some(new_frontier) = delta_resp.sender_frontier {
+                    if merge_failed {
+                        if let Some(hlc) = last_success_hlc {
+                            self.peer_frontiers.insert(peer_key.clone(), hlc);
+                        }
+                    } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
+                    } else if let Some(hlc) = last_success_hlc {
+                        self.peer_frontiers.insert(peer_key.clone(), hlc);
                     }
 
                     any_success = true;
