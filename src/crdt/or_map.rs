@@ -187,6 +187,111 @@ where
         self.deferred.extend(other.deferred.iter().cloned());
     }
 
+    /// Merge a delta into this map.
+    ///
+    /// For OrMap, `merge_delta` is identical to `merge` because the delta
+    /// is the same type (a subset of entries and deferred dots).
+    pub fn merge_delta(&mut self, delta: &OrMap<K, V>) {
+        self.merge(delta);
+    }
+
+    /// Extract changes since the given frontier timestamp.
+    ///
+    /// OrMap entries carry LWW-Register timestamps, so this method returns
+    /// only entries whose register timestamp is strictly greater than
+    /// `frontier`, along with any tombstones. Returns `None` when there
+    /// are no entries or tombstones newer than the frontier.
+    pub fn delta_since(&self, frontier: &HlcTimestamp) -> Option<Self> {
+        let mut delta = OrMap {
+            entries: HashMap::new(),
+            counters: self.counters.clone(),
+            deferred: self.deferred.clone(),
+        };
+        let mut has_entries = false;
+
+        for (key, (dots, reg)) in &self.entries {
+            if !dots.is_empty() && *reg.timestamp() > *frontier {
+                delta
+                    .entries
+                    .insert(key.clone(), (dots.clone(), reg.clone()));
+                has_entries = true;
+            }
+        }
+
+        if !has_entries && delta.deferred.is_empty() {
+            return None;
+        }
+        Some(delta)
+    }
+
+    /// Compute a true incremental delta against a known old state.
+    ///
+    /// Returns an OrMap containing only:
+    /// - Entries whose dots are NOT present in `old`
+    /// - Entries whose LWW-Register has a newer timestamp than in `old`
+    /// - Deferred (tombstone) dots NOT present in `old`
+    /// - Updated counters
+    ///
+    /// Returns `None` if there are no changes.
+    pub fn delta_from(&self, old: &OrMap<K, V>) -> Option<Self>
+    where
+        V: PartialEq,
+    {
+        let mut delta = OrMap {
+            entries: HashMap::new(),
+            counters: HashMap::new(),
+            deferred: HashSet::new(),
+        };
+        let mut has_changes = false;
+
+        // Collect all dots in old state for comparison.
+        let old_all_dots: HashSet<&Dot> = old
+            .entries
+            .values()
+            .flat_map(|(dots, _)| dots.iter())
+            .collect();
+
+        for (key, (dots, reg)) in &self.entries {
+            // Check if this entry has new dots or a newer register value.
+            let new_dots: HashSet<Dot> = dots
+                .iter()
+                .filter(|d| !old_all_dots.contains(d))
+                .cloned()
+                .collect();
+
+            let reg_changed = match old.entries.get(key) {
+                Some((_, old_reg)) => *reg.timestamp() > *old_reg.timestamp(),
+                None => true,
+            };
+
+            if !new_dots.is_empty() || reg_changed {
+                delta
+                    .entries
+                    .insert(key.clone(), (dots.clone(), reg.clone()));
+                has_changes = true;
+            }
+        }
+
+        // Find new tombstones.
+        for d in &self.deferred {
+            if !old.deferred.contains(d) {
+                delta.deferred.insert(d.clone());
+                has_changes = true;
+            }
+        }
+
+        // Include updated counters.
+        for (node_id, &counter) in &self.counters {
+            let old_counter = old.counters.get(node_id).copied().unwrap_or(0);
+            if counter > old_counter {
+                delta.counters.insert(node_id.clone(), counter);
+                has_changes = true;
+            }
+        }
+
+        if has_changes { Some(delta) } else { None }
+    }
+
     /// Return the number of dots currently in the tombstone (deferred) set.
     ///
     /// Useful for monitoring GC effectiveness.
@@ -617,5 +722,171 @@ mod tests {
         assert_eq!(map_a.len(), 2);
         assert_eq!(map_a.get(&"a".to_string()), Some(&1));
         assert_eq!(map_a.get(&"b".to_string()), Some(&2));
+    }
+
+    // ---------------------------------------------------------------
+    // Delta tests
+    // ---------------------------------------------------------------
+
+    fn frontier(physical: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn delta_since_empty_returns_none() {
+        let map: OrMap<String, i32> = OrMap::new();
+        assert!(map.delta_since(&frontier(0)).is_none());
+    }
+
+    #[test]
+    fn delta_since_returns_entries_after_frontier() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
+
+        // Frontier at 150 should only include "b".
+        let delta = map.delta_since(&ts(150, 0, "")).unwrap();
+        assert!(!delta.contains_key(&"a".to_string()));
+        assert!(delta.contains_key(&"b".to_string()));
+    }
+
+    #[test]
+    fn delta_since_returns_none_when_all_older() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+
+        let delta = map.delta_since(&ts(200, 0, ""));
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn delta_from_no_changes_returns_none() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        assert!(map.delta_from(&old).is_none());
+    }
+
+    #[test]
+    fn delta_from_detects_new_entry() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
+
+        let delta = map.delta_from(&old).unwrap();
+        assert!(delta.contains_key(&"b".to_string()));
+        assert_eq!(delta.get(&"b".to_string()), Some(&2));
+    }
+
+    #[test]
+    fn delta_from_detects_updated_value() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        map.set("a".to_string(), 2, ts(200, 0, "A"), &node("A"));
+
+        let delta = map.delta_from(&old).unwrap();
+        assert!(delta.contains_key(&"a".to_string()));
+        assert_eq!(delta.get(&"a".to_string()), Some(&2));
+    }
+
+    #[test]
+    fn delta_from_detects_delete() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        map.delete(&"a".to_string());
+
+        let delta = map.delta_from(&old).unwrap();
+        // Should have new tombstone dots.
+        assert!(!delta.deferred.is_empty());
+    }
+
+    #[test]
+    fn delta_round_trip_add_produces_same_result() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        map.set("b".to_string(), 2, ts(200, 0, "B"), &node("B"));
+
+        // Full merge path.
+        let mut via_full = old.clone();
+        via_full.merge(&map);
+
+        // Delta merge path.
+        let delta = map.delta_from(&old).unwrap();
+        let mut via_delta = old.clone();
+        via_delta.merge_delta(&delta);
+
+        assert_eq!(
+            via_full.get(&"a".to_string()),
+            via_delta.get(&"a".to_string())
+        );
+        assert_eq!(
+            via_full.get(&"b".to_string()),
+            via_delta.get(&"b".to_string())
+        );
+        assert_eq!(via_full.len(), via_delta.len());
+    }
+
+    #[test]
+    fn delta_round_trip_delete_produces_same_result() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        map.set("b".to_string(), 2, ts(101, 0, "A"), &node("A"));
+        let old = map.clone();
+
+        map.delete(&"a".to_string());
+
+        // Full merge path.
+        let mut via_full = old.clone();
+        via_full.merge(&map);
+
+        // Delta merge path.
+        let delta = map.delta_from(&old).unwrap();
+        let mut via_delta = old.clone();
+        via_delta.merge_delta(&delta);
+
+        assert!(!via_full.contains_key(&"a".to_string()));
+        assert!(!via_delta.contains_key(&"a".to_string()));
+        assert_eq!(
+            via_full.get(&"b".to_string()),
+            via_delta.get(&"b".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_delta_is_equivalent_to_merge() {
+        let mut map_a = OrMap::new();
+        map_a.set("x".to_string(), 10, ts(100, 0, "A"), &node("A"));
+
+        let mut map_b = OrMap::new();
+        map_b.set("y".to_string(), 20, ts(200, 0, "B"), &node("B"));
+
+        let mut via_merge = map_a.clone();
+        via_merge.merge(&map_b);
+
+        let mut via_delta = map_a.clone();
+        via_delta.merge_delta(&map_b);
+
+        assert_eq!(via_merge.len(), via_delta.len());
+        assert_eq!(
+            via_merge.get(&"x".to_string()),
+            via_delta.get(&"x".to_string())
+        );
+        assert_eq!(
+            via_merge.get(&"y".to_string()),
+            via_delta.get(&"y".to_string())
+        );
     }
 }

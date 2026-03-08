@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
 /// A PN-Counter (Positive-Negative Counter) CRDT.
@@ -84,6 +85,61 @@ impl PnCounter {
             let entry = self.n.entry(node_id.clone()).or_insert(0);
             *entry = (*entry).max(count);
         }
+    }
+
+    /// Merge a delta into this counter.
+    ///
+    /// For PnCounter, `merge_delta` is identical to `merge` because the delta
+    /// is the same type containing only the changed subset of node entries.
+    pub fn merge_delta(&mut self, delta: &PnCounter) {
+        self.merge(delta);
+    }
+
+    /// Extract changes since the given frontier timestamp.
+    ///
+    /// PnCounter does not embed per-node HLC timestamps, so if the key-level
+    /// HLC indicates the counter was modified after `frontier`, the entire
+    /// counter state is returned as the delta. The caller (sync layer) is
+    /// responsible for checking the key-level HLC before calling this.
+    ///
+    /// Returns `None` only when the counter is completely empty (no P or N
+    /// entries), which means there is nothing to send.
+    pub fn delta_since(&self, _frontier: &HlcTimestamp) -> Option<Self> {
+        if self.p.is_empty() && self.n.is_empty() {
+            return None;
+        }
+        Some(self.clone())
+    }
+
+    /// Compute a true incremental delta against a known old state.
+    ///
+    /// Returns a PnCounter containing only nodes whose P or N counts have
+    /// increased compared to `old`. Returns `None` if there are no changes.
+    ///
+    /// This is the preferred delta method when the peer's last-known state
+    /// is available, as it can significantly reduce payload size for counters
+    /// with many nodes.
+    pub fn delta_from(&self, old: &PnCounter) -> Option<Self> {
+        let mut delta = PnCounter::new();
+        let mut has_changes = false;
+
+        for (node_id, &count) in &self.p {
+            let old_count = old.p.get(node_id).copied().unwrap_or(0);
+            if count > old_count {
+                delta.p.insert(node_id.clone(), count);
+                has_changes = true;
+            }
+        }
+
+        for (node_id, &count) in &self.n {
+            let old_count = old.n.get(node_id).copied().unwrap_or(0);
+            if count > old_count {
+                delta.n.insert(node_id.clone(), count);
+                has_changes = true;
+            }
+        }
+
+        if has_changes { Some(delta) } else { None }
     }
 }
 
@@ -448,5 +504,123 @@ mod tests {
         let mut counter = PnCounter::new();
         counter.n.insert(node("a"), i64::MAX as u64);
         assert_eq!(counter.value(), -i64::MAX);
+    }
+
+    // ---------------------------------------------------------------
+    // Delta tests
+    // ---------------------------------------------------------------
+
+    fn frontier(physical: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn delta_since_empty_counter_returns_none() {
+        let counter = PnCounter::new();
+        assert!(counter.delta_since(&frontier(0)).is_none());
+    }
+
+    #[test]
+    fn delta_since_non_empty_returns_full_state() {
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        counter.increment(&node("B"));
+
+        let delta = counter.delta_since(&frontier(0));
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().value(), 2);
+    }
+
+    #[test]
+    fn delta_from_no_changes_returns_none() {
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+
+        let old = counter.clone();
+        assert!(counter.delta_from(&old).is_none());
+    }
+
+    #[test]
+    fn delta_from_detects_increment() {
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        let old = counter.clone();
+
+        counter.increment(&node("A"));
+        counter.increment(&node("B"));
+
+        let delta = counter.delta_from(&old).unwrap();
+        // Delta should contain node-A with P=2 and node-B with P=1.
+        assert_eq!(delta.p.get(&node("A")), Some(&2));
+        assert_eq!(delta.p.get(&node("B")), Some(&1));
+        assert!(delta.n.is_empty());
+    }
+
+    #[test]
+    fn delta_from_detects_decrement() {
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        let old = counter.clone();
+
+        counter.decrement(&node("A"));
+
+        let delta = counter.delta_from(&old).unwrap();
+        assert!(delta.p.is_empty()); // P didn't change
+        assert_eq!(delta.n.get(&node("A")), Some(&1));
+    }
+
+    #[test]
+    fn delta_round_trip_produces_same_result_as_full_merge() {
+        let na = node("A");
+        let nb = node("B");
+
+        // Build initial state.
+        let mut counter = PnCounter::new();
+        counter.increment(&na);
+        counter.increment(&na);
+        counter.decrement(&nb);
+        let old = counter.clone();
+
+        // Apply more changes.
+        counter.increment(&na);
+        counter.increment(&nb);
+        counter.decrement(&nb);
+
+        // Full merge path.
+        let mut via_full = old.clone();
+        via_full.merge(&counter);
+
+        // Delta merge path.
+        let delta = counter.delta_from(&old).unwrap();
+        let mut via_delta = old.clone();
+        via_delta.merge_delta(&delta);
+
+        assert_eq!(via_full.value(), via_delta.value());
+    }
+
+    #[test]
+    fn merge_delta_is_equivalent_to_merge() {
+        let na = node("A");
+        let nb = node("B");
+
+        let mut a = PnCounter::new();
+        a.increment(&na);
+        a.increment(&na);
+
+        let mut b = PnCounter::new();
+        b.increment(&nb);
+        b.decrement(&nb);
+
+        let mut via_merge = a.clone();
+        via_merge.merge(&b);
+
+        let mut via_delta = a.clone();
+        via_delta.merge_delta(&b);
+
+        assert_eq!(via_merge.value(), via_delta.value());
     }
 }

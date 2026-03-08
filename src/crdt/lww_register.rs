@@ -55,6 +55,27 @@ impl<T: Clone> LwwRegister<T> {
             self.timestamp = other.timestamp.clone();
         }
     }
+
+    /// Merge a delta into this register.
+    ///
+    /// For LwwRegister, `merge_delta` is identical to `merge` because the
+    /// delta is a complete register snapshot (value + timestamp).
+    pub fn merge_delta(&mut self, delta: &LwwRegister<T>) {
+        self.merge(delta);
+    }
+
+    /// Extract changes since the given frontier timestamp.
+    ///
+    /// If the register's timestamp is strictly greater than `frontier`, the
+    /// whole register is the delta (it was modified after the frontier).
+    /// Otherwise returns `None` — the peer already has the current value.
+    pub fn delta_since(&self, frontier: &HlcTimestamp) -> Option<Self> {
+        if self.timestamp > *frontier {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
 }
 
 impl<T: Clone> Default for LwwRegister<T> {
@@ -220,5 +241,82 @@ mod tests {
         let json = serde_json::to_string(&reg).unwrap();
         let back: LwwRegister<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get(), Some(&"hello".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Delta tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn delta_since_returns_some_when_newer() {
+        let mut reg = LwwRegister::new();
+        reg.set("hello", ts(200, 0, "node-a"));
+
+        let delta = reg.delta_since(&ts(100, 0, ""));
+        assert!(delta.is_some());
+        assert_eq!(delta.unwrap().get(), Some(&"hello"));
+    }
+
+    #[test]
+    fn delta_since_returns_none_when_older() {
+        let mut reg = LwwRegister::new();
+        reg.set("hello", ts(100, 0, "node-a"));
+
+        let delta = reg.delta_since(&ts(200, 0, ""));
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn delta_since_returns_none_when_equal() {
+        let mut reg = LwwRegister::new();
+        reg.set("hello", ts(100, 0, "node-a"));
+
+        let delta = reg.delta_since(&ts(100, 0, "node-a"));
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn delta_since_empty_register() {
+        let reg: LwwRegister<String> = LwwRegister::new();
+        // Empty register has timestamp (0, 0, ""), frontier at (0, 0, "") => not >
+        let delta = reg.delta_since(&ts(0, 0, ""));
+        assert!(delta.is_none());
+    }
+
+    #[test]
+    fn delta_round_trip_produces_same_result() {
+        let mut reg_a = LwwRegister::new();
+        reg_a.set(10, ts(100, 0, "node-a"));
+
+        let mut reg_b = LwwRegister::new();
+        reg_b.set(20, ts(200, 0, "node-b"));
+
+        // Full merge path.
+        let mut via_full = reg_a.clone();
+        via_full.merge(&reg_b);
+
+        // Delta path: extract delta from reg_b since reg_a's frontier.
+        let delta = reg_b.delta_since(&ts(100, 0, "node-a")).unwrap();
+        let mut via_delta = reg_a.clone();
+        via_delta.merge_delta(&delta);
+
+        assert_eq!(via_full, via_delta);
+    }
+
+    #[test]
+    fn merge_delta_is_equivalent_to_merge() {
+        let mut reg_a = LwwRegister::new();
+        reg_a.set(1, ts(100, 0, "node-a"));
+
+        let mut reg_b = LwwRegister::new();
+        reg_b.set(2, ts(200, 0, "node-b"));
+
+        let mut via_merge = reg_a.clone();
+        via_merge.merge(&reg_b);
+
+        let mut via_delta = reg_a.clone();
+        via_delta.merge_delta(&reg_b);
+
+        assert_eq!(via_merge, via_delta);
     }
 }

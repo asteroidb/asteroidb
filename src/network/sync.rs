@@ -211,6 +211,87 @@ impl Default for PeerBackoff {
 /// allow partial progress on transient failures.
 pub const DEFAULT_BATCH_SIZE: usize = 100;
 
+/// Maximum serialized size (in bytes) of a delta payload before falling
+/// back to full-state sync. Prevents oversized deltas that would negate
+/// the bandwidth savings.
+pub const MAX_DELTA_PAYLOAD_BYTES: usize = 512 * 1024; // 512 KiB
+
+/// Tracks per-peer delta frontiers for efficient delta sync.
+///
+/// Maintains the last-acknowledged HLC frontier for each peer, enabling
+/// the sync layer to compute and send only changes since that frontier.
+/// When a peer successfully acknowledges a sync, its frontier is advanced.
+///
+/// Periodically advances the minimum frontier across all peers (GC frontier)
+/// so that obsolete delta tracking data can be reclaimed.
+#[derive(Debug, Clone)]
+pub struct PeerFrontierTracker {
+    /// Last-acked frontier per peer address.
+    frontiers: HashMap<String, HlcTimestamp>,
+    /// The minimum frontier across all tracked peers, used for GC.
+    gc_frontier: Option<HlcTimestamp>,
+}
+
+impl PeerFrontierTracker {
+    /// Create a new tracker with no known peers.
+    pub fn new() -> Self {
+        Self {
+            frontiers: HashMap::new(),
+            gc_frontier: None,
+        }
+    }
+
+    /// Get the last-acked frontier for a peer, if known.
+    pub fn frontier_for(&self, peer_addr: &str) -> Option<&HlcTimestamp> {
+        self.frontiers.get(peer_addr)
+    }
+
+    /// Update the frontier for a peer after a successful sync acknowledgement.
+    pub fn advance_frontier(&mut self, peer_addr: &str, frontier: HlcTimestamp) {
+        let entry = self
+            .frontiers
+            .entry(peer_addr.to_string())
+            .or_insert_with(|| HlcTimestamp {
+                physical: 0,
+                logical: 0,
+                node_id: String::new(),
+            });
+        if frontier > *entry {
+            *entry = frontier;
+        }
+    }
+
+    /// Remove tracking for a peer (e.g., when the peer leaves the cluster).
+    pub fn remove_peer(&mut self, peer_addr: &str) {
+        self.frontiers.remove(peer_addr);
+    }
+
+    /// Recompute and return the GC frontier (minimum across all peers).
+    ///
+    /// Delta tracking data at or below this frontier can be safely pruned,
+    /// because all peers have already acknowledged it.
+    pub fn advance_gc_frontier(&mut self) -> Option<&HlcTimestamp> {
+        self.gc_frontier = self.frontiers.values().min().cloned();
+        self.gc_frontier.as_ref()
+    }
+
+    /// Return the current GC frontier without recomputing.
+    pub fn gc_frontier(&self) -> Option<&HlcTimestamp> {
+        self.gc_frontier.as_ref()
+    }
+
+    /// Return the number of tracked peers.
+    pub fn peer_count(&self) -> usize {
+        self.frontiers.len()
+    }
+}
+
+impl Default for PeerFrontierTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Anti-entropy sync client.
 ///
 /// Periodically pushes local CRDT values to every known peer.
@@ -939,5 +1020,85 @@ mod tests {
         assert_eq!(chunks[0].len(), 100);
         assert_eq!(chunks[1].len(), 100);
         assert_eq!(chunks[2].len(), 50);
+    }
+
+    // ---------------------------------------------------------------
+    // PeerFrontierTracker tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn frontier_tracker_new_is_empty() {
+        let tracker = PeerFrontierTracker::new();
+        assert_eq!(tracker.peer_count(), 0);
+        assert!(tracker.gc_frontier().is_none());
+    }
+
+    #[test]
+    fn frontier_tracker_advance_and_get() {
+        let mut tracker = PeerFrontierTracker::new();
+        tracker.advance_frontier("peer-1:8000", hlc(100, 0, "node-1"));
+
+        assert_eq!(tracker.peer_count(), 1);
+        let f = tracker.frontier_for("peer-1:8000").unwrap();
+        assert_eq!(f.physical, 100);
+    }
+
+    #[test]
+    fn frontier_tracker_advance_only_moves_forward() {
+        let mut tracker = PeerFrontierTracker::new();
+        tracker.advance_frontier("peer-1:8000", hlc(200, 0, "node-1"));
+        tracker.advance_frontier("peer-1:8000", hlc(100, 0, "node-1")); // older
+
+        let f = tracker.frontier_for("peer-1:8000").unwrap();
+        assert_eq!(f.physical, 200, "frontier should not regress");
+    }
+
+    #[test]
+    fn frontier_tracker_remove_peer() {
+        let mut tracker = PeerFrontierTracker::new();
+        tracker.advance_frontier("peer-1:8000", hlc(100, 0, "node-1"));
+        assert_eq!(tracker.peer_count(), 1);
+
+        tracker.remove_peer("peer-1:8000");
+        assert_eq!(tracker.peer_count(), 0);
+        assert!(tracker.frontier_for("peer-1:8000").is_none());
+    }
+
+    #[test]
+    fn frontier_tracker_gc_frontier_is_minimum() {
+        let mut tracker = PeerFrontierTracker::new();
+        tracker.advance_frontier("peer-1:8000", hlc(100, 0, "node-1"));
+        tracker.advance_frontier("peer-2:8000", hlc(300, 0, "node-2"));
+        tracker.advance_frontier("peer-3:8000", hlc(200, 0, "node-3"));
+
+        let gc = tracker.advance_gc_frontier().unwrap();
+        assert_eq!(gc.physical, 100, "GC frontier should be the minimum");
+    }
+
+    #[test]
+    fn frontier_tracker_gc_frontier_none_when_empty() {
+        let mut tracker = PeerFrontierTracker::new();
+        assert!(tracker.advance_gc_frontier().is_none());
+    }
+
+    #[test]
+    fn frontier_tracker_gc_frontier_advances_after_peer_catches_up() {
+        let mut tracker = PeerFrontierTracker::new();
+        tracker.advance_frontier("peer-1:8000", hlc(100, 0, "node-1"));
+        tracker.advance_frontier("peer-2:8000", hlc(300, 0, "node-2"));
+
+        let gc1 = tracker.advance_gc_frontier().unwrap().clone();
+        assert_eq!(gc1.physical, 100);
+
+        // Peer 1 catches up.
+        tracker.advance_frontier("peer-1:8000", hlc(250, 0, "node-1"));
+        let gc2 = tracker.advance_gc_frontier().unwrap().clone();
+        assert_eq!(gc2.physical, 250, "GC frontier should advance");
+    }
+
+    #[test]
+    fn frontier_tracker_default() {
+        let tracker = PeerFrontierTracker::default();
+        assert_eq!(tracker.peer_count(), 0);
     }
 }
