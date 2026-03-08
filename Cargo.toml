@@ -15,6 +15,7 @@ axum = "0.8"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 subtle = "2"
 hex = "0.4"
 

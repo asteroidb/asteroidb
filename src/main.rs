@@ -4,6 +4,8 @@ use tokio::sync::Mutex;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::authority::bls::BlsKeypair;
+use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -34,6 +36,12 @@ fn authority_nodes() -> Vec<NodeId> {
 
 #[tokio::main]
 async fn main() {
+    // Initialize structured logging. Users control verbosity via RUST_LOG env var
+    // (e.g. RUST_LOG=info or RUST_LOG=asteroidb_poc=debug).
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Load configuration: either from a config file or from individual env vars.
     let (node_id, bind_addr, advertise_addr, config_peer_registry) =
         match std::env::var("ASTEROIDB_CONFIG") {
@@ -190,6 +198,52 @@ async fn main() {
         ),
     ));
 
+    // Parse optional BLS key seed from environment variable.
+    // When set, the node generates a BLS keypair and enables BLS certificate mode.
+    let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
+        let bytes = hex::decode(&hex_seed).unwrap_or_else(|e| {
+            eprintln!("error: ASTEROIDB_BLS_SEED contains invalid hex: {e}");
+            std::process::exit(1);
+        });
+        let mut seed = [0u8; 32];
+        let len = bytes.len().min(32);
+        seed[..len].copy_from_slice(&bytes[..len]);
+        BlsConfig { seed }
+    });
+
+    // Wire keyset_registry and current_epoch from EpochManager when BLS is configured.
+    let epoch_config = asteroidb_poc::authority::certificate::EpochConfig::default();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let epoch_manager = EpochManager::new(epoch_config.clone(), now_secs);
+    let current_epoch_val = epoch_manager.current_epoch(now_secs);
+
+    let keyset_registry = bls_config.as_ref().map(|bls_cfg| {
+        let keypair = BlsKeypair::generate(&bls_cfg.seed);
+        let mut registry = KeysetRegistry::new();
+        // Register an initial keyset (version 1) with an Ed25519 key derived from
+        // the same seed. The BLS public key is what matters for production verification.
+        let ed_signing_key = ed25519_dalek::SigningKey::from_bytes(&bls_cfg.seed);
+        let ed_verifying_key = ed_signing_key.verifying_key();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                current_epoch_val,
+                vec![(node_id.clone(), ed_verifying_key)],
+            )
+            .expect("initial keyset registration should succeed");
+        // Register the BLS public key for this node.
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(node_id.0.clone(), keypair.public_key)],
+            )
+            .expect("BLS key registration should succeed");
+        Arc::new(std::sync::RwLock::new(registry))
+    });
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -206,25 +260,12 @@ async fn main() {
         latency_model: Some(Arc::clone(&shared_latency_model)),
         cluster_nodes: Some(Arc::clone(&shared_cluster_nodes)),
         slo_tracker: Arc::clone(&slo_tracker),
-        keyset_registry: None,
-        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
-        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        keyset_registry,
+        epoch_config,
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(current_epoch_val)),
     });
 
     let app = router(state);
-
-    // Parse optional BLS key seed from environment variable.
-    // When set, the node generates a BLS keypair and enables BLS certificate mode.
-    let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
-        let bytes = hex::decode(&hex_seed).unwrap_or_else(|e| {
-            eprintln!("error: ASTEROIDB_BLS_SEED contains invalid hex: {e}");
-            std::process::exit(1);
-        });
-        let mut seed = [0u8; 32];
-        let len = bytes.len().min(32);
-        seed[..len].copy_from_slice(&bytes[..len]);
-        BlsConfig { seed }
-    });
 
     let runner_config = NodeRunnerConfig {
         bls_config,
