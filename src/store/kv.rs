@@ -1,7 +1,5 @@
-use std::collections::HashMap;
-use std::fs::File;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +10,7 @@ use crate::crdt::or_set::OrSet;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
+use crate::store::backend::{FileBackend, StorageBackend};
 use crate::store::migration;
 
 /// Current persistence format version written by this code.
@@ -56,19 +55,39 @@ impl CrdtValue {
 /// Provides basic CRUD operations, prefix-based key space partitioning,
 /// and CRDT-aware value merging with type checking. Supports HLC-based
 /// change tracking for delta sync.
+///
+/// The data map uses a `BTreeMap` for efficient O(log n + m) prefix range
+/// scans (see [`keys_with_prefix`](Self::keys_with_prefix)).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
-    data: HashMap<String, CrdtValue>,
+    data: BTreeMap<String, CrdtValue>,
     /// Per-key HLC timestamp of the last modification, used for delta sync.
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
+}
+
+/// Compute the exclusive upper bound for a BTreeMap range scan.
+///
+/// Increments the last byte of `prefix` to produce a string that is
+/// lexicographically just past all strings that start with `prefix`.
+/// Returns `None` if the prefix consists entirely of `0xFF` bytes.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.pop();
+    }
+    None
 }
 
 impl Store {
     /// Create a new, empty store.
     pub fn new() -> Self {
         Self {
-            data: HashMap::new(),
+            data: BTreeMap::new(),
             timestamps: HashMap::new(),
         }
     }
@@ -99,8 +118,26 @@ impl Store {
     }
 
     /// Return keys that start with the given prefix (FR-001 key space partitioning).
+    ///
+    /// Uses O(log n + m) BTreeMap range scan where m is the number of
+    /// matching keys, instead of O(n) full iteration.
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<&String> {
-        self.data.keys().filter(|k| k.starts_with(prefix)).collect()
+        if prefix.is_empty() {
+            return self.data.keys().collect();
+        }
+        if let Some(end) = prefix_upper_bound(prefix) {
+            self.data
+                .range::<String, _>(prefix.to_string()..end)
+                .map(|(k, _)| k)
+                .collect()
+        } else {
+            // Fallback: prefix is all 0xFF bytes -- scan from prefix to end.
+            self.data
+                .range::<String, _>(prefix.to_string()..)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, _)| k)
+                .collect()
+        }
     }
 
     /// Check whether the store contains a value for `key`.
@@ -134,10 +171,16 @@ impl Store {
 
     /// Save the store as a versioned JSON snapshot to the given path.
     ///
-    /// Uses atomic write (write to `.tmp` then rename) to prevent corruption
-    /// on crash. The snapshot includes a `format_version` field for forward
-    /// compatibility.
+    /// Uses a [`FileBackend`] internally for atomic write (write to `.tmp`
+    /// then rename) to prevent corruption on crash. The snapshot includes
+    /// a `format_version` field for forward compatibility.
     pub fn save_snapshot(&self, path: &Path) -> io::Result<()> {
+        let backend = FileBackend::new(path);
+        self.save_to_backend(&backend)
+    }
+
+    /// Save the store to an arbitrary [`StorageBackend`].
+    pub fn save_to_backend(&self, backend: &dyn StorageBackend) -> io::Result<()> {
         let store_value = serde_json::to_value(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let envelope = PersistedStore {
@@ -146,27 +189,25 @@ impl Store {
         };
         let json = serde_json::to_string(&envelope)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Atomic write: write to temp file, fsync, then rename.
-        let tmp_path = path.with_extension("tmp");
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        backend.save(json.as_bytes())
     }
 
     /// Load a store from a versioned JSON snapshot at the given path.
     ///
-    /// Detects the format version and applies migrations if the data was
-    /// written by an older version. Returns an error if the data version
-    /// is newer than what this code supports (forward incompatibility).
+    /// Uses a [`FileBackend`] internally. Detects the format version and
+    /// applies migrations if the data was written by an older version.
+    /// Returns an error if the data version is newer than what this code
+    /// supports (forward incompatibility).
     pub fn load_snapshot(path: &Path) -> io::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
+        let backend = FileBackend::new(path);
+        Self::load_from_backend(&backend)
+    }
+
+    /// Load a store from an arbitrary [`StorageBackend`].
+    pub fn load_from_backend(backend: &dyn StorageBackend) -> io::Result<Self> {
+        let bytes = backend.load()?;
+        let raw =
+            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::deserialize_snapshot(&raw)
     }
 
@@ -226,6 +267,16 @@ impl Store {
     /// prevent silent data loss.
     pub fn load_snapshot_or_default(path: &Path) -> io::Result<Self> {
         match Self::load_snapshot(path) {
+            Ok(store) => Ok(store),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Load a store from a backend, falling back to an empty store when
+    /// no data has been saved yet.
+    pub fn load_from_backend_or_default(backend: &dyn StorageBackend) -> io::Result<Self> {
+        match Self::load_from_backend(backend) {
             Ok(store) => Ok(store),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
@@ -1298,5 +1349,109 @@ mod tests {
             Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
             other => panic!("expected Counter, got {:?}", other),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // StorageBackend integration (#251)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_via_memory_backend() {
+        use crate::store::backend::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+
+        let mut store = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        store.put("hits".into(), CrdtValue::Counter(counter));
+        store.record_change("hits", ts(100, 0, "N1"));
+
+        store.save_to_backend(&backend).unwrap();
+        assert!(backend.exists());
+
+        let loaded = Store::load_from_backend(&backend).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+        assert_eq!(loaded.timestamp_for("hits"), Some(&ts(100, 0, "N1")));
+    }
+
+    #[test]
+    fn load_from_backend_or_default_empty() {
+        use crate::store::backend::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        let store = Store::load_from_backend_or_default(&backend).unwrap();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn save_to_file_backend_matches_save_snapshot() {
+        use crate::store::backend::FileBackend;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Save via save_snapshot (legacy API).
+        let path_a = dir.path().join("a.json");
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.save_snapshot(&path_a).unwrap();
+
+        // Save via save_to_backend with FileBackend.
+        let path_b = dir.path().join("b.json");
+        let backend = FileBackend::new(&path_b);
+        store.save_to_backend(&backend).unwrap();
+
+        // Both should produce loadable stores.
+        let loaded_a = Store::load_snapshot(&path_a).unwrap();
+        let loaded_b = Store::load_from_backend(&backend).unwrap();
+        assert_eq!(loaded_a.len(), loaded_b.len());
+    }
+
+    // ---------------------------------------------------------------
+    // BTreeMap prefix scan optimization (#255)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn btree_keys_with_prefix_returns_sorted() {
+        let mut store = Store::new();
+        store.put("user/zara".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("user/alice".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("user/bob".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("config/db".into(), CrdtValue::Counter(PnCounter::new()));
+
+        // BTreeMap range scan returns keys in sorted order.
+        let user_keys: Vec<&String> = store.keys_with_prefix("user/");
+        assert_eq!(user_keys, vec!["user/alice", "user/bob", "user/zara"]);
+    }
+
+    #[test]
+    fn prefix_upper_bound_helper() {
+        assert_eq!(super::prefix_upper_bound("abc"), Some("abd".to_string()));
+        assert_eq!(super::prefix_upper_bound("a"), Some("b".to_string()));
+        assert_eq!(
+            super::prefix_upper_bound("user/"),
+            Some("user0".to_string())
+        );
+        // Trailing 0x7E ('~') increments to 0x7F
+        assert_eq!(super::prefix_upper_bound("~"), Some("\x7F".to_string()));
+        // Empty prefix => None (no bytes to increment)
+        assert_eq!(super::prefix_upper_bound(""), None);
+    }
+
+    #[test]
+    fn keys_with_prefix_boundary_keys() {
+        let mut store = Store::new();
+        // Keys that are exactly at prefix boundaries.
+        store.put("abc".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("abd".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("ab".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("abcdef".into(), CrdtValue::Counter(PnCounter::new()));
+
+        let keys = store.keys_with_prefix("abc");
+        assert_eq!(keys, vec!["abc", "abcdef"]);
     }
 }
