@@ -1654,55 +1654,93 @@ impl NodeRunner {
         // in production.
         let pending_ops = self.metrics.write_ops_total.swap(0, Ordering::Relaxed);
 
-        let api = self.certified_api.lock().await;
-        let ns = api.namespace().read().unwrap();
+        let (defs, frontier_set) = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap();
 
-        // Iterate over all authority definitions to check each key range.
-        let defs: Vec<_> = ns
-            .all_authority_definitions()
-            .into_iter()
-            .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
-            .collect();
+            // Iterate over all authority definitions to check each key range.
+            let defs: Vec<_> = ns
+                .all_authority_definitions()
+                .into_iter()
+                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
+                .collect();
 
-        // Distribute drained write ops across key ranges. With a single
-        // key range (common case) all ops go to it; with multiple ranges
-        // each gets an equal share (approximation).
-        if pending_ops > 0 && !defs.is_empty() {
-            let ops_per_range = pending_ops / defs.len() as u64;
-            let remainder = pending_ops % defs.len() as u64;
-            for (i, (key_range, _)) in defs.iter().enumerate() {
-                let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
-                for _ in 0..ops {
-                    self.compaction_engine.record_op(key_range);
+            // Distribute drained write ops across key ranges.
+            if pending_ops > 0 && !defs.is_empty() {
+                let ops_per_range = pending_ops / defs.len() as u64;
+                let remainder = pending_ops % defs.len() as u64;
+                for (i, (key_range, _)) in defs.iter().enumerate() {
+                    let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
+                    for _ in 0..ops {
+                        self.compaction_engine.record_op(key_range);
+                    }
                 }
             }
-        }
 
-        for (key_range, _total_authorities) in &defs {
-            if self.compaction_engine.should_checkpoint(key_range, &now) {
-                // Create a checkpoint with a placeholder digest.
-                // In a full implementation this would compute an actual digest
-                // over the store data for this key range.
-                let policy_version = ns
-                    .get_placement_policy(&key_range.prefix)
-                    .map(|p| p.version)
-                    .unwrap_or(crate::types::PolicyVersion(1));
+            for (key_range, _total_authorities) in &defs {
+                if self.compaction_engine.should_checkpoint(key_range, &now) {
+                    let policy_version = ns
+                        .get_placement_policy(&key_range.prefix)
+                        .map(|p| p.version)
+                        .unwrap_or(crate::types::PolicyVersion(1));
 
+                    let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
+                    self.compaction_engine.create_checkpoint(
+                        key_range.clone(),
+                        now.clone(),
+                        digest,
+                        policy_version,
+                    );
+                }
+            }
+
+            let fs = api.frontier_set().clone();
+            (defs, fs)
+        };
+
+        // After checkpoint creation, run compaction to prune old timestamps.
+        // This wires run_compaction into the runtime so that timestamp pruning
+        // actually happens in production (Gap #253).
+        if let Some(ref eventual_api) = self.eventual_api {
+            let mut ev_api = eventual_api.lock().await;
+            let store = ev_api.store_mut();
+            for (key_range, total_authorities) in &defs {
+                let policy_version = {
+                    let certified_api = self.certified_api.lock().await;
+                    let ns = certified_api.namespace().read().unwrap();
+                    ns.get_placement_policy(&key_range.prefix)
+                        .map(|p| p.version)
+                        .unwrap_or(crate::types::PolicyVersion(1))
+                };
                 let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                self.compaction_engine.create_checkpoint(
-                    key_range.clone(),
+                let pruned = self.compaction_engine.run_compaction(
+                    key_range,
                     now.clone(),
                     digest,
                     policy_version,
+                    &frontier_set,
+                    *total_authorities,
+                    store,
                 );
+                if pruned > 0 {
+                    tracing::info!(
+                        node_id = %self.node_id.0,
+                        key_range = %key_range.prefix,
+                        pruned,
+                        "compaction pruned old timestamps"
+                    );
+                }
             }
         }
     }
 
     /// Run tombstone GC on the eventual store (if available).
     ///
-    /// Acquires the store lock, runs `gc_tombstones()` on all CRDT values,
-    /// and logs the number of tombstones collected.
+    /// Before running GC, populates the version floor from the
+    /// `AckFrontierSet` so that tombstones are only reclaimed after all
+    /// authorities have acknowledged them. For each authority's frontier,
+    /// extracts the HLC physical timestamp as a proxy counter and uses it
+    /// to set the GC version floor.
     async fn run_gc(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1711,6 +1749,29 @@ impl NodeRunner {
 
         if !self.tombstone_gc.should_run(now_ms) {
             return;
+        }
+
+        // Populate the global version floor from the ack frontier set.
+        // The global minimum HLC physical timestamp across all authority
+        // frontiers serves as the floor: any dot with a counter below this
+        // value has been acknowledged by every authority and is safe to GC.
+        {
+            let api = self.certified_api.lock().await;
+            let frontiers = api.all_frontiers();
+            if !frontiers.is_empty() {
+                let global_min = frontiers
+                    .iter()
+                    .map(|f| f.frontier_hlc.physical)
+                    .min()
+                    .unwrap();
+                self.tombstone_gc.set_global_floor(global_min);
+
+                // Also set per-authority floors for completeness.
+                for frontier in &frontiers {
+                    self.tombstone_gc
+                        .set_floor(&frontier.authority_id, frontier.frontier_hlc.physical);
+                }
+            }
         }
 
         if let Some(ref eventual_api) = self.eventual_api {

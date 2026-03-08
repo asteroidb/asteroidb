@@ -30,6 +30,13 @@ pub struct TombstoneGc {
     /// A dot `(node_id, counter)` with `counter < version_floor[node_id]`
     /// is safe to garbage-collect (assuming it is not in any live element).
     version_floor: HashMap<NodeId, u64>,
+    /// Global version floor applied to ALL writer nodes.
+    ///
+    /// Derived from the minimum acknowledged frontier HLC physical timestamp
+    /// across all authorities. When set, a dot `(node_id, counter)` with
+    /// `counter < global_floor` is considered safe to GC regardless of the
+    /// per-node floor entries.
+    global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
     /// Minimum time tombstones must be retained after creation.
@@ -48,6 +55,7 @@ impl Default for TombstoneGc {
     fn default() -> Self {
         Self {
             version_floor: HashMap::new(),
+            global_floor: None,
             gc_interval: Duration::from_secs(60),
             retention_period: Duration::from_secs(300),
             last_gc_ms: 0,
@@ -61,6 +69,7 @@ impl TombstoneGc {
     pub fn new(gc_interval: Duration, retention_period: Duration) -> Self {
         Self {
             version_floor: HashMap::new(),
+            global_floor: None,
             gc_interval,
             retention_period,
             last_gc_ms: 0,
@@ -89,6 +98,19 @@ impl TombstoneGc {
     /// Return the current version floor for a node, if known.
     pub fn floor_for(&self, node_id: &NodeId) -> Option<u64> {
         self.version_floor.get(node_id).copied()
+    }
+
+    /// Set the global version floor that applies to ALL writer nodes.
+    ///
+    /// Typically set to the minimum acknowledged frontier HLC physical
+    /// timestamp across all authorities.
+    pub fn set_global_floor(&mut self, floor: u64) {
+        self.global_floor = Some(floor);
+    }
+
+    /// Return the current global version floor, if set.
+    pub fn global_floor(&self) -> Option<u64> {
+        self.global_floor
     }
 
     /// Return the wall-clock timestamp (ms) of the last GC run.
@@ -126,19 +148,34 @@ impl TombstoneGc {
         }
 
         let mut collected = 0u64;
+        let has_floor = !self.version_floor.is_empty() || self.global_floor.is_some();
 
         for key in store.keys().into_iter().cloned().collect::<Vec<_>>() {
             if let Some(value) = store.get_mut(&key) {
                 match value {
                     CrdtValue::Set(set) => {
                         let before = set.deferred_len();
-                        set.compact_deferred();
+                        if has_floor {
+                            set.compact_deferred_with_floor(
+                                &self.version_floor,
+                                self.global_floor,
+                            );
+                        } else {
+                            set.compact_deferred();
+                        }
                         let after = set.deferred_len();
                         collected += before.saturating_sub(after) as u64;
                     }
                     CrdtValue::Map(map) => {
                         let before = map.deferred_len();
-                        map.compact_deferred();
+                        if has_floor {
+                            map.compact_deferred_with_floor(
+                                &self.version_floor,
+                                self.global_floor,
+                            );
+                        } else {
+                            map.compact_deferred();
+                        }
                         let after = map.deferred_len();
                         collected += before.saturating_sub(after) as u64;
                     }

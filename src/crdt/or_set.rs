@@ -195,6 +195,44 @@ where
             }
         });
     }
+
+    /// Remove tombstone dots from `deferred` that satisfy **both** the local
+    /// counter check and a cross-replica version floor check.
+    ///
+    /// A dot `(node_id, counter)` is removed when:
+    /// 1. It is not referenced by any live element, AND
+    /// 2. `counter < max_counter` for that node (local dominance), AND
+    /// 3. `counter < floor` where `floor` is the per-node floor from
+    ///    `version_floor`, falling back to `global_floor` if no per-node
+    ///    entry exists.
+    pub fn compact_deferred_with_floor(
+        &mut self,
+        version_floor: &std::collections::HashMap<NodeId, u64>,
+        global_floor: Option<u64>,
+    ) {
+        let live_dots: HashSet<&Dot> = self
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if live_dots.contains(d) {
+                return true;
+            }
+            let locally_dominated = match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter < max_counter,
+                None => false,
+            };
+            if !locally_dominated {
+                return true;
+            }
+            let effective_floor = version_floor.get(&d.node_id).copied().or(global_floor);
+            match effective_floor {
+                Some(floor) => d.counter >= floor,
+                None => true,
+            }
+        });
+    }
 }
 
 impl<T: Eq + Hash + Clone + Serialize + DeserializeOwned> Default for OrSet<T> {
