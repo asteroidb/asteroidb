@@ -358,14 +358,12 @@ pub async fn set_authority_definition(
     };
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    // Validate majority consensus (FR-009).
+    // Hold consensus lock across both validation and mutation to prevent
+    // TOCTOU races where a concurrent request could invalidate the approval
+    // between the check and the namespace write.
     {
         let consensus = state.consensus.lock().await;
         consensus.propose_authority_update(def.clone(), &approvals)?;
-    }
-
-    // Apply to shared namespace for read handlers and CertifiedApi.
-    {
         let mut ns = state.namespace.write().unwrap();
         ns.set_authority_definition(def);
     }
@@ -473,18 +471,16 @@ pub async fn set_placement_policy(
         policy
     };
 
-    // Validate majority consensus (FR-009) with a provisional version.
-    // The consensus check only validates authority approval, not the version
-    // number, so using a placeholder is safe here.
-    {
+    // Hold consensus lock across both validation and mutation to prevent
+    // TOCTOU races where a concurrent request could invalidate the approval
+    // between the check and the namespace write.
+    let policy = {
         let provisional = build_policy(PolicyVersion(0));
         let consensus = state.consensus.lock().await;
         consensus.propose_policy_update(provisional, &approvals)?;
-    }
 
-    // Atomically read the current version, create the policy, and apply it
-    // inside a single write-lock scope to prevent version collisions.
-    let policy = {
+        // Atomically read the current version, create the policy, and apply it
+        // inside a single write-lock scope to prevent version collisions.
         let mut ns = state.namespace.write().unwrap();
         let current_version = ns.version().0;
         let policy = build_policy(PolicyVersion(current_version + 1));
@@ -516,14 +512,12 @@ pub async fn remove_policy(
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
     let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    // Validate majority consensus (FR-009).
-    {
+    // Hold consensus lock across both validation and mutation to prevent
+    // TOCTOU races where a concurrent request could invalidate the approval
+    // between the check and the namespace write.
+    let removed = {
         let consensus = state.consensus.lock().await;
         consensus.propose_policy_removal(&prefix, &approvals)?;
-    }
-
-    // Apply to shared namespace for read handlers and CertifiedApi.
-    let removed = {
         let mut ns = state.namespace.write().unwrap();
         ns.remove_placement_policy(&prefix)
     };
