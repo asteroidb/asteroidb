@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -157,9 +159,8 @@ impl PeerRegistry {
     }
 
     /// Persist the registry to a JSON file using write-to-temp-then-rename
-    /// to reduce the window for partial-write corruption. Note that this
-    /// does not call `fsync`, so durability across hard power loss is not
-    /// guaranteed; the `load` fallback handles truncated files gracefully.
+    /// with fsync for crash safety, matching the pattern in
+    /// [`Store::save_snapshot`](crate::store::kv::Store::save_snapshot).
     ///
     /// # Errors
     ///
@@ -167,19 +168,30 @@ impl PeerRegistry {
     /// on serialisation errors.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), PeerError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| PeerError::Io(e.to_string()))?;
+        let parent = path.parent();
+        if let Some(p) = parent {
+            std::fs::create_dir_all(p).map_err(|e| PeerError::Io(e.to_string()))?;
         }
         let json =
             serde_json::to_string_pretty(self).map_err(|e| PeerError::Json(e.to_string()))?;
 
-        // Write to a sibling temp file, then rename.
+        // Atomic write: write to temp file, fsync, then rename.
         let tmp_path = path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &json).map_err(|e| PeerError::Io(e.to_string()))?;
+        let mut file = File::create(&tmp_path).map_err(|e| PeerError::Io(e.to_string()))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| PeerError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| PeerError::Io(e.to_string()))?;
+        drop(file);
         if let Err(e) = std::fs::rename(&tmp_path, path) {
             // Clean up stranded temp file on rename failure.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(PeerError::Io(e.to_string()));
+        }
+        // Fsync the parent directory so the rename is durable.
+        if let Some(p) = parent
+            && let Ok(dir) = File::open(p)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }

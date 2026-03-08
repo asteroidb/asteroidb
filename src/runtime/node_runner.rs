@@ -357,7 +357,9 @@ impl NodeRunner {
             peer_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
             cluster_nodes,
-            tracked_cluster_generation: 0,
+            // Use sentinel value to force initial recalculation on first tick,
+            // consistent with `with_cluster_nodes()`.
+            tracked_cluster_generation: u64::MAX,
             membership_client: None,
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
@@ -1219,10 +1221,6 @@ impl NodeRunner {
             return;
         };
 
-        self.metrics
-            .sync_attempt_total
-            .fetch_add(1, Ordering::Relaxed);
-
         let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
 
@@ -1230,6 +1228,11 @@ impl NodeRunner {
             let peer_key = peer.addr.clone();
             let peer_id = &peer.node_id.0;
             let peer_start = Instant::now();
+
+            // Count one attempt per peer so attempt/failure rates are comparable.
+            self.metrics
+                .sync_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
 
             // Check per-peer backoff; skip if still in cooldown.
             let backoff = self.peer_backoffs.entry(peer_key.clone()).or_default();
@@ -1422,7 +1425,13 @@ impl NodeRunner {
             if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
                 let mut api = eventual_api.lock().await;
                 for (key, value) in &dump.entries {
-                    let _ = api.merge_remote(key.clone(), value);
+                    // Preserve original HLC timestamps when available to avoid
+                    // retimestamping imported entries with a local clock tick.
+                    if let Some(hlc) = dump.timestamps.get(key) {
+                        let _ = api.merge_remote_with_hlc(key.clone(), value, hlc.clone());
+                    } else {
+                        let _ = api.merge_remote(key.clone(), value);
+                    }
                 }
                 drop(api);
 

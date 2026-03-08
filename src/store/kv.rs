@@ -123,6 +123,15 @@ impl Store {
         self.data.iter()
     }
 
+    /// Return all key-value pairs with their last-modification HLC timestamp.
+    pub fn all_entries_with_hlc(
+        &self,
+    ) -> impl Iterator<Item = (&String, &CrdtValue, &HlcTimestamp)> {
+        self.data
+            .iter()
+            .filter_map(|(k, v)| self.timestamps.get(k).map(|ts| (k, v, ts)))
+    }
+
     /// Save the store as a versioned JSON snapshot to the given path.
     ///
     /// Uses atomic write (write to `.tmp` then rename) to prevent corruption
