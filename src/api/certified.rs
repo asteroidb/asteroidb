@@ -646,6 +646,30 @@ impl CertifiedApi {
     pub fn is_version_fenced(&self, range: &KeyRange, version: &PolicyVersion) -> bool {
         self.frontiers.is_version_fenced(range, version)
     }
+
+    /// Run garbage collection on stale frontier entries.
+    ///
+    /// Delegates to [`AckFrontierSet::gc_stale_entries`]. Returns the number
+    /// of frontier entries removed.
+    pub fn gc_frontier_entries(
+        &mut self,
+        current_policy_version: PolicyVersion,
+        max_retained_versions: u64,
+        grace_period_secs: u64,
+        now_secs: u64,
+    ) -> usize {
+        self.frontiers.gc_stale_entries(
+            current_policy_version,
+            max_retained_versions,
+            grace_period_secs,
+            now_secs,
+        )
+    }
+
+    /// Return the number of frontier entries currently tracked.
+    pub fn frontier_count(&self) -> usize {
+        self.frontiers.len()
+    }
 }
 
 #[cfg(test)]
