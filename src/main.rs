@@ -164,7 +164,13 @@ async fn main() {
     let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(auth_nodes)));
 
     // Optional shared token for authenticating internal API requests.
-    let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN").ok();
+    // Treat an empty string the same as unset — Docker Compose substitutes
+    // `${ASTEROIDB_INTERNAL_TOKEN}` as "" when the host variable is not
+    // defined, which would otherwise activate the auth middleware with a
+    // degenerate empty token, breaking inter-node communication in CI.
+    let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
     // SLO tracker shared between HTTP handlers and NodeRunner.
     let slo_tracker = Arc::new(asteroidb_poc::ops::slo::SloTracker::new());

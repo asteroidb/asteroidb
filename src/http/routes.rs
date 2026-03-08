@@ -46,7 +46,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             delete(remove_policy),
         );
 
-    let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token {
+    let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token
+        && !token.is_empty()
+    {
         let token1 = token.clone();
         let token2 = token.clone();
         let internal_routes = internal_routes.layer(axum::middleware::from_fn(move |req, next| {
@@ -1840,6 +1842,47 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn empty_string_token_treated_as_no_auth() {
+        // When ASTEROIDB_INTERNAL_TOKEN is set to "" (e.g. Docker Compose
+        // substituting an unset host variable), the router must NOT activate
+        // the auth middleware so that inter-node sync works without a Bearer
+        // header.
+        let state = test_state_with_token(Some(String::new()));
+        let app = router(state);
+
+        // Internal route without any Authorization header should succeed,
+        // just like when internal_token is None.
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty-string token must not activate auth middleware"
+        );
+
+        // Control-plane mutation should also work without auth.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty-string token must not activate auth middleware on CP routes"
+        );
     }
 
     // ---------------------------------------------------------------

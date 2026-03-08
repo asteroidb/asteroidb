@@ -1084,7 +1084,7 @@ pub async fn internal_ping(
             if registry.update_address(&sender_nid, &req.sender_addr) {
                 changed = true;
             }
-        } else if state.internal_token.is_some() {
+        } else if state.internal_token.as_ref().is_some_and(|t| !t.is_empty()) {
             // The request reached us through the auth middleware, so the
             // sender has a valid token — safe to add as a new peer.
             if registry
@@ -1556,5 +1556,45 @@ mod tests {
             CrdtValue::Counter(c) => assert_eq!(c.value(), 1_000_000_000),
             other => panic!("expected Counter, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // validate_peer_address tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn validate_peer_address_accepts_docker_hostnames_with_hyphens() {
+        // Docker container names use hyphens (e.g. asteroidb-node-2:3000).
+        assert!(validate_peer_address("asteroidb-node-1:3000").is_ok());
+        assert!(validate_peer_address("asteroidb-node-2:3000").is_ok());
+        assert!(validate_peer_address("asteroidb-node-3:3000").is_ok());
+    }
+
+    #[test]
+    fn validate_peer_address_accepts_ip_port() {
+        assert!(validate_peer_address("127.0.0.1:3000").is_ok());
+        assert!(validate_peer_address("0.0.0.0:3000").is_ok());
+        assert!(validate_peer_address("192.168.1.1:8080").is_ok());
+    }
+
+    #[test]
+    fn validate_peer_address_accepts_ipv6() {
+        assert!(validate_peer_address("[::1]:3000").is_ok());
+    }
+
+    #[test]
+    fn validate_peer_address_rejects_scheme() {
+        assert!(validate_peer_address("http://localhost:3000").is_err());
+        assert!(validate_peer_address("ftp://host:22").is_err());
+    }
+
+    #[test]
+    fn validate_peer_address_rejects_path() {
+        assert!(validate_peer_address("localhost:3000/secret").is_err());
+    }
+
+    #[test]
+    fn validate_peer_address_rejects_missing_port() {
+        assert!(validate_peer_address("localhost").is_err());
     }
 }
