@@ -741,9 +741,12 @@ pub async fn internal_keys(State(state): State<Arc<AppState>>) -> Json<KeyDumpRe
         timestamps.insert(k.clone(), hlc.clone());
     }
     // Include entries without tracked timestamps (rare, but possible for
-    // stores migrated from older versions).
+    // stores migrated from older versions). Only iterate entries not already
+    // covered by `all_entries_with_hlc()` to avoid redundant cloning.
     for (k, v) in store.all_entries() {
-        entries.entry(k.clone()).or_insert_with(|| v.clone());
+        if !entries.contains_key(k) {
+            entries.insert(k.clone(), v.clone());
+        }
     }
     let frontier = store.current_frontier();
 
@@ -1223,6 +1226,15 @@ pub async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsSnap
 /// Returns a snapshot of all SLO budgets for operational monitoring.
 pub async fn get_slo(State(state): State<Arc<AppState>>) -> Json<SloSnapshot> {
     Json(state.slo_tracker.snapshot())
+}
+
+/// `GET /healthz`
+///
+/// Simple health check endpoint for load balancers and orchestrators.
+/// Returns 200 OK with a static JSON body. Placed outside auth middleware
+/// so that unauthenticated probes succeed.
+pub async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok"}))
 }
 
 // ---------------------------------------------------------------

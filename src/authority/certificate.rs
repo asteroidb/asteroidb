@@ -358,7 +358,12 @@ impl EpochManager {
     /// Create a new epoch manager.
     ///
     /// `epoch_base_secs` is the reference timestamp (in seconds) for epoch 0.
-    pub fn new(config: EpochConfig, epoch_base_secs: u64) -> Self {
+    /// If `config.duration_secs` is 0, it is replaced with the default (86400)
+    /// to prevent division-by-zero in epoch calculations.
+    pub fn new(mut config: EpochConfig, epoch_base_secs: u64) -> Self {
+        if config.duration_secs == 0 {
+            config.duration_secs = 86400;
+        }
         Self {
             config,
             registry: KeysetRegistry::new(),
@@ -371,8 +376,11 @@ impl EpochManager {
     }
 
     /// Compute the epoch number for a given timestamp in seconds.
+    ///
+    /// If `duration_secs` is 0 (misconfiguration), returns 0 to avoid
+    /// a division-by-zero panic.
     pub fn current_epoch(&self, now_secs: u64) -> u64 {
-        if now_secs < self.epoch_base_secs {
+        if self.config.duration_secs == 0 || now_secs < self.epoch_base_secs {
             return 0;
         }
         (now_secs - self.epoch_base_secs) / self.config.duration_secs
