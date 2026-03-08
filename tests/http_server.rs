@@ -11,7 +11,8 @@ use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloTracker};
-use asteroidb_poc::types::{KeyRange, NodeId};
+use asteroidb_poc::placement::PlacementPolicy;
+use asteroidb_poc::types::{KeyRange, NodeId, PolicyVersion};
 use tokio::sync::Mutex;
 
 fn test_state() -> Arc<AppState> {
@@ -29,6 +30,13 @@ fn test_state() -> Arc<AppState> {
         ],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        KeyRange {
+            prefix: String::new(),
+        },
+        3,
+    ));
 
     let namespace = Arc::new(RwLock::new(ns));
 
@@ -286,6 +294,13 @@ fn test_state_with_slo() -> (Arc<AppState>, Arc<SloTracker>) {
         ],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        KeyRange {
+            prefix: String::new(),
+        },
+        3,
+    ));
 
     let namespace = Arc::new(RwLock::new(ns));
 

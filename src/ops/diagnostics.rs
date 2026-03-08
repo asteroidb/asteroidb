@@ -211,6 +211,7 @@ mod tests {
     use crate::compaction::{CompactionEngine, RevalidationTrigger};
     use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
     use crate::crdt::pn_counter::PnCounter;
+    use crate::placement::PlacementPolicy;
     use crate::store::kv::CrdtValue;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -261,6 +262,7 @@ mod tests {
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
         wrap_ns(ns)
     }
 

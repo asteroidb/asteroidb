@@ -1792,7 +1792,7 @@ mod tests {
             bls_sigs.push(sig);
         }
 
-        let agg = crate::authority::bls::aggregate_signatures(&bls_sigs);
+        let agg = crate::authority::bls::aggregate_signatures(&bls_sigs).unwrap();
         cert.set_bls_aggregate(signers, agg);
 
         assert_eq!(cert.signer_count(), 5);
@@ -1815,7 +1815,7 @@ mod tests {
         ikm[0] = 99;
         let kp = crate::authority::bls::BlsKeypair::generate(&ikm);
         let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]).unwrap();
         cert.set_bls_aggregate(vec![(NodeId("a".into()), kp.public_key.clone())], agg);
 
         let result = cert.verify(b"wrong message");
@@ -1887,7 +1887,7 @@ mod tests {
         ikm[0] = 77;
         let kp = crate::authority::bls::BlsKeypair::generate(&ikm);
         let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]).unwrap();
         cert.set_bls_aggregate(vec![(NodeId("b".into()), kp.public_key.clone())], agg);
 
         let json = serde_json::to_string(&cert).unwrap();
@@ -2064,7 +2064,7 @@ mod tests {
 
         let kp = make_bls_keypair(80);
         let sig = crate::authority::bls::sign_message(kp.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig]).unwrap();
 
         // Set 1 signer ID but 0 public keys (mismatch).
         cert.bls_signer_ids = vec![NodeId("a".into())];
@@ -2097,7 +2097,7 @@ mod tests {
         let kp2 = make_bls_keypair(82);
         let sig1 = crate::authority::bls::sign_message(kp1.secret_key(), &message);
         let sig2 = crate::authority::bls::sign_message(kp2.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig1, sig2]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig1, sig2]).unwrap();
 
         // Same signer ID listed twice with different keys.
         cert.bls_signer_ids = vec![NodeId("dup".into()), NodeId("dup".into())];
@@ -2144,7 +2144,7 @@ mod tests {
         let kp_unknown = make_bls_keypair(84);
         let sig_known = crate::authority::bls::sign_message(kp_known.secret_key(), &message);
         let sig_unknown = crate::authority::bls::sign_message(kp_unknown.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig_known, sig_unknown]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig_known, sig_unknown]).unwrap();
 
         cert.set_bls_aggregate(
             vec![
@@ -2201,7 +2201,7 @@ mod tests {
         let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
         let sig_a = crate::authority::bls::sign_message(kp_a.secret_key(), &message);
         let sig_b = crate::authority::bls::sign_message(kp_b.secret_key(), &message);
-        let agg = crate::authority::bls::aggregate_signatures(&[sig_a, sig_b]);
+        let agg = crate::authority::bls::aggregate_signatures(&[sig_a, sig_b]).unwrap();
 
         cert.set_bls_aggregate(
             vec![

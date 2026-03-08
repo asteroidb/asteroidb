@@ -96,6 +96,11 @@ fn make_namespace(prefix: &str, authorities: &[&str]) -> Arc<RwLock<SystemNamesp
         authority_nodes: authorities.iter().map(|a| node(a)).collect(),
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        key_range(prefix),
+        authorities.len(),
+    ));
     wrap_ns(ns)
 }
 
@@ -903,6 +908,16 @@ fn cross_range_certification_contamination_prevented() {
         authority_nodes: vec![node("auth-o1"), node("auth-o2"), node("auth-o3")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        key_range("user/"),
+        3,
+    ));
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        key_range("order/"),
+        3,
+    ));
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -1024,6 +1039,16 @@ fn longest_prefix_authority_resolution_in_integration() {
         authority_nodes: vec![node("auth-v1"), node("auth-v2")],
         auto_generated: false,
     });
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        key_range("user/"),
+        3,
+    ));
+    ns.set_placement_policy(PlacementPolicy::new(
+        PolicyVersion(1),
+        key_range("user/vip/"),
+        2,
+    ));
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
