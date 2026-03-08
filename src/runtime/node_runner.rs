@@ -1245,20 +1245,28 @@ impl NodeRunner {
             // --- Push phase: send only changed local keys to peer ---
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
                 let api = eventual_api.lock().await;
-                // entries_since returns entries sorted by HLC; preserve the
-                // per-entry HLC so we can compute the correct frontier to
-                // advance to after a (possibly partial) push.
+                // entries_since returns entries sorted by HLC; split into
+                // (key, value) pairs for push and a parallel HLC vec for
+                // frontier tracking, avoiding a second clone of every entry.
                 let entries_with_hlc: Vec<(
                     String,
                     crate::store::kv::CrdtValue,
                     crate::hlc::HlcTimestamp,
                 )> = api.store().entries_since(frontier);
-                let changed: Vec<(String, crate::store::kv::CrdtValue)> = entries_with_hlc
-                    .iter()
-                    .map(|(key, value, _hlc)| (key.clone(), value.clone()))
-                    .collect();
-                let changed_count = changed.len();
                 drop(api);
+
+                let changed_count = entries_with_hlc.len();
+                // Separate HLCs (cheap Copy-like fields) from owned key-value
+                // pairs so push_changed_keys can take ownership without an
+                // extra clone of every CrdtValue.
+                let hlc_vec: Vec<crate::hlc::HlcTimestamp> = entries_with_hlc
+                    .iter()
+                    .map(|(_, _, hlc)| hlc.clone())
+                    .collect();
+                let changed: Vec<(String, crate::store::kv::CrdtValue)> = entries_with_hlc
+                    .into_iter()
+                    .map(|(key, value, _hlc)| (key, value))
+                    .collect();
 
                 if !changed.is_empty() {
                     let push_result = sync_client
@@ -1277,7 +1285,7 @@ impl NodeRunner {
                             // entry write (HLC physical) to push completion.
                             if let Some(slo) = &self.slo_tracker {
                                 let now_ms = self.clock.now().physical;
-                                for (_key, _val, hlc) in entries_with_hlc.iter().take(pushed) {
+                                for hlc in hlc_vec.iter().take(pushed) {
                                     let convergence_ms = now_ms.saturating_sub(hlc.physical) as f64;
                                     slo.record_observation(
                                         SLO_REPLICATION_CONVERGENCE,
@@ -1288,7 +1296,7 @@ impl NodeRunner {
                             // Advance peer frontier to the max HLC of the
                             // pushed batch — NOT current_frontier(), which may
                             // have advanced past unpushed concurrent writes.
-                            if let Some((_key, _val, max_hlc)) = entries_with_hlc.last() {
+                            if let Some(max_hlc) = hlc_vec.last() {
                                 self.peer_frontiers
                                     .insert(peer_key.clone(), max_hlc.clone());
                             }
@@ -1302,11 +1310,10 @@ impl NodeRunner {
                             );
                             // On partial failure, advance the frontier only to
                             // the HLC of the last successfully pushed entry.
-                            // entries_with_hlc is sorted by HLC, so index
+                            // hlc_vec is sorted by HLC, so index
                             // `pushed - 1` is the last entry that was sent.
                             if e.pushed > 0
-                                && let Some((_key, _val, last_pushed_hlc)) =
-                                    entries_with_hlc.get(e.pushed - 1)
+                                && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
                             {
                                 self.peer_frontiers
                                     .insert(peer_key.clone(), last_pushed_hlc.clone());

@@ -153,11 +153,12 @@ where
             });
 
             // Add dots from other that we haven't tombstoned.
-            for dot in other_dots {
-                if !self.deferred.contains(dot) {
-                    entry.0.insert(dot.clone());
-                }
-            }
+            entry.0.extend(
+                other_dots
+                    .iter()
+                    .filter(|dot| !self.deferred.contains(dot))
+                    .cloned(),
+            );
 
             // Remove our dots that the other has tombstoned.
             entry.0.retain(|dot| !other.deferred.contains(dot));
@@ -183,9 +184,7 @@ where
         }
 
         // Merge deferred sets.
-        for dot in &other.deferred {
-            self.deferred.insert(dot.clone());
-        }
+        self.deferred.extend(other.deferred.iter().cloned());
     }
 
     /// Return the number of present keys.
