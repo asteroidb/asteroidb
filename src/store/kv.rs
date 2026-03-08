@@ -48,6 +48,48 @@ impl CrdtValue {
             CrdtValue::Register(_) => "Register",
         }
     }
+
+    /// Extract changes since the given frontier timestamp.
+    ///
+    /// Delegates to the underlying CRDT type's `delta_since` method.
+    /// Returns `None` when there is nothing to send (e.g., the value
+    /// has not been modified since the frontier).
+    pub fn delta_since(&self, frontier: &HlcTimestamp) -> Option<Self> {
+        match self {
+            CrdtValue::Counter(c) => c.delta_since(frontier).map(CrdtValue::Counter),
+            CrdtValue::Set(s) => s.delta_since(frontier).map(CrdtValue::Set),
+            CrdtValue::Map(m) => m.delta_since(frontier).map(CrdtValue::Map),
+            CrdtValue::Register(r) => r.delta_since(frontier).map(CrdtValue::Register),
+        }
+    }
+
+    /// Merge a delta into this CRDT value.
+    ///
+    /// Returns `Err` if the delta type does not match the existing value type.
+    pub fn merge_delta(&mut self, delta: &CrdtValue) -> Result<(), CrdtError> {
+        match (self, delta) {
+            (CrdtValue::Counter(a), CrdtValue::Counter(b)) => {
+                a.merge_delta(b);
+                Ok(())
+            }
+            (CrdtValue::Set(a), CrdtValue::Set(b)) => {
+                a.merge_delta(b);
+                Ok(())
+            }
+            (CrdtValue::Map(a), CrdtValue::Map(b)) => {
+                a.merge_delta(b);
+                Ok(())
+            }
+            (CrdtValue::Register(a), CrdtValue::Register(b)) => {
+                a.merge_delta(b);
+                Ok(())
+            }
+            (existing, incoming) => Err(CrdtError::TypeMismatch {
+                expected: existing.type_name().to_string(),
+                actual: incoming.type_name().to_string(),
+            }),
+        }
+    }
 }
 
 /// Key-value store backed by CRDT values (FR-001).
@@ -315,6 +357,19 @@ impl Store {
         Ok(())
     }
 
+    /// Merge a delta CRDT value into an existing entry.
+    ///
+    /// If the key does not exist, the delta is inserted directly (it becomes
+    /// the full state). If the key exists, delegates to `CrdtValue::merge_delta`.
+    pub fn merge_delta_value(&mut self, key: String, delta: &CrdtValue) -> Result<(), CrdtError> {
+        if let Some(existing) = self.data.get_mut(&key) {
+            existing.merge_delta(delta)
+        } else {
+            self.data.insert(key, delta.clone());
+            Ok(())
+        }
+    }
+
     // ---------------------------------------------------------------
     // HLC-tracked operations for delta sync
     // ---------------------------------------------------------------
@@ -383,6 +438,34 @@ impl Store {
     /// Return the number of change-tracking timestamps currently stored.
     pub fn timestamp_count(&self) -> usize {
         self.timestamps.len()
+    }
+
+    /// Return delta entries modified strictly after the given frontier.
+    ///
+    /// Unlike `entries_since` which returns the full CRDT state for each
+    /// changed key, this method calls `delta_since` on each value to
+    /// extract only the changed portion. Falls back to the full state
+    /// when the per-CRDT delta extraction returns `None`.
+    ///
+    /// Returns `(key, delta_value, last_modified)` triples sorted by HLC.
+    pub fn delta_entries_since(
+        &self,
+        frontier: &HlcTimestamp,
+    ) -> Vec<(String, CrdtValue, HlcTimestamp)> {
+        let mut result: Vec<(String, CrdtValue, HlcTimestamp)> = self
+            .timestamps
+            .iter()
+            .filter(|(_, ts)| *ts > frontier)
+            .filter_map(|(key, ts)| {
+                self.data.get(key).map(|v| {
+                    // Try per-CRDT delta; fall back to full state.
+                    let delta = v.delta_since(frontier).unwrap_or_else(|| v.clone());
+                    (key.clone(), delta, ts.clone())
+                })
+            })
+            .collect();
+        result.sort_unstable_by(|a, b| a.2.cmp(&b.2));
+        result
     }
 }
 

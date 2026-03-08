@@ -10,6 +10,7 @@ use std::hash::Hash;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
 /// A unique identifier for each add operation (a "dot" in the dot-store model).
@@ -156,6 +157,79 @@ where
 
         // Merge deferred (tombstone) sets.
         self.deferred.extend(other.deferred.iter().cloned());
+    }
+
+    /// Merge a delta into this set.
+    ///
+    /// For OrSet, `merge_delta` is identical to `merge` because the delta
+    /// is the same type (a subset of elements and deferred entries).
+    pub fn merge_delta(&mut self, delta: &OrSet<T>) {
+        self.merge(delta);
+    }
+
+    /// Extract changes since the given frontier timestamp.
+    ///
+    /// OrSet dots do not carry HLC timestamps, so this method returns the
+    /// full set state when the set is non-empty (the caller is responsible
+    /// for checking the key-level HLC before invoking this). Returns `None`
+    /// when the set is empty and has no tombstones.
+    pub fn delta_since(&self, _frontier: &HlcTimestamp) -> Option<Self> {
+        if self.elements.is_empty() && self.deferred.is_empty() && self.counters.is_empty() {
+            return None;
+        }
+        Some(self.clone())
+    }
+
+    /// Compute a true incremental delta against a known old state.
+    ///
+    /// Returns an OrSet containing only:
+    /// - Elements whose dots are NOT present in `old`
+    /// - Deferred (tombstone) dots NOT present in `old`
+    /// - Updated counters
+    ///
+    /// Returns `None` if there are no changes.
+    pub fn delta_from(&self, old: &OrSet<T>) -> Option<Self> {
+        let mut delta = OrSet {
+            elements: HashMap::new(),
+            counters: HashMap::new(),
+            deferred: HashSet::new(),
+        };
+        let mut has_changes = false;
+
+        // Find new/changed elements (dots not in old).
+        let old_all_dots: HashSet<&Dot> =
+            old.elements.values().flat_map(|dots| dots.iter()).collect();
+
+        for (elem, dots) in &self.elements {
+            let new_dots: HashSet<Dot> = dots
+                .iter()
+                .filter(|d| !old_all_dots.contains(d))
+                .cloned()
+                .collect();
+            if !new_dots.is_empty() {
+                delta.elements.insert(elem.clone(), new_dots);
+                has_changes = true;
+            }
+        }
+
+        // Find new tombstones.
+        for d in &self.deferred {
+            if !old.deferred.contains(d) {
+                delta.deferred.insert(d.clone());
+                has_changes = true;
+            }
+        }
+
+        // Include updated counters so the receiver can generate fresh dots.
+        for (node_id, &counter) in &self.counters {
+            let old_counter = old.counters.get(node_id).copied().unwrap_or(0);
+            if counter > old_counter {
+                delta.counters.insert(node_id.clone(), counter);
+                has_changes = true;
+            }
+        }
+
+        if has_changes { Some(delta) } else { None }
     }
 
     /// Return the number of dots currently in the tombstone (deferred) set.
@@ -743,5 +817,147 @@ mod tests {
         let set: OrSet<String> = serde_json::from_str(json).unwrap();
         assert!(set.contains(&"a".to_string()));
         assert!(set.deferred.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Delta tests
+    // ---------------------------------------------------------------
+
+    fn frontier(physical: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn delta_since_empty_returns_none() {
+        let set: OrSet<String> = OrSet::new();
+        assert!(set.delta_since(&frontier(0)).is_none());
+    }
+
+    #[test]
+    fn delta_since_non_empty_returns_full_state() {
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &node("A"));
+
+        let delta = set.delta_since(&frontier(0));
+        assert!(delta.is_some());
+        assert!(delta.unwrap().contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn delta_from_no_changes_returns_none() {
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &node("A"));
+        let old = set.clone();
+
+        assert!(set.delta_from(&old).is_none());
+    }
+
+    #[test]
+    fn delta_from_detects_new_element() {
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &node("A"));
+        let old = set.clone();
+
+        set.add("y".to_string(), &node("A"));
+
+        let delta = set.delta_from(&old).unwrap();
+        assert!(delta.contains(&"y".to_string()));
+        // "x" should NOT be in the delta (its dot was already in old).
+        assert!(!delta.contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn delta_from_detects_new_tombstone() {
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &node("A"));
+        let old = set.clone();
+
+        set.remove(&"x".to_string());
+
+        let delta = set.delta_from(&old).unwrap();
+        assert!(!delta.deferred.is_empty());
+    }
+
+    #[test]
+    fn delta_from_detects_counter_advance() {
+        let mut set = OrSet::new();
+        let old = set.clone();
+
+        set.add("x".to_string(), &node("A"));
+
+        let delta = set.delta_from(&old).unwrap();
+        // Counter for node A should be included.
+        assert!(delta.counters.contains_key(&node("A")));
+    }
+
+    #[test]
+    fn delta_round_trip_add_produces_same_result() {
+        let na = node("A");
+        let nb = node("B");
+
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &na);
+        set.add("y".to_string(), &na);
+        let old = set.clone();
+
+        set.add("z".to_string(), &nb);
+
+        // Full merge path.
+        let mut via_full = old.clone();
+        via_full.merge(&set);
+
+        // Delta merge path.
+        let delta = set.delta_from(&old).unwrap();
+        let mut via_delta = old.clone();
+        via_delta.merge_delta(&delta);
+
+        assert_eq!(via_full.elements(), via_delta.elements());
+    }
+
+    #[test]
+    fn delta_round_trip_remove_produces_same_result() {
+        let na = node("A");
+
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &na);
+        set.add("y".to_string(), &na);
+        let old = set.clone();
+
+        set.remove(&"x".to_string());
+
+        // Full merge path.
+        let mut via_full = old.clone();
+        via_full.merge(&set);
+
+        // Delta merge path.
+        let delta = set.delta_from(&old).unwrap();
+        let mut via_delta = old.clone();
+        via_delta.merge_delta(&delta);
+
+        assert_eq!(via_full.elements(), via_delta.elements());
+    }
+
+    #[test]
+    fn merge_delta_is_equivalent_to_merge() {
+        let na = node("A");
+        let nb = node("B");
+
+        let mut set_a = OrSet::new();
+        set_a.add("x".to_string(), &na);
+
+        let mut set_b = OrSet::new();
+        set_b.add("y".to_string(), &nb);
+
+        let mut via_merge = set_a.clone();
+        via_merge.merge(&set_b);
+
+        let mut via_delta = set_a.clone();
+        via_delta.merge_delta(&set_b);
+
+        assert_eq!(via_merge.elements(), via_delta.elements());
     }
 }
