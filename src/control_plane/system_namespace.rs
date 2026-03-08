@@ -227,9 +227,16 @@ impl SystemNamespace {
         Ok(Some(ns))
     }
 
+    /// Maximum number of version history entries to retain.
+    const MAX_VERSION_HISTORY: usize = 1000;
+
     fn bump_version(&mut self) {
         self.version = PolicyVersion(self.version.0 + 1);
         self.version_history.push(self.version);
+        if self.version_history.len() > Self::MAX_VERSION_HISTORY {
+            self.version_history
+                .drain(..self.version_history.len() - Self::MAX_VERSION_HISTORY);
+        }
     }
 }
 

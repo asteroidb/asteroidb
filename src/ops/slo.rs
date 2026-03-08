@@ -4,7 +4,7 @@
 //! for dashboards and alerting integration.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -114,7 +114,7 @@ struct Observation {
 struct SloState {
     target: SloTarget,
     window: Duration,
-    observations: Vec<Observation>,
+    observations: VecDeque<Observation>,
 }
 
 impl SloState {
@@ -123,14 +123,14 @@ impl SloState {
         Self {
             target,
             window,
-            observations: Vec::new(),
+            observations: VecDeque::new(),
         }
     }
 
     /// Record an observation, evicting expired entries.
     fn record(&mut self, value: f64, now: Instant) {
         self.evict_expired(now);
-        self.observations.push(Observation {
+        self.observations.push_back(Observation {
             timestamp: now,
             value,
         });
@@ -139,7 +139,13 @@ impl SloState {
     /// Remove observations outside the evaluation window.
     fn evict_expired(&mut self, now: Instant) {
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
-        self.observations.retain(|o| o.timestamp >= cutoff);
+        while let Some(front) = self.observations.front() {
+            if front.timestamp < cutoff {
+                self.observations.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Compute the budget snapshot.
