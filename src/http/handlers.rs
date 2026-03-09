@@ -806,7 +806,7 @@ pub async fn internal_delta_sync(
     let store = api.store();
 
     let entries: Vec<DeltaEntry> = store
-        .entries_since(&req.frontier)
+        .delta_entries_since(&req.frontier)
         .into_iter()
         .map(|(key, value, hlc)| DeltaEntry { key, value, hlc })
         .collect();

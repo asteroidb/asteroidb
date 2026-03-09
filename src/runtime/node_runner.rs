@@ -1345,14 +1345,14 @@ impl NodeRunner {
             if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
                 let api = eventual_api.lock().await;
                 let total_keys = api.store().len();
-                // entries_since returns entries sorted by HLC; split into
-                // (key, value) pairs for push and a parallel HLC vec for
-                // frontier tracking, avoiding a second clone of every entry.
+                // delta_entries_since returns delta-state entries sorted by
+                // HLC; each value contains only the portion changed since
+                // the frontier, reducing bandwidth compared to full state.
                 let entries_with_hlc: Vec<(
                     String,
                     crate::store::kv::CrdtValue,
                     crate::hlc::HlcTimestamp,
-                )> = api.store().entries_since(frontier);
+                )> = api.store().delta_entries_since(frontier);
                 let changed_count = entries_with_hlc.len();
 
                 // Compute change rate and decide whether to use delta or full sync.
