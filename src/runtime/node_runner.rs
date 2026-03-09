@@ -3556,17 +3556,11 @@ mod tests {
             // Just verify the method exists with the right signature.
             // We can't call it without a running server, but the type
             // check confirms the API contract.
-            let _: std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Option<crate::network::sync::SyncResponse>>
-                        + Send
-                        + '_,
-                >,
-            > = Box::pin(client.push_full_state_to_peer(
+            drop(Box::pin(client.push_full_state_to_peer(
                 "127.0.0.1:8080",
                 HashMap::new(),
                 "node-1",
-            ));
+            )));
         }
     }
 
@@ -3668,7 +3662,7 @@ mod tests {
         // Simulate the initial sync path: no frontier for this peer.
         let peer_key = "peer-2:8080".to_string();
         assert!(
-            runner.peer_frontiers.get(&peer_key).is_none(),
+            !runner.peer_frontiers.contains_key(&peer_key),
             "no frontier should exist for unknown peer"
         );
 
