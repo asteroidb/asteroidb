@@ -339,7 +339,7 @@ pub async fn get_internal_frontiers(
 pub async fn list_authorities(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<AuthorityDefinitionResponse>> {
-    let ns = state.namespace.read().unwrap();
+    let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
     let defs: Vec<AuthorityDefinitionResponse> = ns
         .all_authority_definitions()
         .into_iter()
@@ -358,7 +358,7 @@ pub async fn get_authority_definition(
     State(state): State<Arc<AppState>>,
     Path(prefix): Path<String>,
 ) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
-    let ns = state.namespace.read().unwrap();
+    let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
     let def = ns.get_authority_definition(&prefix).ok_or_else(|| {
         ApiError(CrdtError::KeyNotFound(format!(
             "authority definition: {prefix}"
@@ -397,7 +397,7 @@ pub async fn set_authority_definition(
     {
         let consensus = state.consensus.lock().await;
         consensus.propose_authority_update(def.clone(), &approvals)?;
-        let mut ns = state.namespace.write().unwrap();
+        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
         ns.set_authority_definition(def);
     }
 
@@ -416,7 +416,7 @@ pub async fn set_authority_definition(
 pub async fn list_policies(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<PlacementPolicyResponse>> {
-    let ns = state.namespace.read().unwrap();
+    let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
     let policies: Vec<PlacementPolicyResponse> = ns
         .all_placement_policies()
         .into_iter()
@@ -440,7 +440,7 @@ pub async fn get_policy(
     State(state): State<Arc<AppState>>,
     Path(prefix): Path<String>,
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
-    let ns = state.namespace.read().unwrap();
+    let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
     let p = ns.get_placement_policy(&prefix).ok_or_else(|| {
         ApiError(CrdtError::KeyNotFound(format!(
             "placement policy: {prefix}"
@@ -517,7 +517,7 @@ pub async fn set_placement_policy(
 
         // Atomically read the current version, create the policy, and apply it
         // inside a single write-lock scope to prevent version collisions.
-        let mut ns = state.namespace.write().unwrap();
+        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
         let current_version = ns.version().0;
         let policy = build_policy(PolicyVersion(current_version + 1));
         ns.set_placement_policy(policy.clone());
@@ -557,7 +557,7 @@ pub async fn remove_policy(
     let removed = {
         let consensus = state.consensus.lock().await;
         consensus.propose_policy_removal(&prefix, &approvals)?;
-        let mut ns = state.namespace.write().unwrap();
+        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
         ns.remove_placement_policy(&prefix)
     };
 
@@ -587,7 +587,7 @@ pub async fn remove_policy(
 pub async fn get_version_history(
     State(state): State<Arc<AppState>>,
 ) -> Json<VersionHistoryResponse> {
-    let ns = state.namespace.read().unwrap();
+    let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
     Json(VersionHistoryResponse {
         current_version: ns.version().0,
         history: ns.version_history().iter().map(|v| v.0).collect(),
@@ -665,7 +665,7 @@ pub async fn verify_proof(
         certificate,
     };
 
-    let registry = registry_lock.read().unwrap();
+    let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
     let current_epoch = state
         .current_epoch
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -913,7 +913,7 @@ pub async fn internal_join(
     }
 
     let ns_snapshot = {
-        let ns = state.namespace.read().unwrap();
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
         serde_json::to_value(&*ns).unwrap_or(serde_json::Value::Null)
     };
 
@@ -1236,13 +1236,13 @@ pub async fn get_topology(State(state): State<Arc<AppState>>) -> Json<TopologyVi
     let nodes = state
         .cluster_nodes
         .as_ref()
-        .map(|n| n.read().unwrap().clone())
+        .map(|n| n.read().unwrap_or_else(|e| e.into_inner()).clone())
         .unwrap_or_default();
 
     let latency_model = state
         .latency_model
         .as_ref()
-        .map(|m| m.read().unwrap().clone())
+        .map(|m| m.read().unwrap_or_else(|e| e.into_inner()).clone())
         .unwrap_or_default();
 
     Json(TopologyView::build(&nodes, &latency_model))
@@ -1375,7 +1375,7 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
 async fn persist_namespace(state: &AppState) {
     if let Some(path) = &state.namespace_persist_path {
         let json = {
-            let ns = state.namespace.read().unwrap();
+            let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
             match serde_json::to_string_pretty(&*ns) {
                 Ok(j) => j,
                 Err(e) => {

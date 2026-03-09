@@ -59,8 +59,8 @@ impl PnCounter {
     /// `i64::MAX` or is less than `i64::MIN`, the result is clamped to the
     /// respective bound.
     pub fn value(&self) -> i64 {
-        let pos: u64 = self.p.values().sum();
-        let neg: u64 = self.n.values().sum();
+        let pos: u64 = self.p.values().fold(0u64, |acc, &v| acc.saturating_add(v));
+        let neg: u64 = self.n.values().fold(0u64, |acc, &v| acc.saturating_add(v));
         if pos >= neg {
             (pos - neg).min(i64::MAX as u64) as i64
         } else {
