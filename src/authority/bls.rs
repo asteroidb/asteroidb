@@ -148,7 +148,7 @@ pub fn aggregate_signatures(signatures: &[BlsSignature]) -> Result<BlsSignature,
 
     let refs: Vec<&blst::min_pk::Signature> = signatures.iter().map(|s| &s.0).collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&refs, true)
-        .expect("signature aggregation should not fail for valid inputs");
+        .map_err(|e| CrdtError::InvalidArgument(format!("BLS aggregate failed: {e:?}")))?;
     Ok(BlsSignature(agg.to_signature()))
 }
 

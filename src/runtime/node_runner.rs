@@ -307,7 +307,7 @@ impl NodeRunner {
     ) -> Self {
         let (reporter, tracked_versions, tracked_policies) = {
             let api = certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
@@ -395,7 +395,7 @@ impl NodeRunner {
     ) -> Self {
         let (reporter, tracked_versions, tracked_policies) = {
             let api = certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
@@ -596,7 +596,7 @@ impl NodeRunner {
                 .unwrap_or_default()
                 .as_millis() as u64;
             let rtt_ms = rtt.as_secs_f64() * 1000.0;
-            let mut m = model.write().unwrap();
+            let mut m = model.write().unwrap_or_else(|e| e.into_inner());
             m.update_latency(&self.node_id, peer_id, rtt_ms, now_ms);
         }
     }
@@ -609,10 +609,14 @@ impl NodeRunner {
         let (Some(topo_arc), Some(model_arc)) = (&self.topology_view, &self.latency_model) else {
             return;
         };
-        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
-        let model = model_arc.read().unwrap();
+        let nodes: Vec<Node> = self
+            .cluster_nodes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let model = model_arc.read().unwrap_or_else(|e| e.into_inner());
         let new_view = TopologyView::build(&nodes, &model);
-        *topo_arc.write().unwrap() = new_view;
+        *topo_arc.write().unwrap_or_else(|e| e.into_inner()) = new_view;
     }
 
     /// Snapshot the current policy version for each placement policy
@@ -649,7 +653,7 @@ impl NodeRunner {
         // Snapshot current versions while briefly holding the locks.
         let current_versions: HashMap<String, PolicyVersion> = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             Self::snapshot_policy_versions(&ns)
         };
 
@@ -699,15 +703,19 @@ impl NodeRunner {
             }
 
             // Recalculate authorities when any policy change is detected.
-            let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+            let nodes: Vec<Node> = self
+                .cluster_nodes
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             {
-                let mut ns = api.namespace().write().unwrap();
+                let mut ns = api.namespace().write().unwrap_or_else(|e| e.into_inner());
                 ns.recalculate_authorities(&nodes);
             }
 
             // Refresh the frontier reporter scopes.
             if let Some(reporter) = &mut self.frontier_reporter {
-                let ns = api.namespace().read().unwrap();
+                let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
                 reporter.refresh_scopes(&ns);
             }
         }
@@ -720,7 +728,7 @@ impl NodeRunner {
         self.tracked_policy_versions = current_versions;
         let new_policies: HashMap<String, PlacementPolicy> = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             Self::snapshot_policies(&ns)
         };
         self.tracked_policies = new_policies;
@@ -737,12 +745,16 @@ impl NodeRunner {
             return;
         };
 
-        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+        let nodes: Vec<Node> = self
+            .cluster_nodes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         // Get new policies from the namespace.
         let new_policies: HashMap<String, PlacementPolicy> = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             Self::snapshot_policies(&ns)
         };
 
@@ -990,7 +1002,7 @@ impl NodeRunner {
 
     async fn detect_membership_changes(&mut self) {
         let current_generation = {
-            let nodes = self.cluster_nodes.read().unwrap();
+            let nodes = self.cluster_nodes.read().unwrap_or_else(|e| e.into_inner());
             Self::cluster_fingerprint(&nodes)
         };
         if current_generation == self.tracked_cluster_generation {
@@ -998,17 +1010,21 @@ impl NodeRunner {
         }
         self.tracked_cluster_generation = current_generation;
 
-        let nodes: Vec<Node> = self.cluster_nodes.read().unwrap().clone();
+        let nodes: Vec<Node> = self
+            .cluster_nodes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         let api = self.certified_api.lock().await;
         let changed = {
-            let mut ns = api.namespace().write().unwrap();
+            let mut ns = api.namespace().write().unwrap_or_else(|e| e.into_inner());
             ns.recalculate_authorities(&nodes)
         };
 
         if changed > 0 {
             // Refresh the frontier reporter to pick up new authority scopes.
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(self.node_id.clone(), &ns);
             if reporter.is_authority() {
                 self.frontier_reporter = Some(reporter);
@@ -1516,16 +1532,14 @@ impl NodeRunner {
                                         pushed = e.pushed,
                                         "delta push failed"
                                     );
-                                    // On partial failure, advance the frontier only
-                                    // to the HLC of the last successfully pushed
-                                    // entry. hlc_vec is sorted by HLC, so index
-                                    // `pushed - 1` is the last entry that was sent.
-                                    if e.pushed > 0
-                                        && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
-                                    {
-                                        self.peer_frontiers
-                                            .insert(peer_key.clone(), last_pushed_hlc.clone());
-                                    }
+                                    // On partial failure, do NOT advance the frontier.
+                                    // push_changed_keys converts entries into a HashMap,
+                                    // losing HLC order, so the `pushed` count does not
+                                    // correspond to the first N HLCs in hlc_vec.
+                                    // Advancing would permanently skip failed entries.
+                                    // The next sync cycle will re-push from the old
+                                    // frontier, which is safe (merges are idempotent).
+                                    //
                                     // Record failure and move to next peer.
                                     self.peer_backoffs
                                         .entry(peer_key.clone())
@@ -1553,7 +1567,6 @@ impl NodeRunner {
                     .all_entries()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                let local_frontier = api.store().current_frontier();
                 drop(api);
 
                 if !all_entries.is_empty() {
@@ -1567,14 +1580,27 @@ impl NodeRunner {
                         .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                         .await;
 
-                    if success {
-                        // Set the frontier to the local store's current
-                        // frontier so subsequent cycles use delta mode.
-                        if let Some(f) = local_frontier {
-                            self.peer_frontiers.insert(peer_key.clone(), f);
-                        }
+                    if !success {
+                        // Push failed — skip pull and retry next cycle.
+                        continue;
                     }
                 }
+
+                // Set the frontier to ZERO so the first delta pull
+                // fetches ALL entries from the remote peer. Using
+                // local_frontier here would skip remote-only entries
+                // at or below our frontier, causing data loss when
+                // both peers have independent history. This also
+                // handles the empty local store case (nothing to push,
+                // but we still need to pull from the peer).
+                self.peer_frontiers.insert(
+                    peer_key.clone(),
+                    crate::hlc::HlcTimestamp {
+                        physical: 0,
+                        logical: 0,
+                        node_id: String::new(),
+                    },
+                );
             }
 
             // --- Pull phase: pull delta (or full) from peer ---
@@ -1584,12 +1610,12 @@ impl NodeRunner {
                     .await;
 
                 if let Some(delta_resp) = delta_result {
-                    // Apply delta entries, tracking merge errors.
-                    // Only advance the frontier to the HLC of the last
-                    // successfully merged entry so failed entries are retried.
+                    // Apply ALL delta entries, collecting errors instead of
+                    // stopping at the first failure. This prevents entries
+                    // behind a bad key from starving forever (P1-9).
                     let mut api = eventual_api.lock().await;
                     let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut merge_failed = false;
+                    let mut error_count = 0u64;
                     for entry in &delta_resp.entries {
                         match api.merge_remote_with_hlc(
                             entry.key.clone(),
@@ -1598,26 +1624,34 @@ impl NodeRunner {
                         ) {
                             Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
                             Err(e) => {
+                                error_count += 1;
                                 tracing::warn!(
                                     peer = %peer.node_id.0,
                                     key = %entry.key,
                                     error = %e,
-                                    "delta pull merge failed, stopping frontier advance"
+                                    "delta pull merge failed for key"
                                 );
-                                merge_failed = true;
-                                break;
                             }
                         }
                     }
                     drop(api);
 
-                    // Update peer frontier only to the last successfully
-                    // merged entry's HLC. If all entries succeeded and the
-                    // sender provided a frontier, use that instead.
-                    if merge_failed {
-                        if let Some(hlc) = last_success_hlc {
-                            self.peer_frontiers.insert(peer_key.clone(), hlc);
-                        }
+                    if error_count > 0 {
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            error_count,
+                            total_entries = delta_resp.entries.len(),
+                            "delta pull completed with merge errors"
+                        );
+                    }
+
+                    // Advance the frontier conservatively: if any entries
+                    // failed, don't advance past them so those entries are
+                    // retried on the next cycle.
+                    if error_count > 0 {
+                        // Don't advance frontier at all when there are errors —
+                        // the failed entries need to be retried from the
+                        // current frontier position.
                     } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
                     } else if let Some(hlc) = last_success_hlc {
@@ -1649,7 +1683,7 @@ impl NodeRunner {
                 if let Some(delta_resp) = retry_result {
                     let mut api = eventual_api.lock().await;
                     let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut merge_failed = false;
+                    let mut error_count = 0u64;
                     for entry in &delta_resp.entries {
                         match api.merge_remote_with_hlc(
                             entry.key.clone(),
@@ -1658,23 +1692,29 @@ impl NodeRunner {
                         ) {
                             Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
                             Err(e) => {
+                                error_count += 1;
                                 tracing::warn!(
                                     peer = %peer.node_id.0,
                                     key = %entry.key,
                                     error = %e,
-                                    "delta pull retry merge failed, stopping frontier advance"
+                                    "delta pull retry merge failed for key"
                                 );
-                                merge_failed = true;
-                                break;
                             }
                         }
                     }
                     drop(api);
 
-                    if merge_failed {
-                        if let Some(hlc) = last_success_hlc {
-                            self.peer_frontiers.insert(peer_key.clone(), hlc);
-                        }
+                    if error_count > 0 {
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            error_count,
+                            total_entries = delta_resp.entries.len(),
+                            "delta pull retry completed with merge errors"
+                        );
+                    }
+
+                    if error_count > 0 {
+                        // Don't advance frontier — retry failed entries next cycle.
                     } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
                     } else if let Some(hlc) = last_success_hlc {
@@ -1839,7 +1879,6 @@ impl NodeRunner {
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
     async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
@@ -1848,9 +1887,11 @@ impl NodeRunner {
         // in production.
         let pending_ops = self.metrics.write_ops_total.swap(0, Ordering::Relaxed);
 
-        let (defs, frontier_set) = {
+        // Phase 1: Acquire certified_api lock, read all needed data, then drop
+        // the lock before any subsequent .await points.
+        let (defs, frontier_set, policy_versions) = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
 
             // Iterate over all authority definitions to check each key range.
             let defs: Vec<_> = ns
@@ -1859,59 +1900,60 @@ impl NodeRunner {
                 .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
                 .collect();
 
-            // Distribute drained write ops across key ranges.
-            if pending_ops > 0 && !defs.is_empty() {
-                let ops_per_range = pending_ops / defs.len() as u64;
-                let remainder = pending_ops % defs.len() as u64;
-                for (i, (key_range, _)) in defs.iter().enumerate() {
-                    let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
-                    for _ in 0..ops {
-                        self.compaction_engine.record_op(key_range);
-                    }
-                }
-            }
-
-            for (key_range, _total_authorities) in &defs {
-                if self.compaction_engine.should_checkpoint(key_range, &now) {
-                    let policy_version = ns
-                        .get_placement_policy(&key_range.prefix)
-                        .map(|p| p.version)
-                        .unwrap_or(crate::types::PolicyVersion(1));
-
-                    let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                    self.compaction_engine.create_checkpoint(
-                        key_range.clone(),
-                        now.clone(),
-                        digest,
-                        policy_version,
-                    );
-                }
-            }
-
-            let fs = api.frontier_set().clone();
-            (defs, fs)
-        };
-
-        // After checkpoint creation, run compaction to prune old timestamps.
-        // This wires run_compaction into the runtime so that timestamp pruning
-        // actually happens in production (Gap #253).
-        if let Some(ref eventual_api) = self.eventual_api {
-            let mut ev_api = eventual_api.lock().await;
-            let store = ev_api.store_mut();
-            for (key_range, total_authorities) in &defs {
-                let policy_version = {
-                    let certified_api = self.certified_api.lock().await;
-                    let ns = certified_api.namespace().read().unwrap();
+            // Collect policy versions for all key ranges upfront so we don't
+            // need to re-acquire the lock later.
+            let policy_versions: Vec<_> = defs
+                .iter()
+                .map(|(key_range, _)| {
                     ns.get_placement_policy(&key_range.prefix)
                         .map(|p| p.version)
                         .unwrap_or(crate::types::PolicyVersion(1))
-                };
+                })
+                .collect();
+
+            let fs = api.frontier_set().clone();
+
+            // Drop ns (RwLock read guard) and api (tokio Mutex guard) here.
+            (defs, fs, policy_versions)
+        };
+
+        // Phase 2: Distribute drained write ops and create checkpoints using
+        // only the cloned data — no locks held.
+        if pending_ops > 0 && !defs.is_empty() {
+            let ops_per_range = pending_ops / defs.len() as u64;
+            let remainder = pending_ops % defs.len() as u64;
+            for (i, (key_range, _)) in defs.iter().enumerate() {
+                let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
+                for _ in 0..ops {
+                    self.compaction_engine.record_op(key_range);
+                }
+            }
+        }
+
+        for (i, (key_range, _total_authorities)) in defs.iter().enumerate() {
+            if self.compaction_engine.should_checkpoint(key_range, &now) {
+                let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
+                self.compaction_engine.create_checkpoint(
+                    key_range.clone(),
+                    now.clone(),
+                    digest,
+                    policy_versions[i],
+                );
+            }
+        }
+
+        // Phase 3: Run compaction to prune old timestamps. Acquire eventual_api
+        // lock only for the duration needed, with no other locks held.
+        if let Some(ref eventual_api) = self.eventual_api {
+            let mut ev_api = eventual_api.lock().await;
+            let store = ev_api.store_mut();
+            for (i, (key_range, total_authorities)) in defs.iter().enumerate() {
                 let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
                 let pruned = self.compaction_engine.run_compaction(
                     key_range,
                     now.clone(),
                     digest,
-                    policy_version,
+                    policy_versions[i],
                     &frontier_set,
                     *total_authorities,
                     store,
@@ -2003,7 +2045,7 @@ impl NodeRunner {
             crate::types::KeyRange,
             crate::types::PolicyVersion,
         > = {
-            let ns = api.namespace().read().unwrap();
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let mut versions = std::collections::HashMap::new();
             for def in ns.all_authority_definitions() {
                 if let Some(policy) = ns.get_placement_policy(&def.key_range.prefix) {
@@ -2715,13 +2757,16 @@ mod tests {
         // Initially no authority definition for user/.
         {
             let api_lock = api.lock().await;
-            let ns = api_lock.namespace().read().unwrap();
+            let ns = api_lock
+                .namespace()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(ns.get_authority_definition("user/").is_none());
         }
 
         // Simulate nodes joining the cluster.
         {
-            let mut nodes = cluster_nodes.write().unwrap();
+            let mut nodes = cluster_nodes.write().unwrap_or_else(|e| e.into_inner());
             nodes.push(make_node("n1", NodeMode::Store, &["dc:tokyo"]));
             nodes.push(make_node("n2", NodeMode::Store, &["dc:tokyo"]));
             nodes.push(make_node("n3", NodeMode::Store, &["dc:tokyo"]));
@@ -2737,7 +2782,10 @@ mod tests {
 
         // After detection, authority definition should be auto-created.
         let api_lock = api.lock().await;
-        let ns = api_lock.namespace().read().unwrap();
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let def = ns.get_authority_definition("user/");
         assert!(
             def.is_some(),
@@ -2765,7 +2813,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(runner.cluster_nodes().read().unwrap().len(), 1);
+        assert_eq!(
+            runner
+                .cluster_nodes()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2823,7 +2878,10 @@ mod tests {
         // Verify initial authority definition: n1, n2, n3.
         {
             let api_lock = api.lock().await;
-            let ns = api_lock.namespace().read().unwrap();
+            let ns = api_lock
+                .namespace()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let def = ns.get_authority_definition("user/").unwrap();
             assert_eq!(def.authority_nodes.len(), 3);
             assert!(def.authority_nodes.contains(&node_id("n1")));
@@ -2833,7 +2891,7 @@ mod tests {
 
         // Same-size replacement: n3 leaves, n4 joins (still 3 nodes).
         {
-            let mut nodes = cluster_nodes.write().unwrap();
+            let mut nodes = cluster_nodes.write().unwrap_or_else(|e| e.into_inner());
             nodes.retain(|n| n.id != node_id("n3"));
             nodes.push(make_node("n4", NodeMode::Store, &["dc:tokyo"]));
             assert_eq!(nodes.len(), 3, "node count must remain unchanged");
@@ -2861,7 +2919,10 @@ mod tests {
         // After detection, the authority definition should reflect the
         // replacement: n4 replaces n3.
         let api_lock = api.lock().await;
-        let ns = api_lock.namespace().read().unwrap();
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let def = ns.get_authority_definition("user/").unwrap();
         assert_eq!(def.authority_nodes.len(), 3);
         assert!(
@@ -2918,14 +2979,20 @@ mod tests {
         // No authority definition initially.
         {
             let api_lock = api.lock().await;
-            let ns = api_lock.namespace().read().unwrap();
+            let ns = api_lock
+                .namespace()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             assert!(ns.get_authority_definition("data/").is_none());
         }
 
         // Add a new certified policy while the runner is alive.
         {
             let api_lock = api.lock().await;
-            let mut ns = api_lock.namespace().write().unwrap();
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             ns.set_placement_policy(
                 PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                     .with_certified(true)
@@ -2942,7 +3009,10 @@ mod tests {
 
         // After detection, the new policy should have triggered authority creation.
         let api_lock = api.lock().await;
-        let ns = api_lock.namespace().read().unwrap();
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let def = ns.get_authority_definition("data/");
         assert!(
             def.is_some(),
@@ -3007,7 +3077,10 @@ mod tests {
         // Now remove the policy from the namespace.
         {
             let api_lock = api.lock().await;
-            let mut ns = api_lock.namespace().write().unwrap();
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             ns.remove_placement_policy("data/");
         }
 
@@ -3074,7 +3147,10 @@ mod tests {
         // Authority should exist with replica_count=2.
         {
             let api_lock = api.lock().await;
-            let ns = api_lock.namespace().read().unwrap();
+            let ns = api_lock
+                .namespace()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let def = ns.get_authority_definition("user/");
             assert!(def.is_some(), "authority definition should exist initially");
         }
@@ -3082,7 +3158,10 @@ mod tests {
         // Bump the policy version with new replica_count=3.
         {
             let api_lock = api.lock().await;
-            let mut ns = api_lock.namespace().write().unwrap();
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             ns.set_placement_policy(
                 PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
                     .with_certified(true)
@@ -3102,7 +3181,10 @@ mod tests {
 
         // Authority should have been recalculated (3 nodes match the new replica_count=3).
         let api_lock = api.lock().await;
-        let ns = api_lock.namespace().read().unwrap();
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let def = ns.get_authority_definition("user/").unwrap();
         assert_eq!(
             def.authority_nodes.len(),
@@ -3180,7 +3262,10 @@ mod tests {
         // Change the policy to remove the required tag (now all nodes match).
         {
             let api_lock = api.lock().await;
-            let mut ns = api_lock.namespace().write().unwrap();
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3));
         }
 
@@ -3315,7 +3400,10 @@ mod tests {
         // Delete the policy.
         {
             let api_lock = api.lock().await;
-            let mut ns = api_lock.namespace().write().unwrap();
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             ns.remove_placement_policy("data/");
         }
 
