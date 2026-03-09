@@ -1323,4 +1323,9 @@ mod tests {
     fn fallback_default_threshold_constant() {
         assert!((super::DEFAULT_FULL_SYNC_THRESHOLD - 0.5).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn max_delta_payload_bytes_is_512_kib() {
+        assert_eq!(super::MAX_DELTA_PAYLOAD_BYTES, 512 * 1024);
+    }
 }

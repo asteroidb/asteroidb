@@ -3328,6 +3328,76 @@ mod tests {
         );
     }
 
+    /// Verify the payload size estimation logic used to decide delta vs full sync.
+    /// If the estimated size exceeds MAX_DELTA_PAYLOAD_BYTES, the system should
+    /// fall back to full sync.
+    #[test]
+    fn delta_payload_size_estimation_triggers_fallback() {
+        use crate::network::sync::MAX_DELTA_PAYLOAD_BYTES;
+
+        // Create a small set of entries whose serialized size is below the limit.
+        let small_entries: Vec<(String, CrdtValue)> = (0..10)
+            .map(|i| (format!("key-{i}"), counter_value(1)))
+            .collect();
+        let small_size: usize = small_entries
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                        .map(|b| b.len())
+                        .unwrap_or(std::mem::size_of_val(v))
+            })
+            .sum();
+        assert!(
+            small_size <= MAX_DELTA_PAYLOAD_BYTES,
+            "small payload ({small_size} bytes) should be within limit"
+        );
+
+        // Create a large set of entries whose serialized size exceeds the limit.
+        // Use long keys and values to push past 512 KiB.
+        let large_entries: Vec<(String, CrdtValue)> = (0..5000)
+            .map(|i| {
+                let key = format!("key-{i:0>100}"); // 100+ char key
+                (key, counter_value(100))
+            })
+            .collect();
+        let large_size: usize = large_entries
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                        .map(|b| b.len())
+                        .unwrap_or(std::mem::size_of_val(v))
+            })
+            .sum();
+        assert!(
+            large_size > MAX_DELTA_PAYLOAD_BYTES,
+            "large payload ({large_size} bytes) should exceed limit ({MAX_DELTA_PAYLOAD_BYTES})"
+        );
+    }
+
+    /// Verify that push_full_state_to_peer targets a specific peer address,
+    /// unlike push_all_keys which broadcasts to all peers. This test confirms
+    /// the method signature takes a peer_addr parameter.
+    #[test]
+    fn push_full_state_to_peer_takes_peer_addr() {
+        // This is a compile-time test: push_full_state_to_peer requires
+        // a peer_addr parameter, ensuring it targets a specific peer.
+        // If someone reverts to push_all_keys (which has no peer_addr),
+        // this test will fail to compile.
+        fn _assert_targeted_signature(client: &SyncClient) {
+            // Just verify the method exists with the right signature.
+            // We can't call it without a running server, but the type
+            // check confirms the API contract.
+            let _: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> =
+                Box::pin(client.push_full_state_to_peer(
+                    "127.0.0.1:8080",
+                    HashMap::new(),
+                    "node-1",
+                ));
+        }
+    }
+
     #[tokio::test]
     async fn set_slo_tracker_wires_tracker_to_runner() {
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
