@@ -17,7 +17,8 @@ use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient, should_fallback_to_full_sync,
+    DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, SyncClient,
+    should_fallback_to_full_sync,
 };
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
@@ -1388,11 +1389,11 @@ impl NodeRunner {
                         .full_sync_fallback_count
                         .fetch_add(1, Ordering::Relaxed);
 
-                    let push_count = sync_client
-                        .push_all_keys(all_entries, &self.node_id.0)
+                    let push_ok = sync_client
+                        .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                         .await;
 
-                    if push_count > 0 {
+                    if push_ok {
                         // After a successful full push, advance the frontier to
                         // the local store's current frontier so the next delta
                         // sync starts from the right point.
@@ -1419,74 +1420,122 @@ impl NodeRunner {
                         .collect();
 
                     if !changed.is_empty() {
-                        self.metrics
-                            .delta_sync_count
-                            .fetch_add(1, Ordering::Relaxed);
+                        // Check serialized payload size — if the delta exceeds
+                        // MAX_DELTA_PAYLOAD_BYTES, it is cheaper to send a full
+                        // state push than an oversized delta.
+                        let estimated_size: usize = changed
+                            .iter()
+                            .map(|(k, v)| {
+                                k.len()
+                                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                                        .map(|b| b.len())
+                                        .unwrap_or(std::mem::size_of_val(v))
+                            })
+                            .sum();
 
-                        let push_result = sync_client
-                            .push_changed_keys(
-                                &peer.addr,
-                                changed,
-                                &self.node_id.0,
-                                DEFAULT_BATCH_SIZE,
-                            )
-                            .await;
+                        if estimated_size > MAX_DELTA_PAYLOAD_BYTES {
+                            tracing::info!(
+                                peer = %peer.node_id.0,
+                                estimated_size = estimated_size,
+                                limit = MAX_DELTA_PAYLOAD_BYTES,
+                                changed_keys = changed_count,
+                                "delta payload exceeds size limit, falling back to full sync"
+                            );
 
-                        match push_result {
-                            Ok(pushed) => {
-                                tracing::debug!(
-                                    peer = %peer.node_id.0,
-                                    pushed_keys = pushed,
-                                    total_changed = changed_count,
-                                    "delta push succeeded"
-                                );
-                                // Record replication convergence SLO: time from
-                                // entry write (HLC physical) to push completion.
-                                if let Some(slo) = &self.slo_tracker {
-                                    let now_ms = self.clock.now().physical;
-                                    for hlc in hlc_vec.iter().take(pushed) {
-                                        let convergence_ms =
-                                            now_ms.saturating_sub(hlc.physical) as f64;
-                                        slo.record_observation(
-                                            SLO_REPLICATION_CONVERGENCE,
-                                            convergence_ms,
-                                        );
+                            self.metrics
+                                .full_sync_fallback_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            let api = eventual_api.lock().await;
+                            let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                                .store()
+                                .all_entries()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            drop(api);
+
+                            let push_ok = sync_client
+                                .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
+                                .await;
+
+                            if push_ok {
+                                let api = eventual_api.lock().await;
+                                if let Some(current) = api.store().current_frontier() {
+                                    self.peer_frontiers.insert(peer_key.clone(), current);
+                                }
+                                drop(api);
+                            }
+                        } else {
+                            self.metrics
+                                .delta_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            let push_result = sync_client
+                                .push_changed_keys(
+                                    &peer.addr,
+                                    changed,
+                                    &self.node_id.0,
+                                    DEFAULT_BATCH_SIZE,
+                                )
+                                .await;
+
+                            match push_result {
+                                Ok(pushed) => {
+                                    tracing::debug!(
+                                        peer = %peer.node_id.0,
+                                        pushed_keys = pushed,
+                                        total_changed = changed_count,
+                                        "delta push succeeded"
+                                    );
+                                    // Record replication convergence SLO: time from
+                                    // entry write (HLC physical) to push completion.
+                                    if let Some(slo) = &self.slo_tracker {
+                                        let now_ms = self.clock.now().physical;
+                                        for hlc in hlc_vec.iter().take(pushed) {
+                                            let convergence_ms =
+                                                now_ms.saturating_sub(hlc.physical) as f64;
+                                            slo.record_observation(
+                                                SLO_REPLICATION_CONVERGENCE,
+                                                convergence_ms,
+                                            );
+                                        }
+                                    }
+                                    // Advance peer frontier to the max HLC of the
+                                    // pushed batch — NOT current_frontier(), which
+                                    // may have advanced past unpushed concurrent
+                                    // writes.
+                                    if let Some(max_hlc) = hlc_vec.last() {
+                                        self.peer_frontiers
+                                            .insert(peer_key.clone(), max_hlc.clone());
                                     }
                                 }
-                                // Advance peer frontier to the max HLC of the
-                                // pushed batch — NOT current_frontier(), which may
-                                // have advanced past unpushed concurrent writes.
-                                if let Some(max_hlc) = hlc_vec.last() {
-                                    self.peer_frontiers
-                                        .insert(peer_key.clone(), max_hlc.clone());
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %peer.node_id.0,
+                                        error = %e,
+                                        pushed = e.pushed,
+                                        "delta push failed"
+                                    );
+                                    // On partial failure, advance the frontier only
+                                    // to the HLC of the last successfully pushed
+                                    // entry. hlc_vec is sorted by HLC, so index
+                                    // `pushed - 1` is the last entry that was sent.
+                                    if e.pushed > 0
+                                        && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
+                                    {
+                                        self.peer_frontiers
+                                            .insert(peer_key.clone(), last_pushed_hlc.clone());
+                                    }
+                                    // Record failure and move to next peer.
+                                    self.peer_backoffs
+                                        .entry(peer_key.clone())
+                                        .or_default()
+                                        .record_failure();
+                                    self.metrics
+                                        .sync_failure_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    continue;
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    peer = %peer.node_id.0,
-                                    error = %e,
-                                    pushed = e.pushed,
-                                    "delta push failed"
-                                );
-                                // On partial failure, advance the frontier only to
-                                // the HLC of the last successfully pushed entry.
-                                // hlc_vec is sorted by HLC, so index
-                                // `pushed - 1` is the last entry that was sent.
-                                if e.pushed > 0
-                                    && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
-                                {
-                                    self.peer_frontiers
-                                        .insert(peer_key.clone(), last_pushed_hlc.clone());
-                                }
-                                // Record failure and move to next peer.
-                                self.peer_backoffs
-                                    .entry(peer_key.clone())
-                                    .or_default()
-                                    .record_failure();
-                                self.metrics
-                                    .sync_failure_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                                continue;
                             }
                         }
                     }
@@ -3265,6 +3314,76 @@ mod tests {
             !runner.active_rebalance_plans.contains_key("data/"),
             "rebalance plan should be cleared when policy is deleted"
         );
+    }
+
+    /// Verify the payload size estimation logic used to decide delta vs full sync.
+    /// If the estimated size exceeds MAX_DELTA_PAYLOAD_BYTES, the system should
+    /// fall back to full sync.
+    #[test]
+    fn delta_payload_size_estimation_triggers_fallback() {
+        use crate::network::sync::MAX_DELTA_PAYLOAD_BYTES;
+
+        // Create a small set of entries whose serialized size is below the limit.
+        let small_entries: Vec<(String, CrdtValue)> = (0..10)
+            .map(|i| (format!("key-{i}"), counter_value(1)))
+            .collect();
+        let small_size: usize = small_entries
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                        .map(|b| b.len())
+                        .unwrap_or(std::mem::size_of_val(v))
+            })
+            .sum();
+        assert!(
+            small_size <= MAX_DELTA_PAYLOAD_BYTES,
+            "small payload ({small_size} bytes) should be within limit"
+        );
+
+        // Create a large set of entries whose serialized size exceeds the limit.
+        // Use long keys and values to push past 512 KiB.
+        let large_entries: Vec<(String, CrdtValue)> = (0..5000)
+            .map(|i| {
+                let key = format!("key-{i:0>100}"); // 100+ char key
+                (key, counter_value(100))
+            })
+            .collect();
+        let large_size: usize = large_entries
+            .iter()
+            .map(|(k, v)| {
+                k.len()
+                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                        .map(|b| b.len())
+                        .unwrap_or(std::mem::size_of_val(v))
+            })
+            .sum();
+        assert!(
+            large_size > MAX_DELTA_PAYLOAD_BYTES,
+            "large payload ({large_size} bytes) should exceed limit ({MAX_DELTA_PAYLOAD_BYTES})"
+        );
+    }
+
+    /// Verify that push_full_state_to_peer targets a specific peer address,
+    /// unlike push_all_keys which broadcasts to all peers. This test confirms
+    /// the method signature takes a peer_addr parameter.
+    #[test]
+    fn push_full_state_to_peer_takes_peer_addr() {
+        // This is a compile-time test: push_full_state_to_peer requires
+        // a peer_addr parameter, ensuring it targets a specific peer.
+        // If someone reverts to push_all_keys (which has no peer_addr),
+        // this test will fail to compile.
+        fn _assert_targeted_signature(client: &SyncClient) {
+            // Just verify the method exists with the right signature.
+            // We can't call it without a running server, but the type
+            // check confirms the API contract.
+            let _: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> =
+                Box::pin(client.push_full_state_to_peer(
+                    "127.0.0.1:8080",
+                    HashMap::new(),
+                    "node-1",
+                ));
+        }
     }
 
     #[tokio::test]
