@@ -48,22 +48,6 @@ impl<T: Clone> LwwRegister<T> {
         &self.timestamp
     }
 
-    /// Merge another register into this one, keeping the value with the higher timestamp.
-    pub fn merge(&mut self, other: &LwwRegister<T>) {
-        if other.timestamp > self.timestamp {
-            self.value = other.value.clone();
-            self.timestamp = other.timestamp.clone();
-        }
-    }
-
-    /// Merge a delta into this register.
-    ///
-    /// For LwwRegister, `merge_delta` is identical to `merge` because the
-    /// delta is a complete register snapshot (value + timestamp).
-    pub fn merge_delta(&mut self, delta: &LwwRegister<T>) {
-        self.merge(delta);
-    }
-
     /// Extract changes since the given frontier timestamp.
     ///
     /// If the register's timestamp is strictly greater than `frontier`, the
@@ -75,6 +59,44 @@ impl<T: Clone> LwwRegister<T> {
         } else {
             None
         }
+    }
+}
+
+impl<T: Clone + Ord> LwwRegister<T> {
+    /// Merge another register into this one, keeping the value with the higher timestamp.
+    ///
+    /// When timestamps are equal, the larger value (by `Ord`) wins to
+    /// guarantee commutativity: `merge(a, b)` always produces the same
+    /// result as `merge(b, a)`.
+    pub fn merge(&mut self, other: &LwwRegister<T>) {
+        match other.timestamp.cmp(&self.timestamp) {
+            std::cmp::Ordering::Greater => {
+                self.value = other.value.clone();
+                self.timestamp = other.timestamp.clone();
+            }
+            std::cmp::Ordering::Equal => {
+                // Deterministic tiebreaker: keep the larger value so that
+                // merge(a, b) == merge(b, a) even when timestamps collide.
+                match (&self.value, &other.value) {
+                    (Some(s), Some(o)) if o > s => {
+                        self.value = other.value.clone();
+                    }
+                    (None, Some(_)) => {
+                        self.value = other.value.clone();
+                    }
+                    _ => {}
+                }
+            }
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    /// Merge a delta into this register.
+    ///
+    /// For LwwRegister, `merge_delta` is identical to `merge` because the
+    /// delta is a complete register snapshot (value + timestamp).
+    pub fn merge_delta(&mut self, delta: &LwwRegister<T>) {
+        self.merge(delta);
     }
 }
 
