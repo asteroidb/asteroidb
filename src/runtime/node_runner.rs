@@ -1491,6 +1491,41 @@ impl NodeRunner {
                         }
                     }
                 }
+            } else {
+                // No frontier known for this peer — this is the initial sync.
+                // Push the full local state so the peer receives our data even
+                // if it has nothing to offer us in return. Without this push,
+                // data written locally would never reach a peer that starts
+                // empty, because both the delta push and delta pull paths
+                // require a known frontier.
+                let api = eventual_api.lock().await;
+                let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                    .store()
+                    .all_entries()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let local_frontier = api.store().current_frontier();
+                drop(api);
+
+                if !all_entries.is_empty() {
+                    tracing::info!(
+                        peer = %peer.node_id.0,
+                        keys = all_entries.len(),
+                        "initial sync: pushing full state to peer (no frontier known)"
+                    );
+
+                    let success = sync_client
+                        .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
+                        .await;
+
+                    if success {
+                        // Set the frontier to the local store's current
+                        // frontier so subsequent cycles use delta mode.
+                        if let Some(f) = local_frontier {
+                            self.peer_frontiers.insert(peer_key.clone(), f);
+                        }
+                    }
+                }
             }
 
             // --- Pull phase: pull delta (or full) from peer ---
@@ -1645,11 +1680,22 @@ impl NodeRunner {
                 if let Some(remote_frontier) = dump.frontier {
                     self.peer_frontiers
                         .insert(peer_key.clone(), remote_frontier);
+                } else {
+                    // Remote reported no frontier (empty store or older peer).
+                    // Set a zero-epoch frontier so that subsequent sync cycles
+                    // enter the delta push/pull paths instead of repeatedly
+                    // falling back to full sync. A zero frontier causes
+                    // `entries_since()` to return all entries, which is correct
+                    // because the peer has seen nothing so far.
+                    self.peer_frontiers.insert(
+                        peer_key.clone(),
+                        crate::hlc::HlcTimestamp {
+                            physical: 0,
+                            logical: 0,
+                            node_id: String::new(),
+                        },
+                    );
                 }
-                // If the remote did not report a frontier (e.g. empty store or
-                // older peer that doesn't support the field), we intentionally
-                // leave peer_frontiers without an entry. This means the next
-                // sync cycle will fall back to full sync again, which is safe.
 
                 any_success = true;
                 let elapsed = peer_start.elapsed();

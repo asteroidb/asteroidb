@@ -486,6 +486,61 @@ impl SyncClient {
         success_count
     }
 
+    /// Push the full local state to a single peer by address.
+    ///
+    /// Sends a `POST /api/internal/sync` request with all provided entries.
+    /// Returns `true` if the push succeeded, `false` on failure.
+    /// Used for initial sync when no peer frontier is known.
+    pub async fn push_full_state_to_peer(
+        &self,
+        peer_addr: &str,
+        entries: HashMap<String, CrdtValue>,
+        sender_id: &str,
+    ) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+
+        let request = SyncRequest {
+            sender: sender_id.to_string(),
+            entries,
+        };
+
+        let url = format!("http://{peer_addr}/api/internal/sync");
+
+        let req_builder = match self.bincode_post(&url, &request) {
+            Ok(b) => b,
+            Err(_) => self.authorized_post(&url).json(&request),
+        };
+
+        match req_builder.send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    tracing::debug!(
+                        peer_addr = %peer_addr,
+                        "initial full push to peer succeeded"
+                    );
+                    true
+                } else {
+                    tracing::warn!(
+                        peer_addr = %peer_addr,
+                        status = %resp.status(),
+                        "initial full push to peer received non-success status"
+                    );
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer_addr = %peer_addr,
+                    error = %e,
+                    "initial full push to peer failed"
+                );
+                false
+            }
+        }
+    }
+
     /// Push only entries changed since the given frontier to a single peer.
     ///
     /// Extracts entries from `all_entries` that have a timestamp strictly
