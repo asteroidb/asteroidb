@@ -17,7 +17,8 @@ use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    DEFAULT_BATCH_SIZE, PeerBackoff, SyncClient, should_fallback_to_full_sync,
+    DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, SyncClient,
+    should_fallback_to_full_sync,
 };
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
@@ -1388,11 +1389,11 @@ impl NodeRunner {
                         .full_sync_fallback_count
                         .fetch_add(1, Ordering::Relaxed);
 
-                    let push_count = sync_client
-                        .push_all_keys(all_entries, &self.node_id.0)
+                    let push_ok = sync_client
+                        .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                         .await;
 
-                    if push_count > 0 {
+                    if push_ok {
                         // After a successful full push, advance the frontier to
                         // the local store's current frontier so the next delta
                         // sync starts from the right point.
@@ -1419,74 +1420,122 @@ impl NodeRunner {
                         .collect();
 
                     if !changed.is_empty() {
-                        self.metrics
-                            .delta_sync_count
-                            .fetch_add(1, Ordering::Relaxed);
+                        // Check serialized payload size — if the delta exceeds
+                        // MAX_DELTA_PAYLOAD_BYTES, it is cheaper to send a full
+                        // state push than an oversized delta.
+                        let estimated_size: usize = changed
+                            .iter()
+                            .map(|(k, v)| {
+                                k.len()
+                                    + bincode::serde::encode_to_vec(v, bincode::config::standard())
+                                        .map(|b| b.len())
+                                        .unwrap_or(std::mem::size_of_val(v))
+                            })
+                            .sum();
 
-                        let push_result = sync_client
-                            .push_changed_keys(
-                                &peer.addr,
-                                changed,
-                                &self.node_id.0,
-                                DEFAULT_BATCH_SIZE,
-                            )
-                            .await;
+                        if estimated_size > MAX_DELTA_PAYLOAD_BYTES {
+                            tracing::info!(
+                                peer = %peer.node_id.0,
+                                estimated_size = estimated_size,
+                                limit = MAX_DELTA_PAYLOAD_BYTES,
+                                changed_keys = changed_count,
+                                "delta payload exceeds size limit, falling back to full sync"
+                            );
 
-                        match push_result {
-                            Ok(pushed) => {
-                                tracing::debug!(
-                                    peer = %peer.node_id.0,
-                                    pushed_keys = pushed,
-                                    total_changed = changed_count,
-                                    "delta push succeeded"
-                                );
-                                // Record replication convergence SLO: time from
-                                // entry write (HLC physical) to push completion.
-                                if let Some(slo) = &self.slo_tracker {
-                                    let now_ms = self.clock.now().physical;
-                                    for hlc in hlc_vec.iter().take(pushed) {
-                                        let convergence_ms =
-                                            now_ms.saturating_sub(hlc.physical) as f64;
-                                        slo.record_observation(
-                                            SLO_REPLICATION_CONVERGENCE,
-                                            convergence_ms,
-                                        );
+                            self.metrics
+                                .full_sync_fallback_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            let api = eventual_api.lock().await;
+                            let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                                .store()
+                                .all_entries()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            drop(api);
+
+                            let push_ok = sync_client
+                                .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
+                                .await;
+
+                            if push_ok {
+                                let api = eventual_api.lock().await;
+                                if let Some(current) = api.store().current_frontier() {
+                                    self.peer_frontiers.insert(peer_key.clone(), current);
+                                }
+                                drop(api);
+                            }
+                        } else {
+                            self.metrics
+                                .delta_sync_count
+                                .fetch_add(1, Ordering::Relaxed);
+
+                            let push_result = sync_client
+                                .push_changed_keys(
+                                    &peer.addr,
+                                    changed,
+                                    &self.node_id.0,
+                                    DEFAULT_BATCH_SIZE,
+                                )
+                                .await;
+
+                            match push_result {
+                                Ok(pushed) => {
+                                    tracing::debug!(
+                                        peer = %peer.node_id.0,
+                                        pushed_keys = pushed,
+                                        total_changed = changed_count,
+                                        "delta push succeeded"
+                                    );
+                                    // Record replication convergence SLO: time from
+                                    // entry write (HLC physical) to push completion.
+                                    if let Some(slo) = &self.slo_tracker {
+                                        let now_ms = self.clock.now().physical;
+                                        for hlc in hlc_vec.iter().take(pushed) {
+                                            let convergence_ms =
+                                                now_ms.saturating_sub(hlc.physical) as f64;
+                                            slo.record_observation(
+                                                SLO_REPLICATION_CONVERGENCE,
+                                                convergence_ms,
+                                            );
+                                        }
+                                    }
+                                    // Advance peer frontier to the max HLC of the
+                                    // pushed batch — NOT current_frontier(), which
+                                    // may have advanced past unpushed concurrent
+                                    // writes.
+                                    if let Some(max_hlc) = hlc_vec.last() {
+                                        self.peer_frontiers
+                                            .insert(peer_key.clone(), max_hlc.clone());
                                     }
                                 }
-                                // Advance peer frontier to the max HLC of the
-                                // pushed batch — NOT current_frontier(), which may
-                                // have advanced past unpushed concurrent writes.
-                                if let Some(max_hlc) = hlc_vec.last() {
-                                    self.peer_frontiers
-                                        .insert(peer_key.clone(), max_hlc.clone());
+                                Err(e) => {
+                                    tracing::warn!(
+                                        peer = %peer.node_id.0,
+                                        error = %e,
+                                        pushed = e.pushed,
+                                        "delta push failed"
+                                    );
+                                    // On partial failure, advance the frontier only
+                                    // to the HLC of the last successfully pushed
+                                    // entry. hlc_vec is sorted by HLC, so index
+                                    // `pushed - 1` is the last entry that was sent.
+                                    if e.pushed > 0
+                                        && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
+                                    {
+                                        self.peer_frontiers
+                                            .insert(peer_key.clone(), last_pushed_hlc.clone());
+                                    }
+                                    // Record failure and move to next peer.
+                                    self.peer_backoffs
+                                        .entry(peer_key.clone())
+                                        .or_default()
+                                        .record_failure();
+                                    self.metrics
+                                        .sync_failure_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    continue;
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    peer = %peer.node_id.0,
-                                    error = %e,
-                                    pushed = e.pushed,
-                                    "delta push failed"
-                                );
-                                // On partial failure, advance the frontier only to
-                                // the HLC of the last successfully pushed entry.
-                                // hlc_vec is sorted by HLC, so index
-                                // `pushed - 1` is the last entry that was sent.
-                                if e.pushed > 0
-                                    && let Some(last_pushed_hlc) = hlc_vec.get(e.pushed - 1)
-                                {
-                                    self.peer_frontiers
-                                        .insert(peer_key.clone(), last_pushed_hlc.clone());
-                                }
-                                // Record failure and move to next peer.
-                                self.peer_backoffs
-                                    .entry(peer_key.clone())
-                                    .or_default()
-                                    .record_failure();
-                                self.metrics
-                                    .sync_failure_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                                continue;
                             }
                         }
                     }
@@ -1935,8 +1984,12 @@ impl NodeRunner {
 
     /// Run garbage collection on stale ack-frontier entries.
     ///
-    /// Determines the maximum current policy version across all authority
-    /// definitions and delegates to [`CertifiedApi::gc_frontier_entries`].
+    /// Determines the current policy version **per key range** across all
+    /// authority definitions and delegates to
+    /// [`CertifiedApi::gc_frontier_entries`].
+    ///
+    /// Using per-range versions prevents over-deleting slow ranges: if one
+    /// key range is at v10 and another at v3, each range gets its own cutoff.
     async fn run_frontier_gc(&mut self) {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1945,21 +1998,30 @@ impl NodeRunner {
 
         let mut api = self.certified_api.lock().await;
 
-        // Find the maximum policy version across all authority definitions.
-        let max_version = {
+        // Build per-range current version map from authority definitions.
+        let current_versions: std::collections::HashMap<
+            crate::types::KeyRange,
+            crate::types::PolicyVersion,
+        > = {
             let ns = api.namespace().read().unwrap();
-            ns.all_authority_definitions()
-                .into_iter()
-                .filter_map(|def| {
-                    ns.get_placement_policy(&def.key_range.prefix)
-                        .map(|p| p.version)
-                })
-                .max()
-                .unwrap_or(PolicyVersion(0))
+            let mut versions = std::collections::HashMap::new();
+            for def in ns.all_authority_definitions() {
+                if let Some(policy) = ns.get_placement_policy(&def.key_range.prefix) {
+                    versions
+                        .entry(def.key_range.clone())
+                        .and_modify(|v: &mut crate::types::PolicyVersion| {
+                            if policy.version.0 > v.0 {
+                                *v = policy.version;
+                            }
+                        })
+                        .or_insert(policy.version);
+                }
+            }
+            versions
         };
 
         let removed = api.gc_frontier_entries(
-            max_version,
+            &current_versions,
             self.config.frontier_gc_max_retained_versions,
             self.config.frontier_gc_grace_period_secs,
             now_secs,
@@ -1970,7 +2032,6 @@ impl NodeRunner {
                 node_id = %self.node_id.0,
                 removed,
                 remaining = api.frontier_count(),
-                current_policy_version = max_version.0,
                 "ack-frontier GC completed"
             );
         }

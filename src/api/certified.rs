@@ -653,13 +653,13 @@ impl CertifiedApi {
     /// of frontier entries removed.
     pub fn gc_frontier_entries(
         &mut self,
-        current_policy_version: PolicyVersion,
+        current_versions: &std::collections::HashMap<KeyRange, PolicyVersion>,
         max_retained_versions: u64,
         grace_period_secs: u64,
         now_secs: u64,
     ) -> usize {
         self.frontiers.gc_stale_entries(
-            current_policy_version,
+            current_versions,
             max_retained_versions,
             grace_period_secs,
             now_secs,
