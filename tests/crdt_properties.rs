@@ -551,8 +551,14 @@ proptest! {
             prop_assert_eq!(merged.get(), b.get());
             prop_assert_eq!(merged.timestamp(), ts_b);
         } else {
-            // Equal timestamps: a retains its value (merge only updates on strictly greater).
-            prop_assert_eq!(merged.get(), a.get());
+            // Equal timestamps: the larger value wins (deterministic tiebreaker for commutativity).
+            let expected = match (a.get(), b.get()) {
+                (Some(va), Some(vb)) => Some(va.max(vb)),
+                (None, Some(vb)) => Some(vb),
+                (Some(va), None) => Some(va),
+                (None, None) => None,
+            };
+            prop_assert_eq!(merged.get(), expected);
         }
     }
 

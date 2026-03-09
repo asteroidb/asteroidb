@@ -25,7 +25,7 @@ struct Dot {
 pub struct OrMap<K, V>
 where
     K: Eq + Hash + Clone,
-    V: Clone,
+    V: Clone + Ord,
 {
     /// Active entries: key -> (dots that justify presence, LWW value).
     entries: HashMap<K, (HashSet<Dot>, LwwRegister<V>)>,
@@ -39,7 +39,7 @@ where
 impl<K, V> OrMap<K, V>
 where
     K: Eq + Hash + Clone + Serialize + DeserializeOwned,
-    V: Clone + Serialize + DeserializeOwned,
+    V: Clone + Ord + Serialize + DeserializeOwned,
 {
     /// Create an empty OR-Map.
     pub fn new() -> Self {
@@ -380,7 +380,7 @@ where
 impl<K, V> Default for OrMap<K, V>
 where
     K: Eq + Hash + Clone + Serialize + DeserializeOwned,
-    V: Clone + Serialize + DeserializeOwned,
+    V: Clone + Ord + Serialize + DeserializeOwned,
 {
     fn default() -> Self {
         Self::new()
