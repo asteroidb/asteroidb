@@ -266,7 +266,7 @@ impl SloTracker {
 
     /// Record an observation at a specific instant (for testing).
     pub fn record_observation_at(&self, slo_name: &str, value: f64, now: Instant) {
-        let mut states = self.states.lock().unwrap();
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = states.get_mut(slo_name) {
             state.record(value, now);
         }
@@ -279,7 +279,7 @@ impl SloTracker {
 
     /// Produce a snapshot at a specific instant (for testing).
     pub fn snapshot_at(&self, now: Instant) -> SloSnapshot {
-        let states = self.states.lock().unwrap();
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let budgets = states
             .iter()
             .map(|(name, state)| (name.clone(), state.budget(now)))
