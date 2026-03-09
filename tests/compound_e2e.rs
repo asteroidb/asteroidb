@@ -371,6 +371,8 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
             epoch_manager.registry(),
             epoch_manager.current_epoch(base_secs),
             epoch_manager.config(),
+            None,
+            0,
         );
         assert!(
             verify_result.valid,
@@ -569,6 +571,8 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         epoch_manager.registry(),
         epoch_manager.current_epoch(epoch5_time),
         epoch_manager.config(),
+        None,
+        0,
     );
     assert!(
         result.valid,
@@ -583,6 +587,8 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         epoch_manager.registry(),
         epoch_manager.current_epoch(epoch8_time),
         epoch_manager.config(),
+        None,
+        0,
     );
     assert!(
         !result_expired.valid,
@@ -1025,7 +1031,8 @@ fn expired_keyset_proof_rejected_after_reconfig() {
     };
 
     // At epoch 3 (boundary): v1 registered at epoch 0, grace=3 -> 3 <= 0+3 -> valid.
-    let result = verify_proof_with_registry(&bundle, manager.registry(), 3, manager.config());
+    let result =
+        verify_proof_with_registry(&bundle, manager.registry(), 3, manager.config(), None, 0);
     assert!(
         result.valid,
         "v1 should still be valid at grace boundary (epoch 3)"
@@ -1033,7 +1040,7 @@ fn expired_keyset_proof_rejected_after_reconfig() {
 
     // At epoch 4: v1 expired (4 > 0+3).
     let result_expired =
-        verify_proof_with_registry(&bundle, manager.registry(), 4, manager.config());
+        verify_proof_with_registry(&bundle, manager.registry(), 4, manager.config(), None, 0);
     assert!(
         !result_expired.valid,
         "v1 should be rejected after grace period (epoch 4)"

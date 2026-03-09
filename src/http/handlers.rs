@@ -674,6 +674,8 @@ pub async fn verify_proof(
         &registry,
         current_epoch,
         &state.epoch_config,
+        None,
+        0,
     );
 
     Ok(Json(VerifyProofResponse {

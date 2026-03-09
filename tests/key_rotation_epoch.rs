@@ -144,6 +144,8 @@ fn key_rotation_old_and_new_keys_coexist_during_grace() {
         manager.registry(),
         manager.current_epoch(base_secs + 86400 * 5),
         manager.config(),
+        None,
+        0,
     );
     assert!(
         result.valid,
@@ -207,16 +209,25 @@ fn expired_keyset_rejected_after_grace_period() {
     };
 
     // At epoch 3, version 1 (registered at 0, grace 3) is still valid (3 <= 0+3).
-    let result = verify_proof_with_registry(&bundle, manager.registry(), 3, manager.config());
+    let result =
+        verify_proof_with_registry(&bundle, manager.registry(), 3, manager.config(), None, 0);
     assert!(result.valid, "should be valid at boundary of grace period");
 
     // At epoch 4, version 1 is expired (4 > 0+3).
-    let result = verify_proof_with_registry(&bundle, manager.registry(), 4, manager.config());
+    let result =
+        verify_proof_with_registry(&bundle, manager.registry(), 4, manager.config(), None, 0);
     assert!(!result.valid, "should be invalid after grace period expiry");
 
     // Detailed error should show ExpiredKeyset.
-    let err = verify_proof_with_registry_detailed(&bundle, manager.registry(), 4, manager.config())
-        .unwrap_err();
+    let err = verify_proof_with_registry_detailed(
+        &bundle,
+        manager.registry(),
+        4,
+        manager.config(),
+        None,
+        0,
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -302,7 +313,7 @@ fn tampered_signature_detected_with_registry() {
     };
 
     let config = EpochConfig::default();
-    let result = verify_proof_with_registry(&bundle, &registry, 0, &config);
+    let result = verify_proof_with_registry(&bundle, &registry, 0, &config, None, 0);
     assert!(!result.valid, "tampered signature should be detected");
     assert_eq!(result.signatures_valid, Some(false));
 }
@@ -355,7 +366,7 @@ fn full_epoch_lifecycle() {
     let bundle1 = make_bundle(cert1);
 
     // Verify at epoch 0 → valid.
-    let r = verify_proof_with_registry(&bundle1, manager.registry(), 0, manager.config());
+    let r = verify_proof_with_registry(&bundle1, manager.registry(), 0, manager.config(), None, 0);
     assert!(r.valid, "version 1 at epoch 0 should be valid");
 
     // Phase 2: Rotate to version 2 at epoch 3.
@@ -366,11 +377,11 @@ fn full_epoch_lifecycle() {
 
     // Version 1 at epoch 3 → still valid (3 <= 0+2? no, 3 > 2 → expired!)
     // Wait, grace_epochs is 2, so version 1 (registered at epoch 0) is valid up to epoch 2.
-    let r = verify_proof_with_registry(&bundle1, manager.registry(), 3, manager.config());
+    let r = verify_proof_with_registry(&bundle1, manager.registry(), 3, manager.config(), None, 0);
     assert!(!r.valid, "version 1 at epoch 3 should be expired (grace=2)");
 
     // Version 1 at epoch 2 → still valid (2 <= 0+2).
-    let r = verify_proof_with_registry(&bundle1, manager.registry(), 2, manager.config());
+    let r = verify_proof_with_registry(&bundle1, manager.registry(), 2, manager.config(), None, 0);
     assert!(r.valid, "version 1 at epoch 2 should still be valid");
 
     // Phase 3: Sign with version 2 and verify.
@@ -385,7 +396,8 @@ fn full_epoch_lifecycle() {
     let bundle2 = make_bundle(cert2);
 
     // Version 2 at epoch 100 → current version, always valid.
-    let r = verify_proof_with_registry(&bundle2, manager.registry(), 100, manager.config());
+    let r =
+        verify_proof_with_registry(&bundle2, manager.registry(), 100, manager.config(), None, 0);
     assert!(r.valid, "current version should always be valid");
 }
 
@@ -423,7 +435,7 @@ fn backward_compatibility_verify_proof_without_registry() {
     };
 
     // verify_proof (non-registry) should still work.
-    let result = verify_proof(&bundle);
+    let result = verify_proof(&bundle, None, 0);
     assert!(result.valid);
     assert!(result.has_majority);
     assert_eq!(result.signatures_valid, Some(true));

@@ -1798,7 +1798,7 @@ mod tests {
         let proof = result.proof.unwrap();
 
         // Proofs without a certificate must be rejected to prevent forged proofs.
-        let verification = verifier::verify_proof(&proof);
+        let verification = verifier::verify_proof(&proof, None, 0);
         assert!(!verification.valid);
         assert!(verification.has_majority);
         assert!(verification.signatures_valid.is_none());
