@@ -157,7 +157,7 @@ fn bench_verify_proof(c: &mut Criterion) {
 
     c.bench_function("certified/verify_proof_3of5", |b| {
         b.iter(|| {
-            let result = verify_proof(&proof);
+            let result = verify_proof(&proof, None, 0);
             std::hint::black_box(result.valid);
         });
     });
@@ -169,7 +169,7 @@ fn bench_verify_proof_large(c: &mut Criterion) {
 
     c.bench_function("certified/verify_proof_5of9", |b| {
         b.iter(|| {
-            let result = verify_proof(&proof);
+            let result = verify_proof(&proof, None, 0);
             std::hint::black_box(result.valid);
         });
     });
