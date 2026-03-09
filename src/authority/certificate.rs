@@ -179,15 +179,19 @@ impl FormatVersionConfig {
     /// - The current format version is always accepted.
     /// - Older versions are accepted if `elapsed_since_upgrade_secs` is
     ///   within `grace_period_secs`.
-    /// - Format versions newer than `CURRENT_FORMAT_VERSION` are always
-    ///   accepted (forward compatibility for rolling upgrades).
+    /// - Format versions up to `CURRENT_FORMAT_VERSION + 1` are accepted
+    ///   for forward compatibility during rolling upgrades.  Versions
+    ///   further in the future are rejected to prevent unbounded skew.
     pub fn is_version_acceptable(
         &self,
         cert_version: u32,
         elapsed_since_upgrade_secs: u64,
     ) -> bool {
-        if cert_version >= CURRENT_FORMAT_VERSION {
+        if (CURRENT_FORMAT_VERSION..=CURRENT_FORMAT_VERSION + 1).contains(&cert_version) {
             return true;
+        }
+        if cert_version > CURRENT_FORMAT_VERSION + 1 {
+            return false;
         }
         elapsed_since_upgrade_secs <= self.grace_period_secs
     }
@@ -748,6 +752,45 @@ impl MajorityCertificate {
             valid_signers.push(sig.authority_id.clone());
         }
         Ok(valid_signers)
+    }
+
+    /// Verify all signatures, also checking that the certificate format
+    /// version is acceptable under the provided config.
+    ///
+    /// `elapsed_since_upgrade_secs` is the wall-clock time since the node
+    /// upgraded to the current format version.  Old-format certificates are
+    /// rejected once the grace period expires.
+    pub fn verify_signatures_with_format_check(
+        &self,
+        message: &[u8],
+        format_config: &FormatVersionConfig,
+        elapsed_since_upgrade_secs: u64,
+    ) -> Result<Vec<NodeId>, CertError> {
+        if !format_config.is_version_acceptable(self.format_version, elapsed_since_upgrade_secs) {
+            return Err(CertError::ExpiredFormatVersion {
+                version: self.format_version,
+            });
+        }
+        self.verify_signatures(message)
+    }
+
+    /// Verify all signatures using a keyset registry, also checking that the
+    /// certificate format version is acceptable.
+    pub fn verify_signatures_with_registry_and_format_check(
+        &self,
+        message: &[u8],
+        registry: &KeysetRegistry,
+        current_epoch: u64,
+        epoch_config: &EpochConfig,
+        format_config: &FormatVersionConfig,
+        elapsed_since_upgrade_secs: u64,
+    ) -> Result<Vec<NodeId>, CertError> {
+        if !format_config.is_version_acceptable(self.format_version, elapsed_since_upgrade_secs) {
+            return Err(CertError::ExpiredFormatVersion {
+                version: self.format_version,
+            });
+        }
+        self.verify_signatures_with_registry(message, registry, current_epoch, epoch_config)
     }
 
     /// Return references to the authority IDs that have signed.
@@ -2551,12 +2594,15 @@ mod tests {
     }
 
     #[test]
-    fn format_version_future_always_accepted() {
+    fn format_version_one_ahead_accepted() {
         let config = FormatVersionConfig {
             grace_period_secs: 0,
         };
-        // A format version newer than current is accepted (forward compat).
+        // One version ahead is accepted for rolling upgrades.
         assert!(config.is_version_acceptable(CURRENT_FORMAT_VERSION + 1, 999_999));
+        // Two or more versions ahead is rejected to prevent unbounded skew.
+        assert!(!config.is_version_acceptable(CURRENT_FORMAT_VERSION + 2, 0));
+        assert!(!config.is_version_acceptable(CURRENT_FORMAT_VERSION + 10, 0));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::api::certified::ProofBundle;
 use crate::authority::certificate::{
-    CertError, EpochConfig, KeysetRegistry, create_certificate_message,
+    CertError, EpochConfig, FormatVersionConfig, KeysetRegistry, create_certificate_message,
 };
 
 /// Result of verifying a proof bundle.
@@ -32,10 +32,16 @@ pub struct VerificationResult {
 /// 2. If a certificate is present, all Ed25519 signatures are valid against
 ///    the canonical message derived from the proof's key range, frontier HLC,
 ///    and policy version.
+/// 3. If `format_config` is provided, the certificate's format version is
+///    checked against the grace-period policy.
 ///
 /// External clients can use this to verify certification without trusting
 /// the node that returned the proof.
-pub fn verify_proof(bundle: &ProofBundle) -> VerificationResult {
+pub fn verify_proof(
+    bundle: &ProofBundle,
+    format_config: Option<&FormatVersionConfig>,
+    elapsed_since_upgrade_secs: u64,
+) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
 
     // A proof without a certificate is always invalid — a caller could
@@ -47,7 +53,12 @@ pub fn verify_proof(bundle: &ProofBundle) -> VerificationResult {
                 &bundle.frontier_hlc,
                 &bundle.policy_version,
             );
-            match cert.verify_signatures(&message) {
+            let result = if let Some(fc) = format_config {
+                cert.verify_signatures_with_format_check(&message, fc, elapsed_since_upgrade_secs)
+            } else {
+                cert.verify_signatures(&message)
+            };
+            match result {
                 Ok(verified_signers) => (verified_signers.len(), Some(true)),
                 Err(_) => {
                     // Derive count from the unsigned list only as a fallback
@@ -84,6 +95,8 @@ pub fn verify_proof(bundle: &ProofBundle) -> VerificationResult {
 /// 2. Each signature's keyset version is within the epoch grace period.
 /// 3. Signatures are verified against the registry's public keys
 ///    (not just the embedded keys in the certificate).
+/// 4. If `format_config` is provided, the certificate's format version is
+///    checked against the grace-period policy.
 ///
 /// Returns a `VerificationResult` with an optional `keyset_error` if
 /// any keyset/epoch validation fails.
@@ -92,6 +105,8 @@ pub fn verify_proof_with_registry(
     registry: &KeysetRegistry,
     current_epoch: u64,
     epoch_config: &EpochConfig,
+    format_config: Option<&FormatVersionConfig>,
+    elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
     let required = bundle.total_authorities / 2 + 1;
 
@@ -103,12 +118,24 @@ pub fn verify_proof_with_registry(
                 &bundle.frontier_hlc,
                 &bundle.policy_version,
             );
-            match cert.verify_signatures_with_registry(
-                &message,
-                registry,
-                current_epoch,
-                epoch_config,
-            ) {
+            let result = if let Some(fc) = format_config {
+                cert.verify_signatures_with_registry_and_format_check(
+                    &message,
+                    registry,
+                    current_epoch,
+                    epoch_config,
+                    fc,
+                    elapsed_since_upgrade_secs,
+                )
+            } else {
+                cert.verify_signatures_with_registry(
+                    &message,
+                    registry,
+                    current_epoch,
+                    epoch_config,
+                )
+            };
+            match result {
                 Ok(verified_signers) => (verified_signers.len(), Some(true)),
                 Err(_) => {
                     let unique: std::collections::HashSet<&crate::types::NodeId> =
@@ -140,12 +167,14 @@ pub fn verify_proof_with_registry(
 ///
 /// Like `verify_proof_with_registry` but returns the `CertError` on failure
 /// for callers that need to distinguish between expired keys, unknown keys,
-/// and invalid signatures.
+/// invalid signatures, or expired format versions.
 pub fn verify_proof_with_registry_detailed(
     bundle: &ProofBundle,
     registry: &KeysetRegistry,
     current_epoch: u64,
     epoch_config: &EpochConfig,
+    format_config: Option<&FormatVersionConfig>,
+    elapsed_since_upgrade_secs: u64,
 ) -> Result<VerificationResult, CertError> {
     let required = bundle.total_authorities / 2 + 1;
 
@@ -155,8 +184,18 @@ pub fn verify_proof_with_registry_detailed(
             &bundle.frontier_hlc,
             &bundle.policy_version,
         );
-        let result =
-            cert.verify_signatures_with_registry(&message, registry, current_epoch, epoch_config);
+        let result = if let Some(fc) = format_config {
+            cert.verify_signatures_with_registry_and_format_check(
+                &message,
+                registry,
+                current_epoch,
+                epoch_config,
+                fc,
+                elapsed_since_upgrade_secs,
+            )
+        } else {
+            cert.verify_signatures_with_registry(&message, registry, current_epoch, epoch_config)
+        };
         match result {
             Ok(verified_signers) => (verified_signers.len(), Some(true)),
             Err(e) => return Err(e),
@@ -184,8 +223,8 @@ mod tests {
     use super::*;
     use crate::api::certified::ProofBundle;
     use crate::authority::certificate::{
-        AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
-        sign_message,
+        AuthoritySignature, FormatVersionConfig, KeysetVersion, MajorityCertificate,
+        create_certificate_message, sign_message,
     };
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
@@ -257,10 +296,8 @@ mod tests {
 
     #[test]
     fn proof_without_certificate_is_rejected() {
-        // Even with enough contributing authorities, a proof without a
-        // certificate must be rejected to prevent forged proofs.
         let proof = make_proof(3, 5, false);
-        let result = verify_proof(&proof);
+        let result = verify_proof(&proof, None, 0);
 
         assert!(!result.valid);
         assert!(result.has_majority);
@@ -272,7 +309,7 @@ mod tests {
     #[test]
     fn proof_with_insufficient_authorities_fails() {
         let proof = make_proof(2, 5, true);
-        let result = verify_proof(&proof);
+        let result = verify_proof(&proof, None, 0);
 
         assert!(!result.valid);
         assert!(!result.has_majority);
@@ -284,12 +321,10 @@ mod tests {
     fn duplicate_authorities_are_deduplicated() {
         let mut proof = make_proof(2, 5, true);
 
-        // Duplicate an existing authority ID in contributing_authorities.
         let dup = proof.contributing_authorities[0].clone();
         proof.contributing_authorities.push(dup);
 
-        // Raw length is 3, but unique count should still be 2 (below majority).
-        let result = verify_proof(&proof);
+        let result = verify_proof(&proof, None, 0);
         assert!(!result.valid);
         assert!(!result.has_majority);
         assert_eq!(result.contributing_count, 2);
@@ -299,7 +334,7 @@ mod tests {
     #[test]
     fn valid_proof_with_certificate() {
         let proof = make_proof(3, 5, true);
-        let result = verify_proof(&proof);
+        let result = verify_proof(&proof, None, 0);
 
         assert!(result.valid);
         assert!(result.has_majority);
@@ -310,14 +345,13 @@ mod tests {
     fn certificate_with_tampered_signature_fails() {
         let mut proof = make_proof(3, 5, true);
 
-        // Tamper: swap the signature of the first authority with a different one.
         if let Some(cert) = &mut proof.certificate {
             let (sk, _vk) = make_key_pair();
             let bad_sig = sign_message(&sk, b"wrong message");
             cert.signatures[0].signature = bad_sig;
         }
 
-        let result = verify_proof(&proof);
+        let result = verify_proof(&proof, None, 0);
         assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(false));
@@ -325,17 +359,14 @@ mod tests {
 
     #[test]
     fn exact_majority_threshold() {
-        // 1 of 1 = majority (with valid certificate)
         let proof = make_proof(1, 1, true);
-        assert!(verify_proof(&proof).valid);
+        assert!(verify_proof(&proof, None, 0).valid);
 
-        // 2 of 3 = majority (3/2+1 = 2) (with valid certificate)
         let proof = make_proof(2, 3, true);
-        assert!(verify_proof(&proof).valid);
+        assert!(verify_proof(&proof, None, 0).valid);
 
-        // 1 of 3 = not majority
         let proof = make_proof(1, 3, true);
-        assert!(!verify_proof(&proof).valid);
+        assert!(!verify_proof(&proof, None, 0).valid);
     }
 
     // ---------------------------------------------------------------
@@ -396,7 +427,7 @@ mod tests {
     fn verify_with_registry_valid_proof() {
         let (proof, registry) = make_proof_with_registry(3, 5, 1);
         let config = EpochConfig::default();
-        let result = super::verify_proof_with_registry(&proof, &registry, 0, &config);
+        let result = verify_proof_with_registry(&proof, &registry, 0, &config, None, 0);
 
         assert!(result.valid);
         assert!(result.has_majority);
@@ -407,7 +438,6 @@ mod tests {
     fn verify_with_registry_expired_keyset_fails() {
         let (proof, mut registry) = make_proof_with_registry(3, 5, 1);
 
-        // Register a newer version to make version 1 non-current.
         let (_, vk_new) = make_key_pair();
         registry
             .register_keyset(
@@ -422,8 +452,7 @@ mod tests {
             grace_epochs: 3,
         };
 
-        // At epoch 4, version 1 (registered at epoch 0, grace 3) is expired.
-        let result = super::verify_proof_with_registry(&proof, &registry, 4, &config);
+        let result = verify_proof_with_registry(&proof, &registry, 4, &config, None, 0);
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -446,7 +475,7 @@ mod tests {
             grace_epochs: 3,
         };
 
-        let result = super::verify_proof_with_registry_detailed(&proof, &registry, 4, &config);
+        let result = verify_proof_with_registry_detailed(&proof, &registry, 4, &config, None, 0);
         assert!(matches!(
             result,
             Err(CertError::ExpiredKeyset { version: 1, .. })
@@ -457,7 +486,6 @@ mod tests {
     fn verify_with_registry_tampered_signature_detected() {
         let (mut proof, registry) = make_proof_with_registry(3, 5, 1);
 
-        // Tamper: modify the first signature.
         if let Some(cert) = &mut proof.certificate {
             let (sk, _) = make_key_pair();
             let bad_sig = sign_message(&sk, b"wrong message");
@@ -465,7 +493,7 @@ mod tests {
         }
 
         let config = EpochConfig::default();
-        let result = super::verify_proof_with_registry(&proof, &registry, 0, &config);
+        let result = verify_proof_with_registry(&proof, &registry, 0, &config, None, 0);
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -479,14 +507,12 @@ mod tests {
 
         let mut registry = KeysetRegistry::new();
 
-        // Version 1 keys (registered at epoch 0).
         let (sk1, vk1) = make_key_pair();
         let id1 = NodeId("auth-0".into());
         registry
             .register_keyset(KeysetVersion(1), 0, vec![(id1.clone(), vk1)])
             .unwrap();
 
-        // Version 2 keys (registered at epoch 5).
         let (sk2, vk2) = make_key_pair();
         let (sk3, vk3) = make_key_pair();
         let id2 = NodeId("auth-1".into());
@@ -499,7 +525,6 @@ mod tests {
             )
             .unwrap();
 
-        // Certificate with mixed versions.
         let mut cert = MajorityCertificate::new(kr.clone(), hlc.clone(), pv, KeysetVersion(2));
         let sig1 = sign_message(&sk1, &message);
         cert.add_signature(AuthoritySignature {
@@ -537,10 +562,109 @@ mod tests {
             grace_epochs: 7,
         };
 
-        // At epoch 6, version 1 (registered at epoch 0, grace 7) is still valid (6 <= 0+7).
-        let result = super::verify_proof_with_registry(&bundle, &registry, 6, &config);
+        let result = verify_proof_with_registry(&bundle, &registry, 6, &config, None, 0);
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(true));
+    }
+
+    // ---------------------------------------------------------------
+    // Format version checking in verifier
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn verifier_rejects_expired_old_format_certificate() {
+        let mut proof = make_proof(3, 5, true);
+        if let Some(cert) = &mut proof.certificate {
+            cert.format_version = 1;
+        }
+
+        let fc = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+
+        // Within grace period: accepted.
+        let result = verify_proof(&proof, Some(&fc), 50);
+        assert!(result.valid);
+        assert_eq!(result.signatures_valid, Some(true));
+
+        // Beyond grace period: rejected.
+        let result = verify_proof(&proof, Some(&fc), 101);
+        assert!(!result.valid);
+        assert_eq!(result.signatures_valid, Some(false));
+    }
+
+    #[test]
+    fn verifier_accepts_current_format_regardless_of_elapsed() {
+        let proof = make_proof(3, 5, true);
+
+        let fc = FormatVersionConfig {
+            grace_period_secs: 0,
+        };
+
+        let result = verify_proof(&proof, Some(&fc), 999_999);
+        assert!(result.valid);
+        assert_eq!(result.signatures_valid, Some(true));
+    }
+
+    #[test]
+    fn verifier_with_registry_rejects_expired_format() {
+        let (mut proof, registry) = make_proof_with_registry(3, 5, 1);
+        if let Some(cert) = &mut proof.certificate {
+            cert.format_version = 1;
+        }
+
+        let epoch_config = EpochConfig::default();
+        let fc = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+
+        let result = verify_proof_with_registry(&proof, &registry, 0, &epoch_config, Some(&fc), 50);
+        assert!(result.valid);
+
+        let result =
+            verify_proof_with_registry(&proof, &registry, 0, &epoch_config, Some(&fc), 101);
+        assert!(!result.valid);
+        assert_eq!(result.signatures_valid, Some(false));
+    }
+
+    #[test]
+    fn verifier_detailed_returns_expired_format_error() {
+        let (mut proof, registry) = make_proof_with_registry(3, 5, 1);
+        if let Some(cert) = &mut proof.certificate {
+            cert.format_version = 1;
+        }
+
+        let epoch_config = EpochConfig::default();
+        let fc = FormatVersionConfig {
+            grace_period_secs: 100,
+        };
+
+        let result = verify_proof_with_registry_detailed(
+            &proof,
+            &registry,
+            0,
+            &epoch_config,
+            Some(&fc),
+            101,
+        );
+        assert!(
+            matches!(result, Err(CertError::ExpiredFormatVersion { version: 1 })),
+            "expected ExpiredFormatVersion, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verifier_without_format_config_skips_version_check() {
+        let mut proof = make_proof(3, 5, true);
+        if let Some(cert) = &mut proof.certificate {
+            cert.format_version = 1;
+        }
+
+        let result = verify_proof(&proof, None, 999_999);
+        assert!(
+            result.valid,
+            "without format config, old version should still pass"
+        );
     }
 }

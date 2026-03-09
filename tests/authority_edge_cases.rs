@@ -276,7 +276,7 @@ fn broken_quorum_proof_is_invalid() {
         certificate: Some(cert),
     };
 
-    let result = verify_proof(&proof);
+    let result = verify_proof(&proof, None, 0);
     assert!(
         !result.valid,
         "proof with insufficient signers should not verify as valid"
@@ -541,7 +541,7 @@ fn empty_authority_set_rejects_certification() {
         certificate: None,
     };
 
-    let result = verify_proof(&proof);
+    let result = verify_proof(&proof, None, 0);
     assert!(
         !result.valid,
         "empty authority set should not produce a valid proof"
