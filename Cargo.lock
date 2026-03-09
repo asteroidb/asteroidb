@@ -91,6 +91,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "siphasher",
  "subtle",
  "tempfile",
  "thiserror",
@@ -1889,6 +1890,12 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "slab"
