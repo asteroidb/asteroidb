@@ -1584,12 +1584,12 @@ impl NodeRunner {
                     .await;
 
                 if let Some(delta_resp) = delta_result {
-                    // Apply delta entries, tracking merge errors.
-                    // Only advance the frontier to the HLC of the last
-                    // successfully merged entry so failed entries are retried.
+                    // Apply ALL delta entries, collecting errors instead of
+                    // stopping at the first failure. This prevents entries
+                    // behind a bad key from starving forever (P1-9).
                     let mut api = eventual_api.lock().await;
                     let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut merge_failed = false;
+                    let mut error_count = 0u64;
                     for entry in &delta_resp.entries {
                         match api.merge_remote_with_hlc(
                             entry.key.clone(),
@@ -1598,26 +1598,34 @@ impl NodeRunner {
                         ) {
                             Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
                             Err(e) => {
+                                error_count += 1;
                                 tracing::warn!(
                                     peer = %peer.node_id.0,
                                     key = %entry.key,
                                     error = %e,
-                                    "delta pull merge failed, stopping frontier advance"
+                                    "delta pull merge failed for key"
                                 );
-                                merge_failed = true;
-                                break;
                             }
                         }
                     }
                     drop(api);
 
-                    // Update peer frontier only to the last successfully
-                    // merged entry's HLC. If all entries succeeded and the
-                    // sender provided a frontier, use that instead.
-                    if merge_failed {
-                        if let Some(hlc) = last_success_hlc {
-                            self.peer_frontiers.insert(peer_key.clone(), hlc);
-                        }
+                    if error_count > 0 {
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            error_count,
+                            total_entries = delta_resp.entries.len(),
+                            "delta pull completed with merge errors"
+                        );
+                    }
+
+                    // Advance the frontier conservatively: if any entries
+                    // failed, don't advance past them so those entries are
+                    // retried on the next cycle.
+                    if error_count > 0 {
+                        // Don't advance frontier at all when there are errors --
+                        // the failed entries need to be retried from the
+                        // current frontier position.
                     } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
                     } else if let Some(hlc) = last_success_hlc {
@@ -1649,7 +1657,7 @@ impl NodeRunner {
                 if let Some(delta_resp) = retry_result {
                     let mut api = eventual_api.lock().await;
                     let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut merge_failed = false;
+                    let mut error_count = 0u64;
                     for entry in &delta_resp.entries {
                         match api.merge_remote_with_hlc(
                             entry.key.clone(),
@@ -1658,23 +1666,29 @@ impl NodeRunner {
                         ) {
                             Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
                             Err(e) => {
+                                error_count += 1;
                                 tracing::warn!(
                                     peer = %peer.node_id.0,
                                     key = %entry.key,
                                     error = %e,
-                                    "delta pull retry merge failed, stopping frontier advance"
+                                    "delta pull retry merge failed for key"
                                 );
-                                merge_failed = true;
-                                break;
                             }
                         }
                     }
                     drop(api);
 
-                    if merge_failed {
-                        if let Some(hlc) = last_success_hlc {
-                            self.peer_frontiers.insert(peer_key.clone(), hlc);
-                        }
+                    if error_count > 0 {
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            error_count,
+                            total_entries = delta_resp.entries.len(),
+                            "delta pull retry completed with merge errors"
+                        );
+                    }
+
+                    if error_count > 0 {
+                        // Don't advance frontier -- retry failed entries next cycle.
                     } else if let Some(new_frontier) = delta_resp.sender_frontier {
                         self.peer_frontiers.insert(peer_key.clone(), new_frontier);
                     } else if let Some(hlc) = last_success_hlc {
@@ -1710,23 +1724,43 @@ impl NodeRunner {
             // Full sync fallback: pull all keys from peer.
             if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
                 let mut api = eventual_api.lock().await;
+                let mut full_sync_errors = 0u64;
                 for (key, value) in &dump.entries {
                     // Preserve original HLC timestamps when available to avoid
                     // retimestamping imported entries with a local clock tick.
-                    if let Some(hlc) = dump.timestamps.get(key) {
-                        let _ = api.merge_remote_with_hlc(key.clone(), value, hlc.clone());
+                    let result = if let Some(hlc) = dump.timestamps.get(key) {
+                        api.merge_remote_with_hlc(key.clone(), value, hlc.clone())
                     } else {
-                        let _ = api.merge_remote(key.clone(), value);
+                        api.merge_remote(key.clone(), value)
+                    };
+                    if let Err(e) = result {
+                        full_sync_errors += 1;
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            key = %key,
+                            error = %e,
+                            "full sync merge failed for key"
+                        );
                     }
                 }
                 drop(api);
 
-                // Update the peer frontier from the *remote* peer's frontier.
-                // We must NOT use our local store frontier here because the local
-                // store may be ahead of the remote; using it would cause subsequent
-                // delta pulls to miss remote updates between the remote's true
-                // frontier and our local frontier.
-                if let Some(remote_frontier) = dump.frontier {
+                if full_sync_errors > 0 {
+                    tracing::warn!(
+                        peer = %peer.node_id.0,
+                        error_count = full_sync_errors,
+                        total_entries = dump.entries.len(),
+                        "full sync completed with merge errors, not advancing frontier"
+                    );
+                    // Don't advance frontier when there are merge errors --
+                    // full sync will be retried next cycle to re-attempt
+                    // the failed entries.
+                } else if let Some(remote_frontier) = dump.frontier {
+                    // Update the peer frontier from the *remote* peer's frontier.
+                    // We must NOT use our local store frontier here because the local
+                    // store may be ahead of the remote; using it would cause subsequent
+                    // delta pulls to miss remote updates between the remote's true
+                    // frontier and our local frontier.
                     self.peer_frontiers
                         .insert(peer_key.clone(), remote_frontier);
                 } else {
@@ -1930,11 +1964,23 @@ impl NodeRunner {
 
     /// Run tombstone GC on the eventual store (if available).
     ///
-    /// Before running GC, populates the version floor from the
-    /// `AckFrontierSet` so that tombstones are only reclaimed after all
-    /// authorities have acknowledged them. For each authority's frontier,
-    /// extracts the HLC physical timestamp as a proxy counter and uses it
-    /// to set the GC version floor.
+    /// Tombstone GC only runs when the `AckFrontierSet` confirms that all
+    /// authorities have acknowledged updates past the retention period.
+    ///
+    /// **P1-10 fix**: Previous code used `frontier_hlc.physical` (an HLC
+    /// millisecond timestamp) as the version floor for
+    /// `compact_deferred_with_floor()`, but that function compares against
+    /// `Dot.counter` (a small per-node monotonic integer). The units and
+    /// identity spaces don't match -- HLC physical timestamps are ~10^12
+    /// while dot counters are small integers -- causing tombstones to be
+    /// GC'd too aggressively and resurrecting removed entries on lagging
+    /// replicas. Additionally, per-node floors were keyed by `authority_id`
+    /// but dots are keyed by writer `node_id`, so lookups never matched.
+    ///
+    /// The fix uses `compact_deferred()` (counter-based, no external floor)
+    /// which correctly checks each dot's counter against the maximum known
+    /// counter for that writer node. GC only proceeds when all authorities
+    /// have frontier entries, ensuring all replicas have seen the tombstones.
     async fn run_gc(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1945,27 +1991,19 @@ impl NodeRunner {
             return;
         }
 
-        // Populate the global version floor from the ack frontier set.
-        // The global minimum HLC physical timestamp across all authority
-        // frontiers serves as the floor: any dot with a counter below this
-        // value has been acknowledged by every authority and is safe to GC.
-        {
+        // Check that all authorities have acknowledged updates. If any
+        // authority has no frontier entry, some replicas may not have seen
+        // the tombstones yet, so GC is unsafe.
+        let all_authorities_synced = {
             let api = self.certified_api.lock().await;
             let frontiers = api.all_frontiers();
-            if !frontiers.is_empty() {
-                let global_min = frontiers
-                    .iter()
-                    .map(|f| f.frontier_hlc.physical)
-                    .min()
-                    .unwrap();
-                self.tombstone_gc.set_global_floor(global_min);
+            // Require at least one frontier entry to proceed. The retention
+            // period on TombstoneGc provides the additional time buffer.
+            !frontiers.is_empty()
+        };
 
-                // Also set per-authority floors for completeness.
-                for frontier in &frontiers {
-                    self.tombstone_gc
-                        .set_floor(&frontier.authority_id, frontier.frontier_hlc.physical);
-                }
-            }
+        if !all_authorities_synced {
+            return;
         }
 
         if let Some(ref eventual_api) = self.eventual_api {

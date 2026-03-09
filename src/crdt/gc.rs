@@ -405,4 +405,73 @@ mod tests {
         gc.gc_tombstones(&mut store, 5000);
         assert_eq!(gc.last_gc_ms(), 5000);
     }
+
+    /// P1-10 regression: using HLC physical timestamps (huge ms values) as
+    /// the global_floor for compact_deferred_with_floor causes all tombstones
+    /// to be removed because dot counters (small integers) are always below
+    /// the HLC-scale floor. This test demonstrates the bug: a removed element
+    /// resurrects after GC if HLC timestamps are used as counter floors.
+    #[test]
+    fn hlc_as_floor_causes_premature_tombstone_gc() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        set.add("y".to_string(), &n); // counter=2
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // Simulate the old buggy code: use HLC physical timestamp (~10^12)
+        // as global_floor. Since dot counter (1) < floor (1_700_000_000_000),
+        // the tombstone would be removed even though a lagging replica might
+        // not have seen it yet.
+        let hlc_floor = 1_700_000_000_000u64; // ~2023 in ms
+        let empty_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_floor, Some(hlc_floor));
+
+        // BUG: the tombstone was removed because counter < hlc_floor
+        // This would allow "x" to resurrect on a lagging replica.
+        assert_eq!(
+            set.deferred_len(),
+            0,
+            "with HLC-scale floor, tombstone is incorrectly removed"
+        );
+
+        // Now demonstrate that without the HLC floor, compact_deferred
+        // correctly uses counter-based dominance and removes the tombstone
+        // only because counter < max_counter for the node (1 < 2).
+        let mut set2 = OrSet::new();
+        set2.add("x".to_string(), &n);
+        set2.remove(&"x".to_string());
+        set2.add("y".to_string(), &n);
+        assert_eq!(set2.deferred_len(), 1);
+
+        // compact_deferred() uses counter dominance only — safe.
+        set2.compact_deferred();
+        assert_eq!(
+            set2.deferred_len(),
+            0,
+            "counter-based GC should remove tombstone when counter < max"
+        );
+    }
+
+    /// Verify that compact_deferred without floor doesn't remove tombstones
+    /// when the counter hasn't been superseded (no newer dots from that node).
+    #[test]
+    fn compact_deferred_retains_unsuperseded_tombstone() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — max counter for A is still 1.
+
+        assert_eq!(set.deferred_len(), 1);
+        set.compact_deferred();
+        // Tombstone should be retained because counter (1) is NOT < max_counter (1).
+        assert_eq!(
+            set.deferred_len(),
+            1,
+            "tombstone must be retained when counter is not superseded"
+        );
+    }
 }
