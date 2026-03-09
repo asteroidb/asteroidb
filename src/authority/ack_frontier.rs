@@ -419,7 +419,12 @@ impl AckFrontierSet {
     // ---------------------------------------------------------------
 
     /// Remove stale frontier entries whose policy version is older than
-    /// `current_policy_version - max_retained_versions`.
+    /// the per-range current version minus `max_retained_versions`.
+    ///
+    /// Each key range may be at a different policy version; using a single
+    /// global cutoff would over-delete slow ranges. The `current_versions`
+    /// map provides the current policy version **per key range**. Scopes
+    /// whose key range is absent from the map are skipped (never GC'd).
     ///
     /// An entry is eligible for GC only if its `(key_range, policy_version)`
     /// pair has been fenced **and** the fencing happened at least
@@ -430,21 +435,24 @@ impl AckFrontierSet {
     /// Returns the number of frontier entries removed.
     pub fn gc_stale_entries(
         &mut self,
-        current_policy_version: PolicyVersion,
+        current_versions: &HashMap<KeyRange, PolicyVersion>,
         max_retained_versions: u64,
         grace_period_secs: u64,
         now_secs: u64,
     ) -> usize {
-        let cutoff = current_policy_version
-            .0
-            .saturating_sub(max_retained_versions);
-
         // Collect scopes to remove.
         let to_remove: Vec<FrontierScope> = self
             .frontiers
             .keys()
             .filter(|scope| {
-                // Only GC entries older than the cutoff version.
+                // Look up the current version for this scope's key range.
+                let current = match current_versions.get(&scope.key_range) {
+                    Some(v) => v.0,
+                    None => return false, // unknown range — skip
+                };
+                let cutoff = current.saturating_sub(max_retained_versions);
+
+                // Only GC entries older than the per-range cutoff version.
                 if scope.policy_version.0 >= cutoff {
                     return false;
                 }
@@ -479,18 +487,35 @@ impl AckFrontierSet {
 
         // Also clean up fenced_versions and fenced_at entries for scopes
         // that have been fully removed (no remaining frontiers for that
-        // key_range + policy_version).
-        let removed_fenced: Vec<FencedVersion> = self
-            .fenced_versions
-            .iter()
-            .filter(|fv| {
-                fv.policy_version.0 < cutoff
-                    && !self.frontiers.keys().any(|s| {
+        // key_range + policy_version) AND whose grace period has elapsed.
+        let removed_fenced: Vec<FencedVersion> =
+            self.fenced_versions
+                .iter()
+                .filter(|fv| {
+                    let current = match current_versions.get(&fv.key_range) {
+                        Some(v) => v.0,
+                        None => return false,
+                    };
+                    let cutoff = current.saturating_sub(max_retained_versions);
+
+                    // Version must be below the per-range cutoff.
+                    if fv.policy_version.0 >= cutoff {
+                        return false;
+                    }
+
+                    // No remaining frontier entries for this scope.
+                    if self.frontiers.keys().any(|s| {
                         s.key_range == fv.key_range && s.policy_version == fv.policy_version
-                    })
-            })
-            .cloned()
-            .collect();
+                    }) {
+                        return false;
+                    }
+
+                    // Grace period must have elapsed before removing fenced metadata.
+                    let fenced_at = self.fenced_at.get(fv).copied().unwrap_or(0);
+                    now_secs.saturating_sub(fenced_at) >= grace_period_secs
+                })
+                .cloned()
+                .collect();
         for fv in &removed_fenced {
             self.fenced_versions.remove(fv);
             self.fenced_at.remove(fv);
@@ -1453,6 +1478,14 @@ mod tests {
     // GC tests
     // ---------------------------------------------------------------
 
+    /// Helper: build a per-range version map from (prefix, version) pairs.
+    fn versions(pairs: &[(&str, u64)]) -> HashMap<KeyRange, PolicyVersion> {
+        pairs
+            .iter()
+            .map(|(prefix, v)| (kr(prefix), pv(*v)))
+            .collect()
+    }
+
     #[test]
     fn gc_removes_old_fenced_entries() {
         let mut set = AckFrontierSet::new();
@@ -1468,7 +1501,7 @@ mod tests {
 
         // GC with current_version=5, max_retained=2 -> cutoff=3.
         // v1 is fenced and older than cutoff; grace period satisfied (1000+300 <= 1400).
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 300, 1400);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 1400);
         assert_eq!(removed, 1);
         assert_eq!(set.len(), 2);
 
@@ -1496,12 +1529,12 @@ mod tests {
         set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
 
         // Grace period is 300s. At t=1200, only 200s have passed -> not eligible.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 300, 1200);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 1200);
         assert_eq!(removed, 0);
         assert_eq!(set.len(), 1);
 
         // At t=1300, exactly 300s have passed -> eligible.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 300, 1300);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 1300);
         assert_eq!(removed, 1);
         assert_eq!(set.len(), 0);
     }
@@ -1515,7 +1548,7 @@ mod tests {
         set.update(make_frontier_v("auth-2", 200, 0, "user/", 3));
 
         // Even though v1 < cutoff(5-2=3), it is not fenced -> kept.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 0, 10000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 0, 10000);
         assert_eq!(removed, 0);
         assert_eq!(set.len(), 2);
     }
@@ -1528,7 +1561,7 @@ mod tests {
         set.fence_version_at(&kr("user/"), PolicyVersion(3), 1000);
 
         // current=5, max_retained=2 -> cutoff=3. v3 == cutoff -> NOT removed.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 0, 2000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 0, 2000);
         assert_eq!(removed, 0);
         assert_eq!(set.len(), 1);
     }
@@ -1542,7 +1575,7 @@ mod tests {
         set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
 
         // Remove both entries for v1.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 0, 2000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 0, 2000);
         assert_eq!(removed, 2);
 
         // Fenced metadata should also be cleaned up.
@@ -1552,7 +1585,7 @@ mod tests {
     #[test]
     fn gc_returns_zero_for_empty_set() {
         let mut set = AckFrontierSet::new();
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 300, 10000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 10000);
         assert_eq!(removed, 0);
     }
 
@@ -1566,7 +1599,7 @@ mod tests {
         set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
         // order/ v1 is NOT fenced.
 
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 0, 2000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5), ("order/", 5)]), 2, 0, 2000);
         // Only user/v1 is fenced and eligible.
         assert_eq!(removed, 1);
         assert_eq!(set.len(), 1);
@@ -1584,7 +1617,7 @@ mod tests {
         set.fence_version_at(&kr("user/"), PolicyVersion(1), 5000);
 
         // Grace period 0 -> immediately eligible after fencing.
-        let removed = set.gc_stale_entries(PolicyVersion(5), 2, 0, 5000);
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 0, 5000);
         assert_eq!(removed, 1);
     }
 
@@ -1597,5 +1630,104 @@ mod tests {
         set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
         assert!(!set.is_empty());
         assert_eq!(set.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Bug fix tests: per-range GC cutoff (#263)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn gc_per_range_cutoff_does_not_over_delete_slow_range() {
+        let mut set = AckFrontierSet::new();
+
+        // "fast/" range is at policy version 10, "slow/" range is at version 3.
+        // Both have fenced v1 entries.
+        set.update(make_frontier_v("auth-1", 100, 0, "fast/", 1));
+        set.update(make_frontier_v("auth-1", 200, 0, "slow/", 1));
+        set.fence_version_at(&kr("fast/"), PolicyVersion(1), 1000);
+        set.fence_version_at(&kr("slow/"), PolicyVersion(1), 1000);
+
+        // Per-range versions: fast/=10, slow/=3; max_retained=2.
+        // fast/ cutoff = 10 - 2 = 8 -> v1 < 8 -> eligible.
+        // slow/ cutoff = 3  - 2 = 1 -> v1 >= 1 -> NOT eligible.
+        let removed = set.gc_stale_entries(&versions(&[("fast/", 10), ("slow/", 3)]), 2, 0, 2000);
+        assert_eq!(removed, 1);
+        assert_eq!(set.len(), 1);
+
+        // fast/v1 should be gone.
+        assert!(
+            set.get_for_scope(&kr("fast/"), &PolicyVersion(1), &NodeId("auth-1".into()))
+                .is_none()
+        );
+        // slow/v1 should be preserved.
+        assert!(
+            set.get_for_scope(&kr("slow/"), &PolicyVersion(1), &NodeId("auth-1".into()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gc_skips_ranges_not_in_version_map() {
+        let mut set = AckFrontierSet::new();
+
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
+
+        // Pass an empty version map -- no ranges known -> nothing GC'd.
+        let removed = set.gc_stale_entries(&HashMap::new(), 2, 0, 2000);
+        assert_eq!(removed, 0);
+        assert_eq!(set.len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Bug fix tests: fenced metadata grace period (#263)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn gc_fenced_metadata_preserved_until_grace_period_expires() {
+        let mut set = AckFrontierSet::new();
+
+        // Insert and fence v1 at t=1000 with a grace period of 600s.
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
+
+        // Grace period 600s: 1100 - 1000 = 100 < 600 -> frontier entries NOT removed.
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 600, 1100);
+        assert_eq!(removed, 0);
+        // Fenced metadata should still be present.
+        assert!(set.is_version_fenced(&kr("user/"), &PolicyVersion(1)));
+
+        // Grace period satisfied: 1600 - 1000 = 600 >= 600.
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 600, 1600);
+        assert_eq!(removed, 1);
+        assert!(!set.is_version_fenced(&kr("user/"), &PolicyVersion(1)));
+    }
+
+    #[test]
+    fn gc_fenced_empty_scope_stays_fenced_during_grace_period() {
+        let mut set = AckFrontierSet::new();
+
+        // Fence v1 at t=1000 but do NOT add any frontier entries for it.
+        // This simulates a scope where all frontier entries were already
+        // removed by a prior GC pass but the fenced_at metadata must persist.
+        set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
+
+        // At t=1100, grace period (300s) has NOT elapsed.
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 1100);
+        assert_eq!(removed, 0);
+        // Fenced metadata must still be present -- the scope is still protected.
+        assert!(
+            set.is_version_fenced(&kr("user/"), &PolicyVersion(1)),
+            "fenced metadata should NOT be removed before grace period expires"
+        );
+
+        // At t=1300, grace period has elapsed (1300 - 1000 = 300 >= 300).
+        let removed = set.gc_stale_entries(&versions(&[("user/", 5)]), 2, 300, 1300);
+        assert_eq!(removed, 0); // no frontier entries to remove
+        // Now the fenced metadata should be cleaned up.
+        assert!(
+            !set.is_version_fenced(&kr("user/"), &PolicyVersion(1)),
+            "fenced metadata should be removed after grace period expires"
+        );
     }
 }
