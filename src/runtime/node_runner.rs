@@ -1750,23 +1750,43 @@ impl NodeRunner {
             // Full sync fallback: pull all keys from peer.
             if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
                 let mut api = eventual_api.lock().await;
+                let mut full_sync_errors = 0u64;
                 for (key, value) in &dump.entries {
                     // Preserve original HLC timestamps when available to avoid
                     // retimestamping imported entries with a local clock tick.
-                    if let Some(hlc) = dump.timestamps.get(key) {
-                        let _ = api.merge_remote_with_hlc(key.clone(), value, hlc.clone());
+                    let result = if let Some(hlc) = dump.timestamps.get(key) {
+                        api.merge_remote_with_hlc(key.clone(), value, hlc.clone())
                     } else {
-                        let _ = api.merge_remote(key.clone(), value);
+                        api.merge_remote(key.clone(), value)
+                    };
+                    if let Err(e) = result {
+                        full_sync_errors += 1;
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            key = %key,
+                            error = %e,
+                            "full sync merge failed for key"
+                        );
                     }
                 }
                 drop(api);
 
-                // Update the peer frontier from the *remote* peer's frontier.
-                // We must NOT use our local store frontier here because the local
-                // store may be ahead of the remote; using it would cause subsequent
-                // delta pulls to miss remote updates between the remote's true
-                // frontier and our local frontier.
-                if let Some(remote_frontier) = dump.frontier {
+                if full_sync_errors > 0 {
+                    tracing::warn!(
+                        peer = %peer.node_id.0,
+                        error_count = full_sync_errors,
+                        total_entries = dump.entries.len(),
+                        "full sync completed with merge errors, not advancing frontier"
+                    );
+                    // Don't advance frontier when there are merge errors —
+                    // full sync will be retried next cycle to re-attempt
+                    // the failed entries.
+                } else if let Some(remote_frontier) = dump.frontier {
+                    // Update the peer frontier from the *remote* peer's frontier.
+                    // We must NOT use our local store frontier here because the local
+                    // store may be ahead of the remote; using it would cause subsequent
+                    // delta pulls to miss remote updates between the remote's true
+                    // frontier and our local frontier.
                     self.peer_frontiers
                         .insert(peer_key.clone(), remote_frontier);
                 } else {

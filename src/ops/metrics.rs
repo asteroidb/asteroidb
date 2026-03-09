@@ -398,7 +398,10 @@ impl RuntimeMetrics {
 
     /// Record a successful sync for a peer at a specific instant (for testing).
     pub fn record_peer_sync_success_at(&self, peer_id: &str, latency: Duration, now: Instant) {
-        let mut stats = self.peer_sync_stats.lock().unwrap();
+        let mut stats = self
+            .peer_sync_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let entry = stats
             .entry(peer_id.to_string())
             .or_insert_with(PeerSyncStats::new);
@@ -412,7 +415,10 @@ impl RuntimeMetrics {
 
     /// Record a failed sync for a peer at a specific instant (for testing).
     pub fn record_peer_sync_failure_at(&self, peer_id: &str, now: Instant) {
-        let mut stats = self.peer_sync_stats.lock().unwrap();
+        let mut stats = self
+            .peer_sync_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let entry = stats
             .entry(peer_id.to_string())
             .or_insert_with(PeerSyncStats::new);
@@ -426,7 +432,10 @@ impl RuntimeMetrics {
 
     /// Record a certification latency at a specific instant (for testing).
     pub fn record_certification_latency_at(&self, latency: Duration, now: Instant) {
-        let mut window = self.certification_latency_window.lock().unwrap();
+        let mut window = self
+            .certification_latency_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         window.record(now, latency, self.window_duration);
     }
 
@@ -492,7 +501,10 @@ impl RuntimeMetrics {
     /// Create a snapshot at a specific instant (for testing).
     pub fn snapshot_at(&self, now: Instant) -> MetricsSnapshot {
         let peer_snapshots = {
-            let stats = self.peer_sync_stats.lock().unwrap();
+            let stats = self
+                .peer_sync_stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             stats
                 .iter()
                 .map(|(peer_id, s)| (peer_id.clone(), s.snapshot(now, self.window_duration)))
@@ -500,7 +512,10 @@ impl RuntimeMetrics {
         };
 
         let cert_latency_window = {
-            let window = self.certification_latency_window.lock().unwrap();
+            let window = self
+                .certification_latency_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             window.snapshot(now, self.window_duration)
         };
 
