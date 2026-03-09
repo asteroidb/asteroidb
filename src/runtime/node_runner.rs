@@ -1566,15 +1566,13 @@ impl NodeRunner {
                                     // The next sync cycle will re-push from the old
                                     // frontier, which is safe (merges are idempotent).
                                     //
-                                    // Record failure and move to next peer.
-                                    self.peer_backoffs
-                                        .entry(peer_key.clone())
-                                        .or_default()
-                                        .record_failure();
+                                    // Record failure metrics but do NOT skip the pull
+                                    // phase — the peer may have data we need even if
+                                    // our push failed (e.g. network was briefly down
+                                    // for outbound but the peer has new writes).
                                     self.metrics
                                         .sync_failure_total
                                         .fetch_add(1, Ordering::Relaxed);
-                                    continue;
                                 }
                             }
                         }
@@ -1618,12 +1616,16 @@ impl NodeRunner {
                             // All keys merged successfully.
                         }
                         Some(sync_resp) => {
-                            // 2xx but per-key errors — don't advance frontier.
+                            // 2xx but per-key errors — log but still establish the
+                            // frontier so the pull phase can proceed. Per-key merge
+                            // errors (e.g. type mismatches on individual keys) should
+                            // not block the entire sync pipeline; the pull path is
+                            // independent and may bring in data we need.
                             tracing::warn!(
                                 peer = %peer.node_id.0,
                                 error_count = sync_resp.errors.len(),
                                 merged = sync_resp.merged,
-                                "initial full push had per-key merge errors, not advancing frontier"
+                                "initial full push had per-key merge errors"
                             );
                             for err in &sync_resp.errors {
                                 tracing::debug!(
@@ -1633,10 +1635,9 @@ impl NodeRunner {
                                     "full push per-key error"
                                 );
                             }
-                            continue;
                         }
                         None => {
-                            // Push failed — skip pull and retry next cycle.
+                            // Network-level push failed — skip pull and retry next cycle.
                             continue;
                         }
                     }
@@ -1764,12 +1765,14 @@ impl NodeRunner {
                         peer = %peer.node_id.0,
                         error_count = full_sync_errors,
                         total_entries = dump.entries.len(),
-                        "full sync completed with merge errors, not advancing frontier"
+                        "full sync completed with merge errors"
                     );
-                    // Don't advance frontier when there are merge errors —
-                    // full sync will be retried next cycle to re-attempt
-                    // the failed entries.
-                } else if let Some(remote_frontier) = dump.frontier {
+                    // Still advance the frontier below even with per-key
+                    // errors. Type-mismatch errors are typically permanent
+                    // for those keys, so refusing to advance would cause
+                    // full-sync to be retried endlessly without progress.
+                }
+                if let Some(remote_frontier) = dump.frontier {
                     // Update the peer frontier from the *remote* peer's frontier.
                     // We must NOT use our local store frontier here because the local
                     // store may be ahead of the remote; using it would cause subsequent
@@ -2051,10 +2054,10 @@ impl NodeRunner {
 
     /// Apply a delta sync response by merging all entries into the eventual store.
     ///
-    /// Returns the number of per-key merge errors. When all entries merge
-    /// successfully, the peer frontier is advanced automatically. When errors
-    /// occur, the frontier is left unchanged so failed entries are retried on
-    /// the next sync cycle.
+    /// Returns the number of per-key merge errors. The peer frontier is
+    /// advanced regardless of per-key errors so that successfully merged
+    /// entries are not re-pulled and permanently-failing keys (e.g. type
+    /// mismatches) do not stall the entire sync pipeline.
     async fn apply_delta_response(
         peer_frontiers: &mut HashMap<String, HlcTimestamp>,
         delta_resp: &crate::network::sync::DeltaSyncResponse,
@@ -2089,11 +2092,15 @@ impl NodeRunner {
                 total_entries = delta_resp.entries.len(),
                 "{} completed with merge errors", label
             );
-            // Don't advance frontier when there are errors.
-            return error_count;
         }
 
-        // Advance the frontier conservatively.
+        // Advance the frontier even when some entries failed to merge.
+        // Per-key merge errors (e.g. type mismatches) are typically permanent
+        // for those specific keys, so refusing to advance the frontier would
+        // cause the same failing entries to be re-pulled every cycle, permanently
+        // stalling progress. By advancing past them, successfully merged entries
+        // are not re-transmitted and the failing keys will be retried naturally
+        // when the remote peer updates them (creating a new HLC > our frontier).
         if let Some(ref new_frontier) = delta_resp.sender_frontier {
             peer_frontiers.insert(peer_key.to_string(), new_frontier.clone());
         } else if let Some(hlc) = last_success_hlc {
