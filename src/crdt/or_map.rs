@@ -922,4 +922,67 @@ mod tests {
             via_delta.get(&"y".to_string())
         );
     }
+
+    // ---------------------------------------------------------------
+    // Tombstone GC tests (P1-10 regression)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn compact_deferred_removes_dominated_tombstones() {
+        let mut map = OrMap::new();
+        let n = node("A");
+        map.set("k1".into(), 1, ts(100, 0, "A"), &n); // counter=1
+        map.delete(&"k1".to_string()); // dot (A,1) -> deferred
+        map.set("k2".into(), 2, ts(200, 0, "A"), &n); // counter=2
+
+        assert_eq!(map.deferred_len(), 1);
+        map.compact_deferred();
+        assert_eq!(
+            map.deferred_len(),
+            0,
+            "tombstone with counter < max_counter should be removed"
+        );
+    }
+
+    #[test]
+    fn compact_deferred_retains_unsuperseded_tombstones() {
+        let mut map = OrMap::new();
+        let n = node("A");
+        map.set("k1".into(), 1, ts(100, 0, "A"), &n); // counter=1
+        map.delete(&"k1".to_string()); // dot (A,1) -> deferred
+
+        assert_eq!(map.deferred_len(), 1);
+        map.compact_deferred();
+        assert_eq!(
+            map.deferred_len(),
+            1,
+            "tombstone must be retained when counter is not superseded"
+        );
+    }
+
+    /// P1-10 regression: HLC timestamps used as counter floors would cause
+    /// all tombstones to be GC'd because dot counters are always smaller.
+    #[test]
+    fn hlc_floor_causes_premature_tombstone_gc() {
+        let mut map = OrMap::new();
+        let n = node("A");
+        map.set("k1".into(), 1, ts(100, 0, "A"), &n); // counter=1
+        map.delete(&"k1".to_string()); // dot (A,1) -> deferred
+        map.set("k2".into(), 2, ts(200, 0, "A"), &n); // counter=2
+
+        assert_eq!(map.deferred_len(), 1);
+
+        // Using HLC-scale value as floor: dot counter (1) < 1_700_000_000_000
+        let hlc_floor = 1_700_000_000_000u64;
+        let empty_floor = std::collections::HashMap::new();
+        map.compact_deferred_with_floor(&empty_floor, Some(hlc_floor));
+
+        // The tombstone is removed (BUG in the old wiring) because the floor
+        // is in the wrong unit. This test documents the behavior.
+        assert_eq!(
+            map.deferred_len(),
+            0,
+            "HLC-scale floor incorrectly removes tombstone"
+        );
+    }
 }
