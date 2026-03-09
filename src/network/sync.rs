@@ -406,6 +406,42 @@ impl SyncClient {
             .body(bytes))
     }
 
+    /// Build a POST request with JSON-encoded body.
+    fn json_post<T: Serialize>(&self, url: &str, data: &T) -> reqwest::RequestBuilder {
+        self.authorized_post(url).json(data)
+    }
+
+    /// Send a POST request preferring bincode, retrying with JSON if the peer
+    /// rejects the bincode request (non-success status).
+    ///
+    /// This ensures backward compatibility during rolling upgrades where older
+    /// nodes may not support bincode payloads.
+    async fn send_with_json_fallback<T: Serialize>(
+        &self,
+        url: &str,
+        data: &T,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let req_builder = match self.bincode_post(url, data) {
+            Ok(b) => b,
+            Err(_) => {
+                // Bincode encoding failed, go directly to JSON.
+                return self.json_post(url, data).send().await;
+            }
+        };
+
+        match req_builder.send().await {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!(
+                    url = %url,
+                    status = %resp.status(),
+                    "bincode request rejected, retrying with JSON"
+                );
+                self.json_post(url, data).send().await
+            }
+            other => other,
+        }
+    }
+
     /// Deserialize a response body based on the response's Content-Type header.
     ///
     /// Supports both bincode (`application/octet-stream`) and JSON responses
@@ -449,15 +485,7 @@ impl SyncClient {
         for peer in &peers {
             let url = format!("http://{}/api/internal/sync", peer.addr);
 
-            let req_builder = match self.bincode_post(&url, &request) {
-                Ok(b) => b,
-                Err(_) => {
-                    // Fallback to JSON if bincode encoding fails.
-                    self.authorized_post(&url).json(&request)
-                }
-            };
-
-            match req_builder.send().await {
+            match self.send_with_json_fallback(&url, &request).await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         success_count += 1;
@@ -508,12 +536,7 @@ impl SyncClient {
 
         let url = format!("http://{peer_addr}/api/internal/sync");
 
-        let req_builder = match self.bincode_post(&url, &request) {
-            Ok(b) => b,
-            Err(_) => self.authorized_post(&url).json(&request),
-        };
-
-        match req_builder.send().await {
+        match self.send_with_json_fallback(&url, &request).await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     tracing::debug!(
@@ -577,12 +600,7 @@ impl SyncClient {
             };
             let url = format!("http://{peer_addr}/api/internal/sync");
 
-            let req_builder = match self.bincode_post(&url, &request) {
-                Ok(b) => b,
-                Err(_) => self.authorized_post(&url).json(&request),
-            };
-
-            match req_builder.send().await {
+            match self.send_with_json_fallback(&url, &request).await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         // Parse the response body to check for per-key merge
@@ -652,7 +670,8 @@ impl SyncClient {
     pub async fn pull_all_keys(&self, peer_addr: &str) -> Option<KeyDumpResponse> {
         let url = format!("http://{}/api/internal/keys", peer_addr);
 
-        match self
+        // Try with bincode Accept header first.
+        let resp = match self
             .authorized_get(&url)
             .header("accept", CONTENT_TYPE_BINCODE)
             .send()
@@ -660,22 +679,20 @@ impl SyncClient {
         {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match Self::decode_response::<KeyDumpResponse>(resp).await {
-                        Ok(dump) => Some(dump),
+                    resp
+                } else {
+                    tracing::debug!(
+                        status = %resp.status(),
+                        "pull_all_keys bincode request rejected, retrying with JSON"
+                    );
+                    // Retry without bincode Accept header for backward compatibility.
+                    match self.authorized_get(&url).send().await {
+                        Ok(resp) => resp,
                         Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to parse key dump response"
-                            );
-                            None
+                            tracing::warn!(error = %e, "pull_all_keys JSON retry failed");
+                            return None;
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        status = %resp.status(),
-                        "pull_all_keys received non-success status"
-                    );
-                    None
                 }
             }
             Err(e) => {
@@ -683,8 +700,24 @@ impl SyncClient {
                     error = %e,
                     "pull_all_keys request failed"
                 );
-                None
+                return None;
             }
+        };
+
+        if resp.status().is_success() {
+            match Self::decode_response::<KeyDumpResponse>(resp).await {
+                Ok(dump) => Some(dump),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse key dump response");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                status = %resp.status(),
+                "pull_all_keys received non-success status"
+            );
+            None
         }
     }
 
@@ -714,12 +747,7 @@ impl SyncClient {
             frontier: frontier.clone(),
         };
 
-        let req_builder = match self.bincode_post(&url, &req) {
-            Ok(b) => b,
-            Err(_) => self.authorized_post(&url).json(&req),
-        };
-
-        match req_builder.send().await {
+        match self.send_with_json_fallback(&url, &req).await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match Self::decode_response::<DeltaSyncResponse>(resp).await {

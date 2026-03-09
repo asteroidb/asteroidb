@@ -97,6 +97,41 @@ impl FrontierSyncClient {
             .body(bytes))
     }
 
+    /// Build a POST request with JSON-encoded body.
+    fn json_post<T: Serialize>(&self, url: &str, data: &T) -> reqwest::RequestBuilder {
+        self.authorized_post(url).json(data)
+    }
+
+    /// Send a POST request preferring bincode, retrying with JSON if the peer
+    /// rejects the bincode request (non-success status).
+    ///
+    /// This ensures backward compatibility during rolling upgrades where older
+    /// nodes may not support bincode payloads.
+    async fn send_with_json_fallback<T: Serialize>(
+        &self,
+        url: &str,
+        data: &T,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let req_builder = match self.bincode_post(url, data) {
+            Ok(b) => b,
+            Err(_) => {
+                return self.json_post(url, data).send().await;
+            }
+        };
+
+        match req_builder.send().await {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!(
+                    url = %url,
+                    status = %resp.status(),
+                    "bincode request rejected, retrying with JSON"
+                );
+                self.json_post(url, data).send().await
+            }
+            other => other,
+        }
+    }
+
     /// Deserialize a response body based on the response's Content-Type header.
     async fn decode_response<T: for<'de> Deserialize<'de>>(
         resp: reqwest::Response,
@@ -126,12 +161,10 @@ impl FrontierSyncClient {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
         let body = FrontierPushRequest { frontiers };
 
-        let req_builder = match self.bincode_post(&url, &body) {
-            Ok(b) => b,
-            Err(_) => self.authorized_post(&url).json(&body),
-        };
-
-        let resp = req_builder.send().await?.error_for_status()?;
+        let resp = self
+            .send_with_json_fallback(&url, &body)
+            .await?
+            .error_for_status()?;
         Self::decode_response::<FrontierPushResponse>(resp)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
@@ -141,7 +174,8 @@ impl FrontierSyncClient {
     ///
     /// Sends a GET request to `http://{peer_addr}/api/internal/frontiers`
     /// with Accept: application/octet-stream to request bincode responses.
-    /// Falls back to JSON if the peer responds with JSON.
+    /// Falls back to JSON if the peer responds with JSON. If the bincode
+    /// request is rejected, retries without the bincode Accept header.
     pub async fn pull_frontiers(
         &self,
         peer_addr: &str,
@@ -152,8 +186,19 @@ impl FrontierSyncClient {
             .authorized_get(&url)
             .header("accept", CONTENT_TYPE_BINCODE)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+
+        // If bincode Accept was rejected, retry without it for backward compatibility.
+        let resp = if !resp.status().is_success() {
+            tracing::debug!(
+                url = %url,
+                status = %resp.status(),
+                "bincode pull_frontiers rejected, retrying without bincode Accept"
+            );
+            self.authorized_get(&url).send().await?.error_for_status()?
+        } else {
+            resp
+        };
 
         Self::decode_response::<FrontierPullResponse>(resp)
             .await

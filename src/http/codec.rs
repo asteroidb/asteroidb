@@ -55,17 +55,69 @@ pub fn deserialize_internal<T: for<'de> Deserialize<'de>>(
 }
 
 /// Check whether the `Accept` header value indicates bincode preference.
+///
+/// Properly parses the Accept header to handle:
+/// - Case-insensitive MIME type matching
+/// - Multiple comma-separated types (e.g., `application/octet-stream, application/json`)
+/// - Quality values (e.g., `application/octet-stream;q=0.9, application/json;q=0.8`)
+/// - Parameters after the media type (e.g., `application/octet-stream; charset=utf-8`)
+///
+/// Returns `true` if `application/octet-stream` appears with q > 0.
 pub fn accepts_bincode(accept: Option<&str>) -> bool {
-    accept
-        .map(|a| a.contains(CONTENT_TYPE_BINCODE))
-        .unwrap_or(false)
+    let accept = match accept {
+        Some(a) => a,
+        None => return false,
+    };
+
+    for part in accept.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Split into media type and parameters (;key=value)
+        let mut segments = part.split(';');
+        let media_type = segments.next().unwrap_or("").trim();
+
+        // Check if the media type matches (case-insensitive)
+        if !media_type.eq_ignore_ascii_case(CONTENT_TYPE_BINCODE) {
+            continue;
+        }
+
+        // Check for q=0 which means "not acceptable"
+        let mut q_value = 1.0_f64;
+        for segment in segments {
+            let segment = segment.trim();
+            if let Some(q_str) = segment
+                .strip_prefix("q=")
+                .or_else(|| segment.strip_prefix("Q="))
+            {
+                q_value = q_str.trim().parse::<f64>().unwrap_or(1.0);
+            }
+        }
+
+        if q_value > 0.0 {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Check whether the `Content-Type` header value indicates bincode.
+///
+/// Extracts just the media type from the Content-Type header, ignoring
+/// any parameters (e.g., `charset=utf-8`). Comparison is case-insensitive.
 pub fn is_bincode_content_type(content_type: Option<&str>) -> bool {
-    content_type
-        .map(|ct| ct.contains(CONTENT_TYPE_BINCODE))
-        .unwrap_or(false)
+    let ct = match content_type {
+        Some(ct) => ct,
+        None => return false,
+    };
+
+    // Content-Type is a single media type, possibly with parameters.
+    // Extract just the media type part (before any semicolons).
+    let media_type = ct.split(';').next().unwrap_or("").trim();
+    media_type.eq_ignore_ascii_case(CONTENT_TYPE_BINCODE)
 }
 
 /// Error type for serialization/deserialization failures.
@@ -362,10 +414,85 @@ mod tests {
     }
 
     #[test]
+    fn accepts_bincode_case_insensitive() {
+        assert!(accepts_bincode(Some("Application/Octet-Stream")));
+        assert!(accepts_bincode(Some("APPLICATION/OCTET-STREAM")));
+        assert!(accepts_bincode(Some(
+            "application/json, Application/Octet-Stream"
+        )));
+    }
+
+    #[test]
+    fn accepts_bincode_with_q_values() {
+        // Bincode with explicit q=1 should be accepted
+        assert!(accepts_bincode(Some("application/octet-stream;q=1")));
+        assert!(accepts_bincode(Some("application/octet-stream; q=0.9")));
+
+        // Bincode with q=0 means "not acceptable"
+        assert!(!accepts_bincode(Some("application/octet-stream;q=0")));
+        assert!(!accepts_bincode(Some("application/octet-stream; q=0")));
+        assert!(!accepts_bincode(Some("application/octet-stream; q=0.0")));
+    }
+
+    #[test]
+    fn accepts_bincode_with_parameters() {
+        // Parameters after the media type should be ignored for matching
+        assert!(accepts_bincode(Some(
+            "application/octet-stream; charset=utf-8"
+        )));
+        assert!(accepts_bincode(Some(
+            "application/octet-stream; charset=utf-8; q=0.8"
+        )));
+    }
+
+    #[test]
+    fn accepts_bincode_multiple_types_with_q_values() {
+        assert!(accepts_bincode(Some(
+            "application/json;q=0.8, application/octet-stream;q=0.9"
+        )));
+        // Bincode explicitly excluded but JSON present
+        assert!(!accepts_bincode(Some(
+            "application/json;q=0.8, application/octet-stream;q=0"
+        )));
+    }
+
+    #[test]
+    fn accepts_bincode_empty_and_whitespace() {
+        assert!(!accepts_bincode(Some("")));
+        assert!(!accepts_bincode(Some("  ")));
+        assert!(!accepts_bincode(Some(",")));
+    }
+
+    #[test]
     fn is_bincode_content_type_detects_octet_stream() {
         assert!(is_bincode_content_type(Some("application/octet-stream")));
         assert!(!is_bincode_content_type(Some("application/json")));
         assert!(!is_bincode_content_type(None));
+    }
+
+    #[test]
+    fn is_bincode_content_type_case_insensitive() {
+        assert!(is_bincode_content_type(Some("Application/Octet-Stream")));
+        assert!(is_bincode_content_type(Some("APPLICATION/OCTET-STREAM")));
+    }
+
+    #[test]
+    fn is_bincode_content_type_ignores_parameters() {
+        assert!(is_bincode_content_type(Some(
+            "application/octet-stream; charset=utf-8"
+        )));
+        assert!(is_bincode_content_type(Some(
+            "application/octet-stream;boundary=something"
+        )));
+    }
+
+    #[test]
+    fn is_bincode_content_type_rejects_partial_match() {
+        // Should not match substrings
+        assert!(!is_bincode_content_type(Some("x-application/octet-stream")));
+        assert!(!is_bincode_content_type(Some(
+            "application/octet-stream-extra"
+        )));
     }
 
     // ---------------------------------------------------------------
