@@ -310,6 +310,13 @@ pub struct RuntimeMetrics {
     /// during periodic checkpoint checks.
     pub write_ops_total: AtomicU64,
 
+    /// Per-key write operation counts for accurate per-range compaction tracking.
+    ///
+    /// Maps written keys to their cumulative op count since last drain.
+    /// The compaction engine drains this map and aggregates counts by key range
+    /// prefix so that hot ranges trigger compaction independently of idle ones.
+    write_ops_by_key: Mutex<HashMap<String, u64>>,
+
     /// Per-peer sync statistics (peer_id -> stats).
     peer_sync_stats: Mutex<HashMap<String, PeerSyncStats>>,
 
@@ -342,6 +349,7 @@ impl Default for RuntimeMetrics {
             key_rotation_last_version: AtomicU64::default(),
             key_rotation_last_time_ms: AtomicU64::default(),
             write_ops_total: AtomicU64::default(),
+            write_ops_by_key: Mutex::new(HashMap::new()),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
             window_duration: Duration::from_secs(WINDOW_SECS),
@@ -355,6 +363,30 @@ impl RuntimeMetrics {
         Self {
             window_duration: window,
             ..Default::default()
+        }
+    }
+
+    /// Record a write operation for a specific key.
+    ///
+    /// The key is stored so that `drain_write_ops_by_key` can aggregate
+    /// counts by key-range prefix for accurate per-range compaction.
+    pub fn record_write_op(&self, key: &str) {
+        self.write_ops_total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.write_ops_by_key.lock() {
+            *map.entry(key.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Drain the per-key write ops map and return the accumulated counts.
+    ///
+    /// Also resets `write_ops_total` to 0.  The caller (compaction engine)
+    /// should aggregate these by key-range prefix.
+    pub fn drain_write_ops_by_key(&self) -> HashMap<String, u64> {
+        self.write_ops_total.swap(0, Ordering::Relaxed);
+        if let Ok(mut map) = self.write_ops_by_key.lock() {
+            std::mem::take(&mut *map)
+        } else {
+            HashMap::new()
         }
     }
 

@@ -95,6 +95,8 @@ pub async fn eventual_write(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EventualWriteRequest>,
 ) -> Result<Json<WriteResponse>, ApiError> {
+    let written_key = req.key().to_string();
+
     let mut api = state.eventual.lock().await;
 
     match req {
@@ -125,10 +127,7 @@ pub async fn eventual_write(
         }
     }
 
-    state
-        .metrics
-        .write_ops_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.record_write_op(&written_key);
 
     Ok(Json(WriteResponse { ok: true }))
 }
@@ -176,14 +175,12 @@ pub async fn certified_write(
     };
 
     let crdt_value = json_to_crdt_value(&req.value)?;
+    let written_key = req.key.clone();
 
     let mut api = state.certified.lock().await;
     let status = api.certified_write(req.key, crdt_value, on_timeout)?;
 
-    state
-        .metrics
-        .write_ops_total
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.record_write_op(&written_key);
 
     Ok(Json(CertifiedWriteResponse { status }))
 }

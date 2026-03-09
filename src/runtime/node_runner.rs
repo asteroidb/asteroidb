@@ -1902,10 +1902,10 @@ impl NodeRunner {
     async fn check_compaction(&mut self) {
         let now = self.clock.now();
 
-        // Drain write ops recorded by HTTP handlers and feed them into the
-        // compaction engine so that the ops-based checkpoint threshold works
-        // in production.
-        let pending_ops = self.metrics.write_ops_total.swap(0, Ordering::Relaxed);
+        // Drain per-key write ops recorded by HTTP handlers and aggregate
+        // by key range prefix so that hot ranges trigger compaction
+        // independently of idle ones.
+        let ops_by_key = self.metrics.drain_write_ops_by_key();
 
         // Phase 1: Acquire certified_api lock, read all needed data, then drop
         // the lock before any subsequent .await points.
@@ -1937,13 +1937,26 @@ impl NodeRunner {
             (defs, fs, policy_versions)
         };
 
-        // Phase 2: Distribute drained write ops and create checkpoints using
-        // only the cloned data — no locks held.
-        if pending_ops > 0 && !defs.is_empty() {
-            let ops_per_range = pending_ops / defs.len() as u64;
-            let remainder = pending_ops % defs.len() as u64;
-            for (i, (key_range, _)) in defs.iter().enumerate() {
-                let ops = ops_per_range + if (i as u64) < remainder { 1 } else { 0 };
+        // Phase 2: Aggregate per-key write ops into per-range counts by
+        // matching each written key against key range prefixes. Keys that
+        // don't match any range are counted under the first range as a
+        // fallback (maintains the previous behaviour of counting all ops).
+        if !ops_by_key.is_empty() && !defs.is_empty() {
+            let mut range_ops: HashMap<&str, u64> = HashMap::new();
+            for (key, count) in &ops_by_key {
+                let matched = defs
+                    .iter()
+                    .find(|(kr, _)| key.starts_with(&kr.prefix))
+                    .map(|(kr, _)| kr.prefix.as_str());
+                let prefix = matched.unwrap_or(&defs[0].0.prefix);
+                *range_ops.entry(prefix).or_insert(0) += count;
+            }
+
+            for (key_range, _) in &defs {
+                let ops = range_ops
+                    .get(key_range.prefix.as_str())
+                    .copied()
+                    .unwrap_or(0);
                 for _ in 0..ops {
                     self.compaction_engine.record_op(key_range);
                 }
