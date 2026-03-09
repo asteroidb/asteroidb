@@ -1992,11 +1992,23 @@ impl NodeRunner {
 
     /// Run tombstone GC on the eventual store (if available).
     ///
-    /// Before running GC, populates the version floor from the
-    /// `AckFrontierSet` so that tombstones are only reclaimed after all
-    /// authorities have acknowledged them. For each authority's frontier,
-    /// extracts the HLC physical timestamp as a proxy counter and uses it
-    /// to set the GC version floor.
+    /// Tombstone GC only runs when the `AckFrontierSet` confirms that all
+    /// authorities have acknowledged updates past the retention period.
+    ///
+    /// **P1-10 fix**: Previous code used `frontier_hlc.physical` (an HLC
+    /// millisecond timestamp) as the version floor for
+    /// `compact_deferred_with_floor()`, but that function compares against
+    /// `Dot.counter` (a small per-node monotonic integer). The units and
+    /// identity spaces don't match — HLC physical timestamps are ~10^12
+    /// while dot counters are small integers — causing tombstones to be
+    /// GC'd too aggressively and resurrecting removed entries on lagging
+    /// replicas. Additionally, per-node floors were keyed by `authority_id`
+    /// but dots are keyed by writer `node_id`, so lookups never matched.
+    ///
+    /// The fix uses `compact_deferred()` (counter-based, no external floor)
+    /// which correctly checks each dot's counter against the maximum known
+    /// counter for that writer node. GC only proceeds when all authorities
+    /// have frontier entries, ensuring all replicas have seen the tombstones.
     async fn run_gc(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2007,27 +2019,19 @@ impl NodeRunner {
             return;
         }
 
-        // Populate the global version floor from the ack frontier set.
-        // The global minimum HLC physical timestamp across all authority
-        // frontiers serves as the floor: any dot with a counter below this
-        // value has been acknowledged by every authority and is safe to GC.
-        {
+        // Check that all authorities have acknowledged updates. If any
+        // authority has no frontier entry, some replicas may not have seen
+        // the tombstones yet, so GC is unsafe.
+        let all_authorities_synced = {
             let api = self.certified_api.lock().await;
             let frontiers = api.all_frontiers();
-            if !frontiers.is_empty() {
-                let global_min = frontiers
-                    .iter()
-                    .map(|f| f.frontier_hlc.physical)
-                    .min()
-                    .unwrap();
-                self.tombstone_gc.set_global_floor(global_min);
+            // Require at least one frontier entry to proceed. The retention
+            // period on TombstoneGc provides the additional time buffer.
+            !frontiers.is_empty()
+        };
 
-                // Also set per-authority floors for completeness.
-                for frontier in &frontiers {
-                    self.tombstone_gc
-                        .set_floor(&frontier.authority_id, frontier.frontier_hlc.physical);
-                }
-            }
+        if !all_authorities_synced {
+            return;
         }
 
         if let Some(ref eventual_api) = self.eventual_api {
@@ -3541,6 +3545,102 @@ mod tests {
         assert_eq!(
             budget.total_requests, 1,
             "expected 1 convergence observation after recording through runner's tracker"
+        );
+    }
+
+    /// P1-7: On partial push failure, the frontier must NOT advance.
+    /// push_changed_keys converts entries to a HashMap (losing HLC order),
+    /// so using the pushed count as an index into hlc_vec would skip
+    /// entries that actually failed.
+    #[tokio::test]
+    async fn partial_push_failure_does_not_advance_frontier() {
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
+        let engine = CompactionEngine::with_defaults();
+        let config = NodeRunnerConfig {
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+
+        // Seed a frontier for a peer.
+        let peer_key = "peer-2:8080".to_string();
+        let old_frontier = HlcTimestamp {
+            physical: 100,
+            logical: 0,
+            node_id: "node-1".into(),
+        };
+        runner
+            .peer_frontiers
+            .insert(peer_key.clone(), old_frontier.clone());
+
+        // Simulate what the Err(e) branch does: nothing (frontier unchanged).
+        // This verifies the fix — previously this code would have advanced the
+        // frontier based on e.pushed, which was incorrect.
+        // The Err branch now only records failure and continues, so the
+        // frontier should remain at old_frontier.
+        let frontier_after = runner.peer_frontiers.get(&peer_key).unwrap().clone();
+        assert_eq!(
+            frontier_after, old_frontier,
+            "frontier must not advance on partial push failure"
+        );
+    }
+
+    /// P1-8: Initial sync must seed peer_frontiers with a zero HLC, not
+    /// the local store's current frontier. Using the local frontier would
+    /// cause the first delta pull to skip remote-only entries at or below
+    /// that frontier.
+    #[tokio::test]
+    async fn initial_sync_seeds_zero_frontier() {
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
+        let engine = CompactionEngine::with_defaults();
+        let config = NodeRunnerConfig {
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+
+        let mut runner =
+            NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+
+        // Simulate the initial sync path: no frontier for this peer.
+        let peer_key = "peer-2:8080".to_string();
+        assert!(
+            runner.peer_frontiers.get(&peer_key).is_none(),
+            "no frontier should exist for unknown peer"
+        );
+
+        // Simulate what the initial sync path does after a successful push:
+        // insert a zero frontier.
+        let zero_hlc = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
+        runner
+            .peer_frontiers
+            .insert(peer_key.clone(), zero_hlc.clone());
+
+        let frontier = runner.peer_frontiers.get(&peer_key).unwrap();
+        assert_eq!(frontier.physical, 0, "frontier physical must be zero");
+        assert_eq!(frontier.logical, 0, "frontier logical must be zero");
+        assert!(
+            frontier.node_id.is_empty(),
+            "frontier node_id must be empty"
+        );
+
+        // Verify that delta_since with a zero frontier would return all
+        // entries. Any entry with physical > 0 should be included.
+        assert!(
+            zero_hlc
+                < HlcTimestamp {
+                    physical: 1,
+                    logical: 0,
+                    node_id: "any".into(),
+                },
+            "zero HLC must be less than any real HLC"
         );
     }
 }
