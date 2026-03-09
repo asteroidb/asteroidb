@@ -521,16 +521,19 @@ impl SyncClient {
     /// Push the full local state to a single peer by address.
     ///
     /// Sends a `POST /api/internal/sync` request with all provided entries.
-    /// Returns `true` if the push succeeded, `false` on failure.
-    /// Used for initial sync when no peer frontier is known.
+    /// Returns `Some(SyncResponse)` on a 2xx response (callers must check
+    /// `errors` before advancing frontiers), or `None` on transport/HTTP failure.
     pub async fn push_full_state_to_peer(
         &self,
         peer_addr: &str,
         entries: HashMap<String, CrdtValue>,
         sender_id: &str,
-    ) -> bool {
+    ) -> Option<SyncResponse> {
         if entries.is_empty() {
-            return true;
+            return Some(SyncResponse {
+                merged: 0,
+                errors: Vec::new(),
+            });
         }
 
         let request = SyncRequest {
@@ -543,18 +546,32 @@ impl SyncClient {
         match self.send_with_json_fallback(&url, &request).await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    tracing::debug!(
-                        peer_addr = %peer_addr,
-                        "initial full push to peer succeeded"
-                    );
-                    true
+                    match Self::decode_response::<SyncResponse>(resp).await {
+                        Ok(sync_resp) => {
+                            tracing::debug!(
+                                peer_addr = %peer_addr,
+                                merged = sync_resp.merged,
+                                errors = sync_resp.errors.len(),
+                                "initial full push to peer succeeded"
+                            );
+                            Some(sync_resp)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer_addr = %peer_addr,
+                                error = %e,
+                                "initial full push: failed to decode SyncResponse"
+                            );
+                            None
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         peer_addr = %peer_addr,
                         status = %resp.status(),
                         "initial full push to peer received non-success status"
                     );
-                    false
+                    None
                 }
             }
             Err(e) => {
@@ -563,7 +580,7 @@ impl SyncClient {
                     error = %e,
                     "initial full push to peer failed"
                 );
-                false
+                None
             }
         }
     }

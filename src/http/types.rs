@@ -207,6 +207,25 @@ pub struct VerifyProofRequest {
     /// Must be present for the proof to be considered valid.
     #[serde(default)]
     pub certificate: Option<CertificateJson>,
+    /// Optional certificate format version. When provided, the handler uses
+    /// `FormatVersionConfig` to validate version compatibility.
+    #[serde(default)]
+    pub format_version: Option<u32>,
+    /// Optional signature algorithm hint (`"Ed25519"` or `"Bls12_381"`).
+    /// When `"Bls12_381"`, the handler sets the certificate's algorithm field
+    /// so the verifier selects the correct verification path.
+    #[serde(default)]
+    pub signature_algorithm: Option<String>,
+    /// Optional hex-encoded BLS aggregated signature. Reserved for future
+    /// BLS verification through the public endpoint.
+    #[serde(default)]
+    pub bls_aggregate_signature: Option<String>,
+    /// Optional BLS signer node IDs (same order as `bls_public_keys`).
+    #[serde(default)]
+    pub bls_signer_ids: Option<Vec<String>>,
+    /// Optional hex-encoded BLS public keys (same order as `bls_signer_ids`).
+    #[serde(default)]
+    pub bls_public_keys: Option<Vec<String>>,
 }
 
 /// Response for `POST /api/certified/verify`.

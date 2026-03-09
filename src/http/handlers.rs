@@ -626,7 +626,15 @@ pub async fn verify_proof(
     };
     let policy_version = PolicyVersion(req.policy_version);
 
+    // Determine the signature algorithm from the request.
+    let sig_algorithm = match req.signature_algorithm.as_deref() {
+        Some("Bls12_381") => crate::authority::certificate::SignatureAlgorithm::Bls12_381,
+        _ => crate::authority::certificate::SignatureAlgorithm::Ed25519,
+    };
+
     // Reconstruct the certificate from the HTTP payload, if provided.
+    // Apply caller-specified format_version and signature_algorithm so that
+    // BLS certificates and non-default format versions can be verified.
     let certificate = req.certificate.and_then(|cert_json| {
         let mut cert = MajorityCertificate::new(
             key_range.clone(),
@@ -634,6 +642,11 @@ pub async fn verify_proof(
             policy_version,
             KeysetVersion(cert_json.keyset_version),
         );
+        if let Some(fv) = req.format_version {
+            cert.format_version = fv;
+        }
+        cert.signature_algorithm = sig_algorithm;
+
         for sig_json in &cert_json.signatures {
             let pk_bytes = hex_to_bytes_32(&sig_json.public_key)?;
             let sig_bytes = hex_to_bytes_64(&sig_json.signature)?;
@@ -648,6 +661,12 @@ pub async fn verify_proof(
         }
         Some(cert)
     });
+
+    // Build format config when the caller provides a format_version so that
+    // the verifier performs version compatibility checks.
+    let format_config = req
+        .format_version
+        .map(|_| crate::authority::certificate::FormatVersionConfig::default());
 
     let bundle = ProofBundle {
         key_range,
@@ -671,7 +690,7 @@ pub async fn verify_proof(
         &registry,
         current_epoch,
         &state.epoch_config,
-        None,
+        format_config.as_ref(),
         0,
     );
 

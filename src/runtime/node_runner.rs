@@ -1405,19 +1405,28 @@ impl NodeRunner {
                         .full_sync_fallback_count
                         .fetch_add(1, Ordering::Relaxed);
 
-                    let push_ok = sync_client
+                    let push_resp = sync_client
                         .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                         .await;
 
-                    if push_ok {
-                        // After a successful full push, advance the frontier to
-                        // the local store's current frontier so the next delta
-                        // sync starts from the right point.
-                        let api = eventual_api.lock().await;
-                        if let Some(current) = api.store().current_frontier() {
-                            self.peer_frontiers.insert(peer_key.clone(), current);
+                    if let Some(resp) = push_resp {
+                        if !resp.errors.is_empty() {
+                            tracing::warn!(
+                                peer = %peer.node_id.0,
+                                error_count = resp.errors.len(),
+                                merged = resp.merged,
+                                "full sync push had per-key errors, not advancing frontier"
+                            );
+                        } else {
+                            // After a successful full push, advance the frontier to
+                            // the local store's current frontier so the next delta
+                            // sync starts from the right point.
+                            let api = eventual_api.lock().await;
+                            if let Some(current) = api.store().current_frontier() {
+                                self.peer_frontiers.insert(peer_key.clone(), current);
+                            }
+                            drop(api);
                         }
-                        drop(api);
                     }
                 } else {
                     drop(api);
@@ -1478,16 +1487,25 @@ impl NodeRunner {
                             .await
                             .expect("spawn_blocking panicked");
 
-                            let push_ok = sync_client
+                            let push_resp = sync_client
                                 .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                                 .await;
 
-                            if push_ok {
-                                let api = eventual_api.lock().await;
-                                if let Some(current) = api.store().current_frontier() {
-                                    self.peer_frontiers.insert(peer_key.clone(), current);
+                            if let Some(resp) = push_resp {
+                                if !resp.errors.is_empty() {
+                                    tracing::warn!(
+                                        peer = %peer.node_id.0,
+                                        error_count = resp.errors.len(),
+                                        merged = resp.merged,
+                                        "payload overflow full push had per-key errors"
+                                    );
+                                } else {
+                                    let api = eventual_api.lock().await;
+                                    if let Some(current) = api.store().current_frontier() {
+                                        self.peer_frontiers.insert(peer_key.clone(), current);
+                                    }
+                                    drop(api);
                                 }
-                                drop(api);
                             }
                         } else {
                             self.metrics
@@ -1592,13 +1610,35 @@ impl NodeRunner {
                         "initial sync: pushing full state to peer (no frontier known)"
                     );
 
-                    let success = sync_client
+                    match sync_client
                         .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
-                        .await;
-
-                    if !success {
-                        // Push failed — skip pull and retry next cycle.
-                        continue;
+                        .await
+                    {
+                        Some(sync_resp) if sync_resp.errors.is_empty() => {
+                            // All keys merged successfully.
+                        }
+                        Some(sync_resp) => {
+                            // 2xx but per-key errors — don't advance frontier.
+                            tracing::warn!(
+                                peer = %peer.node_id.0,
+                                error_count = sync_resp.errors.len(),
+                                merged = sync_resp.merged,
+                                "initial full push had per-key merge errors, not advancing frontier"
+                            );
+                            for err in &sync_resp.errors {
+                                tracing::debug!(
+                                    peer = %peer.node_id.0,
+                                    key = %err.key,
+                                    error = %err.error,
+                                    "full push per-key error"
+                                );
+                            }
+                            continue;
+                        }
+                        None => {
+                            // Push failed — skip pull and retry next cycle.
+                            continue;
+                        }
                     }
                 }
 
@@ -1626,53 +1666,15 @@ impl NodeRunner {
                     .await;
 
                 if let Some(delta_resp) = delta_result {
-                    // Apply ALL delta entries, collecting errors instead of
-                    // stopping at the first failure. This prevents entries
-                    // behind a bad key from starving forever (P1-9).
-                    let mut api = eventual_api.lock().await;
-                    let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut error_count = 0u64;
-                    for entry in &delta_resp.entries {
-                        match api.merge_remote_with_hlc(
-                            entry.key.clone(),
-                            &entry.value,
-                            entry.hlc.clone(),
-                        ) {
-                            Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
-                            Err(e) => {
-                                error_count += 1;
-                                tracing::warn!(
-                                    peer = %peer.node_id.0,
-                                    key = %entry.key,
-                                    error = %e,
-                                    "delta pull merge failed for key"
-                                );
-                            }
-                        }
-                    }
-                    drop(api);
-
-                    if error_count > 0 {
-                        tracing::warn!(
-                            peer = %peer.node_id.0,
-                            error_count,
-                            total_entries = delta_resp.entries.len(),
-                            "delta pull completed with merge errors"
-                        );
-                    }
-
-                    // Advance the frontier conservatively: if any entries
-                    // failed, don't advance past them so those entries are
-                    // retried on the next cycle.
-                    if error_count > 0 {
-                        // Don't advance frontier at all when there are errors —
-                        // the failed entries need to be retried from the
-                        // current frontier position.
-                    } else if let Some(new_frontier) = delta_resp.sender_frontier {
-                        self.peer_frontiers.insert(peer_key.clone(), new_frontier);
-                    } else if let Some(hlc) = last_success_hlc {
-                        self.peer_frontiers.insert(peer_key.clone(), hlc);
-                    }
+                    let _error_count = Self::apply_delta_response(
+                        &mut self.peer_frontiers,
+                        &delta_resp,
+                        &peer.node_id.0,
+                        &peer_key,
+                        eventual_api,
+                        "delta pull",
+                    )
+                    .await;
 
                     any_success = true;
                     let elapsed = peer_start.elapsed();
@@ -1697,45 +1699,15 @@ impl NodeRunner {
                     .await;
 
                 if let Some(delta_resp) = retry_result {
-                    let mut api = eventual_api.lock().await;
-                    let mut last_success_hlc: Option<crate::hlc::HlcTimestamp> = None;
-                    let mut error_count = 0u64;
-                    for entry in &delta_resp.entries {
-                        match api.merge_remote_with_hlc(
-                            entry.key.clone(),
-                            &entry.value,
-                            entry.hlc.clone(),
-                        ) {
-                            Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
-                            Err(e) => {
-                                error_count += 1;
-                                tracing::warn!(
-                                    peer = %peer.node_id.0,
-                                    key = %entry.key,
-                                    error = %e,
-                                    "delta pull retry merge failed for key"
-                                );
-                            }
-                        }
-                    }
-                    drop(api);
-
-                    if error_count > 0 {
-                        tracing::warn!(
-                            peer = %peer.node_id.0,
-                            error_count,
-                            total_entries = delta_resp.entries.len(),
-                            "delta pull retry completed with merge errors"
-                        );
-                    }
-
-                    if error_count > 0 {
-                        // Don't advance frontier — retry failed entries next cycle.
-                    } else if let Some(new_frontier) = delta_resp.sender_frontier {
-                        self.peer_frontiers.insert(peer_key.clone(), new_frontier);
-                    } else if let Some(hlc) = last_success_hlc {
-                        self.peer_frontiers.insert(peer_key.clone(), hlc);
-                    }
+                    let _error_count = Self::apply_delta_response(
+                        &mut self.peer_frontiers,
+                        &delta_resp,
+                        &peer.node_id.0,
+                        &peer_key,
+                        eventual_api,
+                        "delta pull retry",
+                    )
+                    .await;
 
                     any_success = true;
                     let elapsed = peer_start.elapsed();
@@ -2075,6 +2047,60 @@ impl NodeRunner {
                 );
             }
         }
+    }
+
+    /// Apply a delta sync response by merging all entries into the eventual store.
+    ///
+    /// Returns the number of per-key merge errors. When all entries merge
+    /// successfully, the peer frontier is advanced automatically. When errors
+    /// occur, the frontier is left unchanged so failed entries are retried on
+    /// the next sync cycle.
+    async fn apply_delta_response(
+        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        delta_resp: &crate::network::sync::DeltaSyncResponse,
+        peer_id: &str,
+        peer_key: &str,
+        eventual_api: &Arc<Mutex<EventualApi>>,
+        label: &str,
+    ) -> u64 {
+        let mut api = eventual_api.lock().await;
+        let mut last_success_hlc: Option<HlcTimestamp> = None;
+        let mut error_count = 0u64;
+        for entry in &delta_resp.entries {
+            match api.merge_remote_with_hlc(entry.key.clone(), &entry.value, entry.hlc.clone()) {
+                Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
+                Err(e) => {
+                    error_count += 1;
+                    tracing::warn!(
+                        peer = %peer_id,
+                        key = %entry.key,
+                        error = %e,
+                        "{} merge failed for key", label
+                    );
+                }
+            }
+        }
+        drop(api);
+
+        if error_count > 0 {
+            tracing::warn!(
+                peer = %peer_id,
+                error_count,
+                total_entries = delta_resp.entries.len(),
+                "{} completed with merge errors", label
+            );
+            // Don't advance frontier when there are errors.
+            return error_count;
+        }
+
+        // Advance the frontier conservatively.
+        if let Some(ref new_frontier) = delta_resp.sender_frontier {
+            peer_frontiers.insert(peer_key.to_string(), new_frontier.clone());
+        } else if let Some(hlc) = last_success_hlc {
+            peer_frontiers.insert(peer_key.to_string(), hlc);
+        }
+
+        error_count
     }
 
     /// Run garbage collection on stale ack-frontier entries.
@@ -3530,12 +3556,17 @@ mod tests {
             // Just verify the method exists with the right signature.
             // We can't call it without a running server, but the type
             // check confirms the API contract.
-            let _: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> =
-                Box::pin(client.push_full_state_to_peer(
-                    "127.0.0.1:8080",
-                    HashMap::new(),
-                    "node-1",
-                ));
+            let _: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<crate::network::sync::SyncResponse>>
+                        + Send
+                        + '_,
+                >,
+            > = Box::pin(client.push_full_state_to_peer(
+                "127.0.0.1:8080",
+                HashMap::new(),
+                "node-1",
+            ));
         }
     }
 

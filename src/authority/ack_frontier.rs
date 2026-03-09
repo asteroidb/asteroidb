@@ -424,7 +424,9 @@ impl AckFrontierSet {
     /// Each key range may be at a different policy version; using a single
     /// global cutoff would over-delete slow ranges. The `current_versions`
     /// map provides the current policy version **per key range**. Scopes
-    /// whose key range is absent from the map are skipped (never GC'd).
+    /// whose key range is absent from the map are considered orphaned
+    /// (policy was removed) and are eligible for GC if fenced and the
+    /// grace period has elapsed.
     ///
     /// An entry is eligible for GC only if its `(key_range, policy_version)`
     /// pair has been fenced **and** the fencing happened at least
@@ -446,15 +448,14 @@ impl AckFrontierSet {
             .keys()
             .filter(|scope| {
                 // Look up the current version for this scope's key range.
-                let current = match current_versions.get(&scope.key_range) {
-                    Some(v) => v.0,
-                    None => return false, // unknown range — skip
-                };
-                let cutoff = current.saturating_sub(max_retained_versions);
-
-                // Only GC entries older than the per-range cutoff version.
-                if scope.policy_version.0 >= cutoff {
-                    return false;
+                // If the range is absent from current_versions, it has been
+                // removed (orphaned). Orphaned ranges are eligible for GC
+                // if they are fenced and the grace period has elapsed.
+                if let Some(v) = current_versions.get(&scope.key_range) {
+                    let cutoff = v.0.saturating_sub(max_retained_versions);
+                    if scope.policy_version.0 >= cutoff {
+                        return false;
+                    }
                 }
 
                 // Safety: the scope must be fenced before we can GC it.
@@ -492,15 +493,13 @@ impl AckFrontierSet {
             self.fenced_versions
                 .iter()
                 .filter(|fv| {
-                    let current = match current_versions.get(&fv.key_range) {
-                        Some(v) => v.0,
-                        None => return false,
-                    };
-                    let cutoff = current.saturating_sub(max_retained_versions);
-
-                    // Version must be below the per-range cutoff.
-                    if fv.policy_version.0 >= cutoff {
-                        return false;
+                    // Orphaned ranges (not in current_versions) are always
+                    // eligible for fenced metadata cleanup.
+                    if let Some(v) = current_versions.get(&fv.key_range) {
+                        let cutoff = v.0.saturating_sub(max_retained_versions);
+                        if fv.policy_version.0 >= cutoff {
+                            return false;
+                        }
                     }
 
                     // No remaining frontier entries for this scope.
@@ -1667,13 +1666,38 @@ mod tests {
     }
 
     #[test]
-    fn gc_skips_ranges_not_in_version_map() {
+    fn gc_collects_orphaned_ranges_not_in_version_map() {
         let mut set = AckFrontierSet::new();
 
         set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
         set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
 
-        // Pass an empty version map -- no ranges known -> nothing GC'd.
+        // Pass an empty version map — range is orphaned (policy removed).
+        // Fenced + grace period elapsed -> eligible for GC.
+        let removed = set.gc_stale_entries(&HashMap::new(), 2, 0, 2000);
+        assert_eq!(removed, 1);
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn gc_skips_orphaned_ranges_within_grace_period() {
+        let mut set = AckFrontierSet::new();
+
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        set.fence_version_at(&kr("user/"), PolicyVersion(1), 1000);
+
+        // Orphaned but grace period not yet elapsed (600s, now=1100).
+        let removed = set.gc_stale_entries(&HashMap::new(), 2, 600, 1100);
+        assert_eq!(removed, 0);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn gc_skips_orphaned_unfenced_ranges() {
+        let mut set = AckFrontierSet::new();
+
+        set.update(make_frontier_v("auth-1", 100, 0, "user/", 1));
+        // Not fenced — orphaned but unfenced ranges should NOT be GC'd.
         let removed = set.gc_stale_entries(&HashMap::new(), 2, 0, 2000);
         assert_eq!(removed, 0);
         assert_eq!(set.len(), 1);
