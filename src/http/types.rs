@@ -76,6 +76,21 @@ pub enum EventualWriteRequest {
     RegisterSet { key: String, value: String },
 }
 
+impl EventualWriteRequest {
+    /// Return the key being written, regardless of operation type.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::CounterInc { key }
+            | Self::CounterDec { key }
+            | Self::SetAdd { key, .. }
+            | Self::SetRemove { key, .. }
+            | Self::MapSet { key, .. }
+            | Self::MapDelete { key, .. }
+            | Self::RegisterSet { key, .. } => key,
+        }
+    }
+}
+
 /// Request body for `POST /api/certified/write`.
 #[derive(Debug, Deserialize)]
 pub struct CertifiedWriteRequest {

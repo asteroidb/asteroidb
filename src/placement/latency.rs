@@ -122,9 +122,17 @@ impl LatencyModel {
     }
 
     /// Get the current latency statistics for a node pair.
+    ///
+    /// NOTE: This clones both `NodeId` values to construct the lookup key.
+    /// `NodeId` contains a `String`, so this performs two heap allocations per
+    /// call.  In practice the strings are short node identifiers and this
+    /// method is called infrequently (once per placement decision), so the
+    /// cost is negligible.  Avoiding the clone would require `HashMap`
+    /// `raw_entry` (nightly) or a custom key type with `Borrow` impl.
     pub fn get_latency(&self, from: &NodeId, to: &NodeId) -> Option<LatencyStats> {
-        let key = (from.clone(), to.clone());
-        self.samples.get(&key).map(|s| s.stats())
+        self.samples
+            .get(&(from.clone(), to.clone()))
+            .map(|s| s.stats())
     }
 
     /// Return all nodes reachable from `from` within the given latency bound.

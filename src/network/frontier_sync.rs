@@ -121,9 +121,13 @@ impl FrontierSyncClient {
 
         match req_builder.send().await {
             Ok(resp) if !resp.status().is_success() => {
-                tracing::debug!(
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                let truncated: String = body.chars().take(500).collect();
+                tracing::warn!(
                     url = %url,
-                    status = %resp.status(),
+                    status = %status,
+                    body = %truncated,
                     "bincode request rejected, retrying with JSON"
                 );
                 self.json_post(url, data).send().await
