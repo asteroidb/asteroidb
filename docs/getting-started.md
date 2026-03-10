@@ -1,4 +1,4 @@
-# AsteroidDB Getting Started Guide
+# AsteroidDB はじめにガイド
 
 本ドキュメントでは、AsteroidDB を新規環境でビルド・実行・検証するための手順を説明します。
 
