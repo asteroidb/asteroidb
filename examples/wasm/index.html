@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AsteroidDB WASM Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+    h2 { color: #8b949e; margin: 1.5rem 0 0.5rem; font-size: 1.1rem; }
+    .subtitle { color: #8b949e; margin-bottom: 2rem; }
+    .panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+    .panel h3 { color: #58a6ff; margin-bottom: 0.5rem; }
+    button { background: #238636; color: #fff; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; margin: 0.2rem; font-size: 0.9rem; }
+    button:hover { background: #2ea043; }
+    button.danger { background: #da3633; }
+    button.danger:hover { background: #f85149; }
+    input { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 0.4rem; border-radius: 4px; margin: 0.2rem; font-size: 0.9rem; }
+    .value { font-size: 1.5rem; color: #f0883e; font-weight: bold; margin: 0.5rem 0; }
+    #log { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; margin-top: 1rem; }
+    .log-entry { border-bottom: 1px solid #21262d; padding: 0.3rem 0; }
+    .log-ok { color: #3fb950; }
+    .log-info { color: #58a6ff; }
+    .columns { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .columns > .panel { flex: 1; min-width: 280px; }
+    .tag { display: inline-block; background: #1f6feb33; color: #58a6ff; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.8rem; margin: 0.1rem; }
+  </style>
+</head>
+<body>
+  <h1>AsteroidDB WASM Demo</h1>
+  <p class="subtitle">CRDT operations running in your browser via WebAssembly</p>
+
+  <div class="columns">
+    <!-- PN-Counter Panel -->
+    <div class="panel" id="counter-panel">
+      <h3>PN-Counter <span class="tag">CRDT</span></h3>
+      <p>A counter that supports both increment and decrement across replicas.</p>
+      <div class="value" id="counter-value">0</div>
+      <div>
+        <button onclick="counterIncrement()">+1 (Node A)</button>
+        <button onclick="counterDecrement()">-1 (Node A)</button>
+        <button onclick="counterIncrementB()">+1 (Node B)</button>
+        <button onclick="counterMerge()">Merge A &larr; B</button>
+      </div>
+    </div>
+
+    <!-- OR-Set Panel -->
+    <div class="panel" id="set-panel">
+      <h3>OR-Set <span class="tag">CRDT</span> <span class="tag">add-wins</span></h3>
+      <p>A set with add-wins conflict resolution.</p>
+      <div class="value" id="set-elements">{}</div>
+      <div>
+        <input type="text" id="set-input" placeholder="element name" value="apple">
+        <button onclick="setAdd()">Add (Node A)</button>
+        <button class="danger" onclick="setRemove()">Remove (Node A)</button>
+        <button onclick="setAddB()">Add (Node B)</button>
+        <button onclick="setMerge()">Merge A &larr; B</button>
+      </div>
+    </div>
+
+    <!-- LWW-Register Panel -->
+    <div class="panel" id="register-panel">
+      <h3>LWW-Register <span class="tag">CRDT</span> <span class="tag">last-writer-wins</span></h3>
+      <p>A register where the latest write (by timestamp) wins.</p>
+      <div class="value" id="register-value">(empty)</div>
+      <div>
+        <input type="text" id="register-input" placeholder="value" value="hello">
+        <button onclick="registerSet()">Set (Node A)</button>
+        <button onclick="registerSetB()">Set (Node B)</button>
+        <button onclick="registerMerge()">Merge A &larr; B</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Store Panel -->
+  <div class="panel">
+    <h3>Store <span class="tag">KV</span></h3>
+    <p>Key-value store backed by in-memory WASM storage.</p>
+    <div>
+      <button onclick="storeSave()">Save All to Store</button>
+      <button onclick="storeSnapshot()">Save Snapshot</button>
+      <button onclick="storeLoad()">Load Snapshot</button>
+      <button onclick="storeKeys()">List Keys</button>
+    </div>
+    <div class="value" id="store-info">0 keys</div>
+  </div>
+
+  <!-- Self-Test -->
+  <div class="panel">
+    <h3>Self-Test</h3>
+    <button onclick="runSelfTest()">Run Self-Test</button>
+  </div>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+
+  <script type="module">
+    import init, {
+      WasmPnCounter,
+      WasmOrSet,
+      WasmLwwRegister,
+      WasmStore,
+      self_test,
+    } from "./pkg/asteroidb_wasm_example.js";
+
+    // --- State ---
+    let counterA, counterB;
+    let setA, setB;
+    let registerA, registerB;
+    let store;
+
+    function log(msg, cls = "log-info") {
+      const el = document.getElementById("log");
+      const entry = document.createElement("div");
+      entry.className = "log-entry " + cls;
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      el.prepend(entry);
+    }
+
+    function updateCounterUI() {
+      document.getElementById("counter-value").textContent = counterA.value();
+    }
+
+    function updateSetUI() {
+      const elems = JSON.parse(setA.elements_json());
+      document.getElementById("set-elements").textContent =
+        elems.length > 0 ? elems.sort().join(", ") : "(empty)";
+    }
+
+    function updateRegisterUI() {
+      const val = registerA.get();
+      document.getElementById("register-value").textContent = val || "(empty)";
+    }
+
+    function updateStoreUI() {
+      document.getElementById("store-info").textContent = `${store.len()} keys`;
+    }
+
+    // --- Counter ---
+    window.counterIncrement = () => { counterA.increment(); updateCounterUI(); log("Counter A: +1"); };
+    window.counterDecrement = () => { counterA.decrement(); updateCounterUI(); log("Counter A: -1"); };
+    window.counterIncrementB = () => { counterB.increment(); log(`Counter B: +1 (B value = ${counterB.value()})`); };
+    window.counterMerge = () => { counterA.merge(counterB); updateCounterUI(); log("Counter: merged B into A", "log-ok"); };
+
+    // --- OR-Set ---
+    window.setAdd = () => {
+      const el = document.getElementById("set-input").value;
+      if (!el) return;
+      setA.add(el);
+      updateSetUI();
+      log(`Set A: added "${el}"`);
+    };
+    window.setRemove = () => {
+      const el = document.getElementById("set-input").value;
+      if (!el) return;
+      setA.remove(el);
+      updateSetUI();
+      log(`Set A: removed "${el}"`);
+    };
+    window.setAddB = () => {
+      const el = document.getElementById("set-input").value;
+      if (!el) return;
+      setB.add(el);
+      log(`Set B: added "${el}" (B has ${setB.len()} elements)`);
+    };
+    window.setMerge = () => { setA.merge(setB); updateSetUI(); log("Set: merged B into A", "log-ok"); };
+
+    // --- LWW-Register ---
+    window.registerSet = () => {
+      const val = document.getElementById("register-input").value;
+      registerA.set(val);
+      updateRegisterUI();
+      log(`Register A: set "${val}"`);
+    };
+    window.registerSetB = () => {
+      const val = document.getElementById("register-input").value;
+      registerB.set(val);
+      log(`Register B: set "${val}"`);
+    };
+    window.registerMerge = () => { registerA.merge(registerB); updateRegisterUI(); log("Register: merged B into A", "log-ok"); };
+
+    // --- Store ---
+    window.storeSave = () => {
+      store.put_counter("counter", counterA);
+      store.put_set("fruits", setA);
+      store.put_register("register", registerA);
+      updateStoreUI();
+      log(`Store: saved ${store.len()} keys`, "log-ok");
+    };
+    window.storeSnapshot = () => {
+      try {
+        store.save_snapshot();
+        log("Store: snapshot saved to memory", "log-ok");
+      } catch (e) {
+        log(`Store: snapshot save failed: ${e}`, "log-entry");
+      }
+    };
+    window.storeLoad = () => {
+      try {
+        store.load_snapshot();
+        updateStoreUI();
+        log(`Store: snapshot loaded, ${store.len()} keys`, "log-ok");
+      } catch (e) {
+        log(`Store: snapshot load failed: ${e}`, "log-entry");
+      }
+    };
+    window.storeKeys = () => {
+      const keys = JSON.parse(store.keys_json());
+      log(`Store keys: [${keys.join(", ")}]`);
+    };
+
+    // --- Self-Test ---
+    window.runSelfTest = () => {
+      const result = self_test();
+      result.split("\n").forEach(line => log(line, "log-ok"));
+    };
+
+    // --- Init ---
+    async function main() {
+      await init();
+      log("WASM module loaded successfully", "log-ok");
+
+      counterA = new WasmPnCounter("node-a");
+      counterB = new WasmPnCounter("node-b");
+      setA = new WasmOrSet("node-a");
+      setB = new WasmOrSet("node-b");
+      registerA = new WasmLwwRegister("node-a");
+      registerB = new WasmLwwRegister("node-b");
+      store = new WasmStore();
+
+      updateCounterUI();
+      updateSetUI();
+      updateRegisterUI();
+      updateStoreUI();
+
+      log("All CRDT instances initialized (node-a + node-b)", "log-ok");
+    }
+
+    main().catch(e => {
+      document.body.innerHTML = `<h1 style="color: #f85149;">Failed to load WASM module</h1><pre>${e}</pre>`;
+    });
+  </script>
+</body>
+</html>
