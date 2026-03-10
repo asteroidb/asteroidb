@@ -323,7 +323,13 @@ tests/                    # Integration / E2E tests
 | [Vision](docs/vision.md) | Project goals and scope |
 | [Requirements](docs/requirements.md) | MVP functional and non-functional requirements |
 
+## Contributing
+
+Contributions are welcome! By submitting a pull request you agree to the
+[Contributor License Agreement](CLA.md). Please sign off your commits with
+`git commit -s`.
+
 ## License
 
-This project is currently under development and not yet licensed for
-distribution. A license will be selected before public release.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for
+details.
