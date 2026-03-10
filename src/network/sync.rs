@@ -132,9 +132,14 @@ pub struct PeerBackoff {
 
 impl PeerBackoff {
     /// Initial backoff delay after the first failure.
-    pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    pub const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
     /// Maximum backoff delay.
-    pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    ///
+    /// Capped at 8 seconds to ensure timely convergence under network
+    /// fault conditions (jitter, rolling partitions). A 2-second sync
+    /// interval combined with a 30-second max backoff previously caused
+    /// peers to miss too many sync cycles after transient failures.
+    pub const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
     /// Create a new backoff state that is immediately ready.
     pub fn new() -> Self {
@@ -158,11 +163,12 @@ impl PeerBackoff {
     /// Record a failed sync, increasing the backoff delay.
     ///
     /// Uses exponential backoff: `min(INITIAL_BACKOFF * 2^failures, MAX_BACKOFF)`
-    /// with a random jitter of up to 25% of the computed delay.
+    /// with a random jitter of up to 25% of the computed delay. The exponent
+    /// is capped at 4 (i.e. max multiplier 16x) to keep backoff growth bounded.
     pub fn record_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let base = Self::INITIAL_BACKOFF
-            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(5));
+            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(4));
         let capped = base.min(Self::MAX_BACKOFF);
 
         // Add jitter: up to 25% of the capped delay.
@@ -194,7 +200,7 @@ impl PeerBackoff {
             return Duration::ZERO;
         }
         let base = Self::INITIAL_BACKOFF
-            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(5));
+            .saturating_mul(1u32 << self.consecutive_failures.saturating_sub(1).min(4));
         base.min(Self::MAX_BACKOFF)
     }
 }
@@ -337,7 +343,8 @@ impl SyncClient {
     /// Create a new `SyncClient` with a shared peer registry.
     pub fn new(peer_registry: Arc<Mutex<PeerRegistry>>) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build HTTP client");
         Self {
@@ -350,7 +357,8 @@ impl SyncClient {
     /// Create a `SyncClient` that attaches a Bearer token to all requests.
     pub fn with_token(peer_registry: Arc<Mutex<PeerRegistry>>, token: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build HTTP client");
         Self {
