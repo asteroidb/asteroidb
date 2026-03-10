@@ -4,8 +4,11 @@ use tokio::sync::Mutex;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+#[cfg(feature = "native-crypto")]
 use asteroidb_poc::authority::bls::BlsKeypair;
-use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
+#[cfg(feature = "native-crypto")]
+use asteroidb_poc::authority::certificate::KeysetVersion;
+use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry};
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -200,6 +203,8 @@ async fn main() {
 
     // Parse optional BLS key seed from environment variable.
     // When set, the node generates a BLS keypair and enables BLS certificate mode.
+    // Requires the `native-crypto` feature.
+    #[cfg(feature = "native-crypto")]
     let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
         let bytes = hex::decode(&hex_seed).unwrap_or_else(|e| {
             eprintln!("error: ASTEROIDB_BLS_SEED contains invalid hex: {e}");
@@ -210,6 +215,8 @@ async fn main() {
         seed[..len].copy_from_slice(&bytes[..len]);
         BlsConfig { seed }
     });
+    #[cfg(not(feature = "native-crypto"))]
+    let bls_config: Option<BlsConfig> = None;
 
     // Wire keyset_registry and current_epoch from EpochManager when BLS is configured.
     let epoch_config = asteroidb_poc::authority::certificate::EpochConfig::default();
@@ -220,6 +227,7 @@ async fn main() {
     let epoch_manager = EpochManager::new(epoch_config.clone(), now_secs);
     let current_epoch_val = epoch_manager.current_epoch(now_secs);
 
+    #[cfg(feature = "native-crypto")]
     let keyset_registry = bls_config.as_ref().map(|bls_cfg| {
         let keypair = BlsKeypair::generate(&bls_cfg.seed);
         let mut registry = KeysetRegistry::new();
@@ -243,6 +251,8 @@ async fn main() {
             .expect("BLS key registration should succeed");
         Arc::new(std::sync::RwLock::new(registry))
     });
+    #[cfg(not(feature = "native-crypto"))]
+    let keyset_registry: Option<Arc<std::sync::RwLock<KeysetRegistry>>> = None;
 
     // Build shared HTTP state.
     let state = Arc::new(AppState {

@@ -1,5 +1,8 @@
 pub mod ack_frontier;
+#[cfg(feature = "native-crypto")]
 pub mod bls;
+#[cfg(not(feature = "native-crypto"))]
+pub mod bls_stub;
 pub mod certificate;
 pub mod frontier_reporter;
 pub mod verifier;

@@ -1,3 +1,4 @@
+#![cfg(feature = "native-crypto")]
 //! Integration tests: BLS signature and epoch manager integration in runtime (#208).
 //!
 //! Validates that:
