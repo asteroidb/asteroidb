@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -205,7 +204,12 @@ impl SystemNamespace {
     ///
     /// Writes to a temporary file first, then atomically renames to ensure
     /// crash safety. If the parent directory does not exist, it is created.
-    pub fn save(&self, path: &Path) -> Result<(), PersistError> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save(&self, path: &std::path::Path) -> Result<(), PersistError> {
+        use std::fs::File;
+
         let parent = path.parent();
         if let Some(p) = parent {
             std::fs::create_dir_all(p)?;
@@ -233,7 +237,10 @@ impl SystemNamespace {
     ///
     /// Returns `Ok(None)` if the file does not exist, allowing callers to
     /// fall back to a fresh namespace via [`SystemNamespace::new`].
-    pub fn load(path: &Path) -> Result<Option<Self>, PersistError> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load(path: &std::path::Path) -> Result<Option<Self>, PersistError> {
         if !path.exists() {
             return Ok(None);
         }
