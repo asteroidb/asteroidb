@@ -1,0 +1,137 @@
+# docker-compose.scale.yml — 7-node AsteroidDB cluster for large-scale testing.
+#
+# Usage:
+#   docker compose -f docker-compose.scale.yml up -d --build
+#
+# Each node uses a full-mesh peer config from configs/scale/.
+# Authority nodes are the first 3 (majority quorum of 3 out of 7).
+services:
+  node-1:
+    build: .
+    container_name: asteroidb-node-1
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3001:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-1"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-1.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-2:
+    build: .
+    container_name: asteroidb-node-2
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3002:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-2"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-2.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-3:
+    build: .
+    container_name: asteroidb-node-3
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3003:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-3"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-3.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-4:
+    build: .
+    container_name: asteroidb-node-4
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3004:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-4"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-4.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-5:
+    build: .
+    container_name: asteroidb-node-5
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3005:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-5"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-5.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-6:
+    build: .
+    container_name: asteroidb-node-6
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3006:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-6"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-6.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+  node-7:
+    build: .
+    container_name: asteroidb-node-7
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3007:3000"
+    environment:
+      ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_NODE_ID: "node-7"
+      ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
+      ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
+      ASTEROIDB_AUTHORITY_NODES: "node-1,node-2,node-3"
+    volumes:
+      - ./configs/scale/node-7.json:/etc/asteroidb/config.json:ro
+    networks:
+      - asteroidb
+
+networks:
+  asteroidb:
+    driver: bridge
