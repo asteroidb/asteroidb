@@ -5,11 +5,14 @@ pub mod control_plane;
 pub mod crdt;
 pub mod error;
 pub mod hlc;
+#[cfg(feature = "native-runtime")]
 pub mod http;
+#[cfg(feature = "native-runtime")]
 pub mod network;
 pub mod node;
 pub mod ops;
 pub mod placement;
+#[cfg(feature = "native-runtime")]
 pub mod runtime;
 pub mod store;
 pub mod types;
