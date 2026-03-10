@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, Write};
-use std::path::Path;
+use std::io;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
@@ -558,7 +558,12 @@ impl AckFrontierSet {
     ///
     /// Uses atomic write (temp file + fsync + rename + dir fsync) to ensure
     /// crash safety. Matches the pattern in `SystemNamespace::save`.
-    pub fn save(&self, path: &Path) -> Result<(), io::Error> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save(&self, path: &std::path::Path) -> Result<(), io::Error> {
+        use std::fs::File;
+
         let parent = path.parent();
         if let Some(p) = parent {
             std::fs::create_dir_all(p)?;
@@ -588,7 +593,10 @@ impl AckFrontierSet {
     /// Load a frontier set from a JSON file.
     ///
     /// Performs scope consistency validation after loading.
-    pub fn load(path: &Path) -> Result<Self, io::Error> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load(path: &std::path::Path) -> Result<Self, io::Error> {
         let json = std::fs::read_to_string(path)?;
         Self::from_json(&json)
     }

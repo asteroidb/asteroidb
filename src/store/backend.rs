@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +24,7 @@ pub trait StorageBackend: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// FileBackend
+// FileBackend (not available on wasm32)
 // ---------------------------------------------------------------------------
 
 /// File-based persistence backend using atomic write + fsync.
@@ -31,11 +32,15 @@ pub trait StorageBackend: Send + Sync {
 /// Writes go to a `.tmp` sibling file first, which is fsynced and then
 /// renamed over the target path. This prevents half-written snapshots on
 /// crash.
+///
+/// Not available on `wasm32-unknown-unknown` (no filesystem access).
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct FileBackend {
     path: PathBuf,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FileBackend {
     /// Create a new `FileBackend` that persists to `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -48,8 +53,11 @@ impl FileBackend {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl StorageBackend for FileBackend {
     fn save(&self, data: &[u8]) -> io::Result<()> {
+        use std::fs::File;
+
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }

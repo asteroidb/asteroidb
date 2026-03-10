@@ -10,16 +10,31 @@ keywords = ["database", "distributed", "crdt", "key-value"]
 categories = ["database-implementations"]
 
 [features]
-default = ["native-crypto", "native-tls", "native-storage"]
+default = ["native-crypto", "native-tls", "native-storage", "native-runtime"]
 
 # BLS12-381 signatures via blst (C library). Disable for WASM targets.
 native-crypto = ["dep:blst"]
 
-# System TLS via openssl/native-tls for reqwest. Disable for WASM targets.
-native-tls = ["reqwest/default-tls"]
+# System TLS via openssl/native-tls for reqwest. Implies native-runtime (reqwest is optional).
+native-tls = ["native-runtime", "reqwest/default-tls"]
 
 # Persistent storage via redb (uses libc mmap). Disable for WASM targets.
 native-storage = ["dep:redb"]
+
+# Tokio runtime, axum HTTP server, reqwest HTTP client, clap CLI, tracing-subscriber.
+# Disable for WASM targets where async runtimes and OS networking are unavailable.
+native-runtime = [
+    "dep:tokio",
+    "dep:axum",
+    "dep:reqwest",
+    "dep:clap",
+    "dep:tracing-subscriber",
+]
+
+# Marker feature for WASM builds. Excludes all native features and enables
+# JS-backed entropy for getrandom (required by rand / ed25519-dalek on wasm32).
+# Usage: `cargo build --target wasm32-unknown-unknown --no-default-features --features wasm`
+wasm = ["getrandom/js"]
 
 [dependencies]
 thiserror = "2"
@@ -28,17 +43,18 @@ serde_json = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 blst = { version = "0.3", optional = true }
 rand = "0.8"
-tokio = { version = "1", features = ["full"] }
-axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
-clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 subtle = "2"
 hex = "0.4"
 redb = { version = "2", optional = true }
 bincode = { version = "2", features = ["serde"] }
 siphasher = "1"
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -46,14 +62,22 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "asteroidb"
+path = "src/main.rs"
+required-features = ["native-runtime"]
 
 [[bin]]
 name = "asteroidb-cli"
 path = "src/bin/cli.rs"
+required-features = ["native-runtime"]
 
 [[bench]]
 name = "sync_benchmark"
 harness = false
+required-features = ["native-runtime"]
 
 [[bench]]
 name = "crdt_bench"
