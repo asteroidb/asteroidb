@@ -58,3 +58,11 @@ harness = false
 [[bench]]
 name = "signature_bench"
 harness = false
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "compaction_bench"
+harness = false
