@@ -142,6 +142,32 @@ fn bench_load_snapshot(c: &mut Criterion) {
     });
 }
 
+fn bench_save_snapshot_bincode(c: &mut Criterion) {
+    let (store, _) = build_store(1000);
+    let tmp_dir = TempDir::new().expect("create temp dir");
+    let path = tmp_dir.path().join("bench-snapshot.bin");
+
+    c.bench_function("store/save_snapshot_bincode_1000", |b| {
+        b.iter(|| {
+            store.save_snapshot_bincode(Path::new(&path)).unwrap();
+        });
+    });
+}
+
+fn bench_load_snapshot_bincode(c: &mut Criterion) {
+    let (store, _) = build_store(1000);
+    let tmp_dir = TempDir::new().expect("create temp dir");
+    let path = tmp_dir.path().join("bench-snapshot.bin");
+    store.save_snapshot_bincode(Path::new(&path)).unwrap();
+
+    c.bench_function("store/load_snapshot_bincode_1000", |b| {
+        b.iter(|| {
+            let loaded = Store::load_snapshot_bincode(Path::new(&path)).unwrap();
+            std::hint::black_box(loaded.len());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_store_put,
@@ -150,5 +176,7 @@ criterion_group!(
     bench_entries_since,
     bench_save_snapshot,
     bench_load_snapshot,
+    bench_save_snapshot_bincode,
+    bench_load_snapshot_bincode,
 );
 criterion_main!(benches);

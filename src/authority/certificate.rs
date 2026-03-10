@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -1140,6 +1140,109 @@ pub fn create_certificate_message(
 pub fn sign_message(signing_key: &SigningKey, message: &[u8]) -> Signature {
     use ed25519_dalek::Signer;
     signing_key.sign(message)
+}
+
+/// LRU cache for recently verified BLS signatures.
+///
+/// BLS verification is CPU-expensive (~1.68ms per verify). In hot paths where
+/// the same certificate may be verified multiple times (e.g., re-broadcasting,
+/// repeated reads of certified data), caching avoids redundant elliptic-curve
+/// math.
+///
+/// The cache key is a SHA-256 digest of `(message, aggregated_signature)` and
+/// the cached value is the list of verified signer IDs.
+pub struct BlsVerifyCache {
+    /// Maps cache key (message+sig digest) to verified signer IDs.
+    entries: HashMap<[u8; 32], Vec<NodeId>>,
+    /// Insertion order for LRU eviction (oldest first).
+    order: std::collections::VecDeque<[u8; 32]>,
+    /// Maximum number of entries before eviction.
+    capacity: usize,
+}
+
+impl BlsVerifyCache {
+    /// Create a new cache with the given capacity.
+    ///
+    /// A capacity of 64-256 is typically sufficient for real workloads.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Compute a cache key from a message and aggregated signature bytes.
+    fn cache_key(message: &[u8], sig_bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(message);
+        hasher.update(sig_bytes);
+        hasher.finalize().into()
+    }
+
+    /// Look up a cached verification result.
+    pub fn get(&self, message: &[u8], sig_bytes: &[u8]) -> Option<&Vec<NodeId>> {
+        let key = Self::cache_key(message, sig_bytes);
+        self.entries.get(&key)
+    }
+
+    /// Insert a verification result into the cache.
+    fn insert(&mut self, message: &[u8], sig_bytes: &[u8], signers: Vec<NodeId>) {
+        let key = Self::cache_key(message, sig_bytes);
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            // Evict oldest entry.
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, signers);
+        self.order.push_back(key);
+    }
+
+    /// Verify a `DualModeCertificate` with caching.
+    ///
+    /// Returns cached results for previously-verified (message, signature)
+    /// pairs, avoiding the expensive BLS pairing computation.
+    /// Falls back to full verification for Ed25519 mode or cache misses.
+    pub fn verify_cached(
+        &mut self,
+        cert: &DualModeCertificate,
+        message: &[u8],
+    ) -> Result<Vec<NodeId>, CertError> {
+        // Only cache BLS verifications (Ed25519 is already fast).
+        if cert.signature_algorithm != SignatureAlgorithm::Bls12_381 {
+            return cert.verify(message);
+        }
+
+        let sig_bytes = match &cert.bls_aggregated_signature {
+            Some(sig) => sig.to_bytes(),
+            None => return cert.verify(message),
+        };
+
+        // Check cache first.
+        if let Some(signers) = self.get(message, &sig_bytes) {
+            return Ok(signers.clone());
+        }
+
+        // Cache miss — perform full verification.
+        let signers = cert.verify(message)?;
+        self.insert(message, &sig_bytes, signers.clone());
+        Ok(signers)
+    }
+
+    /// Return the number of entries currently in the cache.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return `true` if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -2685,5 +2788,120 @@ mod tests {
             cert.verify_with_format_check(&message, &config, 201)
                 .is_err()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // BLS verify cache tests (#306)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bls_cache_hit_avoids_reverification() {
+        use crate::authority::bls;
+
+        let keypairs: Vec<bls::BlsKeypair> = (1..=3)
+            .map(|i| {
+                let mut ikm = [0u8; 32];
+                ikm[0] = i;
+                ikm[31] = i + 42;
+                bls::BlsKeypair::generate(&ikm)
+            })
+            .collect();
+
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let sigs: Vec<bls::BlsSignature> = keypairs
+            .iter()
+            .map(|kp| bls::sign_message(kp.secret_key(), &message))
+            .collect();
+        let agg_sig = bls::aggregate_signatures(&sigs).unwrap();
+
+        let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+        let signers: Vec<(NodeId, bls::BlsPublicKey)> = keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, kp)| (NodeId(format!("auth-{i}")), kp.public_key.clone()))
+            .collect();
+        cert.set_bls_aggregate(signers, agg_sig);
+
+        let mut cache = BlsVerifyCache::new(16);
+
+        // First call: cache miss, real verification.
+        let result1 = cache.verify_cached(&cert, &message);
+        assert!(result1.is_ok());
+        assert_eq!(cache.len(), 1);
+
+        // Second call: cache hit.
+        let result2 = cache.verify_cached(&cert, &message);
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap(), result1.unwrap());
+        assert_eq!(cache.len(), 1); // No new entry.
+    }
+
+    #[test]
+    fn bls_cache_evicts_oldest() {
+        use crate::authority::bls;
+
+        let mut cache = BlsVerifyCache::new(2);
+
+        // Create 3 different certs.
+        for seed in 0u8..3 {
+            let keypairs: Vec<bls::BlsKeypair> = (1..=2)
+                .map(|i| {
+                    let mut ikm = [0u8; 32];
+                    ikm[0] = seed * 10 + i;
+                    ikm[31] = seed * 10 + i + 42;
+                    bls::BlsKeypair::generate(&ikm)
+                })
+                .collect();
+
+            let kr = KeyRange {
+                prefix: format!("test-{seed}/"),
+            };
+            let hlc = sample_hlc();
+            let pv = sample_policy_version();
+            let message = create_certificate_message(&kr, &hlc, &pv);
+
+            let sigs: Vec<bls::BlsSignature> = keypairs
+                .iter()
+                .map(|kp| bls::sign_message(kp.secret_key(), &message))
+                .collect();
+            let agg_sig = bls::aggregate_signatures(&sigs).unwrap();
+
+            let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+            let signers: Vec<(NodeId, bls::BlsPublicKey)> = keypairs
+                .iter()
+                .enumerate()
+                .map(|(i, kp)| (NodeId(format!("auth-{i}")), kp.public_key.clone()))
+                .collect();
+            cert.set_bls_aggregate(signers, agg_sig);
+
+            let result = cache.verify_cached(&cert, &message);
+            assert!(result.is_ok());
+        }
+
+        // Cache capacity is 2, so oldest should have been evicted.
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn bls_cache_ed25519_not_cached() {
+        let (sk, vk) = make_key_pair();
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+        let sig = sign_message(&sk, &message);
+
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        cert.add_ed25519_signature(make_auth_sig(NodeId("auth-0".into()), vk, sig));
+
+        let mut cache = BlsVerifyCache::new(16);
+        let result = cache.verify_cached(&cert, &message);
+        assert!(result.is_ok());
+        // Ed25519 should NOT be cached.
+        assert_eq!(cache.len(), 0);
     }
 }
