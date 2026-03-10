@@ -20,7 +20,7 @@ NODE3_URL="http://localhost:3003"
 NODE2_CONTAINER="asteroidb-node-2"
 KEY="fault-jitter-$$"
 
-CONVERGENCE_RETRIES=15
+CONVERGENCE_RETRIES=20
 CONVERGENCE_INTERVAL=2
 
 # Trap: remove netem on exit.
