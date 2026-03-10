@@ -80,6 +80,13 @@ impl<'de> Deserialize<'de> for BlsSignature {
     }
 }
 
+impl BlsSignature {
+    /// Return the raw bytes of this BLS signature (96 bytes for min_pk).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes().to_vec()
+    }
+}
+
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
