@@ -17,7 +17,7 @@ use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, SyncClient,
+    DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
     should_fallback_to_full_sync,
 };
 use crate::node::Node;
@@ -1666,74 +1666,93 @@ impl NodeRunner {
                     .pull_delta(&peer.addr, &self.node_id.0, &frontier)
                     .await;
 
-                if let Some(delta_resp) = delta_result {
-                    let _error_count = Self::apply_delta_response(
-                        &mut self.peer_frontiers,
-                        &delta_resp,
-                        &peer.node_id.0,
-                        &peer_key,
-                        eventual_api,
-                        "delta pull",
-                    )
-                    .await;
+                match delta_result {
+                    PullDeltaResult::Ok(delta_resp) => {
+                        let _error_count = Self::apply_delta_response(
+                            &mut self.peer_frontiers,
+                            &delta_resp,
+                            &peer.node_id.0,
+                            &peer_key,
+                            eventual_api,
+                            "delta pull",
+                        )
+                        .await;
 
-                    any_success = true;
-                    let elapsed = peer_start.elapsed();
-                    self.record_peer_rtt(&peer.node_id, elapsed);
-                    self.metrics.record_peer_sync_success(peer_id, elapsed);
-                    self.peer_backoffs
-                        .entry(peer_key.clone())
-                        .or_default()
-                        .record_success();
-                    tracing::debug!(
-                        peer = %peer.node_id.0,
-                        delta_entries = delta_resp.entries.len(),
-                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
-                        "delta sync pull succeeded"
-                    );
-                    continue;
+                        any_success = true;
+                        let elapsed = peer_start.elapsed();
+                        self.record_peer_rtt(&peer.node_id, elapsed);
+                        self.metrics.record_peer_sync_success(peer_id, elapsed);
+                        self.peer_backoffs
+                            .entry(peer_key.clone())
+                            .or_default()
+                            .record_success();
+                        tracing::debug!(
+                            peer = %peer.node_id.0,
+                            delta_entries = delta_resp.entries.len(),
+                            rtt_ms = elapsed.as_secs_f64() * 1000.0,
+                            "delta sync pull succeeded"
+                        );
+                        continue;
+                    }
+                    PullDeltaResult::DeserializationError => {
+                        // Payload was corrupted (e.g. by network jitter).
+                        // Skip the delta retry — the same corruption is likely
+                        // to recur — and fall through directly to full sync.
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            "delta deserialization failed, skipping retry and falling back to full sync"
+                        );
+                        self.metrics
+                            .sync_fallback_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Fall through to full sync below.
+                    }
+                    PullDeltaResult::NetworkError => {
+                        // Network-level failure; retry once before full sync.
+                        let retry_result = sync_client
+                            .pull_delta(&peer.addr, &self.node_id.0, &frontier)
+                            .await;
+
+                        match retry_result {
+                            PullDeltaResult::Ok(delta_resp) => {
+                                let _error_count = Self::apply_delta_response(
+                                    &mut self.peer_frontiers,
+                                    &delta_resp,
+                                    &peer.node_id.0,
+                                    &peer_key,
+                                    eventual_api,
+                                    "delta pull retry",
+                                )
+                                .await;
+
+                                any_success = true;
+                                let elapsed = peer_start.elapsed();
+                                self.record_peer_rtt(&peer.node_id, elapsed);
+                                self.metrics.record_peer_sync_success(peer_id, elapsed);
+                                self.peer_backoffs
+                                    .entry(peer_key.clone())
+                                    .or_default()
+                                    .record_success();
+                                tracing::debug!(
+                                    peer = %peer.node_id.0,
+                                    rtt_ms = elapsed.as_secs_f64() * 1000.0,
+                                    "delta sync retry succeeded"
+                                );
+                                continue;
+                            }
+                            _ => {
+                                // Retry also failed; fall through to full sync.
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    "delta sync pull failed after retry, falling back to full sync"
+                                );
+                                self.metrics
+                                    .sync_fallback_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
-
-                // Delta sync failed; retry once.
-                let retry_result = sync_client
-                    .pull_delta(&peer.addr, &self.node_id.0, &frontier)
-                    .await;
-
-                if let Some(delta_resp) = retry_result {
-                    let _error_count = Self::apply_delta_response(
-                        &mut self.peer_frontiers,
-                        &delta_resp,
-                        &peer.node_id.0,
-                        &peer_key,
-                        eventual_api,
-                        "delta pull retry",
-                    )
-                    .await;
-
-                    any_success = true;
-                    let elapsed = peer_start.elapsed();
-                    self.record_peer_rtt(&peer.node_id, elapsed);
-                    self.metrics.record_peer_sync_success(peer_id, elapsed);
-                    self.peer_backoffs
-                        .entry(peer_key.clone())
-                        .or_default()
-                        .record_success();
-                    tracing::debug!(
-                        peer = %peer.node_id.0,
-                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
-                        "delta sync retry succeeded"
-                    );
-                    continue;
-                }
-
-                // Both delta attempts failed; fall through to full sync.
-                tracing::warn!(
-                    peer = %peer.node_id.0,
-                    "delta sync pull failed, falling back to full sync"
-                );
-                self.metrics
-                    .sync_fallback_total
-                    .fetch_add(1, Ordering::Relaxed);
             }
 
             // Full sync fallback: pull all keys from peer.

@@ -110,6 +110,27 @@ impl std::fmt::Display for SyncPushError {
 
 impl std::error::Error for SyncPushError {}
 
+/// Result of a delta pull attempt.
+///
+/// Distinguishes between successful pulls, network-level failures, and
+/// deserialization errors (e.g. jitter-corrupted payloads). The caller
+/// can use this to decide whether to retry delta or skip straight to
+/// full sync.
+#[derive(Debug)]
+pub enum PullDeltaResult {
+    /// Delta response was successfully received and decoded.
+    Ok(DeltaSyncResponse),
+    /// Network error (timeout, connection refused, non-2xx status).
+    /// Retry may succeed once the network heals.
+    NetworkError,
+    /// Response was received (2xx) but could not be deserialized.
+    /// This typically indicates payload corruption from jitter; the
+    /// peer's data is intact but the wire encoding was mangled.
+    /// Caller should fall back to full sync immediately rather than
+    /// retrying delta, which would likely fail the same way.
+    DeserializationError,
+}
+
 // ---------------------------------------------------------------
 // Exponential backoff for per-peer retry
 // ---------------------------------------------------------------
@@ -135,11 +156,11 @@ impl PeerBackoff {
     pub const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
     /// Maximum backoff delay.
     ///
-    /// Capped at 8 seconds to ensure timely convergence under network
-    /// fault conditions (jitter, rolling partitions). A 2-second sync
-    /// interval combined with a 30-second max backoff previously caused
-    /// peers to miss too many sync cycles after transient failures.
-    pub const MAX_BACKOFF: Duration = Duration::from_secs(8);
+    /// Capped at 2 seconds to ensure timely convergence under network
+    /// fault conditions (jitter, rolling partitions). A higher cap (e.g.
+    /// 8s) caused peers to miss too many sync cycles after transient
+    /// failures, preventing recovery within the test convergence window.
+    pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
     /// Create a new backoff state that is immediately ready.
     pub fn new() -> Self {
@@ -343,7 +364,7 @@ impl SyncClient {
     /// Create a new `SyncClient` with a shared peer registry.
     pub fn new(peer_registry: Arc<Mutex<PeerRegistry>>) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build HTTP client");
@@ -357,7 +378,7 @@ impl SyncClient {
     /// Create a `SyncClient` that attaches a Bearer token to all requests.
     pub fn with_token(peer_registry: Arc<Mutex<PeerRegistry>>, token: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build HTTP client");
@@ -763,13 +784,16 @@ impl SyncClient {
     ///
     /// Sends `POST /api/internal/sync/delta` with the local frontier.
     /// The peer returns entries modified after that frontier.
-    /// Returns `None` on failure.
+    ///
+    /// Returns a [`PullDeltaResult`] that distinguishes network errors
+    /// from deserialization errors, allowing the caller to skip straight
+    /// to full sync when the payload was corrupted (e.g. by jitter).
     pub async fn pull_delta(
         &self,
         peer_addr: &str,
         sender: &str,
         frontier: &HlcTimestamp,
-    ) -> Option<DeltaSyncResponse> {
+    ) -> PullDeltaResult {
         let url = format!("http://{peer_addr}/api/internal/sync/delta");
         let req = DeltaSyncRequest {
             sender: sender.to_string(),
@@ -780,10 +804,14 @@ impl SyncClient {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match Self::decode_response::<DeltaSyncResponse>(resp).await {
-                        Ok(delta) => Some(delta),
+                        Ok(delta) => PullDeltaResult::Ok(delta),
                         Err(e) => {
-                            tracing::warn!(error = %e, "failed to parse delta sync response");
-                            None
+                            tracing::warn!(
+                                error = %e,
+                                peer = %peer_addr,
+                                "failed to deserialize delta sync response, need full sync"
+                            );
+                            PullDeltaResult::DeserializationError
                         }
                     }
                 } else {
@@ -791,12 +819,12 @@ impl SyncClient {
                         status = %resp.status(),
                         "delta sync request received non-success status"
                     );
-                    None
+                    PullDeltaResult::NetworkError
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "delta sync request failed");
-                None
+                PullDeltaResult::NetworkError
             }
         }
     }
@@ -1048,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_delta_from_unreachable_peer_returns_none() {
+    async fn pull_delta_from_unreachable_peer_returns_network_error() {
         let registry = shared_registry(vec![]);
 
         let http_client = reqwest::Client::builder()
@@ -1060,7 +1088,7 @@ mod tests {
         let result = client
             .pull_delta("127.0.0.1:1", "node-1", &hlc(0, 0, ""))
             .await;
-        assert!(result.is_none());
+        assert!(matches!(result, PullDeltaResult::NetworkError));
     }
 
     // ---------------------------------------------------------------
