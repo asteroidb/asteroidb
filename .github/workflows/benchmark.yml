@@ -1,0 +1,139 @@
+name: Benchmark Regression Check
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # Weekly on Monday at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      baseline_artifact:
+        description: 'Run ID of the baseline benchmark to compare against (optional)'
+        required: false
+        type: string
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run Criterion Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Build benchmarks
+        run: cargo bench --no-run
+
+      - name: Download previous baseline
+        id: download-baseline
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: benchmark.yml
+          name: benchmark-results
+          path: baseline
+          if_no_artifact_found: warn
+          search_artifacts: true
+        continue-on-error: true
+
+      - name: Run criterion benchmarks
+        run: |
+          mkdir -p bench-results
+
+          # Run all criterion benchmarks, saving machine-readable output
+          for bench in crdt_bench store_bench certified_bench signature_bench; do
+            echo "::group::Running ${bench}"
+            cargo bench --bench "${bench}" -- --save-baseline current 2>&1 | tee "bench-results/${bench}.txt"
+            echo "::endgroup::"
+          done
+
+          # Run sync_benchmark (custom harness, not criterion)
+          echo "::group::Running sync_benchmark"
+          cargo bench --bench sync_benchmark 2>&1 | tee "bench-results/sync_benchmark.txt"
+          echo "::endgroup::"
+
+          # Copy criterion data for artifact storage
+          if [ -d "target/criterion" ]; then
+            cp -r target/criterion bench-results/criterion
+          fi
+
+      - name: Compare against baseline
+        id: compare
+        if: steps.download-baseline.outcome == 'success' && hashFiles('baseline/') != ''
+        run: |
+          echo "## Benchmark Comparison" >> "$GITHUB_STEP_SUMMARY"
+          if [ -d "baseline/criterion" ] && [ -d "bench-results/criterion" ]; then
+            bash scripts/bench-compare.sh baseline/criterion bench-results/criterion | tee comparison.txt
+            cat comparison.txt >> "$GITHUB_STEP_SUMMARY"
+
+            # Check for regressions (exit code 1 = regressions found)
+            if grep -q "REGRESSION" comparison.txt; then
+              echo "has_regressions=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_regressions=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No previous criterion data found for comparison." >> "$GITHUB_STEP_SUMMARY"
+            echo "has_regressions=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate summary (no baseline)
+        if: steps.download-baseline.outcome != 'success' || hashFiles('baseline/') == ''
+        run: |
+          echo "## Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "First run -- no baseline available for comparison." >> "$GITHUB_STEP_SUMMARY"
+          echo "Results saved as artifacts for future comparisons." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Benchmark Output" >> "$GITHUB_STEP_SUMMARY"
+          for f in bench-results/*.txt; do
+            bench_name=$(basename "$f" .txt)
+            echo "<details><summary>${bench_name}</summary>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-results/
+          retention-days: 90
+
+      - name: Upload comparison report
+        if: steps.compare.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comparison
+          path: comparison.txt
+          retention-days: 90
+
+      - name: Warn on regressions
+        if: steps.compare.outputs.has_regressions == 'true'
+        run: |
+          echo "::warning::Performance regressions detected (>10% slower). See comparison report."

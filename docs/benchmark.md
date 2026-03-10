@@ -130,6 +130,99 @@ and hardware description for reproducibility.
    jq '.[].mean_us' results.json
    ```
 
+## Criterion Benchmarks (Micro-benchmarks)
+
+In addition to the high-level benchmarks above, AsteroidDB includes Criterion
+micro-benchmarks covering CRDT operations, store operations, certification
+paths, and cryptographic signatures.
+
+### Running Criterion Benchmarks Locally
+
+```bash
+# Run all Criterion benchmarks
+cargo bench
+
+# Run a specific benchmark suite
+cargo bench --bench crdt_bench
+cargo bench --bench store_bench
+cargo bench --bench certified_bench
+cargo bench --bench signature_bench
+
+# Run the sync comparison benchmark (custom harness)
+cargo bench --bench sync_benchmark
+
+# Save a named baseline for later comparison
+cargo bench -- --save-baseline my-baseline
+
+# Compare against a saved baseline
+cargo bench -- --baseline my-baseline
+```
+
+### Available Benchmark Suites
+
+| Suite | File | What it measures |
+|-------|------|------------------|
+| `crdt_bench` | `benches/crdt_bench.rs` | PnCounter, OrSet, OrMap, LwwRegister operations and merges |
+| `store_bench` | `benches/store_bench.rs` | Store put/get, entries_since, snapshot save/load |
+| `certified_bench` | `benches/certified_bench.rs` | Certified write, process_certifications, proof verification |
+| `signature_bench` | `benches/signature_bench.rs` | BLS vs Ed25519 keygen/sign/verify, aggregate operations, DualModeCertificate |
+| `sync_benchmark` | `benches/sync_benchmark.rs` | Full sync vs delta sync payload size comparison |
+
+### Comparing Two Runs Manually
+
+Use `scripts/bench-compare.sh` to compare two sets of Criterion results:
+
+```bash
+# 1. Run benchmarks with a baseline name
+cargo bench -- --save-baseline before
+
+# 2. Make your changes, then run again
+cargo bench -- --save-baseline after
+
+# 3. Compare the two
+bash scripts/bench-compare.sh \
+  target/criterion   \  # baseline (uses 'before' data)
+  target/criterion      # current  (uses latest run data)
+```
+
+The script flags any benchmark that regressed by more than 10% (configurable
+via `BENCH_REGRESSION_THRESHOLD` environment variable).
+
+## CI Benchmark Pipeline
+
+The project runs automated benchmark regression detection via GitHub Actions.
+
+### Schedule
+
+- **Weekly**: Every Monday at 04:00 UTC (cron schedule)
+- **Manual**: Can be triggered via `workflow_dispatch` in the Actions tab
+
+### How It Works
+
+1. The workflow (`.github/workflows/benchmark.yml`) runs all Criterion
+   benchmark suites on a fresh `ubuntu-latest` runner.
+2. Results are saved as GitHub Actions artifacts with 90-day retention.
+3. On subsequent runs, the workflow downloads the previous run's artifact and
+   compares using `scripts/bench-compare.sh`.
+4. A summary table is posted to the GitHub Actions step summary showing
+   baseline vs current timings and percentage change.
+5. Any benchmark that regressed by more than 10% is flagged with a warning
+   annotation on the workflow run.
+
+### Reading CI Results
+
+1. Go to **Actions** > **Benchmark Regression Check** in the GitHub UI.
+2. Open the latest run and check the **step summary** for the comparison table.
+3. Download the `benchmark-results` artifact for raw Criterion data.
+4. Download the `benchmark-comparison` artifact for the full comparison report.
+
+### Triggering a Manual Run
+
+```bash
+# Via GitHub CLI
+gh workflow run benchmark.yml
+```
+
 ## Programmatic Access
 
 The metrics module (`src/ops/metrics.rs`) exposes:
