@@ -1,10 +1,15 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "native-crypto")]
+use std::collections::HashSet;
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "native-crypto")]
 use crate::authority::bls::{self, BlsPublicKey, BlsSignature};
+#[cfg(not(feature = "native-crypto"))]
+use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -975,6 +980,7 @@ impl DualModeCertificate {
     }
 
     /// BLS verification path.
+    #[cfg(feature = "native-crypto")]
     fn verify_bls(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
         // P1-1: Validate signer ID / public key count match.
         if self.bls_signer_ids.len() != self.bls_public_keys.len() {
@@ -1007,6 +1013,85 @@ impl DualModeCertificate {
                 "BLS aggregate verification failed".into(),
             ))
         }
+    }
+
+    /// BLS verification stub when native-crypto is disabled.
+    #[cfg(not(feature = "native-crypto"))]
+    fn verify_bls(&self, _message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        Err(CertError::InvalidSignature(
+            "BLS verification unavailable: native-crypto feature is disabled".into(),
+        ))
+    }
+
+    /// BLS verification with registry cross-check.
+    #[cfg(feature = "native-crypto")]
+    fn verify_bls_with_registry(
+        &self,
+        message: &[u8],
+        registry: &KeysetRegistry,
+    ) -> Result<Vec<NodeId>, CertError> {
+        // P1-1: Validate signer ID / public key count match.
+        if self.bls_signer_ids.len() != self.bls_public_keys.len() {
+            return Err(CertError::InvalidSignature(
+                "signer ID / public key count mismatch".into(),
+            ));
+        }
+
+        // P1-2: Reject duplicate signer IDs.
+        let unique_signers: HashSet<&str> =
+            self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
+        if unique_signers.len() != self.bls_signer_ids.len() {
+            return Err(CertError::InvalidSignature(
+                "duplicate BLS signer IDs".into(),
+            ));
+        }
+
+        let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
+            CertError::InvalidSignature("missing BLS aggregated signature".into())
+        })?;
+
+        if self.bls_signer_ids.is_empty() {
+            return Err(CertError::InvalidSignature("no BLS signers".into()));
+        }
+
+        // P1-3: Cross-check each signer's public key against the registry.
+        let mut registry_keys = Vec::new();
+        for (i, signer_id) in self.bls_signer_ids.iter().enumerate() {
+            let registry_key = registry
+                .get_bls_key(&self.keyset_version, &signer_id.0)
+                .ok_or_else(|| CertError::AuthorityNotInRegistry(signer_id.0.clone()))?;
+
+            // Verify the embedded public key matches the registry.
+            if self.bls_public_keys[i] != *registry_key {
+                return Err(CertError::InvalidSignature(format!(
+                    "BLS public key mismatch for signer {}",
+                    signer_id.0
+                )));
+            }
+
+            registry_keys.push(registry_key.clone());
+        }
+
+        // Verify aggregate signature against registry-trusted keys.
+        if bls::aggregate_verify(&registry_keys, message, agg_sig) {
+            Ok(self.bls_signer_ids.clone())
+        } else {
+            Err(CertError::InvalidSignature(
+                "BLS aggregate verification failed".into(),
+            ))
+        }
+    }
+
+    /// BLS verification with registry stub when native-crypto is disabled.
+    #[cfg(not(feature = "native-crypto"))]
+    fn verify_bls_with_registry(
+        &self,
+        _message: &[u8],
+        _registry: &KeysetRegistry,
+    ) -> Result<Vec<NodeId>, CertError> {
+        Err(CertError::InvalidSignature(
+            "BLS verification unavailable: native-crypto feature is disabled".into(),
+        ))
     }
 
     /// Verify the certificate using a keyset registry for key validation.
@@ -1048,58 +1133,7 @@ impl DualModeCertificate {
                 }
                 cert.verify_signatures_with_registry(message, registry, current_epoch, epoch_config)
             }
-            SignatureAlgorithm::Bls12_381 => {
-                // P1-1: Validate signer ID / public key count match.
-                if self.bls_signer_ids.len() != self.bls_public_keys.len() {
-                    return Err(CertError::InvalidSignature(
-                        "signer ID / public key count mismatch".into(),
-                    ));
-                }
-
-                // P1-2: Reject duplicate signer IDs.
-                let unique_signers: HashSet<&str> =
-                    self.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
-                if unique_signers.len() != self.bls_signer_ids.len() {
-                    return Err(CertError::InvalidSignature(
-                        "duplicate BLS signer IDs".into(),
-                    ));
-                }
-
-                let agg_sig = self.bls_aggregated_signature.as_ref().ok_or_else(|| {
-                    CertError::InvalidSignature("missing BLS aggregated signature".into())
-                })?;
-
-                if self.bls_signer_ids.is_empty() {
-                    return Err(CertError::InvalidSignature("no BLS signers".into()));
-                }
-
-                // P1-3: Cross-check each signer's public key against the registry.
-                let mut registry_keys = Vec::new();
-                for (i, signer_id) in self.bls_signer_ids.iter().enumerate() {
-                    let registry_key = registry
-                        .get_bls_key(&self.keyset_version, &signer_id.0)
-                        .ok_or_else(|| CertError::AuthorityNotInRegistry(signer_id.0.clone()))?;
-
-                    // Verify the embedded public key matches the registry.
-                    if self.bls_public_keys[i] != *registry_key {
-                        return Err(CertError::InvalidSignature(format!(
-                            "BLS public key mismatch for signer {}",
-                            signer_id.0
-                        )));
-                    }
-
-                    registry_keys.push(registry_key.clone());
-                }
-
-                // Verify aggregate signature against registry-trusted keys.
-                if bls::aggregate_verify(&registry_keys, message, agg_sig) {
-                    Ok(self.bls_signer_ids.clone())
-                } else {
-                    Err(CertError::InvalidSignature(
-                        "BLS aggregate verification failed".into(),
-                    ))
-                }
-            }
+            SignatureAlgorithm::Bls12_381 => self.verify_bls_with_registry(message, registry),
         }
     }
 }
