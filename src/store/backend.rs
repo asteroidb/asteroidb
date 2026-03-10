@@ -215,16 +215,20 @@ impl KvBackend for InMemoryKvBackend {
 // RedbBackend
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "native-storage")]
 /// Persistent `KvBackend` backed by [redb](https://docs.rs/redb).
 ///
 /// Uses a single B+tree table for all key-value pairs. Provides ACID
-/// transactions and is pure-Rust, making it suitable for WASM targets.
+/// transactions. Requires the `native-storage` feature (uses libc for
+/// mmap/file I/O, not available on `wasm32-unknown-unknown`).
 pub struct RedbBackend {
     db: redb::Database,
 }
 
+#[cfg(feature = "native-storage")]
 const TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("kv");
 
+#[cfg(feature = "native-storage")]
 impl RedbBackend {
     /// Open (or create) a redb database at `path`.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -233,6 +237,7 @@ impl RedbBackend {
     }
 }
 
+#[cfg(feature = "native-storage")]
 impl KvBackend for RedbBackend {
     fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         let tx = self.db.begin_read().map_err(io::Error::other)?;
@@ -513,6 +518,7 @@ mod tests {
     // RedbBackend
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "native-storage")]
     #[test]
     fn redb_kv_conformance() {
         let dir = tempfile::tempdir().unwrap();
@@ -521,6 +527,7 @@ mod tests {
         kv_backend_conformance(&b);
     }
 
+    #[cfg(feature = "native-storage")]
     #[test]
     fn redb_persistence_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -536,6 +543,7 @@ mod tests {
         assert_eq!(b.get("persist").unwrap(), Some(b"data".to_vec()));
     }
 
+    #[cfg(feature = "native-storage")]
     #[test]
     fn redb_delete_and_scan_empty() {
         let dir = tempfile::tempdir().unwrap();
