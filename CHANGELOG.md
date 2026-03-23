@@ -1,32 +1,32 @@
-# Changelog
+# 変更履歴
 
 ## v0.1.0 (2026-03-08)
 
-Initial release.
+初回リリース。
 
-### Core Features
+### コア機能
 
-- Dual consistency model: eventual (CRDT-based) and certified (authority majority)
-- CRDT types: PnCounter, LWW-Register, OR-Set, OR-Map
-- Hybrid Logical Clock (HLC) for causal ordering
-- Delta-based anti-entropy sync with batching and backoff
-- BLS12-381 threshold signatures with epoch-based key rotation
-- Ed25519/BLS dual-mode certificates
-- Placement policies with tag matching and latency-aware ranking
-- Adaptive compaction with write-rate tracking
-- SLO framework with error budget calculation
+- デュアル整合性モデル: eventual（CRDT ベース）と certified（Authority majority）
+- CRDT 型: PnCounter, LWW-Register, OR-Set, OR-Map
+- Hybrid Logical Clock (HLC) による因果順序付け
+- バッチ処理とバックオフ付き delta ベース anti-entropy sync
+- Epoch ベースの鍵ローテーション付き BLS12-381 threshold signatures
+- Ed25519/BLS デュアルモード certificate
+- タグマッチングとレイテンシ考慮ランキング付き配置ポリシー
+- 書き込みレート追跡付き適応型圧縮
+- Error budget 計算付き SLO フレームワーク
 
-### Operations
+### 運用
 
-- CLI tool (asteroidb-cli): status, get, put, metrics, slo
-- Docker Compose 3-node cluster
-- Fault injection and netem test scripts
-- Criterion micro-benchmarks
-- Multi-node benchmark scripts
+- CLI ツール (asteroidb-cli): status, get, put, metrics, slo
+- Docker Compose 3 ノードクラスタ
+- Fault injection と netem テストスクリプト
+- Criterion マイクロベンチマーク
+- マルチノードベンチマークスクリプト
 
-### Security
+### セキュリティ
 
-- Constant-time bearer token authentication
-- SSRF protection on internal endpoints
-- Peer address validation
-- Ping anti-poisoning (known sender + rate limit)
+- 定数時間 Bearer トークン認証
+- Internal エンドポイントの SSRF 保護
+- ピアアドレス検証
+- Ping アンチポイズニング（既知の送信者 + レートリミット）
