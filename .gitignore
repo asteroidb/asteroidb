@@ -7,3 +7,6 @@ examples/wasm/target/
 # AI agent tool-specific configs (project info is in docs/agent.md)
 CLAUDE.md
 AGENTS.md
+
+# Benchmark output
+bench-results.txt

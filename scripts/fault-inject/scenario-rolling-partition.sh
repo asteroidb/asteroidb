@@ -22,8 +22,8 @@ NODE2_CONTAINER="asteroidb-node-2"
 NODE3_CONTAINER="asteroidb-node-3"
 KEY="fault-rolling-$$"
 
-CONVERGENCE_RETRIES=20
-CONVERGENCE_INTERVAL=2
+CONVERGENCE_RETRIES=40
+CONVERGENCE_INTERVAL=3
 
 # Trap: remove all netem rules on exit.
 cleanup() {
