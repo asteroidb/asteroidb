@@ -9,22 +9,34 @@ repository = "https://github.com/asteroidb/asteroidb"
 keywords = ["database", "distributed", "crdt", "key-value"]
 categories = ["database-implementations"]
 
+[features]
+default = ["native-crypto", "native-tls", "native-storage"]
+
+# BLS12-381 signatures via blst (C library). Disable for WASM targets.
+native-crypto = ["dep:blst"]
+
+# System TLS via openssl/native-tls for reqwest. Disable for WASM targets.
+native-tls = ["reqwest/default-tls"]
+
+# Persistent storage via redb (uses libc mmap). Disable for WASM targets.
+native-storage = ["dep:redb"]
+
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-blst = "0.3"
+blst = { version = "0.3", optional = true }
 rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 subtle = "2"
 hex = "0.4"
-redb = "2"
+redb = { version = "2", optional = true }
 bincode = { version = "2", features = ["serde"] }
 siphasher = "1"
 
@@ -58,3 +70,4 @@ harness = false
 [[bench]]
 name = "signature_bench"
 harness = false
+required-features = ["native-crypto"]
