@@ -1,162 +1,150 @@
-# Security
+# セキュリティ
 
-This document describes the threat model, trust boundaries, and
-cryptographic primitives used by AsteroidDB.
+本ドキュメントでは、AsteroidDB の脅威モデル、信頼境界、使用する暗号プリミティブについて説明します。
 
-## Threat Model Overview
+## 脅威モデルの概要
 
-AsteroidDB's MVP is designed for **crash-fault tolerance**, not Byzantine
-fault tolerance. The system assumes that all participating nodes are honest
-but may fail by crashing or becoming unreachable. A compromised node that
-deviates from the protocol can violate safety guarantees.
+AsteroidDB の MVP は **クラッシュ故障耐性** を前提に設計されており、
+Byzantine 故障耐性は対象外です。参加するすべてのノードは誠実であり、
+クラッシュまたは到達不能になることで障害が発生する想定です。
+プロトコルから逸脱する侵害ノードは安全性保証を破壊し得ます。
 
-### In scope (MVP)
+### スコープ内（MVP）
 
-- **Crash faults**: nodes may stop, restart, or lose network connectivity
-  at any time.
-- **Network partitions**: links between nodes may fail transiently or for
-  extended periods.
-- **Replay attacks on inter-node API**: prevented by bearer token
-  authentication when `ASTEROIDB_INTERNAL_TOKEN` is configured.
-- **Unauthorized control-plane mutations**: protected by the same bearer
-  token; only authenticated requests can modify placement policies and
-  authority definitions.
+- **クラッシュ故障**: ノードはいつでも停止、再起動、ネットワーク接続の喪失が発生し得る。
+- **ネットワークパーティション**: ノード間のリンクは一時的または長期間にわたり障害が発生し得る。
+- **ノード間 API へのリプレイ攻撃**: `ASTEROIDB_INTERNAL_TOKEN` 設定時に
+  Bearer トークン認証で防止。
+- **無許可の control-plane 変更**: 同じ Bearer トークンで保護。認証済みリクエストのみが
+  配置ポリシーと Authority 定義を変更可能。
 
-### Out of scope (MVP)
+### スコープ外（MVP）
 
-- **Byzantine faults**: a malicious node can forge signatures, inject
-  fabricated data, or produce invalid certificates. BFT extensions are
-  planned for a future phase.
-- **Client authentication/authorization**: the public HTTP API (reads and
-  eventual writes) is unauthenticated. Applications should place AsteroidDB
-  behind a reverse proxy or API gateway for client-facing deployments.
-- **Encryption at rest**: data on disk is not encrypted. Use volume-level
-  encryption (e.g., LUKS, dm-crypt) if needed.
-- **TLS for inter-node traffic**: inter-node communication uses plain HTTP
-  by default. Deploy behind a service mesh or configure a TLS terminator
-  for production use.
+- **Byzantine 故障**: 悪意のあるノードは署名の偽造、データの捏造、
+  無効な certificate の生成が可能。BFT 拡張は将来フェーズで計画。
+- **クライアント認証/認可**: 公開 HTTP API（読み取りと eventual write）は
+  未認証。クライアント向けデプロイメントでは AsteroidDB をリバースプロキシまたは
+  API ゲートウェイの背後に配置すること。
+- **保存時暗号化**: ディスク上のデータは暗号化されていない。必要に応じて
+  ボリュームレベルの暗号化（例: LUKS、dm-crypt）を使用すること。
+- **ノード間トラフィックの TLS**: ノード間通信はデフォルトで平文 HTTP を使用。
+  本番環境ではサービスメッシュの背後に配置するか、TLS ターミネータを設定すること。
 
-## Trust Boundaries
+## 信頼境界
 
 ```
 +---------------------------+
-|        Client Zone        |  Untrusted (no auth in MVP)
+|        Client Zone        |  信頼なし（MVP では認証なし）
 +------------+--------------+
              | HTTP
 +------------v--------------+
-|        Node (public API)  |  Reads, eventual writes, certified reads
+|        Node (public API)  |  読み取り、eventual write、certified read
 +------------+--------------+
-             | Internal API (bearer token)
+             | Internal API (Bearer トークン)
 +------------v--------------+
-|     Node <-> Node         |  Delta sync, frontier exchange, join/leave
+|     Node <-> Node         |  Delta sync、frontier 交換、join/leave
 +---------------------------+
-             | Internal API (bearer token)
+             | Internal API (Bearer トークン)
 +------------v--------------+
-|     Control Plane         |  Policy mutations, authority definitions
+|     Control Plane         |  ポリシー変更、Authority 定義
 +---------------------------+
 ```
 
-### Boundary 1: Client to Node
+### 境界 1: クライアントからノード
 
-- **Transport**: HTTP (no TLS by default).
-- **Authentication**: None in MVP. All public endpoints are open.
-- **Threat**: An attacker on the network can read and write data.
-- **Mitigation**: Deploy behind a TLS-terminating reverse proxy with
-  application-level auth for production.
+- **トランスポート**: HTTP（デフォルトで TLS なし）。
+- **認証**: MVP では認証なし。すべての公開エンドポイントがオープン。
+- **脅威**: ネットワーク上の攻撃者がデータの読み書きが可能。
+- **緩和策**: 本番環境ではアプリケーションレベル認証付きの TLS 終端
+  リバースプロキシの背後に配置。
 
-### Boundary 2: Node to Node
+### 境界 2: ノード間
 
-- **Transport**: HTTP with optional bearer token.
-- **Authentication**: When `ASTEROIDB_INTERNAL_TOKEN` is set, all
-  `/api/internal/*` endpoints require `Authorization: Bearer <token>`.
-  Without the token, inter-node routes are open.
-- **Threat**: An attacker who obtains the internal token can join the
-  cluster, inject data, or disrupt sync.
-- **Mitigation**: Use a strong random token, rotate periodically, and
-  restrict network access to cluster nodes.
+- **トランスポート**: HTTP（オプションで Bearer トークン付き）。
+- **認証**: `ASTEROIDB_INTERNAL_TOKEN` 設定時、すべての `/api/internal/*`
+  エンドポイントに `Authorization: Bearer <token>` が必要。
+  トークンなしの場合、ノード間ルートはオープン。
+- **脅威**: internal トークンを取得した攻撃者がクラスタへの参加、
+  データの注入、sync の妨害が可能。
+- **緩和策**: 強力なランダムトークンを使用し、定期的にローテーション。
+  ネットワークアクセスをクラスタノードに限定。
 
-### Boundary 3: Control Plane
+### 境界 3: Control Plane
 
-- **Transport**: Same HTTP layer as node-to-node.
-- **Authentication**: Mutation routes (`PUT /api/control-plane/policies`,
-  `PUT /api/control-plane/authorities`, `DELETE ...`) require bearer token
-  authentication.
-- **Authorization**: Any request with a valid token can modify the control
-  plane. There is no role-based access control in the MVP.
-- **Threat**: Token compromise allows arbitrary policy changes (e.g.,
-  reducing replica count, reassigning authority nodes).
-- **Mitigation**: Limit token distribution, audit policy version history
-  via `GET /api/control-plane/versions`.
+- **トランスポート**: ノード間と同じ HTTP レイヤ。
+- **認証**: 変更ルート（`PUT /api/control-plane/policies`、
+  `PUT /api/control-plane/authorities`、`DELETE ...`）に Bearer トークン認証が必要。
+- **認可**: 有効なトークンを持つリクエストは control plane を変更可能。
+  MVP ではロールベースアクセス制御なし。
+- **脅威**: トークン漏洩により任意のポリシー変更（例: レプリカ数の削減、
+  Authority ノードの再割り当て）が可能。
+- **緩和策**: トークンの配布を限定し、`GET /api/control-plane/versions` で
+  ポリシーバージョン履歴を監査。
 
-## Cryptographic Primitives
+## 暗号プリミティブ
 
-| Primitive | Library | Usage |
-|-----------|---------|-------|
-| **Ed25519** | `ed25519-dalek 2.x` | Individual authority signatures for majority certificates |
-| **BLS12-381** | `blst 0.3` | Aggregate threshold signatures; multiple authority sigs combine into one |
-| **HLC** | Custom (`src/hlc.rs`) | Hybrid Logical Clock for causal ordering and frontier tracking |
-| **SHA-256** | via `blst` DST | Domain separation tag for BLS signature scheme |
+| プリミティブ | ライブラリ | 用途 |
+|------------|----------|------|
+| **Ed25519** | `ed25519-dalek 2.x` | Majority certificate 用の個別 Authority 署名 |
+| **BLS12-381** | `blst 0.3` | Aggregate threshold signatures。複数 Authority 署名を 1 つに統合 |
+| **HLC** | カスタム (`src/hlc.rs`) | 因果順序付けと frontier 追跡のための Hybrid Logical Clock |
+| **SHA-256** | `blst` DST 経由 | BLS 署名スキーム用のドメイン分離タグ |
 
-### Ed25519 Certificates
+### Ed25519 Certificate
 
-Each authority node holds an Ed25519 signing key. When a node acknowledges
-an update, it signs the `(key_range, frontier_hlc, digest_hash)` tuple. A
-majority certificate collects `n/2 + 1` individual signatures and their
-corresponding verifying keys.
+各 Authority ノードは Ed25519 署名鍵を保持します。ノードが更新を確認すると、
+`(key_range, frontier_hlc, digest_hash)` タプルに署名します。
+Majority certificate は `n/2 + 1` 個の個別署名と対応する検証鍵を収集します。
 
-Verification: the client checks each signature against the authority's
-public key and confirms that a majority of the declared authority set has
-signed.
+検証: クライアントは各署名を Authority の公開鍵に対して検証し、
+宣言された Authority セットの過半数が署名していることを確認します。
 
 ### BLS Aggregate Signatures
 
-When BLS mode is enabled (`ASTEROIDB_BLS_SEED`), authority nodes produce
-BLS12-381 signatures instead of Ed25519. Multiple BLS signatures over the
-same message can be aggregated into a single signature, reducing certificate
-size from O(n) to O(1) for n authorities.
+BLS モードが有効な場合（`ASTEROIDB_BLS_SEED`）、Authority ノードは
+Ed25519 の代わりに BLS12-381 署名を生成します。同一メッセージに対する
+複数の BLS 署名は単一の署名に集約でき、n Authority の certificate サイズを
+O(n) から O(1) に削減します。
 
-Domain separation tag: `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`
+ドメイン分離タグ: `BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_`
 
-### Key Management
+### 鍵管理
 
-- **Keyset versioning**: Keys are managed in the system namespace under a
-  monotonically increasing `keyset_version` (starting at 1).
-- **Epoch rotation**: Default epoch length is 24 hours. On epoch boundary,
-  the node switches to the next published keyset.
-- **Grace period**: Verification accepts signatures from the current epoch
-  and up to 7 past epochs, allowing for clock skew and delayed propagation.
-- **Rotation procedure**:
-  1. Publish next keyset to system namespace.
-  2. Wait for epoch boundary -- nodes switch automatically.
-  3. After grace period expires, old keys are invalidated.
+- **Keyset バージョニング**: 鍵は system namespace で単調増加する
+  `keyset_version`（初期値 1）で管理。
+- **Epoch ローテーション**: デフォルトの epoch 長は 24 時間。epoch 境界で
+  ノードは次に公開された keyset に切り替え。
+- **猶予期間**: 検証は現在の epoch と過去 7 epoch 分の署名を受理し、
+  クロックスキューや伝播遅延に対応。
+- **ローテーション手順**:
+  1. 次の keyset を system namespace に公開。
+  2. Epoch 境界を待つ -- ノードは自動的に切り替え。
+  3. 猶予期間終了後、旧鍵は無効化。
 
-## Authentication: Internal Token
+## 認証: Internal トークン
 
-AsteroidDB uses a shared-secret bearer token for inter-node and
-control-plane authentication.
+AsteroidDB はノード間および control-plane の認証に共有シークレット Bearer トークンを使用します。
 
-### Configuration
+### 設定
 
-Set the `ASTEROIDB_INTERNAL_TOKEN` environment variable on all nodes with
-the same value:
+すべてのノードで同じ値の `ASTEROIDB_INTERNAL_TOKEN` 環境変数を設定:
 
 ```bash
 export ASTEROIDB_INTERNAL_TOKEN=$(openssl rand -hex 32)
 ```
 
-### Protected routes
+### 保護対象ルート
 
-When the token is configured, the following routes require
-`Authorization: Bearer <token>`:
+トークン設定時、以下のルートに `Authorization: Bearer <token>` が必要:
 
-- `/api/internal/*` -- sync, frontier exchange, join, leave, ping
+- `/api/internal/*` -- sync、frontier 交換、join、leave、ping
 - `PUT /api/control-plane/authorities`
 - `PUT /api/control-plane/policies`
 - `DELETE /api/control-plane/policies/{prefix}`
 
-### Unprotected routes
+### 非保護ルート
 
-Public API endpoints are always open:
+公開 API エンドポイントは常にオープン:
 
 - `GET /api/eventual/{key}`
 - `POST /api/eventual/write`
@@ -166,35 +154,32 @@ Public API endpoints are always open:
 - `GET /api/metrics`
 - `GET /api/slo`
 - `GET /api/topology`
-- `GET /api/control-plane/authorities` (read)
-- `GET /api/control-plane/policies` (read)
-- `GET /api/control-plane/versions` (read)
+- `GET /api/control-plane/authorities`（読み取り）
+- `GET /api/control-plane/policies`（読み取り）
+- `GET /api/control-plane/versions`（読み取り）
 
-## Known Limitations
+## 既知の制限事項
 
-1. **No Byzantine tolerance**: A compromised authority node can produce
-   valid-looking signatures for arbitrary data. This is an explicit MVP
-   scope boundary.
+1. **Byzantine 耐性なし**: 侵害された Authority ノードは任意のデータに対して
+   正当に見える署名を生成可能。これは明示的な MVP スコープ境界。
 
-2. **Shared-secret token model**: All nodes share the same token. There is
-   no per-node identity or mutual TLS. Token compromise gives full cluster
-   access.
+2. **共有シークレットトークンモデル**: すべてのノードが同一トークンを共有。
+   ノードごとの ID や相互 TLS なし。トークン漏洩でクラスタへのフルアクセスが可能。
 
-3. **No TLS**: All traffic is plain HTTP. Eavesdropping and MITM attacks
-   are possible on untrusted networks.
+3. **TLS なし**: すべてのトラフィックが平文 HTTP。信頼できないネットワーク上で
+   盗聴や MITM 攻撃が可能。
 
-4. **No client auth**: Any network-reachable client can read and write data
-   via the public API.
+4. **クライアント認証なし**: ネットワーク到達可能な任意のクライアントが
+   公開 API 経由でデータの読み書きが可能。
 
-5. **No audit logging**: There is no tamper-evident log of API requests.
-   Policy version history provides partial auditability for control-plane
-   changes.
+5. **監査ログなし**: API リクエストの改ざん防止ログなし。ポリシーバージョン履歴が
+   control-plane 変更の部分的な監査性を提供。
 
-6. **Clock dependency**: HLC depends on roughly synchronized clocks. Large
-   clock skew (>> epoch length) can cause frontier tracking anomalies.
+6. **クロック依存**: HLC はおおよそ同期されたクロックに依存。大きなクロックスキュー
+   （>> epoch 長）は frontier 追跡の異常を引き起こす可能性あり。
 
-## Reporting Vulnerabilities
+## 脆弱性の報告
 
-This project is in active development and not yet deployed in production.
-If you discover a security issue, please open a GitHub issue or contact the
-maintainers directly.
+本プロジェクトは活発に開発中であり、まだ本番環境にはデプロイされていません。
+セキュリティ上の問題を発見した場合は、GitHub Issue を作成するか、
+メンテナーに直接ご連絡ください。
