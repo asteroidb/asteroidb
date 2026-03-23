@@ -1,42 +1,41 @@
-# AsteroidDB Benchmark Guide
+# AsteroidDB ベンチマークガイド
 
-## Overview
+## 概要
 
-AsteroidDB benchmarks measure three key performance indicators that characterize
-the system's behaviour under normal operation and failure recovery:
+AsteroidDB のベンチマークは、通常運用時と障害回復時のシステム動作を特徴づける
+3 つの主要パフォーマンス指標を計測します:
 
-| # | Metric | What it measures |
-|---|--------|------------------|
-| 1 | **Eventual write latency** | Time to accept a single `eventual_counter_inc` operation locally |
-| 2 | **Certified confirmation time** | End-to-end time from `certified_write` to `Certified` status via majority frontier advancement |
-| 3 | **Recovery convergence time** | Time for 3 divergent nodes to reach identical state via CRDT merge after partition recovery |
+| # | メトリクス | 計測内容 |
+|---|----------|---------|
+| 1 | **Eventual write レイテンシ** | 単一の `eventual_counter_inc` 操作をローカルで受理するまでの時間 |
+| 2 | **Certified 確定時間** | `certified_write` から majority frontier 進行による `Certified` ステータスまでのエンドツーエンド時間 |
+| 3 | **回復収束時間** | パーティション回復後、3 つの乖離ノードが CRDT マージにより同一状態に到達するまでの時間 |
 
-## Running the Benchmark
+## ベンチマークの実行
 
-### Prerequisites
+### 前提条件
 
 - Rust toolchain (edition 2024)
-- Repository cloned and dependencies resolved (`cargo build`)
+- リポジトリのクローンと依存関係の解決 (`cargo build`)
 
-### Execution
+### 実行方法
 
 ```bash
-# Run the benchmark (human-readable progress on stderr, JSON on stdout)
+# ベンチマークを実行（進捗は stderr に、JSON は stdout に出力）
 cargo run --example benchmark
 
-# Save JSON results to a file
+# JSON 結果をファイルに保存
 cargo run --example benchmark > results.json
 
-# Release mode for more representative numbers
+# より実際的な数値のためにリリースモードで実行
 cargo run --release --example benchmark > results.json
 ```
 
-### Output
+### 出力
 
-The benchmark prints progress and CSV summary to **stderr** and a JSON array of
-results to **stdout**.
+ベンチマークは進捗と CSV サマリーを **stderr** に、JSON 配列の結果を **stdout** に出力します。
 
-JSON schema per entry:
+エントリごとの JSON スキーマ:
 
 ```json
 {
@@ -51,95 +50,94 @@ JSON schema per entry:
 }
 ```
 
-## Metric Details
+## メトリクスの詳細
 
-### 1. Eventual Write Latency
+### 1. Eventual Write レイテンシ
 
-- **Operation**: `EventualApi::eventual_counter_inc` on distinct keys
-- **Iterations**: 1000
-- **Measures**: Wall-clock time of a single local CRDT write (no network)
-- **Relevance**: FR-002/FR-004 -- baseline cost of the eventual consistency path
+- **操作**: 異なるキーに対する `EventualApi::eventual_counter_inc`
+- **反復回数**: 1000
+- **計測内容**: 単一のローカル CRDT 書き込みのウォールクロック時間（ネットワークなし）
+- **関連要件**: FR-002/FR-004 -- eventual 整合性パスの基本コスト
 
-### 2. Certified Confirmation Time
+### 2. Certified 確定時間
 
-- **Operation**: `CertifiedApi::certified_write` followed by 2-of-3 authority
-  frontier updates and `process_certifications`
-- **Iterations**: 100
-- **Measures**: Full certification round-trip (write + frontier sync + status check)
-- **Relevance**: FR-003/FR-004 -- time to achieve majority consensus confirmation
+- **操作**: `CertifiedApi::certified_write` の後、2-of-3 Authority の
+  frontier 更新と `process_certifications` を実行
+- **反復回数**: 100
+- **計測内容**: 完全な certification ラウンドトリップ（書き込み + frontier sync + ステータス確認）
+- **関連要件**: FR-003/FR-004 -- majority consensus 確認に要する時間
 
-### 3. Recovery Convergence Time
+### 3. 回復収束時間
 
-- **Operation**: 3-node partition scenario with divergent PN-Counter state,
-  then full CRDT merge propagation
-- **Iterations**: 100
-- **Measures**: Wall-clock time from start of merge propagation to all 3 nodes
-  holding identical state
-- **Relevance**: FR-002/NFR -- demonstrates CRDT convergence guarantee after
-  network partition
+- **操作**: 乖離した PN-Counter 状態を持つ 3 ノードパーティションシナリオ、
+  その後のフル CRDT マージ伝播
+- **反復回数**: 100
+- **計測内容**: マージ伝播開始から 3 ノードすべてが同一状態を保持するまでの
+  ウォールクロック時間
+- **関連要件**: FR-002/NFR -- ネットワークパーティション後の CRDT 収束保証のデモンストレーション
 
-## Result Recording Template
+## 結果記録テンプレート
 
-Copy the table below and fill in the measured values. Include the commit hash
-and hardware description for reproducibility.
+以下の表をコピーして計測値を記入してください。再現性のため、
+コミットハッシュとハードウェアの説明を含めてください。
 
 ```
-## Benchmark Results
+## ベンチマーク結果
 
-**Date**: YYYY-MM-DD
-**Commit**: <hash>
-**Hardware**: <CPU / RAM / OS>
-**Build mode**: release | debug
+**日付**: YYYY-MM-DD
+**コミット**: <hash>
+**ハードウェア**: <CPU / RAM / OS>
+**ビルドモード**: release | debug
 
-| Metric                      | Iterations | Mean (us) | P50 (us) | P95 (us) | P99 (us) | Min (us) | Max (us) |
-|-----------------------------|------------|-----------|----------|----------|----------|----------|----------|
-| eventual_write_latency      |            |           |          |          |          |          |          |
-| certified_confirmation_time |            |           |          |          |          |          |          |
-| recovery_convergence_time   |            |           |          |          |          |          |          |
+| メトリクス                     | 反復回数 | 平均 (us) | P50 (us) | P95 (us) | P99 (us) | 最小 (us) | 最大 (us) |
+|-------------------------------|---------|-----------|----------|----------|----------|----------|----------|
+| eventual_write_latency        |         |           |          |          |          |          |          |
+| certified_confirmation_time   |         |           |          |          |          |          |          |
+| recovery_convergence_time     |         |           |          |          |          |          |          |
 
-### Notes
+### 備考
 
-- (describe any anomalies, environment specifics, etc.)
+- （異常値、環境固有の事情等を記載）
 ```
 
-## Reproducing Results
+## 結果の再現
 
-1. Check out the target commit:
+1. 対象コミットをチェックアウト:
    ```bash
    git checkout <commit-hash>
    ```
 
-2. Build in release mode:
+2. リリースモードでビルド:
    ```bash
    cargo build --release --example benchmark
    ```
 
-3. Run the benchmark and save results:
+3. ベンチマークを実行して結果を保存:
    ```bash
    cargo run --release --example benchmark > results.json 2> benchmark.log
    ```
 
-4. Extract CSV from the log:
+4. ログから CSV を抽出:
    ```bash
    grep -A4 "Results (CSV)" benchmark.log
    ```
 
-5. Compare with previous runs using the JSON output:
+5. JSON 出力を使って以前の実行結果と比較:
    ```bash
-   # Example: compare mean latencies with jq
+   # 例: jq で平均レイテンシを比較
    jq '.[].mean_us' results.json
    ```
 
-## Programmatic Access
+## プログラムからのアクセス
 
-The metrics module (`src/ops/metrics.rs`) exposes:
+メトリクスモジュール (`src/ops/metrics.rs`) は以下を公開しています:
 
-- `BenchmarkResult` -- serializable struct with all statistics
-- `collect_latencies(name, &[Duration]) -> BenchmarkResult` -- compute stats from raw durations
-- `to_csv_row(&BenchmarkResult) -> String` -- CSV formatting
-- `csv_header() -> &str` -- matching CSV header
+- `BenchmarkResult` -- すべての統計情報を含むシリアライズ可能な構造体
+- `collect_latencies(name, &[Duration]) -> BenchmarkResult` -- 生の Duration から統計を計算
+- `to_csv_row(&BenchmarkResult) -> String` -- CSV フォーマット
+- `csv_header() -> &str` -- 対応する CSV ヘッダー
 
-These can be used in integration tests or custom benchmarks:
+これらは統合テストやカスタムベンチマークで使用できます:
 
 ```rust
 use std::time::{Duration, Instant};
@@ -148,7 +146,7 @@ use asteroidb_poc::ops::metrics::{collect_latencies, BenchmarkResult};
 let mut durations = Vec::new();
 for _ in 0..100 {
     let start = Instant::now();
-    // ... operation to measure ...
+    // ... 計測対象の操作 ...
     durations.push(start.elapsed());
 }
 let result: BenchmarkResult = collect_latencies("my_benchmark", &durations);

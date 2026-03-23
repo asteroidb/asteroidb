@@ -1,0 +1,37 @@
+{
+  "node": {
+    "id": "node-1",
+    "mode": "Both",
+    "tags": []
+  },
+  "bind_addr": "0.0.0.0:3000",
+  "peers": {
+    "self_id": "node-1",
+    "peers": {
+      "node-2": {
+        "node_id": "node-2",
+        "addr": "asteroidb-node-2:3000"
+      },
+      "node-3": {
+        "node_id": "node-3",
+        "addr": "asteroidb-node-3:3000"
+      },
+      "node-4": {
+        "node_id": "node-4",
+        "addr": "asteroidb-node-4:3000"
+      },
+      "node-5": {
+        "node_id": "node-5",
+        "addr": "asteroidb-node-5:3000"
+      },
+      "node-6": {
+        "node_id": "node-6",
+        "addr": "asteroidb-node-6:3000"
+      },
+      "node-7": {
+        "node_id": "node-7",
+        "addr": "asteroidb-node-7:3000"
+      }
+    }
+  }
+}
