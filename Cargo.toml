@@ -36,17 +36,6 @@ native-runtime = [
 # Usage: `cargo build --target wasm32-unknown-unknown --no-default-features --features wasm`
 wasm = ["getrandom/js"]
 
-[dependencies]
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-blst = { version = "0.3", optional = true }
-rand = "0.8"
-tokio = { version = "1", features = ["full"], optional = true }
-axum = { version = "0.8", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"], optional = true }
-clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 subtle = "2"
