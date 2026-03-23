@@ -36,6 +36,7 @@ native-runtime = [
 # Usage: `cargo build --target wasm32-unknown-unknown --no-default-features --features wasm`
 wasm = ["getrandom/js"]
 
+
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -1,4 +1,4 @@
-# AsteroidDB netem Testing Guide
+# AsteroidDB netem テストガイド
 
 Linux の `tc` (traffic control) / netem を Docker コンテナ内で使い、
 ネットワーク遅延や分断をシミュレートして AsteroidDB の挙動を検証する手順を説明します。
