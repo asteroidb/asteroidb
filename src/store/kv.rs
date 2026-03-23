@@ -500,6 +500,26 @@ impl Store {
                 count += 1;
             }
         }
+
+        // Also clean orphaned timestamp entries for keys that have been
+        // deleted from `data` but still linger in `timestamps`.  These
+        // arise when `Store::delete()` removes a key from `data` without
+        // touching `timestamps`.
+        let orphaned: Vec<String> = self
+            .timestamps
+            .iter()
+            .filter(|(k, ts)| {
+                *ts <= frontier
+                    && !self.data.contains_key(k.as_str())
+                    && (prefix.is_empty() || k.starts_with(prefix))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in orphaned {
+            self.timestamps.remove(&key);
+            count += 1;
+        }
+
         count
     }
 

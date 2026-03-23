@@ -1172,29 +1172,57 @@ impl BlsVerifyCache {
         }
     }
 
-    /// Compute a cache key from a message and aggregated signature bytes.
-    fn cache_key(message: &[u8], sig_bytes: &[u8]) -> [u8; 32] {
+    /// Compute a cache key from a message, aggregated signature bytes, and signer IDs.
+    ///
+    /// Including `signer_ids` ensures that different signer sets for the same
+    /// (message, signature) produce distinct cache keys, preventing a cached
+    /// result from being returned for a certificate with a different signer set.
+    fn cache_key(message: &[u8], sig_bytes: &[u8], signer_ids: &[NodeId]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(message);
         hasher.update(sig_bytes);
+        for id in signer_ids {
+            hasher.update(id.0.as_bytes());
+            hasher.update(b"\x00"); // separator to avoid ambiguous concatenation
+        }
         hasher.finalize().into()
     }
 
     /// Look up a cached verification result.
-    pub fn get(&self, message: &[u8], sig_bytes: &[u8]) -> Option<&Vec<NodeId>> {
-        let key = Self::cache_key(message, sig_bytes);
-        self.entries.get(&key)
+    pub fn get(
+        &mut self,
+        message: &[u8],
+        sig_bytes: &[u8],
+        signer_ids: &[NodeId],
+    ) -> Option<Vec<NodeId>> {
+        let key = Self::cache_key(message, sig_bytes, signer_ids);
+        if self.entries.contains_key(&key) {
+            // Update recency: remove from current position and push to back.
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            self.entries.get(&key).cloned()
+        } else {
+            None
+        }
     }
 
     /// Insert a verification result into the cache.
-    fn insert(&mut self, message: &[u8], sig_bytes: &[u8], signers: Vec<NodeId>) {
-        let key = Self::cache_key(message, sig_bytes);
+    fn insert(
+        &mut self,
+        message: &[u8],
+        sig_bytes: &[u8],
+        signer_ids: &[NodeId],
+        signers: Vec<NodeId>,
+    ) {
+        let key = Self::cache_key(message, sig_bytes, signer_ids);
         if self.entries.contains_key(&key) {
             return;
         }
         if self.entries.len() >= self.capacity {
-            // Evict oldest entry.
+            // Evict least-recently-used entry.
             if let Some(oldest) = self.order.pop_front() {
                 self.entries.remove(&oldest);
             }
@@ -1223,14 +1251,30 @@ impl BlsVerifyCache {
             None => return cert.verify(message),
         };
 
-        // Check cache first.
-        if let Some(signers) = self.get(message, &sig_bytes) {
-            return Ok(signers.clone());
+        // Re-validate structural invariants even on cache hits, since a
+        // tampered certificate could match a cached (message, sig) pair
+        // but carry different signer metadata.
+        if cert.bls_signer_ids.len() != cert.bls_public_keys.len() {
+            return Err(CertError::InvalidSignature(
+                "signer ID / public key count mismatch".into(),
+            ));
+        }
+        let unique_signers: HashSet<&str> =
+            cert.bls_signer_ids.iter().map(|s| s.0.as_str()).collect();
+        if unique_signers.len() != cert.bls_signer_ids.len() {
+            return Err(CertError::InvalidSignature(
+                "duplicate BLS signer IDs".into(),
+            ));
+        }
+
+        // Check cache (key includes signer_ids for binding).
+        if let Some(signers) = self.get(message, &sig_bytes, &cert.bls_signer_ids) {
+            return Ok(signers);
         }
 
         // Cache miss — perform full verification.
         let signers = cert.verify(message)?;
-        self.insert(message, &sig_bytes, signers.clone());
+        self.insert(message, &sig_bytes, &cert.bls_signer_ids, signers.clone());
         Ok(signers)
     }
 
