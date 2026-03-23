@@ -139,7 +139,7 @@ try_certified_write() {
 
     curl -sf -w "\n%{http_code}" -X POST "${url}/api/certified/write" \
         -H "Content-Type: application/json" \
-        -d "{\"key\":\"${key}\",\"value\":{\"counter\":{\"value\":0}},\"on_timeout\":\"${on_timeout}\"}" \
+        -d "{\"key\":\"${key}\",\"value\":{\"type\":\"counter\",\"value\":0},\"on_timeout\":\"${on_timeout}\"}" \
         --max-time 10 2>/dev/null || echo -e "\n000"
 }
 
@@ -211,7 +211,7 @@ wait_for_cluster() {
     echo "[split-brain] Waiting for cluster to be ready..."
     for port in 3001 3002 3003; do
         for attempt in $(seq 1 30); do
-            if curl -sf --max-time 2 "http://localhost:${port}/api/eventual/__health_check" > /dev/null 2>&1; then
+            if curl -sf --max-time 2 "http://localhost:${port}/healthz" > /dev/null 2>&1; then
                 echo "  Node on port ${port} is ready"
                 break
             fi
@@ -307,9 +307,9 @@ except:
     if wait_for_cert_status "certified" "$NODE2_URL" "$KEY_MAJORITY" 15 2; then
         echo -e "  ${CLR_GREEN}[OK] Majority partition achieved certification.${CLR_RESET}"
     else
-        echo -e "  ${CLR_YELLOW}[WARN] Majority did not certify within timeout.${CLR_RESET}"
-        echo "  (This may be expected if frontier reporting requires all 3 nodes)"
-        # Not a hard failure — the safety property is that minority CANNOT certify.
+        echo -e "  ${CLR_RED}[FAIL] Majority did not certify within timeout — availability violation.${CLR_RESET}"
+        FAIL=$(( FAIL + 1 ))
+        return 1
     fi
 
     # === STEP 6: Verify eventual writes still work on both sides ===
