@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
 #[cfg(feature = "native-crypto")]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
