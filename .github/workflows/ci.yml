@@ -177,3 +177,11 @@ jobs:
           name: build-logs
           path: build-output.txt
           retention-days: 7
+
+  netem-tests:
+    name: netem-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Skip (nightly only)
+        run: echo "Full netem tests run nightly via netem.yml; skipping in CI."
