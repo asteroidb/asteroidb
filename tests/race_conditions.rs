@@ -1,8 +1,16 @@
-//! Race condition tests for concurrent CRDT merge and Authority consensus (#302).
+//! Concurrent merge correctness and Authority consensus tests (#302).
 //!
-//! Verifies that concurrent operations do not corrupt state. Each test spawns
-//! multiple tokio tasks with barriers to synchronize the start, ensuring maximum
-//! overlap of concurrent operations.
+//! Verifies that:
+//! - CRDT merge operations produce correct results regardless of merge order
+//!   (commutativity, associativity, idempotency).
+//! - Authority certification and frontier tracking maintain invariants under
+//!   concurrent access with a multi-threaded runtime.
+//!
+//! The CRDT merge tests (Test A, H) verify merge-order independence: since
+//! CRDTs are designed to be commutative, testing different merge orderings
+//! (even serialised behind a lock) validates correctness. The Authority and
+//! store tests (B-G) use `flavor = "multi_thread"` to exercise real task
+//! interleaving.
 //!
 //! Evaluation of model-checking tools:
 //! - **shuttle-rs** (awslabs/shuttle): Provides deterministic concurrency testing
@@ -13,9 +21,9 @@
 //! - **turmoil** (tokio-rs): Network simulation for distributed systems, complementary
 //!   but targets a different layer (network faults rather than CPU-level races).
 //!
-//! Decision: Use tokio::test with manual race condition injection (barriers + high
-//! concurrency) for practical coverage. Consider shuttle for new, isolated modules
-//! where the wrapper cost is acceptable.
+//! Decision: Use multi-threaded tokio::test with barriers for practical concurrent
+//! coverage. Consider shuttle for new, isolated modules where the wrapper cost is
+//! acceptable.
 
 use std::sync::{Arc, RwLock};
 
@@ -82,14 +90,14 @@ fn make_namespace_with_authorities(
 }
 
 // =========================================================================
-// Test A: Concurrent CRDT merge from multiple peers (same key, different values)
+// Test A: CRDT merge correctness — order-independent convergence
 // =========================================================================
 
-/// Concurrent PnCounter merges from N peers must converge to the same final
-/// value regardless of merge order. All replicas start with independent
-/// increments and merge concurrently.
-#[tokio::test]
-async fn concurrent_pn_counter_merge_converges() {
+/// PnCounter merges from N peers must converge to the same final value
+/// regardless of merge order. All replicas start with independent
+/// increments and are merged in task-scheduling order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pn_counter_merge_order_converges() {
     const NUM_PEERS: usize = 10;
     const INCREMENTS_PER_PEER: usize = 100;
 
@@ -133,10 +141,10 @@ async fn concurrent_pn_counter_merge_converges() {
     );
 }
 
-/// Concurrent OrSet merges with add-wins semantics: one peer adds, another
-/// removes concurrently. After all merges, the add-wins property must hold.
-#[tokio::test]
-async fn concurrent_or_set_merge_add_wins() {
+/// OrSet merges with add-wins semantics: one peer adds, another removes
+/// concurrently. After all merges, the add-wins property must hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn or_set_merge_add_wins_correctness() {
     const NUM_ADDERS: usize = 8;
     const NUM_REMOVERS: usize = 4;
     let total_tasks = NUM_ADDERS + NUM_REMOVERS;
@@ -187,10 +195,9 @@ async fn concurrent_or_set_merge_add_wins() {
     );
 }
 
-/// Concurrent LwwRegister merges: highest timestamp must win regardless of
-/// merge order or concurrency.
-#[tokio::test]
-async fn concurrent_lww_register_merge_highest_ts_wins() {
+/// LwwRegister merges: highest timestamp must win regardless of merge order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lww_register_merge_highest_ts_wins() {
     const NUM_PEERS: usize = 20;
 
     let mut registers: Vec<LwwRegister<String>> = Vec::with_capacity(NUM_PEERS);
@@ -231,10 +238,10 @@ async fn concurrent_lww_register_merge_highest_ts_wins() {
     );
 }
 
-/// Concurrent OrMap merges: concurrent set and delete on the same key must
-/// resolve with add-wins semantics.
-#[tokio::test]
-async fn concurrent_or_map_merge_add_wins() {
+/// OrMap merges: concurrent set and delete on the same key must resolve
+/// with add-wins semantics and LWW for values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn or_map_merge_add_wins_correctness() {
     const NUM_SETTERS: usize = 6;
     const NUM_DELETERS: usize = 3;
     let total_tasks = NUM_SETTERS + NUM_DELETERS;
@@ -306,8 +313,9 @@ async fn concurrent_or_map_merge_add_wins() {
 // =========================================================================
 
 /// Multiple tasks concurrently submit certified writes and advance frontiers.
-/// No write should be lost or misclassified.
-#[tokio::test]
+/// No write should be lost or misclassified. Verifies both certification
+/// status and that values are actually persisted in the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_certified_write_and_frontier_advance() {
     let authority_ids = ["auth-1", "auth-2", "auth-3"];
     let ns = make_namespace_with_authorities("data/", &authority_ids);
@@ -366,23 +374,41 @@ async fn concurrent_certified_write_and_frontier_advance() {
         locked.process_certifications();
     }
 
-    // Verify all writes are tracked (pending or certified).
+    // Verify all writes are tracked and values exist in the store.
     let locked = certified_api.lock().await;
     for i in 0..NUM_WRITERS {
         let key = format!("data/key-{i}");
+
+        // Check certification status.
         let status = locked.get_certification_status(&key);
-        // get_certification_status returns CertificationStatus directly (not Option).
-        // Writes that were submitted must be Pending or Certified.
         assert!(
             status == CertificationStatus::Pending || status == CertificationStatus::Certified,
             "write for {key} must be Pending or Certified, got {status:?}"
         );
+
+        // Verify the value actually exists in the store (not just status).
+        let read = locked.get_certified(&key);
+        assert!(
+            read.value.is_some(),
+            "key '{key}' must exist in store after certified_write"
+        );
+        // Verify the stored value matches what was written.
+        match read.value {
+            Some(CrdtValue::Counter(c)) => {
+                assert_eq!(
+                    c.value(),
+                    i as i64,
+                    "stored counter for {key} must have value {i}"
+                );
+            }
+            other => panic!("expected Counter for {key}, got {other:?}"),
+        }
     }
 }
 
 /// Concurrent signature collection on a MajorityCertificate must not
 /// produce duplicate signers or corrupt the certificate.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_certificate_signature_collection() {
     const NUM_AUTHORITIES: usize = 7;
 
@@ -454,8 +480,9 @@ async fn concurrent_certificate_signature_collection() {
 // =========================================================================
 
 /// Concurrent frontier updates from multiple authorities must not lose
-/// updates or regress frontiers.
-#[tokio::test]
+/// updates or regress frontiers. Checks both per-authority and majority
+/// frontier invariants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_frontier_updates_no_regression() {
     const NUM_AUTHORITIES: usize = 5;
     const UPDATES_PER_AUTHORITY: usize = 50;
@@ -491,14 +518,26 @@ async fn concurrent_frontier_updates_no_regression() {
     // After all updates, each authority's frontier should be at the highest
     // timestamp it ever reported (monotonic advancement).
     let locked = frontier_set.lock().await;
-    let max_ts = ts(
-        1000 + (UPDATES_PER_AUTHORITY - 1) as u64,
-        0,
-        "", // node_id doesn't matter for comparison
-    );
+    let max_physical = 1000 + (UPDATES_PER_AUTHORITY - 1) as u64;
 
-    // Check majority frontier: with 5 authorities all at the same max,
-    // majority_frontier should exist.
+    // Check per-authority frontiers: each authority must be at its max.
+    for auth_idx in 0..NUM_AUTHORITIES {
+        let auth_id = node_id(&format!("auth-{auth_idx}"));
+        let frontier = locked.get_for_scope(&kr("data/"), &PolicyVersion(1), &auth_id);
+        assert!(
+            frontier.is_some(),
+            "authority auth-{auth_idx} must have a frontier entry"
+        );
+        let f = frontier.unwrap();
+        assert_eq!(
+            f.frontier_hlc.physical, max_physical,
+            "auth-{auth_idx} frontier must be at max timestamp {max_physical}, got {}",
+            f.frontier_hlc.physical
+        );
+    }
+
+    // Also check majority frontier: with all authorities at the same max,
+    // majority_frontier should exist and be at or above max.
     let majority =
         locked.majority_frontier_for_scope(&kr("data/"), &PolicyVersion(1), NUM_AUTHORITIES);
     assert!(
@@ -508,14 +547,14 @@ async fn concurrent_frontier_updates_no_regression() {
 
     let mf = majority.unwrap();
     assert!(
-        mf.physical >= max_ts.physical,
+        mf.physical >= max_physical,
         "majority frontier must be at or above the maximum reported timestamp"
     );
 }
 
 /// Concurrent frontier updates across different key ranges must be isolated.
 /// Updates for "users/" must not affect "orders/" and vice versa.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_frontier_updates_across_key_ranges() {
     let frontier_set = Arc::new(Mutex::new(AckFrontierSet::new()));
     let prefixes = ["users/", "orders/", "events/"];
@@ -564,7 +603,7 @@ async fn concurrent_frontier_updates_across_key_ranges() {
 
 /// Concurrent store merges and compaction eligibility checks must not corrupt
 /// the store or produce inconsistent state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_store_merge_and_compaction_check() {
     const NUM_MERGE_TASKS: usize = 10;
     const NUM_COMPACTION_TASKS: usize = 5;
@@ -667,7 +706,7 @@ async fn concurrent_store_merge_and_compaction_check() {
 /// Simulates concurrent delta sync operations: multiple tasks push deltas
 /// to a shared store while others read the store state. Verifies that
 /// all pushed deltas are eventually reflected and no data is lost.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_delta_sync_push_pull() {
     const NUM_PUSH_TASKS: usize = 8;
     const NUM_PULL_TASKS: usize = 4;
@@ -740,7 +779,7 @@ async fn concurrent_delta_sync_push_pull() {
 
 /// Concurrent merges of the same key from multiple peers: all increments
 /// from all peers must be reflected in the final counter value.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_merge_same_key_multiple_peers() {
     const NUM_PEERS: usize = 20;
     const INCREMENTS_PER_PEER: usize = 50;
@@ -784,7 +823,7 @@ async fn concurrent_merge_same_key_multiple_peers() {
 
 /// Concurrent writes to different CRDT types must not interfere with each
 /// other or produce type mismatches.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_different_crdt_types() {
     const NUM_TASKS: usize = 12;
 
@@ -881,7 +920,7 @@ async fn concurrent_writes_different_crdt_types() {
 /// Concurrent frontier updates with fencing: once a version is fenced,
 /// no further updates for that version should be accepted, even under
 /// high concurrency.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_frontier_fencing() {
     let frontier_set = Arc::new(Mutex::new(AckFrontierSet::new()));
     const UPDATES_BEFORE_FENCE: usize = 10;
@@ -953,7 +992,7 @@ async fn concurrent_frontier_fencing() {
 /// High-concurrency interleaved reads, writes, and merges on the same
 /// EventualApi instance. Verifies that no panics or corruptions occur
 /// under heavy concurrent load.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stress_interleaved_operations() {
     const TOTAL_TASKS: usize = 50;
 
@@ -1038,12 +1077,13 @@ async fn stress_interleaved_operations() {
 }
 
 // =========================================================================
-// Test H: Pure CRDT merge order independence (no locks, thread pool)
+// Test H: Pure CRDT merge commutativity (different orderings, multi-thread)
 // =========================================================================
 
 /// Verify that merging N replicas in any order produces the same result.
-/// Uses concurrent tasks to exercise different merge orderings.
-#[tokio::test]
+/// Uses concurrent tasks on a multi-threaded runtime to exercise different
+/// merge orderings in parallel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn merge_order_independence_via_concurrent_fold() {
     const NUM_REPLICAS: usize = 10;
 
