@@ -123,26 +123,44 @@ where
     /// Node counters are merged by taking the maximum.
     /// Deferred (tombstone) sets are merged as a union.
     pub fn merge(&mut self, other: &OrSet<T>) {
+        let other_has_tombstones = !other.deferred.is_empty();
+
         // Process elements present in the other replica.
         for (elem, other_dots) in &other.elements {
-            let dots = self.elements.entry(elem.clone()).or_default();
-
-            // Add dots from other that we haven't tombstoned.
-            dots.extend(
-                other_dots
-                    .iter()
-                    .filter(|dot| !self.deferred.contains(dot))
-                    .cloned(),
-            );
-
-            // Remove our dots that the other has tombstoned.
-            dots.retain(|dot| !other.deferred.contains(dot));
+            if let Some(dots) = self.elements.get_mut(elem) {
+                // Element exists in both — merge dots in place without cloning the key.
+                for dot in other_dots {
+                    if !self.deferred.contains(dot) {
+                        dots.insert(dot.clone());
+                    }
+                }
+                // Remove our dots that the other has tombstoned.
+                if other_has_tombstones {
+                    dots.retain(|dot| !other.deferred.contains(dot));
+                }
+            } else {
+                // Element only in other — filter and insert directly.
+                let filtered: HashSet<Dot> = if self.deferred.is_empty() {
+                    other_dots.clone()
+                } else {
+                    other_dots
+                        .iter()
+                        .filter(|dot| !self.deferred.contains(dot))
+                        .cloned()
+                        .collect()
+                };
+                if !filtered.is_empty() {
+                    self.elements.insert(elem.clone(), filtered);
+                }
+            }
         }
 
         // Apply other's tombstones to self-only elements (not in other.elements).
-        for (elem, dots) in &mut self.elements {
-            if !other.elements.contains_key(elem) {
-                dots.retain(|dot| !other.deferred.contains(dot));
+        if other_has_tombstones {
+            for (elem, dots) in &mut self.elements {
+                if !other.elements.contains_key(elem) {
+                    dots.retain(|dot| !other.deferred.contains(dot));
+                }
             }
         }
 

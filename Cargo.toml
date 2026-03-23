@@ -55,6 +55,7 @@ hex = "0.4"
 redb = { version = "2", optional = true }
 bincode = { version = "2", features = ["serde"] }
 siphasher = "1"
+sha2 = "0.10"
 getrandom = "0.2"
 
 [dev-dependencies]

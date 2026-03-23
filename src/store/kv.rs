@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -151,7 +153,11 @@ impl Store {
     }
 
     /// Remove and return the value for the given key.
+    ///
+    /// Also removes the corresponding change-tracking timestamp so that
+    /// orphaned entries never accumulate in `self.timestamps`.
     pub fn delete(&mut self, key: &str) -> Option<CrdtValue> {
+        self.timestamps.remove(key);
         self.data.remove(key)
     }
 
@@ -236,6 +242,60 @@ impl Store {
         let json = serde_json::to_string(&envelope)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         backend.save(json.as_bytes())
+    }
+
+    /// Save the store as a bincode-encoded snapshot to the given path.
+    ///
+    /// Uses bincode for faster serialization compared to JSON (~2-4x speedup).
+    /// The snapshot includes a 4-byte format version prefix for forward
+    /// compatibility detection.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_snapshot_bincode(&self, path: &Path) -> io::Result<()> {
+        let backend = FileBackend::new(path);
+        self.save_to_backend_bincode(&backend)
+    }
+
+    /// Save the store to an arbitrary [`StorageBackend`] using bincode.
+    pub fn save_to_backend_bincode(&self, backend: &dyn StorageBackend) -> io::Result<()> {
+        let mut buf = Vec::new();
+        // Write format version as a 4-byte LE prefix.
+        buf.extend_from_slice(&CURRENT_FORMAT_VERSION.to_le_bytes());
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        buf.extend_from_slice(&encoded);
+        backend.save(&buf)
+    }
+
+    /// Load a store from a bincode-encoded snapshot at the given path.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_snapshot_bincode(path: &Path) -> io::Result<Self> {
+        let backend = FileBackend::new(path);
+        Self::load_from_backend_bincode(&backend)
+    }
+
+    /// Load a store from an arbitrary [`StorageBackend`] using bincode.
+    pub fn load_from_backend_bincode(backend: &dyn StorageBackend) -> io::Result<Self> {
+        let bytes = backend.load()?;
+        if bytes.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bincode snapshot too short",
+            ));
+        }
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if version > CURRENT_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::error::CrdtError::IncompatibleVersion {
+                    data_version: version,
+                    code_version: CURRENT_FORMAT_VERSION,
+                },
+            ));
+        }
+        let (store, _len) =
+            bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(store)
     }
 
     /// Load a store from a versioned JSON snapshot at the given path.
@@ -432,16 +492,33 @@ impl Store {
     ///
     /// Returns the number of timestamp entries pruned.
     pub fn prune_timestamps_before(&mut self, prefix: &str, frontier: &HlcTimestamp) -> usize {
-        let keys_to_prune: Vec<String> = self
-            .timestamps
-            .iter()
-            .filter(|(key, ts)| key.starts_with(prefix) && *ts <= frontier)
-            .map(|(key, _)| key.clone())
-            .collect();
-        let count = keys_to_prune.len();
-        for key in keys_to_prune {
-            self.timestamps.remove(&key);
+        // Use the BTreeMap's efficient prefix range scan to find candidate
+        // keys instead of scanning the entire timestamps HashMap.
+        let candidate_keys: Vec<String> = if prefix.is_empty() {
+            self.data.keys().cloned().collect()
+        } else if let Some(end) = prefix_upper_bound(prefix) {
+            self.data
+                .range::<String, _>(prefix.to_string()..end)
+                .map(|(k, _)| k.clone())
+                .collect()
+        } else {
+            self.data
+                .range::<String, _>(prefix.to_string()..)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+
+        let mut count = 0;
+        for key in candidate_keys {
+            if let Some(ts) = self.timestamps.get(&key)
+                && ts <= frontier
+            {
+                self.timestamps.remove(&key);
+                count += 1;
+            }
         }
+
         count
     }
 
@@ -635,6 +712,20 @@ mod tests {
     fn delete_nonexistent_returns_none() {
         let mut store = Store::new();
         assert!(store.delete("ghost").is_none());
+    }
+
+    #[test]
+    fn delete_also_removes_timestamp() {
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(1, 0, "n1"));
+        assert!(store.timestamp_for("k").is_some());
+
+        store.delete("k");
+        assert!(
+            store.timestamp_for("k").is_none(),
+            "timestamp should be removed when key is deleted"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1649,5 +1740,83 @@ mod tests {
         store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
         store.record_change("k", ts(100, 0, "n"));
         assert_eq!(store.timestamp_count(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Bincode snapshot tests (#306)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bincode_snapshot_roundtrip() {
+        let mut store = Store::new();
+        let n = node("bench-node");
+
+        let mut counter = PnCounter::new();
+        counter.increment(&n);
+        counter.increment(&n);
+        store.put("key-a".into(), CrdtValue::Counter(counter));
+        store.record_change("key-a", ts(100, 0, "bench-node"));
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("test-bincode.bin");
+
+        store.save_snapshot_bincode(&path).unwrap();
+        let loaded = Store::load_snapshot_bincode(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("key-a"));
+    }
+
+    #[test]
+    fn bincode_snapshot_preserves_timestamps() {
+        let mut store = Store::new();
+        let n = node("bench-node");
+
+        let mut counter = PnCounter::new();
+        counter.increment(&n);
+        store.put("key-a".into(), CrdtValue::Counter(counter));
+        store.record_change("key-a", ts(200, 5, "bench-node"));
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("test-bincode.bin");
+
+        store.save_snapshot_bincode(&path).unwrap();
+        let loaded = Store::load_snapshot_bincode(&path).unwrap();
+
+        let loaded_ts = loaded.timestamp_for("key-a").unwrap();
+        assert_eq!(loaded_ts.physical, 200);
+        assert_eq!(loaded_ts.logical, 5);
+    }
+
+    #[test]
+    fn bincode_snapshot_multiple_crdt_types() {
+        use crate::crdt::lww_register::LwwRegister;
+        use crate::crdt::or_set::OrSet;
+
+        let mut store = Store::new();
+        let n = node("n1");
+
+        let mut counter = PnCounter::new();
+        counter.increment(&n);
+        store.put("counter".into(), CrdtValue::Counter(counter));
+
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n);
+        store.put("set".into(), CrdtValue::Set(set));
+
+        let mut reg = LwwRegister::new();
+        reg.set("hello".to_string(), ts(100, 0, "n1"));
+        store.put("reg".into(), CrdtValue::Register(reg));
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("multi-type.bin");
+
+        store.save_snapshot_bincode(&path).unwrap();
+        let loaded = Store::load_snapshot_bincode(&path).unwrap();
+
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.contains_key("counter"));
+        assert!(loaded.contains_key("set"));
+        assert!(loaded.contains_key("reg"));
     }
 }
