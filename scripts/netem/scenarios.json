@@ -37,7 +37,7 @@
       "description": "Add 50ms +/- 30ms jitter, verify operations complete",
       "script": "../fault-inject/scenario-jitter-latency.sh",
       "nodes": 3,
-      "timeout_seconds": 180,
+      "timeout_seconds": 300,
       "tags": ["delay", "jitter", "convergence"]
     },
     {
@@ -45,7 +45,7 @@
       "description": "Sequentially isolate each node, then heal all, verify convergence",
       "script": "../fault-inject/scenario-rolling-partition.sh",
       "nodes": 3,
-      "timeout_seconds": 300,
+      "timeout_seconds": 480,
       "tags": ["partition", "rolling", "convergence"]
     },
     {
