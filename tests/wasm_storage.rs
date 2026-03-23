@@ -473,5 +473,5 @@ fn both_backends_coexist() {
     // Both remain usable.
     kv.put("user:3", b"carol").unwrap();
     assert_eq!(kv.len(), 3);
-    assert!(blob.load().unwrap().len() > 0);
+    assert!(!blob.load().unwrap().is_empty());
 }
