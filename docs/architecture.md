@@ -1,11 +1,11 @@
-# AsteroidDB Architecture
+# AsteroidDB アーキテクチャ
 
-This document describes the internal architecture of AsteroidDB, including
-component responsibilities, data flows, and key design decisions.
+本ドキュメントでは、AsteroidDB の内部アーキテクチャについて、コンポーネントの責務、
+データフロー、主要な設計判断を説明します。
 
-## Component Overview
+## コンポーネント概要
 
-AsteroidDB is structured around three planes that share a common node layer:
+AsteroidDB は共通のノードレイヤを共有する 3 つのプレーンで構成されています:
 
 ```mermaid
 graph TB
@@ -27,45 +27,45 @@ graph TB
 
 ### Data Plane
 
-Responsible for storing and replicating CRDT-based key-value data.
+CRDT ベースのキーバリューデータの保存とレプリケーションを担当します。
 
-| Component | Location | Role |
-|-----------|----------|------|
-| CRDT Store | `src/store/` | Versioned KV storage with PN-Counter, OR-Set, OR-Map, LWW-Register |
-| Delta Sync | `src/network/sync.rs` | Anti-entropy replication with batching and exponential backoff |
-| Compaction Engine | `src/compaction/engine.rs` | Removes compactable operation logs (majority-acknowledged only) |
-| Adaptive Tuner | `src/compaction/tuner.rs` | Adjusts compaction frequency based on write rate |
+| コンポーネント | 場所 | 役割 |
+|--------------|------|------|
+| CRDT Store | `src/store/` | バージョン管理付き KV ストレージ（PN-Counter, OR-Set, OR-Map, LWW-Register） |
+| Delta Sync | `src/network/sync.rs` | バッチ処理と指数バックオフ付き anti-entropy レプリケーション |
+| Compaction Engine | `src/compaction/engine.rs` | 圧縮可能な操作ログの削除（majority 確認済みのみ） |
+| Adaptive Tuner | `src/compaction/tuner.rs` | 書き込みレートに基づく圧縮頻度の自動調整 |
 
 ### Authority Plane
 
-Provides certified consistency by requiring majority acknowledgment from
-authority nodes assigned to a key range.
+キー範囲に割り当てられた Authority ノードの majority 確認を要求することで、
+Certified 整合性を提供します。
 
-| Component | Location | Role |
-|-----------|----------|------|
-| Ack Frontier | `src/authority/ack_frontier.rs` | Tracks HLC-based frontier of acknowledged updates per authority |
-| Certificate | `src/authority/certificate.rs` | Dual-mode (Ed25519 / BLS) majority certificate construction |
-| BLS Signatures | `src/authority/bls.rs` | BLS12-381 aggregate signatures via the `blst` crate |
-| Epoch Manager | `src/authority/certificate.rs` | Key rotation with 24h epochs, 7-epoch grace period |
+| コンポーネント | 場所 | 役割 |
+|--------------|------|------|
+| Ack Frontier | `src/authority/ack_frontier.rs` | Authority ごとの確認済み更新を HLC ベースの frontier で追跡 |
+| Certificate | `src/authority/certificate.rs` | デュアルモード（Ed25519 / BLS）majority certificate の構築 |
+| BLS Signatures | `src/authority/bls.rs` | `blst` クレート経由の BLS12-381 aggregate signatures |
+| Epoch Manager | `src/authority/certificate.rs` | 24 時間 epoch、7 epoch 猶予期間付き鍵ローテーション |
 
 ### Control Plane
 
-Manages cluster-wide configuration stored in the system namespace.
+system namespace に格納されたクラスタ全体の設定を管理します。
 
-| Component | Location | Role |
-|-----------|----------|------|
-| System Namespace | `src/control_plane/system_namespace.rs` | Stores placement policies and authority definitions |
-| Consensus | `src/control_plane/consensus.rs` | Quorum-based voting for policy mutations |
-| Placement Policy | `src/placement/policy.rs` | Tag matching, required/forbidden constraints, replica count |
-| Latency Model | `src/placement/latency.rs` | Sliding-window RTT tracking for latency-aware placement |
-| Topology View | `src/placement/topology.rs` | Groups nodes by region tags for topology-aware decisions |
-| Rebalance | `src/placement/rebalance.rs` | Computes rebalance plans when policy or membership changes |
+| コンポーネント | 場所 | 役割 |
+|--------------|------|------|
+| System Namespace | `src/control_plane/system_namespace.rs` | 配置ポリシーと Authority 定義の格納 |
+| Consensus | `src/control_plane/consensus.rs` | ポリシー変更に対する quorum ベースの投票 |
+| Placement Policy | `src/placement/policy.rs` | タグマッチング、必須/禁止制約、レプリカ数 |
+| Latency Model | `src/placement/latency.rs` | レイテンシ考慮配置のためのスライディングウィンドウ RTT 追跡 |
+| Topology View | `src/placement/topology.rs` | トポロジー考慮判断のためのリージョン別ノードグルーピング |
+| Rebalance | `src/placement/rebalance.rs` | ポリシーまたはメンバーシップ変更時のリバランス計画算出 |
 
-## Data Flows
+## データフロー
 
 ### Eventual Write
 
-An eventual write is accepted locally and propagated asynchronously.
+Eventual write はローカルで受理され、非同期で伝播します。
 
 ```mermaid
 sequenceDiagram
@@ -88,16 +88,14 @@ sequenceDiagram
     Note over N1,N3: All nodes converge to the same state
 ```
 
-Key properties:
-- Write returns immediately after local acceptance (low latency).
-- Delta sync runs periodically with exponential backoff on failure.
-- CRDT merge is commutative, associative, and idempotent -- order does not
-  matter.
+主な特性:
+- 書き込みはローカル受理後すぐにレスポンスを返却（低レイテンシ）。
+- Delta sync は定期的に実行され、失敗時は指数バックオフが適用。
+- CRDT マージは可換・結合・冪等であり、順序は問わない。
 
 ### Certified Write
 
-A certified write waits for majority authority acknowledgment before
-confirming.
+Certified write は majority Authority の確認を待ってから確定します。
 
 ```mermaid
 sequenceDiagram
@@ -121,13 +119,13 @@ sequenceDiagram
     N1-->>C: 200 OK {status: "certified", proof: {...}}
 ```
 
-Certificate construction:
-1. The writing node records the update with an HLC timestamp.
-2. Authority nodes exchange `ack_frontier` updates.
-3. When a majority of authorities have advanced their frontier past the
-   update's timestamp, a `majority_certificate` is assembled.
-4. In Ed25519 mode, individual signatures are collected. In BLS mode, they
-   are aggregated into a single compact signature.
+Certificate 構築の流れ:
+1. 書き込みノードが HLC タイムスタンプ付きで更新を記録。
+2. Authority ノードが `ack_frontier` の更新を交換。
+3. 過半数の Authority が更新のタイムスタンプを超えて frontier を進めると、
+   `majority_certificate` が組み立てられる。
+4. Ed25519 モードでは個別署名を収集。BLS モードでは単一のコンパクトな
+   署名に集約。
 
 ### Certified Read
 
@@ -145,10 +143,10 @@ sequenceDiagram
     end
 ```
 
-The `proof` bundle contains the frontier HLC, signer public keys, and
-signatures, allowing the client to independently verify the certificate.
+`proof` バンドルには frontier HLC、署名者の公開鍵、署名が含まれ、
+クライアントが独立して certificate を検証できます。
 
-### Control Plane Policy Update
+### Control Plane ポリシー更新
 
 ```mermaid
 sequenceDiagram
@@ -173,7 +171,7 @@ sequenceDiagram
     Note over N1,N3: Policy propagates to all nodes
 ```
 
-### Partition Recovery
+### パーティション回復
 
 ```mermaid
 sequenceDiagram
@@ -196,32 +194,30 @@ sequenceDiagram
     Note over N1,N2: Both nodes hold identical state
 ```
 
-## Node Modes
+## ノードモード
 
-Each node operates in one of three modes:
+各ノードは 3 つのモードのいずれかで動作します:
 
-| Mode | Stores data | Receives subscriptions | Use case |
-|------|-------------|----------------------|----------|
-| `store` | Yes | No | Primary data nodes |
-| `subscribe` | No | Yes | Read-only replicas, edge caches |
-| `both` | Yes | Yes | Full-featured nodes (default) |
+| モード | データ保存 | サブスクリプション受信 | 用途 |
+|--------|----------|-------------------|------|
+| `store` | あり | なし | プライマリデータノード |
+| `subscribe` | なし | あり | 読み取り専用レプリカ、エッジキャッシュ |
+| `both` | あり | あり | フル機能ノード（デフォルト） |
 
-## Placement Policy
+## 配置ポリシー
 
-Placement decisions are made via tag-based rules rather than a fixed
-`Region > DC > Rack` hierarchy. This allows the same policy engine to work
-for terrestrial multi-DC deployments and satellite constellations.
+配置の決定は、固定の `Region > DC > Rack` 階層ではなく、タグベースのルールで行います。
+これにより、同じポリシーエンジンで地上のマルチ DC デプロイメントと
+衛星コンステレーションの両方に対応できます。
 
-A policy specifies:
-- **Replica count** -- minimum number of copies.
-- **Required tags** -- nodes must have all specified tags to be eligible.
-- **Forbidden tags** -- nodes with any of these tags are excluded.
-- **Partition behavior** -- whether local writes are allowed during a
-  network split.
-- **Certified range** -- whether the key range participates in authority
-  certification.
+ポリシーでは以下を指定します:
+- **レプリカ数** -- コピーの最小数。
+- **必須タグ** -- 対象となるにはノードがすべての指定タグを持つ必要がある。
+- **禁止タグ** -- これらのタグを持つノードは除外。
+- **パーティション時の挙動** -- ネットワーク分断時にローカル書き込みを許可するかどうか。
+- **Certified 範囲** -- そのキー範囲が Authority certification に参加するかどうか。
 
-Example policy:
+ポリシーの例:
 
 ```json
 {
@@ -234,41 +230,38 @@ Example policy:
 }
 ```
 
-## Compaction
+## 圧縮 (Compaction)
 
-The compaction engine removes stale CRDT operation logs to reclaim space.
-Safety invariant: only operations acknowledged by a majority of authority
-nodes may be compacted.
+圧縮エンジンは古い CRDT 操作ログを削除してスペースを回収します。
+安全性の不変条件: 過半数の Authority ノードが確認した操作のみ圧縮可能。
 
-- **Checkpoint trigger**: every 30 seconds or 10,000 operations (whichever
-  comes first).
-- **Adaptive tuning**: the `WriteRateTracker` adjusts compaction frequency
-  based on observed write throughput.
-- **Digest verification**: periodic key-range checksums detect state
-  divergence, triggering re-verification on mismatch.
+- **チェックポイントトリガ**: 30 秒ごと、または 10,000 操作ごと（いずれか早い方）。
+- **適応型チューニング**: `WriteRateTracker` が観測された書き込みスループットに基づいて
+  圧縮頻度を調整。
+- **ダイジェスト検証**: 定期的なキー範囲チェックサムで状態の乖離を検出し、
+  不一致時に再検証をトリガ。
 
-## Key Design Decisions
+## 主要な設計判断
 
-| Decision | Rationale |
-|----------|-----------|
-| CRDT as the default | Partition tolerance is non-negotiable for high-latency links; CRDTs provide automatic convergence without coordination. |
-| Separate eventual / certified APIs | Lets applications choose consistency per operation instead of per database. |
-| Tag-based placement (no hierarchy) | A fixed Region > DC > Rack model breaks in satellite or ad-hoc deployments. Tags are strictly more flexible. |
-| HLC-based ack frontier | Hybrid Logical Clocks combine wall-clock ordering with causality tracking, surviving clock skew and compaction. |
-| Ed25519 + BLS dual mode | Ed25519 is simple and well-supported for MVP. BLS aggregate signatures reduce certificate size as the authority set grows. |
-| System namespace in the DB itself | Avoids an external coordination service (e.g., etcd). The control plane uses the same consensus mechanism it manages. |
-| Majority-only consensus (MVP) | Simpler than configurable quorum sizes. Sufficient for crash-fault tolerance. Byzantine tolerance is deferred. |
+| 判断 | 根拠 |
+|------|------|
+| CRDT をデフォルトに | 高遅延リンクにおいてパーティション耐性は交渉の余地なし。CRDT は調整なしの自動収束を提供。 |
+| Eventual / Certified API の分離 | データベース単位ではなく、操作単位で整合性をアプリケーションが選択可能に。 |
+| タグベース配置（階層なし） | 固定の Region > DC > Rack モデルは衛星やアドホックデプロイメントで破綻。タグは厳密にそれより柔軟。 |
+| HLC ベースの ack frontier | Hybrid Logical Clock はウォールクロック順序と因果追跡を組み合わせ、クロックスキューや圧縮に耐える。 |
+| Ed25519 + BLS デュアルモード | Ed25519 は MVP 向けにシンプルで広くサポートされている。BLS aggregate signatures は Authority セット拡大時に certificate サイズを削減。 |
+| System namespace を DB 自身に | 外部調整サービス（例: etcd）が不要。Control plane は自身が管理する同じ合意メカニズムを使用。 |
+| Majority のみの合意（MVP） | 構成可能な quorum サイズより単純。クラッシュ故障耐性には十分。Byzantine 耐性は将来対応。 |
 
-## Trade-offs
+## トレードオフ
 
-- **Availability over strong consistency by default**: Eventual mode
-  sacrifices linearizability for partition tolerance. Applications needing
-  strong guarantees must use the certified path, which adds latency.
-- **No Byzantine fault tolerance**: The MVP assumes crash faults only. A
-  malicious authority node can forge certificates. BFT is planned for a
-  future phase.
-- **Single-writer certified path**: Certified writes are currently initiated
-  by one node that collects acks. A true distributed commit protocol would
-  add more resilience but also more complexity.
-- **No sharding**: All nodes replicate all keys (filtered by placement
-  policy). True horizontal partitioning is a future extension.
+- **デフォルトでは可用性が強整合性より優先**: Eventual モードは
+  パーティション耐性のために線形化可能性を犠牲にする。強い保証が必要な
+  アプリケーションは Certified パスを使用する必要があり、レイテンシが増加。
+- **Byzantine 障害耐性なし**: MVP はクラッシュ故障のみを想定。悪意のある
+  Authority ノードは certificate を偽造可能。BFT は将来フェーズで計画。
+- **単一ライター Certified パス**: Certified write は現在 1 ノードが ack を
+  収集して開始。真の分散コミットプロトコルはより高い耐障害性を提供するが、
+  複雑さも増加。
+- **シャーディングなし**: すべてのノードがすべてのキーをレプリケート
+  （配置ポリシーでフィルタリング）。真の水平パーティショニングは将来の拡張。

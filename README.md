@@ -1,26 +1,24 @@
 # AsteroidDB
 
-A distributed key-value store that unifies eventual and certified consistency
-in a single cluster -- designed for environments ranging from multi-region
-data centers to high-latency satellite constellations.
+整合性レベルの異なるワークロードを単一クラスタで統合運用する分散キーバリューストア。
+マルチリージョンデータセンターから高遅延の衛星コンステレーションまで対応する設計です。
 
-## Key Features
+## 主要機能
 
-- **Dual consistency model** -- choose per-operation between availability-first
-  *eventual* writes (CRDT-based) and authority-confirmed *certified* writes.
-- **CRDT-native storage** -- PN-Counter, OR-Set, OR-Map, and LWW-Register with
-  automatic conflict-free merge after network partitions.
-- **BLS threshold signatures** -- majority certificates backed by BLS12-381
-  aggregate signatures (with Ed25519 fallback).
-- **Tag-based placement** -- no fixed topology hierarchy; replica placement is
-  controlled by arbitrary node tags, required/forbidden constraints, and
-  latency-aware ranking.
-- **SLO monitoring** -- built-in error-budget tracking for certification
-  latency, sync failure rate, and frontier skew.
-- **Control plane** -- system namespace stores placement policies and authority
-  definitions, updated via quorum consensus.
+- **デュアル整合性モデル** -- 操作ごとに可用性優先の *Eventual* 書き込み（CRDT ベース）と
+  Authority 確認済みの *Certified* 書き込みを選択可能。
+- **CRDT ネイティブストレージ** -- PN-Counter、OR-Set、OR-Map、LWW-Register を搭載し、
+  ネットワーク分断後も自動的にコンフリクトフリーなマージを実行。
+- **BLS threshold signatures** -- BLS12-381 aggregate signatures による majority certificate
+  （Ed25519 フォールバック付き）。
+- **タグベース配置** -- 固定のトポロジー階層なし。任意のノードタグ、必須/禁止制約、
+  レイテンシ考慮ランキングでレプリカ配置を制御。
+- **SLO モニタリング** -- certification レイテンシ、sync 失敗率、frontier スキューの
+  error budget トラッキングを内蔵。
+- **Control Plane** -- system namespace に配置ポリシーと Authority 定義を格納し、
+  quorum consensus で更新。
 
-## Architecture
+## アーキテクチャ
 
 ```
                          +-----------+
@@ -47,74 +45,71 @@ data centers to high-latency satellite constellations.
                     +----------------------+
 ```
 
-**Data Plane** -- Handles CRDT reads/writes, anti-entropy delta sync between
-peers, and log compaction. Writes are locally accepted and propagate
-asynchronously.
+**Data Plane** -- CRDT の読み書き、ピア間の anti-entropy delta sync、ログ圧縮を担当。
+書き込みはローカルで受理され、非同期で伝播します。
 
-**Authority Plane** -- A per-key-range group of authority nodes. When a
-majority acknowledges an update (tracked by HLC-based `ack_frontier`), a
-`majority_certificate` is issued. Clients can request certified reads with
-cryptographic proof.
+**Authority Plane** -- キー範囲ごとの Authority ノード群。過半数が更新を確認すると
+（HLC ベースの `ack_frontier` で追跡）、`majority_certificate` が発行されます。
+クライアントは暗号学的証明付きの Certified read を要求可能です。
 
-**Control Plane** -- Manages placement policies and authority definitions in
-a `system namespace`. Mutations require quorum consensus among control-plane
-authority nodes.
+**Control Plane** -- `system namespace` で配置ポリシーと Authority 定義を管理。
+変更には control-plane Authority ノード群の quorum consensus が必要です。
 
-## Quick Start
+## クイックスタート
 
-### Prerequisites
+### 前提条件
 
 - Rust toolchain (edition 2024, 1.85+)
-- Docker & Docker Compose (for multi-node cluster)
+- Docker & Docker Compose（マルチノードクラスタ用）
 
-### Build
+### ビルド
 
 ```bash
 cargo build --release
 ```
 
-### Run a single node
+### 単一ノードの実行
 
 ```bash
 cargo run
-# Listening on 127.0.0.1:3000
+# 127.0.0.1:3000 でリッスン開始
 ```
 
-Environment variables:
+環境変数:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ASTEROIDB_BIND_ADDR` | `127.0.0.1:3000` | HTTP listen address |
-| `ASTEROIDB_NODE_ID` | `node-1` | Unique node identifier |
-| `ASTEROIDB_ADVERTISE_ADDR` | same as bind | Address advertised to peers |
-| `ASTEROIDB_INTERNAL_TOKEN` | *(none)* | Bearer token for inter-node auth |
-| `ASTEROIDB_DATA_DIR` | `./data` | Persistence directory |
-| `ASTEROIDB_CONFIG` | *(none)* | Path to JSON config file |
-| `ASTEROIDB_BLS_SEED` | *(none)* | Hex-encoded 32-byte BLS key seed |
-| `ASTEROIDB_AUTHORITY_NODES` | `auth-1,auth-2,auth-3` | Comma-separated list of authority node IDs |
+| 変数 | デフォルト値 | 説明 |
+|------|------------|------|
+| `ASTEROIDB_BIND_ADDR` | `127.0.0.1:3000` | HTTP リッスンアドレス |
+| `ASTEROIDB_NODE_ID` | `node-1` | 一意なノード識別子 |
+| `ASTEROIDB_ADVERTISE_ADDR` | bind と同じ | ピアに公開するアドレス |
+| `ASTEROIDB_INTERNAL_TOKEN` | *(なし)* | ノード間認証用 Bearer トークン |
+| `ASTEROIDB_DATA_DIR` | `./data` | 永続化ディレクトリ |
+| `ASTEROIDB_CONFIG` | *(なし)* | JSON 設定ファイルのパス |
+| `ASTEROIDB_BLS_SEED` | *(なし)* | 16 進エンコードされた 32 バイト BLS 鍵シード |
+| `ASTEROIDB_AUTHORITY_NODES` | `auth-1,auth-2,auth-3` | Authority ノード ID のカンマ区切りリスト |
 
-### Run a 3-node cluster with Docker Compose
+### Docker Compose で 3 ノードクラスタを実行
 
 ```bash
-# Start
+# 起動
 docker compose up -d --build
 
-# Check health
+# ヘルスチェック
 scripts/cluster-status.sh
 
-# Stop
+# 停止
 docker compose down
 ```
 
-Nodes are exposed on `localhost:3001`, `localhost:3002`, `localhost:3003`.
+各ノードは `localhost:3001`、`localhost:3002`、`localhost:3003` で公開されます。
 
-### Run the interactive demo
+### インタラクティブデモの実行
 
 ```bash
 scripts/demo.sh
 ```
 
-## API Examples
+## API の使用例
 
 ### Eventual write (LWW Register)
 
@@ -131,28 +126,28 @@ curl -s http://localhost:3001/api/eventual/sensor-1 | jq .
 # {"key":"sensor-1","value":{"type":"register","value":"23.5"}}
 ```
 
-### CRDT counter operations
+### CRDT counter 操作
 
 ```bash
-# Increment a counter
+# カウンタのインクリメント
 curl -s -X POST http://localhost:3001/api/eventual/write \
   -H 'Content-Type: application/json' \
   -d '{"type":"counter_inc","key":"page-views"}'
 
-# Read counter
+# カウンタの読み取り
 curl -s http://localhost:3001/api/eventual/page-views | jq .
 # {"key":"page-views","value":{"type":"counter","value":1}}
 ```
 
-### OR-Set operations
+### OR-Set 操作
 
 ```bash
-# Add element to a set
+# Set に要素を追加
 curl -s -X POST http://localhost:3001/api/eventual/write \
   -H 'Content-Type: application/json' \
   -d '{"type":"set_add","key":"tags","element":"important"}'
 
-# Remove element
+# 要素を削除
 curl -s -X POST http://localhost:3001/api/eventual/write \
   -H 'Content-Type: application/json' \
   -d '{"type":"set_remove","key":"tags","element":"important"}'
@@ -170,14 +165,14 @@ curl -s -X POST http://localhost:3001/api/certified/write \
   }'
 ```
 
-### Certified read (with proof)
+### Certified read（証明付き）
 
 ```bash
 curl -s http://localhost:3001/api/certified/balance | jq .
-# Returns value + certification status + cryptographic proof bundle
+# 値 + 認証ステータス + 暗号学的証明バンドルを返却
 ```
 
-### Check certification status
+### 認証ステータスの確認
 
 ```bash
 curl -s http://localhost:3001/api/status/balance | jq .
@@ -190,7 +185,7 @@ curl -s http://localhost:3001/api/status/balance | jq .
 curl -s http://localhost:3001/api/slo | jq .
 ```
 
-### Metrics
+### メトリクス
 
 ```bash
 curl -s http://localhost:3001/api/metrics | jq .
@@ -198,138 +193,138 @@ curl -s http://localhost:3001/api/metrics | jq .
 
 ## CLI
 
-The `asteroidb-cli` binary provides operational commands:
+`asteroidb-cli` バイナリは運用コマンドを提供します:
 
 ```bash
-# Build the CLI
+# CLI のビルド
 cargo build --release --bin asteroidb-cli
 
-# Node status summary
+# ノードステータスの概要
 asteroidb-cli status
 
-# Read a key
+# キーの読み取り
 asteroidb-cli get sensor-1
 
-# Write a register value
+# Register 値の書き込み
 asteroidb-cli put sensor-1 "23.5"
 
-# Detailed metrics
+# 詳細メトリクス
 asteroidb-cli metrics
 
 # SLO error budget
 asteroidb-cli slo
 ```
 
-Use `--host` or `ASTEROIDB_HOST` to target a specific node:
+`--host` または `ASTEROIDB_HOST` で対象ノードを指定:
 
 ```bash
 asteroidb-cli --host 127.0.0.1:3002 status
 ```
 
-## Development
+## 開発
 
-### Build and test
+### ビルドとテスト
 
 ```bash
-cargo build                    # Debug build
-cargo build --release          # Release build
-cargo test                     # All tests
-cargo test --lib               # Library unit tests only
-cargo test <module>            # Specific module
+cargo build                    # デバッグビルド
+cargo build --release          # リリースビルド
+cargo test                     # 全テスト
+cargo test --lib               # ライブラリユニットテストのみ
+cargo test <module>            # 特定モジュール
 ```
 
-### Lint and format
+### Lint とフォーマット
 
 ```bash
-cargo fmt --check              # Check formatting
-cargo fmt                      # Auto-format
+cargo fmt --check              # フォーマット確認
+cargo fmt                      # 自動フォーマット
 cargo clippy -- -D warnings    # Lint (CI gate)
 ```
 
-### CI gate (must pass before merge)
+### CI gate（マージ前に通過必須）
 
 ```bash
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
-### Network simulation
+### ネットワークシミュレーション
 
 ```bash
-# Lightweight netem scenarios (requires tc / NET_ADMIN)
+# 軽量 netem シナリオ (tc / NET_ADMIN が必要)
 scripts/test-netem-light.sh
 ```
 
-## Project Structure
+## プロジェクト構成
 
 ```
 src/
-  lib.rs                  # Library root
-  main.rs                 # Binary entry point (HTTP server + NodeRunner)
-  bin/cli.rs              # asteroidb-cli binary
-  crdt/                   # CRDT implementations
+  lib.rs                  # ライブラリルート
+  main.rs                 # バイナリエントリポイント (HTTP サーバー + NodeRunner)
+  bin/cli.rs              # asteroidb-cli バイナリ
+  crdt/                   # CRDT 実装
     pn_counter.rs         #   PN-Counter
     or_set.rs             #   OR-Set
     or_map.rs             #   OR-Map + LWW-Register
     lww_register.rs       #   LWW-Register
-  store/                  # Versioned KV storage with persistence
-  authority/              # Consensus and certificate management
-    ack_frontier.rs       #   HLC-based frontier tracking
-    certificate.rs        #   Ed25519 / BLS dual-mode certificates
+  store/                  # バージョン管理付き KV ストレージ + 永続化
+  authority/              # 合意・証明書管理
+    ack_frontier.rs       #   HLC ベースの frontier 追跡
+    certificate.rs        #   Ed25519 / BLS デュアルモード証明書
     bls.rs                #   BLS12-381 threshold signatures
-  placement/              # Tag-based replica placement
-    policy.rs             #   Placement policies
-    latency.rs            #   Sliding-window RTT model
-    topology.rs           #   Region-aware topology view
-    rebalance.rs          #   Rebalance plan computation
-  control_plane/          # System namespace and quorum consensus
-  network/                # Peer management and delta sync
-    membership.rs         #   Fan-out join/leave protocol
-    sync.rs               #   Anti-entropy delta sync with backoff
-  ops/                    # Operational tooling
-    metrics.rs            #   Runtime metrics collection
-    slo.rs                #   SLO framework and error budgets
-  compaction/             # Log compaction engine
-    engine.rs             #   Compaction with adaptive tuning
-    tuner.rs              #   Write-rate tracker
-  api/                    # Client API logic
+  placement/              # タグベースレプリカ配置
+    policy.rs             #   配置ポリシー
+    latency.rs            #   スライディングウィンドウ RTT モデル
+    topology.rs           #   リージョン対応トポロジービュー
+    rebalance.rs          #   リバランス計画の算出
+  control_plane/          # System namespace と quorum consensus
+  network/                # ピア管理と delta sync
+    membership.rs         #   Fan-out join/leave プロトコル
+    sync.rs               #   Anti-entropy delta sync（backoff 付き）
+  ops/                    # 運用ツーリング
+    metrics.rs            #   ランタイムメトリクス収集
+    slo.rs                #   SLO フレームワークと error budget
+  compaction/             # ログ圧縮エンジン
+    engine.rs             #   適応型チューニング付き圧縮
+    tuner.rs              #   書き込みレートトラッカー
+  api/                    # クライアント API ロジック
     certified.rs          #   Certified read/write
     eventual.rs           #   Eventual read/write
-    status.rs             #   Certification status
-  http/                   # HTTP API layer (Axum)
-    routes.rs             #   Route definitions
-    handlers.rs           #   Request handlers
-    types.rs              #   Request/response types
-    auth.rs               #   Bearer token middleware
+    status.rs             #   認証ステータス
+  http/                   # HTTP API レイヤ (Axum)
+    routes.rs             #   ルート定義
+    handlers.rs           #   リクエストハンドラ
+    types.rs              #   リクエスト/レスポンス型
+    auth.rs               #   Bearer トークンミドルウェア
   hlc.rs                  # Hybrid Logical Clock
-  node.rs                 # Node definition
-  error.rs                # Shared error types
-  types.rs                # Shared type definitions
-  runtime/                # NodeRunner background loops
-docs/                     # Documentation
-configs/                  # Per-node JSON configs for Docker
-scripts/                  # Cluster management and test scripts
-tests/                    # Integration / E2E tests
+  node.rs                 # ノード定義
+  error.rs                # 共通エラー型
+  types.rs                # 共通型定義
+  runtime/                # NodeRunner バックグラウンドループ
+docs/                     # ドキュメント
+configs/                  # Docker 用ノード別 JSON 設定
+scripts/                  # クラスタ管理・テストスクリプト
+tests/                    # 統合 / E2E テスト
 ```
 
-## Documentation
+## ドキュメント
 
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/architecture.md) | Component design, data flows, and sequence diagrams |
-| [Getting Started](docs/getting-started.md) | Build, run, and verify AsteroidDB |
-| [Benchmark](docs/benchmark.md) | Performance benchmarks and profiling |
-| [Netem Testing](docs/netem-testing.md) | Network emulation test scenarios |
-| [Security](SECURITY.md) | Threat model, trust boundaries, and cryptographic primitives |
-| [Vision](docs/vision.md) | Project goals and scope |
-| [Requirements](docs/requirements.md) | MVP functional and non-functional requirements |
+| ドキュメント | 説明 |
+|------------|------|
+| [アーキテクチャ](docs/architecture.md) | コンポーネント設計、データフロー、シーケンス図 |
+| [はじめに](docs/getting-started.md) | AsteroidDB のビルド・実行・検証 |
+| [ベンチマーク](docs/benchmark.md) | パフォーマンスベンチマークとプロファイリング |
+| [Netem テスト](docs/netem-testing.md) | ネットワークエミュレーションテストシナリオ |
+| [セキュリティ](SECURITY.md) | 脅威モデル、信頼境界、暗号プリミティブ |
+| [ビジョン](docs/vision.md) | プロジェクトの目標とスコープ |
+| [要件定義](docs/requirements.md) | MVP 機能要件・非機能要件 |
 
-## Contributing
+## コントリビューション
 
-Contributions are welcome! By submitting a pull request you agree to the
-[Contributor License Agreement](CLA.md). Please sign off your commits with
-`git commit -s`.
+コントリビューションを歓迎します！ プルリクエストの送信により
+[コントリビューターライセンス契約](CLA.md) に同意したものとみなされます。
+コミットには `git commit -s` でサインオフを付与してください。
 
-## License
+## ライセンス
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for
-details.
+Apache License, Version 2.0 の下でライセンスされています。
+詳細は [LICENSE](LICENSE) を参照してください。

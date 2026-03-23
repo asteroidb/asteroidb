@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, watch};
 
 use crate::api::certified::CertifiedApi;
 use crate::api::eventual::EventualApi;
+#[cfg(feature = "native-crypto")]
 use crate::authority::bls::BlsKeypair;
 use crate::authority::certificate::{EpochConfig, EpochManager};
 use crate::authority::frontier_reporter::FrontierReporter;
@@ -36,6 +37,10 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// When present, the node generates a BLS keypair and registers its public
 /// key in the `EpochManager`'s keyset registry. Nodes without this config
 /// continue using Ed25519 signatures only (backward compat).
+///
+/// Requires the `native-crypto` feature for actual BLS key generation.
+/// Without that feature, `BlsConfig` can still be provided but will be
+/// silently ignored (Ed25519-only mode is used).
 #[derive(Debug, Clone)]
 pub struct BlsConfig {
     /// 32-byte seed (IKM) for BLS key generation.
@@ -190,7 +195,12 @@ pub struct NodeRunner {
     /// Generated from `BlsConfig::seed` when BLS is configured. Used to
     /// produce BLS signatures and enable `DualModeCertificate` with
     /// `CertificateMode::Bls` instead of Ed25519-only certificates.
+    ///
+    /// Only available with the `native-crypto` feature.
+    #[cfg(feature = "native-crypto")]
     bls_keypair: Option<BlsKeypair>,
+    #[cfg(not(feature = "native-crypto"))]
+    bls_keypair: Option<()>,
     /// Tombstone garbage collector for CRDT deferred sets.
     ///
     /// Periodically removes safely-reclaimable tombstone dots from
@@ -247,6 +257,7 @@ impl NodeRunner {
     ///
     /// Uses the current wall-clock time as the epoch base so that epoch 0
     /// starts at the time the node is created.
+    #[cfg(feature = "native-crypto")]
     fn init_epoch_and_bls(
         config: &NodeRunnerConfig,
         node_id: &NodeId,
@@ -267,6 +278,20 @@ impl NodeRunner {
         });
 
         (epoch_manager, bls_keypair)
+    }
+
+    /// Initialize epoch manager without BLS (native-crypto disabled).
+    #[cfg(not(feature = "native-crypto"))]
+    fn init_epoch_and_bls(
+        config: &NodeRunnerConfig,
+        _node_id: &NodeId,
+    ) -> (EpochManager, Option<()>) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let epoch_manager = EpochManager::new(config.epoch_config.clone(), now_secs);
+        (epoch_manager, None)
     }
 
     /// Create a new `NodeRunner` without anti-entropy sync.
@@ -562,6 +587,9 @@ impl NodeRunner {
     }
 
     /// Return a reference to the BLS keypair, if configured.
+    ///
+    /// Only available with the `native-crypto` feature.
+    #[cfg(feature = "native-crypto")]
     pub fn bls_keypair(&self) -> Option<&BlsKeypair> {
         self.bls_keypair.as_ref()
     }
@@ -572,6 +600,7 @@ impl NodeRunner {
     /// registered in the keyset registry, otherwise `CertificateMode::Ed25519`.
     pub fn certificate_mode(&self) -> crate::authority::certificate::CertificateMode {
         use crate::authority::certificate::CertificateMode;
+        #[cfg(feature = "native-crypto")]
         if self.bls_keypair.is_some() {
             let version = self.epoch_manager.registry().current_version();
             if self
