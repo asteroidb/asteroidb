@@ -55,6 +55,7 @@ hex = "0.4"
 redb = { version = "2", optional = true }
 bincode = { version = "2", features = ["serde"] }
 siphasher = "1"
+sha2 = "0.10"
 getrandom = "0.2"
 
 [dev-dependencies]
@@ -96,3 +97,11 @@ harness = false
 name = "signature_bench"
 harness = false
 required-features = ["native-crypto"]
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "compaction_bench"
+harness = false
