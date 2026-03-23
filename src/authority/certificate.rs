@@ -1180,6 +1180,7 @@ impl BlsVerifyCache {
     fn cache_key(message: &[u8], sig_bytes: &[u8], signer_ids: &[NodeId]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
+        hasher.update((message.len() as u64).to_le_bytes());
         hasher.update(message);
         hasher.update(sig_bytes);
         for id in signer_ids {

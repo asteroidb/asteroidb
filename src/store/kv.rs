@@ -150,7 +150,11 @@ impl Store {
     }
 
     /// Remove and return the value for the given key.
+    ///
+    /// Also removes the corresponding change-tracking timestamp so that
+    /// orphaned entries never accumulate in `self.timestamps`.
     pub fn delete(&mut self, key: &str) -> Option<CrdtValue> {
+        self.timestamps.remove(key);
         self.data.remove(key)
     }
 
@@ -501,25 +505,6 @@ impl Store {
             }
         }
 
-        // Also clean orphaned timestamp entries for keys that have been
-        // deleted from `data` but still linger in `timestamps`.  These
-        // arise when `Store::delete()` removes a key from `data` without
-        // touching `timestamps`.
-        let orphaned: Vec<String> = self
-            .timestamps
-            .iter()
-            .filter(|(k, ts)| {
-                *ts <= frontier
-                    && !self.data.contains_key(k.as_str())
-                    && (prefix.is_empty() || k.starts_with(prefix))
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in orphaned {
-            self.timestamps.remove(&key);
-            count += 1;
-        }
-
         count
     }
 
@@ -713,6 +698,20 @@ mod tests {
     fn delete_nonexistent_returns_none() {
         let mut store = Store::new();
         assert!(store.delete("ghost").is_none());
+    }
+
+    #[test]
+    fn delete_also_removes_timestamp() {
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(1, 0, "n1"));
+        assert!(store.timestamp_for("k").is_some());
+
+        store.delete("k");
+        assert!(
+            store.timestamp_for("k").is_none(),
+            "timestamp should be removed when key is deleted"
+        );
     }
 
     // ---------------------------------------------------------------
