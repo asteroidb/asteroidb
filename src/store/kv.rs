@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +9,9 @@ use crate::crdt::or_set::OrSet;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
-use crate::store::backend::{FileBackend, StorageBackend};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::store::backend::FileBackend;
+use crate::store::backend::StorageBackend;
 use crate::store::migration;
 
 /// Current persistence format version written by this code.
@@ -220,7 +221,10 @@ impl Store {
     /// Uses a [`FileBackend`] internally for atomic write (write to `.tmp`
     /// then rename) to prevent corruption on crash. The snapshot includes
     /// a `format_version` field for forward compatibility.
-    pub fn save_snapshot(&self, path: &Path) -> io::Result<()> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_snapshot(&self, path: &std::path::Path) -> io::Result<()> {
         let backend = FileBackend::new(path);
         self.save_to_backend(&backend)
     }
@@ -296,7 +300,10 @@ impl Store {
     /// applies migrations if the data was written by an older version.
     /// Returns an error if the data version is newer than what this code
     /// supports (forward incompatibility).
-    pub fn load_snapshot(path: &Path) -> io::Result<Self> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_snapshot(path: &std::path::Path) -> io::Result<Self> {
         let backend = FileBackend::new(path);
         Self::load_from_backend(&backend)
     }
@@ -363,7 +370,10 @@ impl Store {
     ///
     /// Returns an error for incompatible versions or other I/O failures to
     /// prevent silent data loss.
-    pub fn load_snapshot_or_default(path: &Path) -> io::Result<Self> {
+    ///
+    /// Not available on `wasm32-unknown-unknown` (no filesystem access).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_snapshot_or_default(path: &std::path::Path) -> io::Result<Self> {
         match Self::load_snapshot(path) {
             Ok(store) => Ok(store),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
