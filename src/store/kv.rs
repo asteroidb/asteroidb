@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -247,6 +249,7 @@ impl Store {
     /// Uses bincode for faster serialization compared to JSON (~2-4x speedup).
     /// The snapshot includes a 4-byte format version prefix for forward
     /// compatibility detection.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_snapshot_bincode(&self, path: &Path) -> io::Result<()> {
         let backend = FileBackend::new(path);
         self.save_to_backend_bincode(&backend)
@@ -264,6 +267,7 @@ impl Store {
     }
 
     /// Load a store from a bincode-encoded snapshot at the given path.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_snapshot_bincode(path: &Path) -> io::Result<Self> {
         let backend = FileBackend::new(path);
         Self::load_from_backend_bincode(&backend)
