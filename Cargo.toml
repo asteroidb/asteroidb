@@ -71,3 +71,11 @@ harness = false
 name = "signature_bench"
 harness = false
 required-features = ["native-crypto"]
+
+[[bench]]
+name = "sync_bench"
+harness = false
+
+[[bench]]
+name = "compaction_bench"
+harness = false
