@@ -1,64 +1,61 @@
-# AsteroidDB Contributor License Agreement
+# AsteroidDB コントリビューターライセンス契約
 
-Thank you for your interest in contributing to AsteroidDB. This Contributor
-License Agreement ("Agreement") documents the rights granted by contributors
-to the AsteroidDB project.
+AsteroidDB へのコントリビューションにご関心をお寄せいただきありがとうございます。
+本コントリビューターライセンス契約（以下「本契約」）は、コントリビューターが
+AsteroidDB プロジェクトに付与する権利を文書化するものです。
 
-By submitting a pull request or otherwise contributing to this project, you
-agree to the following terms:
+プルリクエストの送信またはその他の方法で本プロジェクトにコントリビューションを
+行うことにより、以下の条件に同意したものとみなされます。
 
-## 1. Definitions
+## 1. 定義
 
-- **"You"** means the individual or legal entity submitting a Contribution.
-- **"Contribution"** means any original work of authorship, including any
-  modifications or additions to existing work, that you intentionally submit
-  to this project for inclusion.
+- **「あなた」** とは、コントリビューションを提出する個人または法人を指します。
+- **「コントリビューション」** とは、既存の著作物に対する修正や追加を含め、
+  あなたが本プロジェクトへの組み込みを意図して提出したオリジナルの著作物を指します。
 
-## 2. Grant of Copyright License
+## 2. 著作権ライセンスの付与
 
-You hereby grant to the AsteroidDB project maintainers and to recipients of
-software distributed by the project a perpetual, worldwide, non-exclusive,
-no-charge, royalty-free, irrevocable copyright license to reproduce, prepare
-derivative works of, publicly display, publicly perform, sublicense, and
-distribute your Contributions and such derivative works.
+あなたは、AsteroidDB プロジェクトのメンテナーおよび本プロジェクトが配布する
+ソフトウェアの受領者に対して、あなたのコントリビューションおよびその派生著作物を
+複製、派生著作物の作成、公開表示、公開演奏、サブライセンス、および配布するための
+永続的、全世界的、非独占的、無償、ロイヤリティフリー、取消不能な著作権ライセンスを
+付与します。
 
-## 3. Grant of Patent License
+## 3. 特許ライセンスの付与
 
-You hereby grant to the AsteroidDB project maintainers and to recipients of
-software distributed by the project a perpetual, worldwide, non-exclusive,
-no-charge, royalty-free, irrevocable patent license to make, have made, use,
-offer to sell, sell, import, and otherwise transfer your Contributions, where
-such license applies only to those patent claims licensable by you that are
-necessarily infringed by your Contribution(s) alone or by combination of your
-Contribution(s) with the project to which such Contribution(s) was submitted.
+あなたは、AsteroidDB プロジェクトのメンテナーおよび本プロジェクトが配布する
+ソフトウェアの受領者に対して、あなたのコントリビューションを製造、製造させ、使用、
+販売の申し出、販売、輸入、およびその他の方法で移転するための永続的、全世界的、
+非独占的、無償、ロイヤリティフリー、取消不能な特許ライセンスを付与します。
+ただし、このライセンスはあなたがライセンスを付与できる特許請求のうち、
+あなたのコントリビューション単独で、またはあなたのコントリビューションと
+提出先プロジェクトの組み合わせで必然的に侵害されるものにのみ適用されます。
 
-## 4. Representations
+## 4. 表明
 
-You represent that:
+あなたは以下を表明します:
 
-- Each Contribution is your original creation or you have sufficient rights to
-  submit it under this Agreement.
-- Your Contribution does not violate any third party's intellectual property
-  rights.
-- You are legally entitled to grant the above licenses.
-- If your employer has rights to intellectual property that you create, you
-  have received permission to make Contributions on behalf of that employer,
-  or your employer has waived such rights.
+- 各コントリビューションはあなたのオリジナルの創作物であるか、
+  本契約の下で提出するための十分な権利を有していること。
+- あなたのコントリビューションは第三者の知的財産権を侵害しないこと。
+- あなたは上記のライセンスを付与する法的権限を有していること。
+- あなたの雇用主があなたが創作する知的財産に対する権利を有する場合、
+  その雇用主の代わりにコントリビューションを行う許可を得ているか、
+  雇用主がそのような権利を放棄していること。
 
-## 5. Support and Warranty Disclaimer
+## 5. サポートおよび保証の免責
 
-Your Contributions are provided on an "AS IS" basis, without warranties or
-conditions of any kind, either express or implied.
+あなたのコントリビューションは「現状有姿」で提供され、明示または黙示を問わず、
+いかなる種類の保証または条件も付随しません。
 
-## 6. Agreement
+## 6. 契約
 
-By submitting a Contribution (via pull request, issue, or other means), you
-acknowledge that you have read and agree to the terms of this Agreement. You
-indicate your acceptance by adding a `Signed-off-by` line to your commit
-messages:
+コントリビューション（プルリクエスト、Issue、またはその他の手段による）を
+提出することにより、あなたは本契約の条件を読み、同意したことを確認します。
+コミットメッセージに `Signed-off-by` 行を追加することで同意を表明します:
 
 ```
 Signed-off-by: Your Name <your-email@example.com>
 ```
 
-This can be done automatically by using `git commit -s`.
+これは `git commit -s` を使用することで自動的に行えます。
