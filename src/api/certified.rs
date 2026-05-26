@@ -401,7 +401,7 @@ impl CertifiedApi {
         // a proof that corresponds to the old value.
         self.certified_cache.remove(&key);
 
-        let timestamp = self.clock.now().expect("HLC overflow");
+        let timestamp = self.clock.now()?;
 
         // Write to the local store (eventual consistency path).
         self.store.put(key.clone(), value.clone());

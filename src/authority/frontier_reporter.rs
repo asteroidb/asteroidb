@@ -1,5 +1,6 @@
 use crate::authority::ack_frontier::{AckFrontier, FrontierScope};
 use crate::control_plane::system_namespace::SystemNamespace;
+use crate::error::HlcError;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::types::{NodeId, PolicyVersion};
 
@@ -54,9 +55,9 @@ impl FrontierReporter {
     ///
     /// Because `Hlc::now()` is monotonic, successive calls will never
     /// produce timestamps that go backwards.
-    pub fn report_frontiers(&self, clock: &mut Hlc) -> Vec<AckFrontier> {
-        let now = clock.now().expect("HLC overflow");
-        self.report_frontiers_at(&now)
+    pub fn report_frontiers(&self, clock: &mut Hlc) -> Result<Vec<AckFrontier>, HlcError> {
+        let now = clock.now()?;
+        Ok(self.report_frontiers_at(&now))
     }
 
     /// Generate frontier reports for all authority scopes at a specific timestamp.
@@ -242,7 +243,7 @@ mod tests {
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         let mut clock = Hlc::new("auth-1".into());
 
-        let frontiers = reporter.report_frontiers(&mut clock);
+        let frontiers = reporter.report_frontiers(&mut clock).unwrap();
         assert_eq!(frontiers.len(), 1);
         // HLC clock should produce a valid timestamp.
         assert!(frontiers[0].frontier_hlc.physical > 0);
@@ -254,8 +255,8 @@ mod tests {
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         let mut clock = Hlc::new("auth-1".into());
 
-        let f1 = reporter.report_frontiers(&mut clock);
-        let f2 = reporter.report_frontiers(&mut clock);
+        let f1 = reporter.report_frontiers(&mut clock).unwrap();
+        let f2 = reporter.report_frontiers(&mut clock).unwrap();
 
         assert!(
             f2[0].frontier_hlc > f1[0].frontier_hlc,
@@ -383,7 +384,7 @@ mod tests {
         let reporter = FrontierReporter::new(node("store-node"), &ns);
         let mut clock = Hlc::new("store-node".into());
 
-        let frontiers = reporter.report_frontiers(&mut clock);
+        let frontiers = reporter.report_frontiers(&mut clock).unwrap();
         assert!(frontiers.is_empty());
     }
 

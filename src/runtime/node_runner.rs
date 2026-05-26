@@ -1212,7 +1212,13 @@ impl NodeRunner {
     }
 
     async fn process_certifications(&mut self) {
-        let now = self.clock.now().expect("HLC overflow");
+        let now = match self.clock.now() {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in process_certifications; skipping");
+                return;
+            }
+        };
         let now_ms = now.physical;
 
         let mut api = self.certified_api.lock().await;
@@ -1275,7 +1281,13 @@ impl NodeRunner {
     }
 
     async fn run_cleanup(&mut self) {
-        let now_ms = self.clock.now().expect("HLC overflow").physical;
+        let now_ms = match self.clock.now() {
+            Ok(ts) => ts.physical,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in run_cleanup; skipping");
+                return;
+            }
+        };
         let mut api = self.certified_api.lock().await;
         api.cleanup(now_ms);
     }
@@ -1307,10 +1319,19 @@ impl NodeRunner {
     /// Generate and apply frontier reports for this authority node.
     async fn report_frontiers(&mut self) {
         if let Some(reporter) = &self.frontier_reporter {
-            let frontiers = reporter.report_frontiers(&mut self.clock);
-            let mut api = self.certified_api.lock().await;
-            for f in frontiers {
-                api.update_frontier(f);
+            match reporter.report_frontiers(&mut self.clock) {
+                Ok(frontiers) => {
+                    let mut api = self.certified_api.lock().await;
+                    for f in frontiers {
+                        api.update_frontier(f);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "HLC overflow in report_frontiers; skipping frontier update"
+                    );
+                }
             }
         }
 
@@ -1569,15 +1590,24 @@ impl NodeRunner {
                                     // Record replication convergence SLO: time from
                                     // entry write (HLC physical) to push completion.
                                     if let Some(slo) = &self.slo_tracker {
-                                        let now_ms =
-                                            self.clock.now().expect("HLC overflow").physical;
-                                        for hlc in hlc_vec.iter().take(pushed) {
-                                            let convergence_ms =
-                                                now_ms.saturating_sub(hlc.physical) as f64;
-                                            slo.record_observation(
-                                                SLO_REPLICATION_CONVERGENCE,
-                                                convergence_ms,
-                                            );
+                                        match self.clock.now() {
+                                            Ok(ts) => {
+                                                let now_ms = ts.physical;
+                                                for hlc in hlc_vec.iter().take(pushed) {
+                                                    let convergence_ms =
+                                                        now_ms.saturating_sub(hlc.physical) as f64;
+                                                    slo.record_observation(
+                                                        SLO_REPLICATION_CONVERGENCE,
+                                                        convergence_ms,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "HLC overflow recording SLO convergence; skipping"
+                                                );
+                                            }
                                         }
                                     }
                                     // Advance peer frontier to the max HLC of the
@@ -1948,7 +1978,13 @@ impl NodeRunner {
     }
 
     async fn check_compaction(&mut self) {
-        let now = self.clock.now().expect("HLC overflow");
+        let now = match self.clock.now() {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in check_compaction; skipping");
+                return;
+            }
+        };
 
         // Drain per-key write ops recorded by HTTP handlers and aggregate
         // by key range prefix so that hot ranges trigger compaction
@@ -3394,7 +3430,8 @@ mod tests {
             let mut ea = eventual_api.lock().await;
             let mut counter = crate::crdt::pn_counter::PnCounter::new();
             counter.increment(&node_id("node-1"));
-            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
         }
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -3523,7 +3560,8 @@ mod tests {
             let mut ea = eventual_api.lock().await;
             let mut counter = crate::crdt::pn_counter::PnCounter::new();
             counter.increment(&node_id("node-1"));
-            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
         }
 
         let mut runner = NodeRunner::with_cluster_nodes(

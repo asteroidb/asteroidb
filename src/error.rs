@@ -47,6 +47,12 @@ pub enum CrdtError {
     Internal(String),
 }
 
+impl From<HlcError> for CrdtError {
+    fn from(e: HlcError) -> Self {
+        CrdtError::Internal(format!("HLC error: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

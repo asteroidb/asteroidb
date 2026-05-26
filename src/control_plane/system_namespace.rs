@@ -372,6 +372,17 @@ mod tests {
     }
 
     #[test]
+    fn set_placement_policy_rejects_zero_replica_count() {
+        let mut ns = SystemNamespace::new();
+        let invalid = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 0);
+        let err = ns.set_placement_policy(invalid).unwrap_err();
+        assert!(
+            matches!(err, crate::error::CrdtError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
     fn all_placement_policies_lists_all() {
         let mut ns = SystemNamespace::new();
         ns.set_placement_policy(make_policy("user/")).unwrap();

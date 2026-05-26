@@ -250,6 +250,40 @@ mod tests {
     }
 
     #[test]
+    fn now_returns_overflow_error_when_logical_is_at_max() {
+        // Drive the clock to physical=u64::MAX, logical=u32::MAX by first
+        // doing an update() with a far-future peer timestamp (logical=u32::MAX-1),
+        // which sets local logical to u32::MAX without itself overflowing.
+        // Then calling now() increments logical past u32::MAX → Overflow.
+        let mut clock = Hlc::new("node-a".into());
+        let near_max = HlcTimestamp {
+            physical: u64::MAX,
+            logical: u32::MAX - 1,
+            node_id: "node-b".into(),
+        };
+        clock.update(&near_max).expect("should not overflow yet");
+        // Now logical == u32::MAX, physical == u64::MAX.
+        // next now() must return Overflow.
+        let result = clock.now();
+        assert_eq!(result, Err(HlcError::Overflow));
+    }
+
+    #[test]
+    fn update_returns_overflow_error_when_logical_would_overflow() {
+        // A peer sends logical=u32::MAX with a physical timestamp far in the
+        // future.  The "received physical is ahead" branch attempts
+        // received.logical.checked_add(1) which overflows → Err.
+        let mut clock = Hlc::new("node-a".into());
+        let overflow_ts = HlcTimestamp {
+            physical: u64::MAX,
+            logical: u32::MAX,
+            node_id: "node-b".into(),
+        };
+        let result = clock.update(&overflow_ts);
+        assert_eq!(result, Err(HlcError::Overflow));
+    }
+
+    #[test]
     fn serialization_roundtrip() {
         let ts = HlcTimestamp {
             physical: 1_700_000_000_000,
