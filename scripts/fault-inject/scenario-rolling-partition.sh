@@ -22,7 +22,7 @@ NODE2_CONTAINER="asteroidb-node-2"
 NODE3_CONTAINER="asteroidb-node-3"
 KEY="fault-rolling-$$"
 
-CONVERGENCE_RETRIES=40
+CONVERGENCE_RETRIES=30
 CONVERGENCE_INTERVAL=3
 
 # Trap: remove all netem rules on exit.
@@ -40,15 +40,30 @@ if ! check_cluster "$NODE1_URL" "$NODE2_URL" "$NODE3_URL"; then
     exit 1
 fi
 
-# === STEP 2: Write initial data ===
-log_step 2 "Write 2 initial increments to node-1"
+# === STEP 2: Write initial data and wait for full cluster sync ===
+log_step 2 "Write 2 initial increments to node-1 and wait for cluster sync"
 for i in 1 2; do
     curl -sf -X POST "${NODE1_URL}/api/eventual/write" \
         -H "Content-Type: application/json" \
         -d "{\"type\":\"counter_inc\",\"key\":\"${KEY}\"}" > /dev/null
     echo "  Increment ${i}/2 sent"
 done
-sleep 3
+
+# Wait for all nodes to sync the initial writes before starting partitions.
+# This avoids a race where node-1 is partitioned before its writes propagate.
+echo "  Waiting for all nodes to see initial 2 writes..."
+initial_synced=true
+for pair in "node-1:${NODE1_URL}" "node-2:${NODE2_URL}" "node-3:${NODE3_URL}"; do
+    name="${pair%%:*}"
+    url="${pair#*:}"
+    if ! wait_for_convergence "2" "$url" "$name" 15 2 "$KEY"; then
+        echo "  WARNING: ${name} did not receive initial writes; proceeding anyway."
+        initial_synced=false
+    fi
+done
+if $initial_synced; then
+    echo "  All nodes confirmed initial state."
+fi
 
 # === STEP 3: Partition node-1, write to node-2, heal ===
 log_step 3 "Partition node-1, write 2 to node-2, heal node-1"
@@ -63,7 +78,7 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE1_CONTAINER"
-sleep 3
+sleep 5
 
 # === STEP 4: Partition node-2, write to node-3, heal ===
 log_step 4 "Partition node-2, write 2 to node-3, heal node-2"
@@ -93,6 +108,11 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
+
+# Allow sync to re-establish after the partition is removed.
+# Two full sync cycles (sync_interval=2s each) plus a small buffer is
+# sufficient for node-3 to send/receive the missing writes.
+sleep 6
 
 # === STEP 6: Verify convergence ===
 log_step 6 "Verify full convergence (expected total: 8)"
