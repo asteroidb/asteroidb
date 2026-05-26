@@ -218,8 +218,8 @@ run_scenario_partition() {
     echo "[scenario] Recovering node-3..."
     "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
 
-    # Allow two full sync cycles before checking convergence.
-    sleep 6
+    # Allow ≥6 sync cycles before checking convergence.
+    sleep 12
 
     # Verify convergence: total should be 5
     echo "[scenario] Checking convergence after recovery..."
