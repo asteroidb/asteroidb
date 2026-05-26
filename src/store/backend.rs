@@ -68,10 +68,7 @@ impl StorageBackend for FileBackend {
         // no-op) still get a distinct temporary path.
         let tmp_path = self.path.with_file_name(format!(
             "{}.{}.tmp",
-            self.path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
+            self.path.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id(),
         ));
         let mut file = File::create(&tmp_path)?;
@@ -407,7 +404,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
-        assert!(!leftover_tmp, "no .tmp file should remain after a successful save");
+        assert!(
+            !leftover_tmp,
+            "no .tmp file should remain after a successful save"
+        );
     }
 
     // ---------------------------------------------------------------

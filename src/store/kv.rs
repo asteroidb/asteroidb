@@ -1421,10 +1421,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
-        assert!(
-            !leftover_tmp,
-            "temp file should not persist on success"
-        );
+        assert!(!leftover_tmp, "temp file should not persist on success");
     }
 
     // ---------------------------------------------------------------
