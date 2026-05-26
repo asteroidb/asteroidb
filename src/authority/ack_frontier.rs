@@ -351,7 +351,11 @@ impl AckFrontierSet {
             self.frontiers.values().map(|f| &f.frontier_hlc).collect();
         timestamps.sort();
 
-        Some(timestamps[timestamps.len() - majority])
+        // saturating_sub prevents panic if the guard above is bypassed,
+        // but returns timestamps[0] (minimum) which may be incorrect.
+        // The guard `if frontiers.len() < majority { return None; }` should
+        // prevent this path under normal operation.
+        Some(timestamps[timestamps.len().saturating_sub(majority)])
     }
 
     /// Check whether a given timestamp is certified across all scopes.
@@ -397,7 +401,11 @@ impl AckFrontierSet {
         let mut timestamps: Vec<&HlcTimestamp> = scoped.iter().map(|f| &f.frontier_hlc).collect();
         timestamps.sort();
 
-        Some(timestamps[timestamps.len() - majority].clone())
+        // saturating_sub prevents panic if the guard above is bypassed,
+        // but returns timestamps[0] (minimum) which may be incorrect.
+        // The guard `if scoped.len() < majority { return None; }` should
+        // prevent this path under normal operation.
+        Some(timestamps[timestamps.len().saturating_sub(majority)].clone())
     }
 
     /// Check whether a given timestamp is certified within a specific scope.
