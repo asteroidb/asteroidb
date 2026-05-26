@@ -295,6 +295,29 @@ run_scenario_loss || S2_EXIT=$?
 scenario_result "Packet Loss (5%)" "$S2_EXIT" "$S2_START"
 echo ""
 
+# After packet loss removal, wait for node-2's gossip TCP connection to
+# recover before starting the partition scenario. Netem removal can leave
+# the TCP gossip session in a half-broken state that takes many seconds to
+# re-establish, even though the HTTP health endpoint still responds.
+echo "[light-netem] Waiting for node-2 gossip to recover post-packet-loss..."
+_sync_key="netem-light-recovery-$$"
+write_counter "$NODE1_URL" "$_sync_key" 1
+_gossip_ok=false
+for _attempt in $(seq 1 30); do
+    _val=$(extract_value "$(read_counter "$NODE2_URL" "$_sync_key")")
+    if [ "$_val" = "1" ]; then
+        _gossip_ok=true
+        break
+    fi
+    sleep 3
+done
+if $_gossip_ok; then
+    echo "[light-netem] node-2 gossip recovered."
+else
+    echo "[light-netem] WARN: node-2 gossip not confirmed after 90s; proceeding."
+fi
+echo ""
+
 # ======================================================================
 # Scenario 3: Partition (node-3 isolated for 3s, then recover)
 # ======================================================================
