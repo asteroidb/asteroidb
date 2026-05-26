@@ -55,7 +55,7 @@ impl FrontierReporter {
     /// Because `Hlc::now()` is monotonic, successive calls will never
     /// produce timestamps that go backwards.
     pub fn report_frontiers(&self, clock: &mut Hlc) -> Vec<AckFrontier> {
-        let now = clock.now();
+        let now = clock.now().expect("HLC overflow");
         self.report_frontiers_at(&now)
     }
 
@@ -206,7 +206,7 @@ mod tests {
         });
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(3), kr("data/"), 2).with_certified(true),
-        );
+        ).unwrap();
 
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         assert_eq!(

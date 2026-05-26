@@ -41,10 +41,18 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// Requires the `native-crypto` feature for actual BLS key generation.
 /// Without that feature, `BlsConfig` can still be provided but will be
 /// silently ignored (Ed25519-only mode is used).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BlsConfig {
     /// 32-byte seed (IKM) for BLS key generation.
     pub seed: [u8; 32],
+}
+
+impl std::fmt::Debug for BlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlsConfig")
+            .field("seed", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -1204,7 +1212,7 @@ impl NodeRunner {
     }
 
     async fn process_certifications(&mut self) {
-        let now = self.clock.now();
+        let now = self.clock.now().expect("HLC overflow");
         let now_ms = now.physical;
 
         let mut api = self.certified_api.lock().await;
@@ -1267,7 +1275,7 @@ impl NodeRunner {
     }
 
     async fn run_cleanup(&mut self) {
-        let now_ms = self.clock.now().physical;
+        let now_ms = self.clock.now().expect("HLC overflow").physical;
         let mut api = self.certified_api.lock().await;
         api.cleanup(now_ms);
     }
@@ -1561,7 +1569,7 @@ impl NodeRunner {
                                     // Record replication convergence SLO: time from
                                     // entry write (HLC physical) to push completion.
                                     if let Some(slo) = &self.slo_tracker {
-                                        let now_ms = self.clock.now().physical;
+                                        let now_ms = self.clock.now().expect("HLC overflow").physical;
                                         for hlc in hlc_vec.iter().take(pushed) {
                                             let convergence_ms =
                                                 now_ms.saturating_sub(hlc.physical) as f64;
@@ -1939,7 +1947,7 @@ impl NodeRunner {
     }
 
     async fn check_compaction(&mut self) {
-        let now = self.clock.now();
+        let now = self.clock.now().expect("HLC overflow");
 
         // Drain per-key write ops recorded by HTTP handlers and aggregate
         // by key range prefix so that hot ranges trigger compaction
@@ -2254,7 +2262,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3)).unwrap();
         wrap_ns(ns)
     }
 
@@ -2724,7 +2732,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1)).unwrap();
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -2859,7 +2867,7 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        ).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -2968,7 +2976,7 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        ).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3131,7 +3139,7 @@ mod tests {
                 PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                     .with_certified(true)
                     .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-            );
+            ).unwrap();
         }
 
         let handle = runner.shutdown_handle();
@@ -3166,7 +3174,7 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        ).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3239,7 +3247,7 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        ).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3300,7 +3308,7 @@ mod tests {
                 PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
                     .with_certified(true)
                     .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-            );
+            ).unwrap();
         }
 
         // Call detect_version_changes directly.
@@ -3342,7 +3350,7 @@ mod tests {
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        ).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3400,7 +3408,7 @@ mod tests {
                 .namespace()
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3));
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3)).unwrap();
         }
 
         // Detect version changes, which should compute a rebalance plan.
@@ -3473,7 +3481,7 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)).unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));

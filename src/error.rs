@@ -1,5 +1,12 @@
 use thiserror::Error;
 
+/// Error type for Hybrid Logical Clock operations.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum HlcError {
+    #[error("HLC logical counter overflow: physical clock is not advancing fast enough")]
+    Overflow,
+}
+
 /// Common error type for CRDT operations.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CrdtError {
@@ -23,6 +30,9 @@ pub enum CrdtError {
 
     #[error("timeout")]
     Timeout,
+
+    #[error("certification timed out waiting for authority quorum")]
+    CertificationTimeout,
 
     #[error("incompatible format version: data={data_version}, code={code_version}")]
     IncompatibleVersion {

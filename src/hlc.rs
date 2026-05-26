@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::HlcError;
+
 /// A snapshot of the Hybrid Logical Clock at a point in time.
 ///
 /// Ordering: physical time first, then logical counter, then node_id for total ordering.
@@ -54,27 +56,26 @@ impl Hlc {
     }
 
     /// Generate a new timestamp, ensuring monotonicity.
-    pub fn now(&mut self) -> HlcTimestamp {
+    ///
+    /// Returns `Err(HlcError::Overflow)` if the logical counter would overflow
+    /// `u32::MAX` without the physical clock advancing. This prevents silent
+    /// clamping (the former `saturating_add` behaviour) that would produce
+    /// duplicate timestamps and violate strict monotonicity.
+    pub fn now(&mut self) -> Result<HlcTimestamp, HlcError> {
         let wall = physical_ms();
 
         if wall > self.physical {
             self.physical = wall;
             self.logical = 0;
         } else {
-            self.logical = self.logical.saturating_add(1);
-            // If the logical counter saturated, advance the physical
-            // timestamp by 1 ms and reset logical to preserve monotonicity.
-            if self.logical == u32::MAX {
-                self.physical = self.physical.saturating_add(1);
-                self.logical = 0;
-            }
+            self.logical = self.logical.checked_add(1).ok_or(HlcError::Overflow)?;
         }
 
-        HlcTimestamp {
+        Ok(HlcTimestamp {
             physical: self.physical,
             logical: self.logical,
             node_id: self.node_id.clone(),
-        }
+        })
     }
 
     /// Update the local clock based on a received timestamp.
@@ -82,36 +83,33 @@ impl Hlc {
     /// Takes the maximum of the local physical time, the received physical time,
     /// and the current wall clock, then adjusts the logical counter accordingly.
     ///
-    /// Uses saturating arithmetic to prevent overflow when a peer sends
-    /// `logical: u32::MAX`. When saturation is detected the physical
-    /// timestamp is advanced by 1 ms and the logical counter is reset to 0,
-    /// preserving strict monotonicity.
-    pub fn update(&mut self, received: &HlcTimestamp) {
+    /// Returns `Err(HlcError::Overflow)` if the logical counter would overflow
+    /// `u32::MAX`. This surfaces clearly instead of silently clamping (the former
+    /// `saturating_add` behaviour), which could produce duplicate timestamps.
+    pub fn update(&mut self, received: &HlcTimestamp) -> Result<(), HlcError> {
         let wall = physical_ms();
         let max_physical = wall.max(self.physical).max(received.physical);
 
         if max_physical == self.physical && max_physical == received.physical {
             // All three equal (or wall <= both): advance logical beyond both.
-            self.logical = self.logical.max(received.logical).saturating_add(1);
+            self.logical = self
+                .logical
+                .max(received.logical)
+                .checked_add(1)
+                .ok_or(HlcError::Overflow)?;
         } else if max_physical == self.physical {
             // Local physical is ahead: just bump logical.
-            self.logical = self.logical.saturating_add(1);
+            self.logical = self.logical.checked_add(1).ok_or(HlcError::Overflow)?;
         } else if max_physical == received.physical {
             // Received physical is ahead: adopt its logical + 1.
-            self.logical = received.logical.saturating_add(1);
+            self.logical = received.logical.checked_add(1).ok_or(HlcError::Overflow)?;
         } else {
             // Wall clock is ahead of both: reset logical.
             self.logical = 0;
         }
 
         self.physical = max_physical;
-
-        // If the logical counter saturated, advance the physical timestamp
-        // by 1 ms and reset logical to preserve strict monotonicity.
-        if self.logical == u32::MAX {
-            self.physical = self.physical.saturating_add(1);
-            self.logical = 0;
-        }
+        Ok(())
     }
 }
 
@@ -130,9 +128,9 @@ mod tests {
     #[test]
     fn monotonicity() {
         let mut clock = Hlc::new("node-a".into());
-        let t1 = clock.now();
-        let t2 = clock.now();
-        let t3 = clock.now();
+        let t1 = clock.now().expect("HLC overflow");
+        let t2 = clock.now().expect("HLC overflow");
+        let t3 = clock.now().expect("HLC overflow");
 
         assert!(t1 < t2, "successive now() must increase");
         assert!(t2 < t3, "successive now() must increase");
@@ -141,7 +139,7 @@ mod tests {
     #[test]
     fn update_advances_clock() {
         let mut clock = Hlc::new("node-a".into());
-        let local = clock.now();
+        let local = clock.now().expect("HLC overflow");
 
         // Simulate receiving a timestamp far in the future.
         let future = HlcTimestamp {
@@ -149,16 +147,16 @@ mod tests {
             logical: 5,
             node_id: "node-b".into(),
         };
-        clock.update(&future);
+        clock.update(&future).expect("HLC overflow");
 
-        let after = clock.now();
+        let after = clock.now().expect("HLC overflow");
         assert!(after > future, "clock must advance past received timestamp");
     }
 
     #[test]
     fn update_with_past_timestamp() {
         let mut clock = Hlc::new("node-a".into());
-        let local = clock.now();
+        let local = clock.now().expect("HLC overflow");
 
         // A timestamp in the past should not regress the clock.
         let past = HlcTimestamp {
@@ -166,9 +164,9 @@ mod tests {
             logical: 0,
             node_id: "node-b".into(),
         };
-        clock.update(&past);
+        clock.update(&past).expect("HLC overflow");
 
-        let after = clock.now();
+        let after = clock.now().expect("HLC overflow");
         assert!(after > local, "clock must never regress");
     }
 
@@ -223,8 +221,8 @@ mod tests {
         let mut clock_a = Hlc::new("node-a".into());
         let mut clock_b = Hlc::new("node-b".into());
 
-        let ta = clock_a.now();
-        let tb = clock_b.now();
+        let ta = clock_a.now().expect("HLC overflow");
+        let tb = clock_b.now().expect("HLC overflow");
 
         // Even if physical times happen to match, timestamps are still totally ordered.
         assert_ne!(ta, tb, "different nodes produce different timestamps");
@@ -237,15 +235,15 @@ mod tests {
         let mut clock_a = Hlc::new("node-a".into());
         let mut clock_b = Hlc::new("node-b".into());
 
-        let ta1 = clock_a.now();
-        clock_b.update(&ta1);
-        let tb1 = clock_b.now();
+        let ta1 = clock_a.now().expect("HLC overflow");
+        clock_b.update(&ta1).expect("HLC overflow");
+        let tb1 = clock_b.now().expect("HLC overflow");
 
         // b's timestamp must be after a's.
         assert!(tb1 > ta1);
 
-        clock_a.update(&tb1);
-        let ta2 = clock_a.now();
+        clock_a.update(&tb1).expect("HLC overflow");
+        let ta2 = clock_a.now().expect("HLC overflow");
 
         // a's new timestamp must be after b's.
         assert!(ta2 > tb1);

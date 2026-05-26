@@ -43,7 +43,7 @@ impl EventualApi {
     /// to other nodes asynchronously. Records the HLC timestamp
     /// for delta sync tracking.
     pub fn eventual_write(&mut self, key: String, value: CrdtValue) {
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.put(key.clone(), value);
         self.store.record_change(&key, ts);
     }
@@ -70,7 +70,7 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.increment(&self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -96,7 +96,7 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.decrement(&self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -122,7 +122,7 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.add(element, &self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -147,7 +147,7 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.remove(&element.to_string());
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -175,11 +175,11 @@ impl EventualApi {
                     .put(key.to_string(), CrdtValue::Map(OrMap::new()));
             }
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.set(map_key, map_value, ts, &self.node_id);
         }
-        let change_ts = self.clock.now();
+        let change_ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, change_ts);
         Ok(())
     }
@@ -204,7 +204,7 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.delete(&map_key.to_string());
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -227,11 +227,11 @@ impl EventualApi {
                     .put(key.to_string(), CrdtValue::Register(LwwRegister::new()));
             }
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
             r.set(value, ts);
         }
-        let change_ts = self.clock.now();
+        let change_ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(key, change_ts);
         Ok(())
     }
@@ -243,7 +243,7 @@ impl EventualApi {
     /// for delta sync tracking.
     pub fn merge_remote(&mut self, key: String, remote_value: &CrdtValue) -> Result<(), CrdtError> {
         self.store.merge_value(key.clone(), remote_value)?;
-        let ts = self.clock.now();
+        let ts = self.clock.now().expect("HLC overflow");
         self.store.record_change(&key, ts);
         Ok(())
     }
@@ -260,7 +260,7 @@ impl EventualApi {
         remote_value: &CrdtValue,
         hlc: HlcTimestamp,
     ) -> Result<(), CrdtError> {
-        self.clock.update(&hlc);
+        self.clock.update(&hlc).expect("HLC overflow");
         self.store.merge_value(key.clone(), remote_value)?;
         // Always record the change using the maximum of the incoming HLC
         // and any existing timestamp for this key. This ensures that

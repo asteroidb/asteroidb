@@ -517,7 +517,7 @@ pub async fn set_placement_policy(
         let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
         let current_version = ns.version().0;
         let policy = build_policy(PolicyVersion(current_version + 1));
-        ns.set_placement_policy(policy.clone());
+        ns.set_placement_policy(policy.clone()).unwrap();
         policy
     };
 
@@ -1453,7 +1453,7 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
             let mut map = OrMap::new();
             let mut clock = Hlc::new("http-writer".into());
             for (k, v) in entries {
-                let ts = clock.now();
+                let ts = clock.now().expect("HLC overflow");
                 map.set(k.clone(), v.clone(), ts, &writer);
             }
             Ok(CrdtValue::Map(map))
@@ -1462,7 +1462,7 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
             let mut reg = LwwRegister::new();
             if let Some(v) = value {
                 let mut clock = Hlc::new("http-writer".into());
-                let ts = clock.now();
+                let ts = clock.now().expect("HLC overflow");
                 reg.set(v.clone(), ts);
             }
             Ok(CrdtValue::Register(reg))
