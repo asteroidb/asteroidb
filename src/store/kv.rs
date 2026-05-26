@@ -299,6 +299,10 @@ impl Store {
         // Apply schema migrations when the stored version is older than the
         // current format version, matching the behaviour of the JSON load path.
         if version < CURRENT_FORMAT_VERSION {
+            // SAFETY: V1ToV2 migration is currently a no-op (same schema), so the
+            // serde_json roundtrip here does not risk data loss. If future migrations
+            // introduce actual schema changes, this path must be updated to decode
+            // from a v1-specific type before applying migrations.
             let store_value = serde_json::to_value(&store)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let registry = migration::default_registry();
@@ -1832,5 +1836,63 @@ mod tests {
         assert!(loaded.contains_key("counter"));
         assert!(loaded.contains_key("set"));
         assert!(loaded.contains_key("reg"));
+    }
+
+    #[test]
+    fn bincode_v1_snapshot_migrates_on_load() {
+        use crate::store::backend::MemoryBackend;
+
+        // Build a v1 bincode snapshot by hand:
+        //   - 4-byte LE version prefix set to 1 (version 1)
+        //   - bincode-encoded Store payload (same schema as v2; V1ToV2 is a no-op)
+        let mut original = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        counter.increment(&node("A"));
+        original.put("hits".into(), CrdtValue::Counter(counter));
+        original.record_change("hits", ts(42, 0, "A"));
+
+        let mut set = OrSet::new();
+        set.add("alice".to_string(), &node("A"));
+        original.put("users".into(), CrdtValue::Set(set));
+
+        // Encode the store with bincode (no version prefix yet).
+        let payload = bincode::serde::encode_to_vec(&original, bincode::config::standard())
+            .expect("bincode encode failed");
+
+        // Prepend the v1 version prefix (little-endian u32 = 1).
+        let mut v1_bytes = Vec::with_capacity(4 + payload.len());
+        v1_bytes.extend_from_slice(&1u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&payload);
+
+        // Store the crafted v1 snapshot in a MemoryBackend.
+        let backend = MemoryBackend::new();
+        backend.save(&v1_bytes).unwrap();
+
+        // load_from_backend_bincode must detect version 1 < 2, apply migrations,
+        // and return the data intact (V1ToV2 is a no-op, so nothing changes).
+        let loaded = Store::load_from_backend_bincode(&backend)
+            .expect("v1 bincode snapshot should migrate and load successfully");
+
+        assert_eq!(loaded.len(), 2, "all keys must survive migration");
+
+        // Verify counter value survived the migration roundtrip.
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+
+        // Verify set value survived the migration roundtrip.
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => assert!(s.contains(&"alice".to_string())),
+            other => panic!("expected Set, got {:?}", other),
+        }
+
+        // Verify timestamps are restored after migration.
+        assert_eq!(
+            loaded.timestamp_for("hits"),
+            Some(&ts(42, 0, "A")),
+            "timestamp must survive migration"
+        );
     }
 }
