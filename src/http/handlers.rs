@@ -1011,6 +1011,12 @@ pub async fn internal_announce(
 
     // Validate the caller-supplied address to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    if !is_safe_peer_address(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "announce address is not safe (loopback or link-local): {}",
+            req.address
+        ))));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
