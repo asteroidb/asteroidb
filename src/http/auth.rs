@@ -3,20 +3,25 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 
 /// Compare two byte slices in constant time, independent of their lengths.
 ///
-/// Pads the shorter slice with zeros before calling `ct_eq` so that the
-/// comparison always processes `max(a.len(), b.len())` bytes, preventing
-/// a timing side-channel when the two tokens have different lengths.
+/// Zero-pads both slices to `max(a.len(), b.len())` bytes so the content
+/// comparison always runs over the same number of bytes. Length equality is
+/// then AND-ed in via `subtle::Choice` so that different-length inputs are
+/// rejected without leaking which byte position diverged.
 fn ct_eq_tokens(a: &[u8], b: &[u8]) -> bool {
     let max_len = a.len().max(b.len());
     let mut buf_a = vec![0u8; max_len];
     let mut buf_b = vec![0u8; max_len];
     buf_a[..a.len()].copy_from_slice(a);
     buf_b[..b.len()].copy_from_slice(b);
-    buf_a.ct_eq(&buf_b).into()
+    // Lengths must match AND content must match; both checked without
+    // short-circuiting so the total work is constant with respect to input.
+    let len_eq = Choice::from((a.len() == b.len()) as u8);
+    let content_eq = buf_a.ct_eq(&buf_b);
+    (len_eq & content_eq).into()
 }
 
 /// Axum middleware that validates Bearer token authentication.
@@ -181,5 +186,14 @@ mod tests {
     #[test]
     fn ct_eq_tokens_both_empty() {
         assert!(ct_eq_tokens(b"", b""));
+    }
+
+    #[test]
+    fn ct_eq_tokens_null_byte_padding_false_positive() {
+        // Zero-padding must not cause "secret" to match "secret\0\0":
+        // the shorter token padded to the same length would produce identical
+        // byte sequences without the length check, which ct_eq_tokens must reject.
+        assert!(!ct_eq_tokens(b"secret", b"secret\x00\x00"));
+        assert!(!ct_eq_tokens(b"secret\x00\x00", b"secret"));
     }
 }
