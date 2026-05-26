@@ -1135,22 +1135,21 @@ pub async fn internal_ping(
         // registry via a bare ping.
         // Apply the SSRF guard before writing sender_addr into the registry.
         if registry.get_peer(&sender_nid).is_some() {
-            if is_safe_peer_address(&req.sender_addr) {
-                if registry.update_address(&sender_nid, &req.sender_addr) {
-                    changed = true;
-                }
+            if is_safe_peer_address(&req.sender_addr)
+                && registry.update_address(&sender_nid, &req.sender_addr)
+            {
+                changed = true;
             }
         } else if state.internal_token.as_ref().is_some_and(|t| !t.is_empty()) {
-            if is_safe_peer_address(&req.sender_addr) {
-                if registry
+            if is_safe_peer_address(&req.sender_addr)
+                && registry
                     .add_peer(PeerConfig {
                         node_id: sender_nid.clone(),
                         addr: req.sender_addr.clone(),
                     })
                     .is_ok()
-                {
-                    changed = true;
-                }
+            {
+                changed = true;
             }
         } else {
             tracing::warn!(
