@@ -365,7 +365,7 @@ impl CertifiedApi {
     /// If the write is already certified at the current scoped frontier,
     /// returns `Ok(CertificationStatus::Certified)`. Otherwise, behaviour
     /// depends on `on_timeout`:
-    /// - `OnTimeout::Error` — returns `Err(CrdtError::Timeout)`.
+    /// - `OnTimeout::Error` — returns `Err(CrdtError::CertificationTimeout)`.
     /// - `OnTimeout::Pending` — returns `Ok(CertificationStatus::Pending)`.
     ///
     /// Callers using `OnTimeout::Pending` can poll with

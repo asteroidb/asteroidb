@@ -310,6 +310,11 @@ where
     /// When neither condition holds the dot is retained.  Callers that do
     /// not yet have reliable floor data should use [`compact_deferred`]
     /// instead, which applies only criterion (1).
+    ///
+    /// # Warning
+    /// The `floor` criterion alone can delete tombstones that have not yet
+    /// reached all replicas. Ensure the floor value only reflects versions
+    /// confirmed by all known replicas. Do not call during partial sync rounds.
     pub fn compact_deferred_with_floor(
         &mut self,
         version_floor: &std::collections::HashMap<NodeId, u64>,
