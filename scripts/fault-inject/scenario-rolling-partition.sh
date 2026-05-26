@@ -63,7 +63,7 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE1_CONTAINER"
-sleep 5
+sleep 8
 
 # === STEP 4: Partition node-2, write to node-3, heal ===
 log_step 4 "Partition node-2, write 2 to node-3, heal node-2"
@@ -78,7 +78,7 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER"
-sleep 3
+sleep 8
 
 # === STEP 5: Partition node-3, write to node-1, heal ===
 log_step 5 "Partition node-3, write 2 to node-1, heal node-3"
@@ -97,7 +97,7 @@ sleep 3
 # Allow sync to re-establish after the partition is removed.
 # Two full sync cycles (sync_interval=2s each) plus a small buffer is
 # sufficient for node-3 to send/receive the missing writes.
-sleep 6
+sleep 10
 
 # === STEP 6: Verify convergence ===
 log_step 6 "Verify full convergence (expected total: 8)"
