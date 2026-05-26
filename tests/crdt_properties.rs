@@ -621,13 +621,15 @@ proptest! {
             .unwrap()
             .clone();
 
-        let expected_val = if a.timestamp() == &max_ts {
-            a.get().cloned()
-        } else if b.timestamp() == &max_ts {
-            b.get().cloned()
-        } else {
-            c.get().cloned()
-        };
+        // When multiple registers share the max timestamp, the merge applies
+        // Ord tie-breaking on the value (largest wins) to guarantee
+        // commutativity. Collect the max value among all at max_ts.
+        let expected_val = [&a, &b, &c]
+            .iter()
+            .filter(|r| r.timestamp() == &max_ts)
+            .filter_map(|r| r.get())
+            .max()
+            .cloned();
 
         // Merge all three.
         let mut merged = a.clone();
