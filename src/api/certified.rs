@@ -890,7 +890,10 @@ mod tests {
         assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
         // The value must be accessible via the store (local write committed).
         let read = api.get_certified("key1");
-        assert!(read.value.is_some(), "local write must be committed even on CertificationTimeout");
+        assert!(
+            read.value.is_some(),
+            "local write must be committed even on CertificationTimeout"
+        );
     }
 
     // ---------------------------------------------------------------
