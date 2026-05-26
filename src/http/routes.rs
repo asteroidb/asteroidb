@@ -137,7 +137,8 @@ mod tests {
                 prefix: String::new(),
             },
             3,
-        )).unwrap();
+        ))
+        .unwrap();
 
         let namespace = Arc::new(RwLock::new(ns));
 

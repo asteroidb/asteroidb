@@ -206,7 +206,8 @@ mod tests {
         });
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(3), kr("data/"), 2).with_certified(true),
-        ).unwrap();
+        )
+        .unwrap();
 
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         assert_eq!(

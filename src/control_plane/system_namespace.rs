@@ -670,7 +670,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -711,7 +712,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         // Initial: 2 matching nodes
         let nodes_v1 = vec![
@@ -749,7 +751,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes_v1 = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -792,7 +795,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -813,7 +817,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -858,8 +863,10 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"])).unwrap();
-        ns.set_placement_policy(make_certified_policy("order/", &["dc:osaka"])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
+        ns.set_placement_policy(make_certified_policy("order/", &["dc:osaka"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -886,8 +893,10 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[])).unwrap();
-        ns.set_placement_policy(make_certified_policy("order/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
+        ns.set_placement_policy(make_certified_policy("order/", &[]))
+            .unwrap();
         let version_before = *ns.version();
 
         let nodes = vec![
@@ -906,7 +915,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -933,7 +943,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("order/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("order/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -999,7 +1010,8 @@ mod tests {
         let mut ns = SystemNamespace::new();
 
         // Add a certified policy for "data/" so recalculate creates an auto definition.
-        ns.set_placement_policy(make_certified_policy("data/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("data/", &[]))
+            .unwrap();
 
         // Manually set a catch-all authority definition.
         ns.set_authority_definition(AuthorityDefinition {
@@ -1042,7 +1054,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[])).unwrap();
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![make_node("n1", NodeMode::Store, &[])];
         ns.recalculate_authorities(&nodes);
