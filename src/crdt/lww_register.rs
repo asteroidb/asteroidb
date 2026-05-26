@@ -65,14 +65,29 @@ impl<T: Clone> LwwRegister<T> {
 impl<T: Clone + Ord> LwwRegister<T> {
     /// Merge another register into this one, keeping the value with the higher timestamp.
     ///
-    /// `HlcTimestamp` provides a total order (physical → logical → node_id), so
-    /// two genuinely concurrent writes from different nodes always have distinct
-    /// timestamps.  Using strict `>` here mirrors the behaviour of `set`, ensuring
-    /// both methods converge to the same winner and preventing replica divergence.
+    /// When timestamps are equal, the larger value (by `Ord`) wins to
+    /// guarantee commutativity: `merge(a, b)` always produces the same
+    /// result as `merge(b, a)`.
     pub fn merge(&mut self, other: &LwwRegister<T>) {
-        if other.timestamp > self.timestamp {
-            self.value = other.value.clone();
-            self.timestamp = other.timestamp.clone();
+        match other.timestamp.cmp(&self.timestamp) {
+            std::cmp::Ordering::Greater => {
+                self.value = other.value.clone();
+                self.timestamp = other.timestamp.clone();
+            }
+            std::cmp::Ordering::Equal => {
+                // Deterministic tiebreaker: keep the larger value so that
+                // merge(a, b) == merge(b, a) even when timestamps collide.
+                match (&self.value, &other.value) {
+                    (Some(s), Some(o)) if o > s => {
+                        self.value = other.value.clone();
+                    }
+                    (None, Some(_)) => {
+                        self.value = other.value.clone();
+                    }
+                    _ => {}
+                }
+            }
+            std::cmp::Ordering::Less => {}
         }
     }
 
