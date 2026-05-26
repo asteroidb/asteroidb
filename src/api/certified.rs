@@ -14,7 +14,13 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// What to do when `certified_write` cannot achieve consensus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnTimeout {
-    /// Return `CrdtError::Timeout`.
+    /// Return `CrdtError::CertificationTimeout`.
+    ///
+    /// The local write is already durable in the store when this error is
+    /// returned.  Callers can use this to distinguish a certification timeout
+    /// (write committed locally, certification did not complete) from a
+    /// generic failure.  Retry via `process_certifications` once more
+    /// Authority frontiers arrive, without re-issuing the write.
     Error,
     /// Accept the write as `Pending` and let the caller poll status later.
     Pending,
@@ -403,8 +409,11 @@ impl CertifiedApi {
 
         let timestamp = self.clock.now();
 
-        // Write to the local store (eventual consistency path).
+        // Write to the local store (eventual consistency path) and record the
+        // HLC timestamp so the entry is immediately visible to delta sync
+        // (`entries_since` / `delta_entries_since`).
         self.store.put(key.clone(), value.clone());
+        self.store.record_change(&key, timestamp.clone());
 
         // Check if already certified at the current scoped frontier.
         let already_certified = self.frontiers.is_certified_at_for_scope(
@@ -421,7 +430,7 @@ impl CertifiedApi {
         };
 
         let pw = PendingWrite {
-            key,
+            key: key.clone(),
             value,
             timestamp,
             status,
@@ -441,7 +450,13 @@ impl CertifiedApi {
         }
 
         match on_timeout {
-            OnTimeout::Error => Err(CrdtError::Timeout),
+            // The local write is already durable in the store.  Return a
+            // distinct error so callers can tell that the value IS present
+            // locally and only the Authority-majority certification timed
+            // out.  They can retry certification via `process_certifications`
+            // once more Authority frontiers arrive, without re-issuing the
+            // write.
+            OnTimeout::Error => Err(CrdtError::CertificationTimeout),
             OnTimeout::Pending => Ok(CertificationStatus::Pending),
         }
     }
@@ -867,10 +882,15 @@ mod tests {
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.certified_write("key1".into(), counter_value(1), OnTimeout::Error);
 
-        assert_eq!(result.unwrap_err(), CrdtError::Timeout);
+        // Must return the distinct CertificationTimeout error so callers know
+        // the local write succeeded and only certification timed out.
+        assert_eq!(result.unwrap_err(), CrdtError::CertificationTimeout);
         // The write should still be tracked as pending.
         assert_eq!(api.pending_writes().len(), 1);
         assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
+        // The value must be accessible via the store (local write committed).
+        let read = api.get_certified("key1");
+        assert!(read.value.is_some(), "local write must be committed even on CertificationTimeout");
     }
 
     // ---------------------------------------------------------------

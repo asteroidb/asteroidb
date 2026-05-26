@@ -493,6 +493,12 @@ impl IntoResponse for ApiError {
             CrdtError::Internal(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", msg.clone())
             }
+            CrdtError::CertificationTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "CERTIFICATION_TIMEOUT",
+                "local write committed but certification timed out waiting for authority quorum"
+                    .to_string(),
+            ),
         };
 
         let body = ErrorResponse {
