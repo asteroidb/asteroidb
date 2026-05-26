@@ -100,7 +100,8 @@ fn make_namespace(prefix: &str, authorities: &[&str]) -> Arc<RwLock<SystemNamesp
         PolicyVersion(1),
         key_range(prefix),
         authorities.len(),
-    ));
+    ))
+    .unwrap();
     wrap_ns(ns)
 }
 
@@ -766,9 +767,9 @@ fn hlc_ordering_in_certification() {
     let mut clock = Hlc::new("node-1".into());
 
     // Generate ordered timestamps
-    let t1 = clock.now();
-    let t2 = clock.now();
-    let t3 = clock.now();
+    let t1 = clock.now().expect("HLC overflow");
+    let t2 = clock.now().expect("HLC overflow");
+    let t3 = clock.now().expect("HLC overflow");
 
     // Verify ordering
     assert!(t1 < t2);
@@ -912,12 +913,14 @@ fn cross_range_certification_contamination_prevented() {
         PolicyVersion(1),
         key_range("user/"),
         3,
-    ));
+    ))
+    .unwrap();
     ns.set_placement_policy(PlacementPolicy::new(
         PolicyVersion(1),
         key_range("order/"),
         3,
-    ));
+    ))
+    .unwrap();
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -991,7 +994,8 @@ fn policy_version_transition_certification() {
     // Policy at version 2.
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(2), key_range("data/"), 3).with_certified(true),
-    );
+    )
+    .unwrap();
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 
@@ -1043,12 +1047,14 @@ fn longest_prefix_authority_resolution_in_integration() {
         PolicyVersion(1),
         key_range("user/"),
         3,
-    ));
+    ))
+    .unwrap();
     ns.set_placement_policy(PlacementPolicy::new(
         PolicyVersion(1),
         key_range("user/vip/"),
         2,
-    ));
+    ))
+    .unwrap();
 
     let mut api = CertifiedApi::new(node("node-1"), wrap_ns(ns));
 

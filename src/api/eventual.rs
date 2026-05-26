@@ -330,7 +330,8 @@ mod tests {
 
         let mut counter = PnCounter::new();
         counter.increment(&node("node-a"));
-        api.eventual_write("hits".into(), CrdtValue::Counter(counter)).unwrap();
+        api.eventual_write("hits".into(), CrdtValue::Counter(counter))
+            .unwrap();
 
         match api.get_eventual("hits") {
             Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
@@ -344,12 +345,14 @@ mod tests {
 
         let mut c1 = PnCounter::new();
         c1.increment(&node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(c1)).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Counter(c1))
+            .unwrap();
 
         let mut c2 = PnCounter::new();
         c2.increment(&node("node-a"));
         c2.increment(&node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(c2)).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Counter(c2))
+            .unwrap();
 
         match api.get_eventual("k") {
             Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
@@ -403,7 +406,8 @@ mod tests {
     #[test]
     fn counter_inc_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
 
         let err = api.eventual_counter_inc("k").unwrap_err();
         assert_eq!(
@@ -418,7 +422,8 @@ mod tests {
     #[test]
     fn counter_dec_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Register(LwwRegister::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Register(LwwRegister::new()))
+            .unwrap();
 
         let err = api.eventual_counter_dec("k").unwrap_err();
         assert_eq!(
@@ -477,7 +482,8 @@ mod tests {
     #[test]
     fn set_add_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api.eventual_set_add("k", "x".into()).unwrap_err();
         assert_eq!(
@@ -551,7 +557,8 @@ mod tests {
     #[test]
     fn map_set_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
 
         let err = api
             .eventual_map_set("k", "key".into(), "val".into())
@@ -602,7 +609,8 @@ mod tests {
     #[test]
     fn register_set_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api.eventual_register_set("k", "val".into()).unwrap_err();
         assert_eq!(
@@ -657,7 +665,8 @@ mod tests {
     #[test]
     fn merge_remote_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new())).unwrap();
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api
             .merge_remote("k".into(), &CrdtValue::Set(OrSet::new()))

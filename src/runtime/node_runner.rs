@@ -2490,6 +2490,8 @@ mod tests {
         });
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
+        // Compaction checkpoints are only created when an eventual_api is present.
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));
 
         let compaction_config = CompactionConfig {
             time_threshold_ms: 10,
@@ -2511,6 +2513,7 @@ mod tests {
 
         let mut runner =
             NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+        runner.set_eventual_api(eventual_api);
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {

@@ -70,7 +70,8 @@ fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         PolicyVersion(1),
         KeyRange { prefix: "".into() },
         3,
-    ));
+    ))
+    .unwrap();
     wrap_ns(ns)
 }
 

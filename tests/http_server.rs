@@ -36,7 +36,8 @@ fn test_state() -> Arc<AppState> {
             prefix: String::new(),
         },
         3,
-    ));
+    ))
+    .unwrap();
 
     let namespace = Arc::new(RwLock::new(ns));
 
@@ -304,7 +305,8 @@ fn test_state_with_slo() -> (Arc<AppState>, Arc<SloTracker>) {
             prefix: String::new(),
         },
         3,
-    ));
+    ))
+    .unwrap();
 
     let namespace = Arc::new(RwLock::new(ns));
 

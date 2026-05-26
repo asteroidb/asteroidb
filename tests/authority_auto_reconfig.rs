@@ -94,7 +94,7 @@ async fn authority_auto_created_from_certified_policy() {
     let policy = PlacementPolicy::new(PolicyVersion(1), kr("sensor/"), 3)
         .with_certified(true)
         .with_required_tags([tag("dc:tokyo")].into());
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = wrap_api(CertifiedApi::new(node_id("runner"), shared_ns.clone()));
@@ -150,7 +150,7 @@ async fn node_join_triggers_authority_recalculation() {
     let policy = PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
         .with_certified(true)
         .with_required_tags([tag("dc:tokyo")].into());
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = wrap_api(CertifiedApi::new(node_id("runner"), shared_ns.clone()));
@@ -211,7 +211,7 @@ async fn node_leave_triggers_authority_recalculation() {
     let policy = PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
         .with_certified(true)
         .with_required_tags([tag("dc:tokyo")].into());
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = wrap_api(CertifiedApi::new(node_id("runner"), shared_ns.clone()));
@@ -271,7 +271,7 @@ async fn policy_change_triggers_authority_recalculation() {
     let policy_v1 = PlacementPolicy::new(PolicyVersion(1), kr("events/"), 3)
         .with_certified(true)
         .with_required_tags([tag("dc:tokyo")].into());
-    ns.set_placement_policy(policy_v1);
+    ns.set_placement_policy(policy_v1).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = wrap_api(CertifiedApi::new(node_id("runner"), shared_ns.clone()));
@@ -307,7 +307,7 @@ async fn policy_change_triggers_authority_recalculation() {
             let policy_v2 = PlacementPolicy::new(PolicyVersion(2), kr("events/"), 3)
                 .with_certified(true)
                 .with_required_tags([tag("dc:osaka")].into());
-            ns.set_placement_policy(policy_v2);
+            ns.set_placement_policy(policy_v2).unwrap();
 
             // Also trigger recalculation with current nodes.
             let nodes = nodes_ref.read().unwrap().clone();
@@ -349,7 +349,7 @@ async fn certification_safe_during_reconfiguration() {
     // Setup: single-authority system (auth-1) with certified policy.
     let mut ns = SystemNamespace::new();
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr(""),
         authority_nodes: vec![node_id("auth-1")],
@@ -405,7 +405,7 @@ fn no_certified_policies_no_authority_changes() {
     let mut ns = SystemNamespace::new();
     // Non-certified policy.
     let policy = PlacementPolicy::new(PolicyVersion(1), kr("cache/"), 3);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let nodes = vec![
         make_node("n1", NodeMode::Store, &[]),
@@ -435,7 +435,7 @@ async fn authority_demotion_stops_frontier_reporting() {
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1)
         .with_certified(true)
         .with_required_tags([tag("active")].into());
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = wrap_api(CertifiedApi::new(node_id("auth-1"), shared_ns.clone()));

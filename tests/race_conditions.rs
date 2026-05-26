@@ -84,7 +84,7 @@ fn make_namespace_with_authorities(
     ns.set_authority_definition(auth_def);
 
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(prefix), authority_ids.len());
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     Arc::new(RwLock::new(ns))
 }
@@ -833,15 +833,21 @@ async fn concurrent_writes_different_crdt_types() {
     // Pre-create keys of different types.
     {
         let mut locked = eventual_api.lock().await;
-        locked.eventual_write(
-            "counter/key".to_string(),
-            CrdtValue::Counter(PnCounter::new()),
-        );
-        locked.eventual_write("set/key".to_string(), CrdtValue::Set(OrSet::new()));
-        locked.eventual_write(
-            "register/key".to_string(),
-            CrdtValue::Register(LwwRegister::new()),
-        );
+        locked
+            .eventual_write(
+                "counter/key".to_string(),
+                CrdtValue::Counter(PnCounter::new()),
+            )
+            .unwrap();
+        locked
+            .eventual_write("set/key".to_string(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
+        locked
+            .eventual_write(
+                "register/key".to_string(),
+                CrdtValue::Register(LwwRegister::new()),
+            )
+            .unwrap();
     }
 
     let mut handles = Vec::new();
@@ -1001,11 +1007,15 @@ async fn stress_interleaved_operations() {
     // Pre-populate.
     {
         let mut locked = eventual_api.lock().await;
-        locked.eventual_write(
-            "stress/counter".to_string(),
-            CrdtValue::Counter(PnCounter::new()),
-        );
-        locked.eventual_write("stress/set".to_string(), CrdtValue::Set(OrSet::new()));
+        locked
+            .eventual_write(
+                "stress/counter".to_string(),
+                CrdtValue::Counter(PnCounter::new()),
+            )
+            .unwrap();
+        locked
+            .eventual_write("stress/set".to_string(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
     }
 
     let barrier = Arc::new(Barrier::new(TOTAL_TASKS));
