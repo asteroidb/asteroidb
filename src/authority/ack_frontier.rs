@@ -351,8 +351,10 @@ impl AckFrontierSet {
             self.frontiers.values().map(|f| &f.frontier_hlc).collect();
         timestamps.sort();
 
-        // Use saturating_sub to guard against usize underflow if, despite the
-        // check above, `timestamps.len()` were somehow less than `majority`.
+        // saturating_sub prevents panic if the guard above is bypassed,
+        // but returns timestamps[0] (minimum) which may be incorrect.
+        // The guard `if frontiers.len() < majority { return None; }` should
+        // prevent this path under normal operation.
         Some(timestamps[timestamps.len().saturating_sub(majority)])
     }
 
@@ -399,8 +401,10 @@ impl AckFrontierSet {
         let mut timestamps: Vec<&HlcTimestamp> = scoped.iter().map(|f| &f.frontier_hlc).collect();
         timestamps.sort();
 
-        // Use saturating_sub to guard against usize underflow if, despite the
-        // check above, `timestamps.len()` were somehow less than `majority`.
+        // saturating_sub prevents panic if the guard above is bypassed,
+        // but returns timestamps[0] (minimum) which may be incorrect.
+        // The guard `if scoped.len() < majority { return None; }` should
+        // prevent this path under normal operation.
         Some(timestamps[timestamps.len().saturating_sub(majority)].clone())
     }
 

@@ -388,9 +388,11 @@ impl RuntimeMetrics {
             }
             // Enforce the cardinality cap before inserting a new key.
             if map.len() >= MAX_KEY_METRICS {
-                // Evict an arbitrary entry to keep the map bounded.
-                // HashMap iteration order is non-deterministic, so this
-                // effectively evicts a pseudo-random key with O(1) cost.
+                // Evicts the first entry in bucket iteration order (not random,
+                // but O(1)).  Rust's hashbrown HashMap iterates in bucket order,
+                // so within a single session the same key tends to be evicted
+                // first — there is a structural bias toward the first bucket's
+                // occupant, not uniform randomness.
                 if let Some(evict_key) = map.keys().next().cloned() {
                     map.remove(&evict_key);
                 }
@@ -1077,5 +1079,26 @@ mod tests {
         let m = RuntimeMetrics::default();
         assert_eq!(m.delta_sync_count.load(Ordering::Relaxed), 0);
         assert_eq!(m.full_sync_fallback_count.load(Ordering::Relaxed), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // MAX_KEY_METRICS cap eviction test
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn write_ops_by_key_respects_cap() {
+        let m = RuntimeMetrics::default();
+        // Insert MAX_KEY_METRICS + 1 distinct keys; the map must never exceed
+        // MAX_KEY_METRICS entries.
+        for i in 0..=(MAX_KEY_METRICS as u64) {
+            m.record_write_op(&format!("key-{i}"));
+        }
+        let map = m.write_ops_by_key.lock().unwrap();
+        assert!(
+            map.len() <= MAX_KEY_METRICS,
+            "write_ops_by_key exceeded MAX_KEY_METRICS: {} > {}",
+            map.len(),
+            MAX_KEY_METRICS,
+        );
     }
 }
