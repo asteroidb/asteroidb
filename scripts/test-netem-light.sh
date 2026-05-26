@@ -77,8 +77,8 @@ check_convergence() {
     local key="$2"
     shift 2
     # remaining args are "name:url" pairs
-    local retries=10
-    local interval=1
+    local retries=20
+    local interval=3
 
     for pair in "$@"; do
         local name="${pair%%:*}"
@@ -220,6 +220,30 @@ run_scenario_partition() {
     return "$exit_code"
 }
 
+# Verify that gossip sync is working before running netem scenarios.
+# Writes a warmup value to node-1 and waits for node-2 to see it.
+verify_cluster_sync() {
+    local warmup_key="netem-light-warmup-$$"
+    echo "[light-netem] Verifying cluster gossip sync with warmup write..."
+    write_counter "$NODE1_URL" "$warmup_key" 1
+    local synced=false
+    for attempt in $(seq 1 15); do
+        local json val
+        json=$(read_counter "$NODE2_URL" "$warmup_key")
+        val=$(extract_value "$json")
+        if [ "$val" = "1" ]; then
+            synced=true
+            break
+        fi
+        sleep 2
+    done
+    if ! $synced; then
+        echo "[light-netem] ERROR: Cluster sync not working (node-2 never received warmup write). Aborting."
+        exit 1
+    fi
+    echo "[light-netem] Cluster sync OK (node-2 received warmup write)."
+}
+
 # --- Start cluster ---
 separator
 echo -e "${CLR_BOLD}AsteroidDB Lightweight Netem Tests${CLR_RESET}"
@@ -229,6 +253,7 @@ echo ""
 echo "[light-netem] Starting cluster..."
 docker compose -f "$COMPOSE_FILE" up -d --build --quiet-pull 2>&1 | tail -5
 wait_for_cluster
+verify_cluster_sync
 echo ""
 
 # ======================================================================
