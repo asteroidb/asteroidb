@@ -404,7 +404,10 @@ impl CertifiedApi {
         let timestamp = self.clock.now();
 
         // Write to the local store (eventual consistency path).
-        self.store.put(key.clone(), value.clone());
+        // Use put_with_timestamp so the entry is immediately visible to
+        // delta_sync without requiring a separate record_change call.
+        self.store
+            .put_with_timestamp(key.clone(), value.clone(), timestamp.clone());
 
         // Check if already certified at the current scoped frontier.
         let already_certified = self.frontiers.is_certified_at_for_scope(

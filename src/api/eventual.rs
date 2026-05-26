@@ -40,12 +40,12 @@ impl EventualApi {
     /// Write a CRDT value locally (FR-004).
     ///
     /// The value is accepted immediately and will be propagated
-    /// to other nodes asynchronously. Records the HLC timestamp
-    /// for delta sync tracking.
+    /// to other nodes asynchronously. Atomically records the HLC timestamp
+    /// for delta sync tracking so the entry is immediately visible to
+    /// `delta_sync` without a separate `record_change` call.
     pub fn eventual_write(&mut self, key: String, value: CrdtValue) {
         let ts = self.clock.now();
-        self.store.put(key.clone(), value);
-        self.store.record_change(&key, ts);
+        self.store.put_with_timestamp(key, value, ts);
     }
 
     /// Increment a PN-Counter at the given key.
