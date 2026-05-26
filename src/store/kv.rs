@@ -292,9 +292,23 @@ impl Store {
                 },
             ));
         }
-        let (store, _len) =
+        let (store, _len): (Self, _) =
             bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Apply schema migrations when the stored version is older than the
+        // current format version, matching the behaviour of the JSON load path.
+        if version < CURRENT_FORMAT_VERSION {
+            let store_value = serde_json::to_value(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let registry = migration::default_registry();
+            let migrated = registry
+                .apply_migrations(store_value, version, CURRENT_FORMAT_VERSION)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            return serde_json::from_value(migrated)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+
         Ok(store)
     }
 

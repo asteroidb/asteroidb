@@ -50,6 +50,12 @@ impl MigrationRegistry {
             });
         }
 
+        // Nothing to do when versions already match — return immediately to
+        // prevent any chance of an infinite loop in a misconfigured registry.
+        if from_version == to_version {
+            return Ok(data);
+        }
+
         let mut current = from_version;
         while current < to_version {
             let migration = self
