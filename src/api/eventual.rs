@@ -709,4 +709,67 @@ mod tests {
         let keys = api.keys_with_prefix("log/");
         assert!(keys.is_empty());
     }
+
+    // ---------------------------------------------------------------
+    // Delta sync visibility (API layer)
+    // ---------------------------------------------------------------
+
+    /// Verify that `eventual_write` produces an entry immediately visible
+    /// to delta sync (`entries_since` / `delta_entries_since`) at the API
+    /// layer — not just at the `Store` level.
+    #[test]
+    fn eventual_write_is_visible_to_delta_sync() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        // Record the frontier before any writes so we can query delta since
+        // the beginning.
+        let frontier_before = crate::hlc::HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: "".into(),
+        };
+
+        // Write a value via the EventualApi.
+        let mut counter = PnCounter::new();
+        counter.increment(&node("node-a"));
+        api.eventual_write("hits".into(), CrdtValue::Counter(counter));
+
+        // The written key must appear in entries_since (the delta sync view).
+        let delta = api.store().entries_since(&frontier_before);
+        assert_eq!(delta.len(), 1, "expected exactly one delta entry after eventual_write");
+        assert_eq!(delta[0].0, "hits");
+
+        // The entry must also appear via delta_entries_since.
+        let delta2 = api.store().delta_entries_since(&frontier_before);
+        assert_eq!(delta2.len(), 1);
+        assert_eq!(delta2[0].0, "hits");
+    }
+
+    /// Verify that multiple `eventual_write` calls each produce delta-visible
+    /// entries, covering heterogeneous CRDT types.
+    #[test]
+    fn eventual_write_multiple_keys_all_visible_to_delta_sync() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        let frontier_before = crate::hlc::HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: "".into(),
+        };
+
+        api.eventual_write("key1".into(), CrdtValue::Counter(PnCounter::new()));
+        api.eventual_write("key2".into(), CrdtValue::Set(OrSet::new()));
+        api.eventual_write("key3".into(), CrdtValue::Register(LwwRegister::new()));
+
+        let delta = api.store().entries_since(&frontier_before);
+        assert_eq!(
+            delta.len(),
+            3,
+            "all three eventual_write calls must be visible to delta sync"
+        );
+
+        let mut keys: Vec<&str> = delta.iter().map(|(k, _, _)| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["key1", "key2", "key3"]);
+    }
 }
