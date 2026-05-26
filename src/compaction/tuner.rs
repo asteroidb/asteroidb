@@ -280,6 +280,16 @@ impl AdaptiveCompactionConfig {
 
         let mut changed = false;
 
+        // True when every tracked prefix is pinned — used to gate both
+        // ops_threshold (write-rate-based) and time_threshold (lag-based)
+        // adjustments so that a fully-pinned config is completely static.
+        let all_pinned = !self.write_rate_tracker.buckets.is_empty()
+            && self
+                .write_rate_tracker
+                .buckets
+                .keys()
+                .all(|k| self.pinned.contains(k));
+
         // Adjust ops_threshold based on write rate — but only when write-rate
         // data is actually present. Skipping when buckets is empty avoids false
         // low-load detection on startup (an empty sum would yield 0.0 ops/sec,
@@ -288,12 +298,6 @@ impl AdaptiveCompactionConfig {
         //
         // Also skip when all non-empty prefixes are pinned.
         if !self.write_rate_tracker.buckets.is_empty() {
-            let all_pinned = self
-                .write_rate_tracker
-                .buckets
-                .keys()
-                .all(|k| self.pinned.contains(k));
-
             if !all_pinned {
                 // Compute aggregate write rate across all non-pinned prefixes.
                 let aggregate_rate: f64 = self
@@ -325,10 +329,13 @@ impl AdaptiveCompactionConfig {
             }
         }
 
-        // Adjust time_threshold based on frontier lag.
+        // Adjust time_threshold based on frontier lag. Skip when all tracked
+        // prefixes are pinned so a fully-pinned config remains completely static.
         // Dead zone: only adjust when lag is well outside the band (>15s or <1s)
         // to prevent oscillation at boundaries.
-        if let Some(lag_ms) = avg_frontier_lag_ms {
+        if !all_pinned
+            && let Some(lag_ms) = avg_frontier_lag_ms
+        {
             let new_time = if lag_ms > 15_000 {
                 // High lag: increase time threshold by 50% (max 120s).
                 let increased =
@@ -649,6 +656,47 @@ mod tests {
         assert_eq!(snap.max_checkpoint_history, 10);
         assert!(snap.write_rates.contains_key("user/"));
         assert!(snap.pinned_prefixes.contains(&"system/".to_string()));
+    }
+
+    #[test]
+    fn tune_all_pinned_with_high_lag_does_not_adjust_time_threshold() {
+        // Regression: when all tracked prefixes are pinned, time_threshold must
+        // not be adjusted by frontier lag either (previously it ran unchecked).
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        adaptive.pin_prefix("user/");
+        adaptive.record_ops("user/", 1_000, 800);
+
+        // All prefixes pinned, high lag — nothing should change.
+        let changed = adaptive.tune(2_000, Some(20_000));
+        assert!(!changed);
+        assert_eq!(adaptive.effective().ops_threshold, 10_000);
+        assert_eq!(adaptive.effective().time_threshold_ms, 30_000);
+    }
+
+    #[test]
+    fn tune_unpinned_with_high_lag_adjusts_time_threshold() {
+        // When there is at least one unpinned prefix, lag-based time_threshold
+        // tuning should still run normally.
+        let base = CompactionConfig {
+            time_threshold_ms: 30_000,
+            ops_threshold: 10_000,
+        };
+        let mut adaptive = AdaptiveCompactionConfig::with_write_rate_window(base, 10_000);
+        adaptive.set_tuning_interval_ms(0);
+
+        adaptive.pin_prefix("system/");
+        adaptive.record_ops("system/", 1_000, 800); // pinned
+        adaptive.record_ops("user/", 1_000, 100); // unpinned
+
+        let changed = adaptive.tune(2_000, Some(20_000));
+        assert!(changed);
+        assert_eq!(adaptive.effective().time_threshold_ms, 45_000);
     }
 
     #[test]

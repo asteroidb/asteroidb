@@ -29,24 +29,22 @@ fn parse_host(addr: &str) -> &str {
     }
 }
 
+/// Check whether an IPv4 address is dangerous (loopback or link-local/metadata).
+fn is_dangerous_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 127 || (o[0] == 169 && o[1] == 254)
+}
+
 /// Check whether a peer address is safe to connect to.
 ///
 /// Rejects loopback (`127.0.0.0/8`, `::1`), link-local IPv4 (`169.254.0.0/16`),
-/// and IPv6 link-local (`fe80::/10`). Used in HTTP handlers to guard against
-/// SSRF via injected inbound ping payloads.
+/// IPv6 link-local (`fe80::/10`), and IPv4-mapped IPv6 equivalents of those
+/// ranges (e.g. `::ffff:169.254.169.254`). Used in HTTP handlers to guard
+/// against SSRF via injected inbound ping payloads.
 pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
     let host = parse_host(addr);
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) => {
-            let o = v4.octets();
-            if o[0] == 127 {
-                return false;
-            }
-            if o[0] == 169 && o[1] == 254 {
-                return false;
-            }
-            true
-        }
+        Ok(IpAddr::V4(v4)) => !is_dangerous_v4(v4),
         Ok(IpAddr::V6(v6)) => {
             if v6.is_loopback() {
                 return false;
@@ -54,6 +52,12 @@ pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
             let segments = v6.segments();
             if (segments[0] & 0xffc0) == 0xfe80 {
                 return false;
+            }
+            // Reject IPv4-mapped IPv6 (::ffff:x.x.x.x) if the mapped v4 is dangerous.
+            if let Some(v4) = v6.to_ipv4() {
+                if is_dangerous_v4(v4) {
+                    return false;
+                }
             }
             true
         }
@@ -63,11 +67,11 @@ pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
 
 /// Returns `true` if the address is a cloud metadata or link-local endpoint.
 ///
-/// Used in [`MembershipClient::reconcile_peers`] where loopback addresses are
-/// allowed (local cluster deployments and tests use `127.x.x.x`), but
-/// cloud metadata endpoints (`169.254.x.x`, `fe80::/10`) must still be
-/// rejected to prevent peer-list-poisoning SSRF.
-fn is_metadata_or_link_local(addr: &str) -> bool {
+/// Used in join/announce handlers and [`MembershipClient::reconcile_peers`]
+/// where loopback is allowed (local cluster deployments and tests use
+/// `127.x.x.x`), but cloud metadata endpoints (`169.254.x.x`, `fe80::/10`)
+/// must be rejected unconditionally. Also catches IPv4-mapped IPv6 variants.
+pub(crate) fn is_metadata_or_link_local(addr: &str) -> bool {
     let host = parse_host(addr);
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => {
@@ -76,7 +80,15 @@ fn is_metadata_or_link_local(addr: &str) -> bool {
         }
         Ok(IpAddr::V6(v6)) => {
             let segments = v6.segments();
-            (segments[0] & 0xffc0) == 0xfe80
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Catch ::ffff:169.254.x.x
+            if let Some(v4) = v6.to_ipv4() {
+                let o = v4.octets();
+                return o[0] == 169 && o[1] == 254;
+            }
+            false
         }
         Err(_) => false,
     }
@@ -467,6 +479,33 @@ mod tests {
     #[test]
     fn safe_address_allows_public_ipv6() {
         assert!(is_safe_peer_address("[2001:db8::1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_mapped_metadata_endpoint() {
+        // ::ffff:169.254.169.254 encodes the cloud metadata address in IPv6.
+        // Without to_ipv4() check this would bypass the link-local guard.
+        assert!(!is_safe_peer_address("[::ffff:169.254.169.254]:80"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_mapped_loopback() {
+        // ::ffff:127.0.0.1 is IPv4-mapped loopback.
+        assert!(!is_safe_peer_address("[::ffff:127.0.0.1]:4000"));
+    }
+
+    #[test]
+    fn metadata_or_link_local_blocks_ipv4_mapped_metadata() {
+        // ::ffff:169.254.169.254 must be caught by is_metadata_or_link_local too.
+        assert!(is_metadata_or_link_local("[::ffff:169.254.169.254]:80"));
+    }
+
+    #[test]
+    fn metadata_or_link_local_allows_loopback() {
+        // Loopback is allowed in contexts that use is_metadata_or_link_local
+        // (join/announce/reconcile) so that local cluster deployments work.
+        assert!(!is_metadata_or_link_local("127.0.0.1:3000"));
+        assert!(!is_metadata_or_link_local("[::1]:3000"));
     }
 
     #[tokio::test]

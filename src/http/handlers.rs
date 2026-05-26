@@ -27,7 +27,7 @@ use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use crate::network::PeerRegistry;
-use crate::network::membership::is_safe_peer_address;
+use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
 use crate::network::sync::{
     DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
     SyncResponse,
@@ -856,6 +856,13 @@ pub async fn internal_join(
 
     // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    // Reject cloud metadata / link-local targets even if format is valid.
+    if is_metadata_or_link_local(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "peer address is a reserved link-local endpoint: {}",
+            req.address
+        ))));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1011,6 +1018,13 @@ pub async fn internal_announce(
 
     // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    // Reject cloud metadata / link-local targets even if format is valid.
+    if is_metadata_or_link_local(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "peer address is a reserved link-local endpoint: {}",
+            req.address
+        ))));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1162,8 +1176,10 @@ pub async fn internal_ping(
         if sender_is_known {
             let mut new_peers_added: usize = 0;
             for peer_info in &req.known_peers {
-                // Skip addresses that could redirect pings to cloud metadata
-                // endpoints or other dangerous targets (SSRF guard).
+                // Validate format then SSRF before accepting peer addresses.
+                if validate_peer_address(&peer_info.address).is_err() {
+                    continue;
+                }
                 if !is_safe_peer_address(&peer_info.address) {
                     continue;
                 }
