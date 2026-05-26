@@ -142,4 +142,44 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for ct_eq_tokens (timing side-channel fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ct_eq_tokens_equal_slices() {
+        assert!(ct_eq_tokens(b"secret", b"secret"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_different_content_same_length() {
+        assert!(!ct_eq_tokens(b"secret", b"notseq"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_different_lengths_both_wrong() {
+        // Tokens of different lengths must always be rejected, regardless of
+        // their content, to prevent a timing side-channel on length comparison.
+        assert!(!ct_eq_tokens(b"short", b"longer-token"));
+        assert!(!ct_eq_tokens(b"longer-token", b"short"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_length_mismatch_with_correct_prefix() {
+        // A prefix match must not cause acceptance when lengths differ.
+        assert!(!ct_eq_tokens(b"secret", b"secret-extra"));
+        assert!(!ct_eq_tokens(b"secret-extra", b"secret"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_empty_vs_nonempty() {
+        assert!(!ct_eq_tokens(b"", b"token"));
+        assert!(!ct_eq_tokens(b"token", b""));
+    }
+
+    #[test]
+    fn ct_eq_tokens_both_empty() {
+        assert!(ct_eq_tokens(b"", b""));
+    }
 }
