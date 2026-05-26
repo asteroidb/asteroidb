@@ -218,8 +218,8 @@ run_scenario_partition() {
     echo "[scenario] Recovering node-3..."
     "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
 
-    # Allow two full sync cycles before checking convergence.
-    sleep 6
+    # Allow ≥6 sync cycles before checking convergence.
+    sleep 12
 
     # Verify convergence: total should be 5
     echo "[scenario] Checking convergence after recovery..."
@@ -234,27 +234,27 @@ run_scenario_partition() {
 }
 
 # Verify that gossip sync is working before running netem scenarios.
-# Writes a warmup value to node-1 and waits for node-2 to see it.
+# Writes a warmup value to node-1 and waits for ALL nodes to see it.
 verify_cluster_sync() {
     local warmup_key="netem-light-warmup-$$"
     echo "[light-netem] Verifying cluster gossip sync with warmup write..."
     write_counter "$NODE1_URL" "$warmup_key" 1
     local synced=false
-    for attempt in $(seq 1 15); do
-        local json val
-        json=$(read_counter "$NODE2_URL" "$warmup_key")
-        val=$(extract_value "$json")
-        if [ "$val" = "1" ]; then
+    for attempt in $(seq 1 20); do
+        local v2 v3
+        v2=$(extract_value "$(read_counter "$NODE2_URL" "$warmup_key")")
+        v3=$(extract_value "$(read_counter "$NODE3_URL" "$warmup_key")")
+        if [ "$v2" = "1" ] && [ "$v3" = "1" ]; then
             synced=true
             break
         fi
         sleep 2
     done
     if ! $synced; then
-        echo "[light-netem] ERROR: Cluster sync not working (node-2 never received warmup write). Aborting."
+        echo "[light-netem] ERROR: Cluster sync not working (not all nodes received warmup write). Aborting."
         exit 1
     fi
-    echo "[light-netem] Cluster sync OK (node-2 received warmup write)."
+    echo "[light-netem] Cluster sync OK (all nodes received warmup write)."
 }
 
 # --- Start cluster ---
