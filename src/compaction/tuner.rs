@@ -273,13 +273,19 @@ impl AdaptiveCompactionConfig {
         }
         self.last_tuning_ms = now_ms;
 
+        // No data yet — skip tuning to avoid false low-load detection on startup
+        // (an empty bucket would yield aggregate_rate == 0.0, which is below
+        // LOW_WRITE_RATE_THRESHOLD and would immediately double ops_threshold).
+        if self.write_rate_tracker.buckets.is_empty() {
+            return false;
+        }
+
         // If all prefixes are pinned, skip tuning entirely.
-        let all_pinned = !self.write_rate_tracker.buckets.is_empty()
-            && self
-                .write_rate_tracker
-                .buckets
-                .keys()
-                .all(|k| self.pinned.contains(k));
+        let all_pinned = self
+            .write_rate_tracker
+            .buckets
+            .keys()
+            .all(|k| self.pinned.contains(k));
         if all_pinned {
             return false;
         }

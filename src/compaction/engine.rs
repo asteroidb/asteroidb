@@ -297,8 +297,10 @@ impl CompactionEngine {
 
     /// Verify the digest hash for a key range against the stored checkpoint.
     ///
-    /// Returns `Ok(())` if the digests match, or `Err(RevalidationTrigger::DigestMismatch)`
-    /// if they differ.
+    /// Returns `Ok(())` if the digests match, `Err(RevalidationTrigger::DigestMismatch)`
+    /// if they differ, or `Err(RevalidationTrigger::Manual)` if no checkpoint exists
+    /// (indicating a missing baseline — treat as a verification failure to prevent
+    /// silent acceptance of arbitrary hashes when no reference point is available).
     pub fn verify_digest(
         &self,
         prefix: &str,
@@ -310,7 +312,10 @@ impl CompactionEngine {
                 expected: cp.digest_hash.clone(),
                 actual: actual_hash.to_string(),
             }),
-            None => Ok(()),
+            None => Err(RevalidationTrigger::DigestMismatch {
+                expected: String::new(),
+                actual: actual_hash.to_string(),
+            }),
         }
     }
 
@@ -611,7 +616,14 @@ mod tests {
     #[test]
     fn verify_digest_no_checkpoint() {
         let engine = CompactionEngine::with_defaults();
-        assert!(engine.verify_digest("user/", "anything").is_ok());
+        // No checkpoint => verification must fail to prevent silent corruption acceptance.
+        assert_eq!(
+            engine.verify_digest("user/", "anything"),
+            Err(RevalidationTrigger::DigestMismatch {
+                expected: String::new(),
+                actual: "anything".into(),
+            })
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! about membership changes directly.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,68 @@ use tokio::sync::Mutex;
 use crate::http::types::{AnnounceRequest, AnnounceResponse, PeerInfo, PingRequest, PingResponse};
 use crate::network::peer::{PeerConfig, PeerRegistry};
 use crate::types::NodeId;
+
+/// Check whether a peer address is safe to connect to.
+///
+/// Addresses are expected in `host:port` form (the format stored in
+/// [`PeerInfo::address`]). The function rejects:
+///
+/// * Link-local IPv4 addresses (`169.254.0.0/16`) — includes the AWS/GCP/Azure
+///   instance-metadata endpoint (`169.254.169.254`).
+/// * IPv4 loopback (`127.0.0.0/8`).
+/// * IPv6 loopback (`::1`).
+/// * IPv6 link-local addresses (`fe80::/10`).
+///
+/// Hostnames that cannot be parsed as IP addresses are allowed through so
+/// that legitimate DNS-based cluster addresses work; further validation
+/// (e.g. DNS rebinding protection) can be added at the transport layer.
+fn is_safe_peer_address(addr: &str) -> bool {
+    // Strip an optional trailing path so callers can pass full addresses.
+    // PeerInfo addresses are plain "host:port", so we only need to handle
+    // the bracketed-IPv6 form for the port-split step.
+    let host = if let Some(bracketed) = addr.strip_prefix('[') {
+        // IPv6 literal: `[::1]:port` → `::1`
+        bracketed
+            .split(']')
+            .next()
+            .unwrap_or(addr)
+    } else {
+        // IPv4 / hostname: `192.0.2.1:port` or `example.com:port`
+        addr.rsplit(':')
+            .nth(1) // everything before the last ':'
+            .map(|_| addr.rsplitn(2, ':').last().unwrap_or(addr))
+            .unwrap_or(addr)
+    };
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            // 127.0.0.0/8 — loopback
+            if o[0] == 127 {
+                return false;
+            }
+            // 169.254.0.0/16 — link-local / cloud metadata endpoints
+            if o[0] == 169 && o[1] == 254 {
+                return false;
+            }
+            true
+        }
+        Ok(IpAddr::V6(v6)) => {
+            // ::1 — loopback
+            if v6.is_loopback() {
+                return false;
+            }
+            // fe80::/10 — link-local
+            let segments = v6.segments();
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            true
+        }
+        // Not an IP address — hostname; allow and rely on DNS resolution.
+        Err(_) => true,
+    }
+}
 
 /// Number of consecutive ping failures before a peer is automatically evicted.
 const MAX_PING_FAILURES: u32 = 3;
@@ -313,9 +376,21 @@ impl MembershipClient {
         let mut added = 0;
 
         for peer_info in remote_peers {
+            // Reject addresses that could redirect internal HTTP requests to
+            // cloud metadata endpoints or other dangerous targets (SSRF).
+            if !is_safe_peer_address(&peer_info.address) {
+                tracing::warn!(
+                    peer = %peer_info.node_id,
+                    address = %peer_info.address,
+                    "rejecting peer with unsafe address (possible SSRF attempt)"
+                );
+                continue;
+            }
+
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
+                // Re-validate the new address before accepting the update.
                 registry.update_address(&peer_nid, &peer_info.address);
             } else if added < MAX_NEW_PEERS
                 && registry
@@ -344,6 +419,81 @@ mod tests {
 
     fn nid(s: &str) -> NodeId {
         NodeId(s.into())
+    }
+
+    // ── is_safe_peer_address ────────────────────────────────────────────────
+
+    #[test]
+    fn safe_address_allows_public_ipv4() {
+        assert!(is_safe_peer_address("203.0.113.10:4000"));
+    }
+
+    #[test]
+    fn safe_address_allows_hostname() {
+        assert!(is_safe_peer_address("peer.example.com:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_link_local_metadata_endpoint() {
+        // AWS / GCP / Azure instance-metadata service
+        assert!(!is_safe_peer_address("169.254.169.254:80"));
+    }
+
+    #[test]
+    fn safe_address_blocks_link_local_ipv4_range() {
+        assert!(!is_safe_peer_address("169.254.0.1:4000"));
+        assert!(!is_safe_peer_address("169.254.255.255:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_loopback() {
+        assert!(!is_safe_peer_address("127.0.0.1:4000"));
+        assert!(!is_safe_peer_address("127.1.2.3:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv6_loopback() {
+        assert!(!is_safe_peer_address("[::1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv6_link_local() {
+        assert!(!is_safe_peer_address("[fe80::1]:4000"));
+        assert!(!is_safe_peer_address("[fe80::dead:beef]:4000"));
+    }
+
+    #[test]
+    fn safe_address_allows_public_ipv6() {
+        assert!(is_safe_peer_address("[2001:db8::1]:4000"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_link_local_metadata_address() {
+        let registry = Arc::new(Mutex::new(
+            PeerRegistry::new(nid("node-1"), vec![]).unwrap(),
+        ));
+        let client = MembershipClient::new(
+            nid("node-1"),
+            "10.0.0.1:3000".to_string(),
+            Arc::clone(&registry),
+        );
+
+        let remote_peers = vec![
+            PeerInfo {
+                node_id: "attacker".into(),
+                // AWS metadata endpoint — must be rejected
+                address: "169.254.169.254:80".into(),
+            },
+            PeerInfo {
+                node_id: "node-2".into(),
+                address: "10.0.0.2:3001".into(),
+            },
+        ];
+
+        let added = client.reconcile_peers(&remote_peers).await;
+        // Only the legitimate peer should be added
+        assert_eq!(added, 1);
+        assert_eq!(registry.lock().await.peer_count(), 1);
     }
 
     #[tokio::test]

@@ -2002,18 +2002,6 @@ impl NodeRunner {
             }
         }
 
-        for (i, (key_range, _total_authorities)) in defs.iter().enumerate() {
-            if self.compaction_engine.should_checkpoint(key_range, &now) {
-                let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                self.compaction_engine.create_checkpoint(
-                    key_range.clone(),
-                    now.clone(),
-                    digest,
-                    policy_versions[i],
-                );
-            }
-        }
-
         // Phase 3: Run compaction to prune old timestamps. Acquire eventual_api
         // lock only for the duration needed, with no other locks held.
         if let Some(ref eventual_api) = self.eventual_api {
