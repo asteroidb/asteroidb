@@ -372,7 +372,7 @@ fn convergence_after_compaction_in_one_partition() {
 }
 
 #[test]
-fn convergence_long_partition_hlc_drift() {
+fn convergence_concurrent_writes_same_key_converge() {
     // Simulate a long partition where physical times diverge significantly.
     let mut node_a = EventualApi::new(node("node-a"));
     let mut node_c = EventualApi::new(node("node-c"));

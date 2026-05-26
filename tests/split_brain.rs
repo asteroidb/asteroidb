@@ -463,7 +463,7 @@ fn dual_mode_bls_majority_can_reach_majority() {
 // ===========================================================================
 
 #[test]
-fn cross_partition_signatures_have_majority_only_after_heal() {
+fn cross_partition_signatures_combine_into_majority_certificate() {
     // Signatures gathered from both sides of a partition for the same message
     // can be combined into a certificate that claims majority.  This is
     // intentional: reaching both partitions requires the partition to have
