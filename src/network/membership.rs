@@ -35,10 +35,7 @@ pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
     // the bracketed-IPv6 form for the port-split step.
     let host = if let Some(bracketed) = addr.strip_prefix('[') {
         // IPv6 literal: `[::1]:port` → `::1`
-        bracketed
-            .split(']')
-            .next()
-            .unwrap_or(addr)
+        bracketed.split(']').next().unwrap_or(addr)
     } else {
         // IPv4 / hostname: `192.0.2.1:port` or `example.com:port`
         addr.rsplit(':')
@@ -586,18 +583,20 @@ mod tests {
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 (203.0.113.0/24) documentation addresses — these are
+        // routable-looking IPs that pass the SSRF guard (not loopback or link-local).
         let remote_peers = vec![
             PeerInfo {
                 node_id: "node-2".into(),
-                address: "127.0.0.1:3001".into(),
+                address: "203.0.113.1:3001".into(),
             },
             PeerInfo {
                 node_id: "node-3".into(),
-                address: "127.0.0.1:3002".into(),
+                address: "203.0.113.2:3002".into(),
             },
         ];
 

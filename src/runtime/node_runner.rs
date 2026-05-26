@@ -2002,10 +2002,10 @@ impl NodeRunner {
             }
         }
 
-        // Phase 3: Run compaction to prune old timestamps. When eventual_api is
-        // None (sync-less node), use a temporary empty store so that checkpoint
-        // eligibility is still evaluated and checkpoints are recorded — only the
-        // pruning step is a no-op in that case.
+        // Phase 3: Run compaction to prune old timestamps. Only runs when
+        // eventual_api is available — without a real store there is nothing to
+        // checkpoint or prune. Running against a temporary empty store would
+        // accumulate empty checkpoints and waste state-machine cycles.
         if let Some(ref eventual_api) = self.eventual_api {
             let mut ev_api = eventual_api.lock().await;
             let store = ev_api.store_mut();
@@ -2028,24 +2028,6 @@ impl NodeRunner {
                         "compaction pruned old timestamps"
                     );
                 }
-            }
-        } else {
-            // No eventual_api (sync-less node): run compaction against a
-            // temporary empty store so that checkpoints are created on
-            // schedule. Pruning is a no-op because the store is empty, but
-            // run_compaction still advances the checkpoint state machine.
-            let mut temp_store = crate::store::kv::Store::new();
-            for (i, (key_range, total_authorities)) in defs.iter().enumerate() {
-                let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                self.compaction_engine.run_compaction(
-                    key_range,
-                    now.clone(),
-                    digest,
-                    policy_versions[i],
-                    &frontier_set,
-                    *total_authorities,
-                    &mut temp_store,
-                );
             }
         }
     }
@@ -2446,6 +2428,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
 
@@ -2467,8 +2450,14 @@ mod tests {
             ..NodeRunnerConfig::default()
         };
 
+        // Compaction now requires an eventual_api — without it, checkpoints are
+        // not created (running against an empty store accumulates stale entries).
+        let eventual_api = crate::api::eventual::EventualApi::new(node_id("node-1"));
+        let eventual_api = Arc::new(Mutex::new(eventual_api));
+
         let mut runner =
             NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+        runner.set_eventual_api(eventual_api);
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {

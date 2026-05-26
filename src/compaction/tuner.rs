@@ -273,52 +273,56 @@ impl AdaptiveCompactionConfig {
         }
         self.last_tuning_ms = now_ms;
 
-        // No data yet — skip tuning to avoid false low-load detection on startup
-        // (an empty bucket would yield aggregate_rate == 0.0, which is below
-        // LOW_WRITE_RATE_THRESHOLD and would immediately double ops_threshold).
-        if self.write_rate_tracker.buckets.is_empty() {
-            return false;
-        }
-
-        // If all prefixes are pinned, skip tuning entirely.
-        let all_pinned = self
-            .write_rate_tracker
-            .buckets
-            .keys()
-            .all(|k| self.pinned.contains(k));
-        if all_pinned {
+        // Skip entirely only when there is no data of any kind to act on.
+        if self.write_rate_tracker.buckets.is_empty() && avg_frontier_lag_ms.is_none() {
             return false;
         }
 
         let mut changed = false;
 
-        // Compute aggregate write rate across all non-pinned prefixes.
-        let aggregate_rate: f64 = self
-            .write_rate_tracker
-            .buckets
-            .keys()
-            .filter(|k| !self.pinned.contains(k.as_str()))
-            .map(|k| self.write_rate_tracker.write_rate(k, now_ms))
-            .sum();
+        // Adjust ops_threshold based on write rate — but only when write-rate
+        // data is actually present. Skipping when buckets is empty avoids false
+        // low-load detection on startup (an empty sum would yield 0.0 ops/sec,
+        // which is below the LOW_WRITE_RATE_THRESHOLD dead zone and would
+        // immediately double ops_threshold).
+        //
+        // Also skip when all non-empty prefixes are pinned.
+        if !self.write_rate_tracker.buckets.is_empty() {
+            let all_pinned = self
+                .write_rate_tracker
+                .buckets
+                .keys()
+                .all(|k| self.pinned.contains(k));
 
-        // Adjust ops_threshold based on write rate.
-        // Dead zone: only adjust when rate is well outside the band (>750 or <30)
-        // to prevent oscillation at boundaries.
-        let new_ops = if aggregate_rate > 750.0 {
-            // High write rate: halve ops threshold (min 1,000).
-            let halved = self.effective.ops_threshold / 2;
-            halved.max(1_000)
-        } else if aggregate_rate < 30.0 {
-            // Low write rate: double ops threshold (max 50,000).
-            let doubled = self.effective.ops_threshold.saturating_mul(2);
-            doubled.min(50_000)
-        } else {
-            self.effective.ops_threshold
-        };
+            if !all_pinned {
+                // Compute aggregate write rate across all non-pinned prefixes.
+                let aggregate_rate: f64 = self
+                    .write_rate_tracker
+                    .buckets
+                    .keys()
+                    .filter(|k| !self.pinned.contains(k.as_str()))
+                    .map(|k| self.write_rate_tracker.write_rate(k, now_ms))
+                    .sum();
 
-        if new_ops != self.effective.ops_threshold {
-            self.effective.ops_threshold = new_ops;
-            changed = true;
+                // Dead zone: only adjust when rate is well outside the band
+                // (>750 or <30) to prevent oscillation at boundaries.
+                let new_ops = if aggregate_rate > 750.0 {
+                    // High write rate: halve ops threshold (min 1,000).
+                    let halved = self.effective.ops_threshold / 2;
+                    halved.max(1_000)
+                } else if aggregate_rate < 30.0 {
+                    // Low write rate: double ops threshold (max 50,000).
+                    let doubled = self.effective.ops_threshold.saturating_mul(2);
+                    doubled.min(50_000)
+                } else {
+                    self.effective.ops_threshold
+                };
+
+                if new_ops != self.effective.ops_threshold {
+                    self.effective.ops_threshold = new_ops;
+                    changed = true;
+                }
+            }
         }
 
         // Adjust time_threshold based on frontier lag.
