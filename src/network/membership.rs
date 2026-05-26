@@ -612,20 +612,21 @@ mod tests {
                 nid("node-1"),
                 vec![PeerConfig {
                     node_id: nid("node-2"),
-                    addr: "127.0.0.1:3001".into(),
+                    addr: "203.0.113.1:3001".into(),
                 }],
             )
             .unwrap(),
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 addresses so the SSRF guard passes.
         let remote_peers = vec![PeerInfo {
             node_id: "node-2".into(),
-            address: "127.0.0.1:3001".into(),
+            address: "203.0.113.1:3001".into(),
         }];
 
         let added = client.reconcile_peers(&remote_peers).await;
@@ -640,13 +641,14 @@ mod tests {
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 addresses so the SSRF guard passes.
         let remote_peers = vec![PeerInfo {
             node_id: "node-1".into(),
-            address: "127.0.0.1:3000".into(),
+            address: "203.0.113.0:3000".into(),
         }];
 
         let added = client.reconcile_peers(&remote_peers).await;

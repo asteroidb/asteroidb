@@ -854,8 +854,13 @@ pub async fn internal_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the caller-supplied address to prevent SSRF.
+    // Validate address format and reject loopback/link-local to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    if !is_safe_peer_address(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(
+            "address refers to a loopback or link-local destination".to_string(),
+        )));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1110,27 +1115,8 @@ pub async fn internal_ping(
 ) -> Result<Json<PingResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the sender's address format and ensure it is not a loopback or
-    // link-local address that could be used for SSRF (e.g. cloud metadata endpoints).
+    // Validate the sender's address format.
     validate_peer_address(&req.sender_addr).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-    if !is_safe_peer_address(&req.sender_addr) {
-        return Err(ApiError(CrdtError::InvalidArgument(format!(
-            "sender address is not safe (loopback or link-local): {}",
-            req.sender_addr
-        ))));
-    }
-
-    // Validate all peer addresses in the known_peers list.
-    for peer in &req.known_peers {
-        validate_peer_address(&peer.address)
-            .map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-        if !is_safe_peer_address(&peer.address) {
-            return Err(ApiError(CrdtError::InvalidArgument(format!(
-                "peer address is not safe (loopback or link-local): {}",
-                peer.address
-            ))));
-        }
-    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1158,21 +1144,24 @@ pub async fn internal_ping(
         // is configured and was validated by the middleware). Without auth,
         // unknown nodes must not be able to inject themselves into the
         // registry via a bare ping.
+        // Apply the SSRF guard before writing sender_addr into the registry.
         if registry.get_peer(&sender_nid).is_some() {
-            if registry.update_address(&sender_nid, &req.sender_addr) {
-                changed = true;
+            if is_safe_peer_address(&req.sender_addr) {
+                if registry.update_address(&sender_nid, &req.sender_addr) {
+                    changed = true;
+                }
             }
         } else if state.internal_token.as_ref().is_some_and(|t| !t.is_empty()) {
-            // The request reached us through the auth middleware, so the
-            // sender has a valid token — safe to add as a new peer.
-            if registry
-                .add_peer(PeerConfig {
-                    node_id: sender_nid.clone(),
-                    addr: req.sender_addr.clone(),
-                })
-                .is_ok()
-            {
-                changed = true;
+            if is_safe_peer_address(&req.sender_addr) {
+                if registry
+                    .add_peer(PeerConfig {
+                        node_id: sender_nid.clone(),
+                        addr: req.sender_addr.clone(),
+                    })
+                    .is_ok()
+                {
+                    changed = true;
+                }
             }
         } else {
             tracing::warn!(
@@ -1185,6 +1174,11 @@ pub async fn internal_ping(
         if sender_is_known {
             let mut new_peers_added: usize = 0;
             for peer_info in &req.known_peers {
+                // Skip addresses that could redirect pings to cloud metadata
+                // endpoints or other dangerous targets (SSRF guard).
+                if !is_safe_peer_address(&peer_info.address) {
+                    continue;
+                }
                 let peer_nid = NodeId(peer_info.node_id.clone());
                 if registry.get_peer(&peer_nid).is_some() {
                     // Update address if it changed.
