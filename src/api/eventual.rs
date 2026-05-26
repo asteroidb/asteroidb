@@ -736,7 +736,11 @@ mod tests {
 
         // The written key must appear in entries_since (the delta sync view).
         let delta = api.store().entries_since(&frontier_before);
-        assert_eq!(delta.len(), 1, "expected exactly one delta entry after eventual_write");
+        assert_eq!(
+            delta.len(),
+            1,
+            "expected exactly one delta entry after eventual_write"
+        );
         assert_eq!(delta[0].0, "hits");
 
         // The entry must also appear via delta_entries_since.
