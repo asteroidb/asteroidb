@@ -373,17 +373,6 @@ impl MembershipClient {
         let mut added = 0;
 
         for peer_info in remote_peers {
-            // Reject addresses that could redirect internal HTTP requests to
-            // cloud metadata endpoints or other dangerous targets (SSRF).
-            if !is_safe_peer_address(&peer_info.address) {
-                tracing::warn!(
-                    peer = %peer_info.node_id,
-                    address = %peer_info.address,
-                    "rejecting peer with unsafe address (possible SSRF attempt)"
-                );
-                continue;
-            }
-
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
