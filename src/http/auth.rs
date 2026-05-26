@@ -5,6 +5,20 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 
+/// Compare two byte slices in constant time, independent of their lengths.
+///
+/// Pads the shorter slice with zeros before calling `ct_eq` so that the
+/// comparison always processes `max(a.len(), b.len())` bytes, preventing
+/// a timing side-channel when the two tokens have different lengths.
+fn ct_eq_tokens(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut buf_a = vec![0u8; max_len];
+    let mut buf_b = vec![0u8; max_len];
+    buf_a[..a.len()].copy_from_slice(a);
+    buf_b[..b.len()].copy_from_slice(b);
+    buf_a.ct_eq(&buf_b).into()
+}
+
 /// Axum middleware that validates Bearer token authentication.
 ///
 /// Extracts the `Authorization` header and checks that it contains a
@@ -23,7 +37,7 @@ pub async fn require_bearer_token(
 
     match auth_header {
         Some(header) => match header.strip_prefix("Bearer ") {
-            Some(token) if token.as_bytes().ct_eq(expected_token.as_bytes()).into() => {
+            Some(token) if ct_eq_tokens(token.as_bytes(), expected_token.as_bytes()) => {
                 next.run(request).await
             }
             _ => StatusCode::UNAUTHORIZED.into_response(),

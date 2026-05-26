@@ -63,7 +63,17 @@ impl StorageBackend for FileBackend {
         }
 
         // Atomic write: temp file -> fsync -> rename.
-        let tmp_path = self.path.with_extension("tmp");
+        // Use `<filename>.<pid>.tmp` rather than `with_extension("tmp")` so
+        // that paths that already end in `.tmp` (where `with_extension` is a
+        // no-op) still get a distinct temporary path.
+        let tmp_path = self.path.with_file_name(format!(
+            "{}.{}.tmp",
+            self.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            std::process::id(),
+        ));
         let mut file = File::create(&tmp_path)?;
         file.write_all(data)?;
         file.sync_all()?;
