@@ -854,13 +854,8 @@ pub async fn internal_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate address format and reject loopback/link-local to prevent SSRF.
+    // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-    if !is_safe_peer_address(&req.address) {
-        return Err(ApiError(CrdtError::InvalidArgument(
-            "address refers to a loopback or link-local destination".to_string(),
-        )));
-    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1014,14 +1009,8 @@ pub async fn internal_announce(
 ) -> Result<Json<AnnounceResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the caller-supplied address to prevent SSRF.
+    // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-    if !is_safe_peer_address(&req.address) {
-        return Err(ApiError(CrdtError::InvalidArgument(format!(
-            "announce address is not safe (loopback or link-local): {}",
-            req.address
-        ))));
-    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
