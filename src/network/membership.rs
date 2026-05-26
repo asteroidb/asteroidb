@@ -54,10 +54,8 @@ pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
                 return false;
             }
             // Reject IPv4-mapped IPv6 (::ffff:x.x.x.x) if the mapped v4 is dangerous.
-            if let Some(v4) = v6.to_ipv4() {
-                if is_dangerous_v4(v4) {
-                    return false;
-                }
+            if v6.to_ipv4().is_some_and(is_dangerous_v4) {
+                return false;
             }
             true
         }

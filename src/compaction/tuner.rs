@@ -297,35 +297,33 @@ impl AdaptiveCompactionConfig {
         // immediately double ops_threshold).
         //
         // Also skip when all non-empty prefixes are pinned.
-        if !self.write_rate_tracker.buckets.is_empty() {
-            if !all_pinned {
-                // Compute aggregate write rate across all non-pinned prefixes.
-                let aggregate_rate: f64 = self
-                    .write_rate_tracker
-                    .buckets
-                    .keys()
-                    .filter(|k| !self.pinned.contains(k.as_str()))
-                    .map(|k| self.write_rate_tracker.write_rate(k, now_ms))
-                    .sum();
+        if !self.write_rate_tracker.buckets.is_empty() && !all_pinned {
+            // Compute aggregate write rate across all non-pinned prefixes.
+            let aggregate_rate: f64 = self
+                .write_rate_tracker
+                .buckets
+                .keys()
+                .filter(|k| !self.pinned.contains(k.as_str()))
+                .map(|k| self.write_rate_tracker.write_rate(k, now_ms))
+                .sum();
 
-                // Dead zone: only adjust when rate is well outside the band
-                // (>750 or <30) to prevent oscillation at boundaries.
-                let new_ops = if aggregate_rate > 750.0 {
-                    // High write rate: halve ops threshold (min 1,000).
-                    let halved = self.effective.ops_threshold / 2;
-                    halved.max(1_000)
-                } else if aggregate_rate < 30.0 {
-                    // Low write rate: double ops threshold (max 50,000).
-                    let doubled = self.effective.ops_threshold.saturating_mul(2);
-                    doubled.min(50_000)
-                } else {
-                    self.effective.ops_threshold
-                };
+            // Dead zone: only adjust when rate is well outside the band
+            // (>750 or <30) to prevent oscillation at boundaries.
+            let new_ops = if aggregate_rate > 750.0 {
+                // High write rate: halve ops threshold (min 1,000).
+                let halved = self.effective.ops_threshold / 2;
+                halved.max(1_000)
+            } else if aggregate_rate < 30.0 {
+                // Low write rate: double ops threshold (max 50,000).
+                let doubled = self.effective.ops_threshold.saturating_mul(2);
+                doubled.min(50_000)
+            } else {
+                self.effective.ops_threshold
+            };
 
-                if new_ops != self.effective.ops_threshold {
-                    self.effective.ops_threshold = new_ops;
-                    changed = true;
-                }
+            if new_ops != self.effective.ops_threshold {
+                self.effective.ops_threshold = new_ops;
+                changed = true;
             }
         }
 
