@@ -463,13 +463,19 @@ fn dual_mode_bls_majority_can_reach_majority() {
 // ===========================================================================
 
 #[test]
-fn cannot_combine_minority_certificates_into_majority() {
-    // Two certificates from different partitions, each with 1 signer,
-    // cannot be combined to form a 2-signer certificate that claims majority.
+fn cross_partition_signatures_have_majority_only_after_heal() {
+    // Signatures gathered from both sides of a partition for the same message
+    // can be combined into a certificate that claims majority.  This is
+    // intentional: reaching both partitions requires the partition to have
+    // already healed.  During a TRUE partition an attacker cannot obtain
+    // signatures from both sides for the same frontier_hlc, so the safety
+    // guarantee is preserved by the certified-write path, not by the
+    // certificate math alone.
     //
-    // This tests that the quorum intersection property holds: the signatures
-    // are tied to specific authority IDs, and duplicate-signer detection
-    // prevents inflation.
+    // This test documents and verifies that exact behaviour: two minority
+    // signatures (auth-1 from partition A, auth-2 from partition B) combine
+    // to form a valid 2-of-3 majority certificate, which is correct because
+    // it proves the partition boundary was crossed (i.e. partition has healed).
     let (sk1, _) = make_ed25519_keypair(1);
     let (sk2, _) = make_ed25519_keypair(2);
     let key_range = KeyRange { prefix: "".into() };
@@ -484,24 +490,15 @@ fn cannot_combine_minority_certificates_into_majority() {
     // Partition B certificate: signed by auth-2 only.
     let sig2 = real_authority_sig("auth-2", &sk2, &message);
 
-    // Now try to combine into a single certificate.
+    // Combine into a single certificate (only possible after partition heal).
     let mut combined =
         MajorityCertificate::new(key_range.clone(), hlc.clone(), pv, KeysetVersion(1));
     combined.add_signature(sig1);
     combined.add_signature(sig2);
 
-    // This has 2 of 3 signatures and technically has majority.
-    // The point is that in a REAL partition, authority-1 would have a different
-    // frontier_hlc than authority-2, making this scenario impossible if the
-    // certified write path is correct (the same key can't have both frontiers).
-    //
-    // But at the certificate level, if someone could somehow get signatures
-    // from both partitions for the same message, the math works. This is
-    // expected because it requires crossing the partition boundary, which
-    // means the partition has already healed.
+    // 2 of 3 signatures → majority holds once the partition has healed.
     assert!(combined.has_majority(3));
-    // The safety guarantee is that during a TRUE partition, you can't get
-    // signatures from both sides for the same frontier_hlc.
+    assert_eq!(combined.signature_count(), 2);
 }
 
 #[test]
