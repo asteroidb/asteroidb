@@ -1,6 +1,5 @@
 use std::sync::{Arc, RwLock};
 
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 
 use asteroidb_poc::api::certified::CertifiedApi;
@@ -36,6 +35,27 @@ fn authority_nodes() -> Vec<NodeId> {
             NodeId("auth-3".into()),
         ],
     }
+}
+
+/// Wait for a shutdown signal.
+///
+/// On Unix, this resolves on either SIGINT (Ctrl-C) or SIGTERM (the default
+/// signal sent by `kubectl delete pod` / `docker stop`).  On non-Unix targets
+/// (e.g. Windows) only SIGINT is available, so we fall back to that alone.
+#[cfg(unix)]
+async fn wait_for_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm =
+        signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[tokio::main]
@@ -378,13 +398,8 @@ async fn main() {
         MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
     };
 
-    // Register SIGTERM handler for Kubernetes/Docker graceful pod termination.
-    // SIGTERM is the default signal sent by `kubectl delete pod`, `docker stop`,
-    // and container runtimes before SIGKILL, so it must be handled for clean
-    // shutdown. SIGINT (ctrl-c) is kept for interactive/development use.
-    let mut sigterm =
-        signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-
+    // wait_for_signal() resolves on SIGINT (Ctrl-C) on all platforms, and
+    // additionally on SIGTERM on Unix (Kubernetes/Docker graceful shutdown).
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
@@ -394,26 +409,8 @@ async fn main() {
         _stats = runner.run() => {
             println!("NodeRunner exited.");
         }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down (SIGINT)...");
-            // Announce departure to all peers before stopping (P1-1).
-            let leave_count = shutdown_membership_client.fan_out_leave().await;
-            if leave_count > 0 {
-                println!("Fan-out leave acknowledged by {leave_count} peers");
-            }
-            // Persist system namespace before stopping.
-            {
-                let ns = namespace.read().unwrap();
-                if let Err(e) = ns.save(&ns_persist_path) {
-                    eprintln!("warning: failed to save system namespace on shutdown: {e}");
-                } else {
-                    println!("System namespace saved to {}", ns_persist_path.display());
-                }
-            }
-            let _ = shutdown_handle.send(true);
-        }
-        _ = sigterm.recv() => {
-            println!("\nShutting down (SIGTERM)...");
+        _ = wait_for_signal() => {
+            println!("\nShutting down...");
             // Announce departure to all peers before stopping (P1-1).
             let leave_count = shutdown_membership_client.fan_out_leave().await;
             if leave_count > 0 {
