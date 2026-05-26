@@ -27,6 +27,7 @@ use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use crate::network::PeerRegistry;
+use crate::network::membership::is_safe_peer_address;
 use crate::network::sync::{
     DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
     SyncResponse,
@@ -1103,13 +1104,26 @@ pub async fn internal_ping(
 ) -> Result<Json<PingResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the sender's address to prevent SSRF.
+    // Validate the sender's address format and ensure it is not a loopback or
+    // link-local address that could be used for SSRF (e.g. cloud metadata endpoints).
     validate_peer_address(&req.sender_addr).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    if !is_safe_peer_address(&req.sender_addr) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "sender address is not safe (loopback or link-local): {}",
+            req.sender_addr
+        ))));
+    }
 
     // Validate all peer addresses in the known_peers list.
     for peer in &req.known_peers {
         validate_peer_address(&peer.address)
             .map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+        if !is_safe_peer_address(&peer.address) {
+            return Err(ApiError(CrdtError::InvalidArgument(format!(
+                "peer address is not safe (loopback or link-local): {}",
+                peer.address
+            ))));
+        }
     }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {

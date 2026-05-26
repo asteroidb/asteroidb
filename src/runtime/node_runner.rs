@@ -2002,8 +2002,10 @@ impl NodeRunner {
             }
         }
 
-        // Phase 3: Run compaction to prune old timestamps. Acquire eventual_api
-        // lock only for the duration needed, with no other locks held.
+        // Phase 3: Run compaction to prune old timestamps. When eventual_api is
+        // None (sync-less node), use a temporary empty store so that checkpoint
+        // eligibility is still evaluated and checkpoints are recorded — only the
+        // pruning step is a no-op in that case.
         if let Some(ref eventual_api) = self.eventual_api {
             let mut ev_api = eventual_api.lock().await;
             let store = ev_api.store_mut();
@@ -2026,6 +2028,24 @@ impl NodeRunner {
                         "compaction pruned old timestamps"
                     );
                 }
+            }
+        } else {
+            // No eventual_api (sync-less node): run compaction against a
+            // temporary empty store so that checkpoints are created on
+            // schedule. Pruning is a no-op because the store is empty, but
+            // run_compaction still advances the checkpoint state machine.
+            let mut temp_store = crate::store::kv::Store::new();
+            for (i, (key_range, total_authorities)) in defs.iter().enumerate() {
+                let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
+                self.compaction_engine.run_compaction(
+                    key_range,
+                    now.clone(),
+                    digest,
+                    policy_versions[i],
+                    &frontier_set,
+                    *total_authorities,
+                    &mut temp_store,
+                );
             }
         }
     }

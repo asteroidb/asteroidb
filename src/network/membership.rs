@@ -29,7 +29,7 @@ use crate::types::NodeId;
 /// Hostnames that cannot be parsed as IP addresses are allowed through so
 /// that legitimate DNS-based cluster addresses work; further validation
 /// (e.g. DNS rebinding protection) can be added at the transport layer.
-fn is_safe_peer_address(addr: &str) -> bool {
+pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
     // Strip an optional trailing path so callers can pass full addresses.
     // PeerInfo addresses are plain "host:port", so we only need to handle
     // the bracketed-IPv6 form for the port-split step.
