@@ -63,7 +63,8 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE1_CONTAINER"
-sleep 8
+# Allow ≥7 gossip cycles so node-1 syncs from node-2 before the next partition.
+sleep 15
 
 # === STEP 4: Partition node-2, write to node-3, heal ===
 log_step 4 "Partition node-2, write 2 to node-3, heal node-2"
@@ -78,7 +79,8 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER"
-sleep 8
+# Allow ≥7 gossip cycles so node-2 (and node-1) sync before the next partition.
+sleep 15
 
 # === STEP 5: Partition node-3, write to node-1, heal ===
 log_step 5 "Partition node-3, write 2 to node-1, heal node-3"
@@ -93,9 +95,8 @@ done
 sleep 3
 
 "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
-
-# Allow sync to re-establish after the partition is removed.
-sleep 10
+# Allow ≥10 gossip cycles before the final convergence check.
+sleep 20
 
 # === STEP 6: Verify convergence ===
 log_step 6 "Verify full convergence (expected total: 8)"
