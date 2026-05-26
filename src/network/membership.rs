@@ -15,62 +15,70 @@ use crate::http::types::{AnnounceRequest, AnnounceResponse, PeerInfo, PingReques
 use crate::network::peer::{PeerConfig, PeerRegistry};
 use crate::types::NodeId;
 
-/// Check whether a peer address is safe to connect to.
-///
-/// Addresses are expected in `host:port` form (the format stored in
-/// [`PeerInfo::address`]). The function rejects:
-///
-/// * Link-local IPv4 addresses (`169.254.0.0/16`) — includes the AWS/GCP/Azure
-///   instance-metadata endpoint (`169.254.169.254`).
-/// * IPv4 loopback (`127.0.0.0/8`).
-/// * IPv6 loopback (`::1`).
-/// * IPv6 link-local addresses (`fe80::/10`).
-///
-/// Hostnames that cannot be parsed as IP addresses are allowed through so
-/// that legitimate DNS-based cluster addresses work; further validation
-/// (e.g. DNS rebinding protection) can be added at the transport layer.
-pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
-    // Strip an optional trailing path so callers can pass full addresses.
-    // PeerInfo addresses are plain "host:port", so we only need to handle
-    // the bracketed-IPv6 form for the port-split step.
-    let host = if let Some(bracketed) = addr.strip_prefix('[') {
+/// Parse the host portion from a `host:port` address string.
+fn parse_host(addr: &str) -> &str {
+    if let Some(bracketed) = addr.strip_prefix('[') {
         // IPv6 literal: `[::1]:port` → `::1`
         bracketed.split(']').next().unwrap_or(addr)
     } else {
         // IPv4 / hostname: `192.0.2.1:port` or `example.com:port`
         addr.rsplit(':')
-            .nth(1) // everything before the last ':'
+            .nth(1)
             .map(|_| addr.rsplitn(2, ':').last().unwrap_or(addr))
             .unwrap_or(addr)
-    };
+    }
+}
 
+/// Check whether a peer address is safe to connect to.
+///
+/// Rejects loopback (`127.0.0.0/8`, `::1`), link-local IPv4 (`169.254.0.0/16`),
+/// and IPv6 link-local (`fe80::/10`). Used in HTTP handlers to guard against
+/// SSRF via injected inbound ping payloads.
+pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
+    let host = parse_host(addr);
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => {
             let o = v4.octets();
-            // 127.0.0.0/8 — loopback
             if o[0] == 127 {
                 return false;
             }
-            // 169.254.0.0/16 — link-local / cloud metadata endpoints
             if o[0] == 169 && o[1] == 254 {
                 return false;
             }
             true
         }
         Ok(IpAddr::V6(v6)) => {
-            // ::1 — loopback
             if v6.is_loopback() {
                 return false;
             }
-            // fe80::/10 — link-local
             let segments = v6.segments();
             if (segments[0] & 0xffc0) == 0xfe80 {
                 return false;
             }
             true
         }
-        // Not an IP address — hostname; allow and rely on DNS resolution.
         Err(_) => true,
+    }
+}
+
+/// Returns `true` if the address is a cloud metadata or link-local endpoint.
+///
+/// Used in [`MembershipClient::reconcile_peers`] where loopback addresses are
+/// allowed (local cluster deployments and tests use `127.x.x.x`), but
+/// cloud metadata endpoints (`169.254.x.x`, `fe80::/10`) must still be
+/// rejected to prevent peer-list-poisoning SSRF.
+fn is_metadata_or_link_local(addr: &str) -> bool {
+    let host = parse_host(addr);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            o[0] == 169 && o[1] == 254
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let segments = v6.segments();
+            (segments[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
     }
 }
 
@@ -373,6 +381,14 @@ impl MembershipClient {
         let mut added = 0;
 
         for peer_info in remote_peers {
+            // Reject cloud metadata / link-local targets to prevent peer-list
+            // poisoning SSRF. Loopback is intentionally allowed here so that
+            // local cluster deployments (and tests) work correctly; the full
+            // `is_safe_peer_address` check (including loopback) is enforced at
+            // the HTTP handler boundary on inbound ping requests.
+            if is_metadata_or_link_local(&peer_info.address) {
+                continue;
+            }
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
