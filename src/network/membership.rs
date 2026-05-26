@@ -83,7 +83,10 @@ pub(crate) fn is_metadata_or_link_local(addr: &str) -> bool {
             if (segments[0] & 0xffc0) == 0xfe80 {
                 return true;
             }
-            // Catch ::ffff:169.254.x.x
+            // Catch ::ffff:169.254.x.x (cloud metadata in IPv4-mapped form).
+            // Note: ::ffff:127.x.x.x (loopback) is intentionally NOT blocked
+            // here — local cluster deployments use loopback addresses and
+            // is_metadata_or_link_local must allow them.
             if let Some(v4) = v6.to_ipv4() {
                 let o = v4.octets();
                 return o[0] == 169 && o[1] == 254;
@@ -404,7 +407,11 @@ impl MembershipClient {
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
-                // Re-validate the new address before accepting the update.
+                // Re-apply the metadata/link-local guard so a compromised trusted
+                // peer cannot redirect a known node's address to a dangerous target.
+                if is_metadata_or_link_local(&peer_info.address) {
+                    continue;
+                }
                 registry.update_address(&peer_nid, &peer_info.address);
             } else if added < MAX_NEW_PEERS
                 && registry

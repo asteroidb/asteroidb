@@ -1362,6 +1362,14 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
     if addr.contains("://") {
         return Err(format!("address must not contain a scheme: {addr}"));
     }
+    // Must not contain userinfo (the '@' character is used in RFC 3986 authority
+    // as "userinfo@host". Allowing it lets an attacker craft addresses like
+    // "attacker@169.254.169.254:80" where parse_host returns "attacker@169.254.169.254",
+    // which fails IpAddr parsing (Err => safe), but reqwest resolves it as
+    // host=169.254.169.254 — defeating all IP-level SSRF guards.
+    if addr.contains('@') {
+        return Err(format!("address must not contain '@': {addr}"));
+    }
     // Must not contain path or query components.
     if addr.contains('/') || addr.contains('?') || addr.contains('#') {
         return Err(format!(
@@ -1665,6 +1673,15 @@ mod tests {
     #[test]
     fn validate_peer_address_accepts_ipv6() {
         assert!(validate_peer_address("[::1]:3000").is_ok());
+    }
+
+    #[test]
+    fn validate_peer_address_rejects_userinfo_at_sign() {
+        // @ in address allows userinfo injection: attacker@169.254.169.254:80
+        // passes IP parsing (Err->safe) but reqwest connects to 169.254.169.254.
+        assert!(validate_peer_address("attacker@169.254.169.254:80").is_err());
+        assert!(validate_peer_address("user@host:3000").is_err());
+        assert!(validate_peer_address("user@127.0.0.1:80").is_err());
     }
 
     #[test]
