@@ -7,6 +7,14 @@ use std::time::{Duration, Instant};
 /// Default window duration for time-series metrics (60 seconds).
 const WINDOW_SECS: u64 = 60;
 
+/// Maximum number of distinct keys tracked in `write_ops_by_key`.
+///
+/// Once this limit is reached, a random existing entry is evicted before
+/// inserting the new key.  This bounds the map's memory footprint under
+/// high-cardinality write workloads while preserving approximate per-range
+/// compaction signal.
+const MAX_KEY_METRICS: usize = 10_000;
+
 /// Aggregated benchmark result for a single measurement.
 ///
 /// Captures latency statistics (mean, percentiles, min, max) for a named
@@ -373,7 +381,21 @@ impl RuntimeMetrics {
     pub fn record_write_op(&self, key: &str) {
         self.write_ops_total.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut map) = self.write_ops_by_key.lock() {
-            *map.entry(key.to_string()).or_insert(0) += 1;
+            // If the key already exists just increment — no eviction needed.
+            if map.contains_key(key) {
+                *map.get_mut(key).unwrap() += 1;
+                return;
+            }
+            // Enforce the cardinality cap before inserting a new key.
+            if map.len() >= MAX_KEY_METRICS {
+                // Evict an arbitrary entry to keep the map bounded.
+                // HashMap iteration order is non-deterministic, so this
+                // effectively evicts a pseudo-random key with O(1) cost.
+                if let Some(evict_key) = map.keys().next().cloned() {
+                    map.remove(&evict_key);
+                }
+            }
+            map.insert(key.to_string(), 1);
         }
     }
 
