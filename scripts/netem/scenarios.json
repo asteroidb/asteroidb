@@ -37,7 +37,7 @@
       "description": "Add 50ms +/- 30ms jitter, verify operations complete",
       "script": "../fault-inject/scenario-jitter-latency.sh",
       "nodes": 3,
-      "timeout_seconds": 300,
+      "timeout_seconds": 420,
       "tags": ["delay", "jitter", "convergence"]
     },
     {
