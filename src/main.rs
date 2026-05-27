@@ -45,10 +45,21 @@ fn authority_nodes() -> Vec<NodeId> {
 #[cfg(unix)]
 async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            // SIGTERM registration can fail under restrictive seccomp profiles or
+            // when the process starts before the tokio runtime is fully active.
+            // Fall back to SIGINT-only shutdown to avoid a startup panic that
+            // would skip the graceful fan_out_leave membership announcement.
+            eprintln!("warn: SIGTERM handler registration failed ({e}); falling back to SIGINT");
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
