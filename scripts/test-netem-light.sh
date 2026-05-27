@@ -313,6 +313,11 @@ for _attempt in $(seq 1 30); do
 done
 if $_gossip_ok; then
     echo "[light-netem] node-2 gossip recovered."
+    # Extra stabilization: one successful propagation confirms reconnection but
+    # the TCP gossip may still be in slow-start. Wait ~8 more gossip cycles
+    # (sync_interval=2s) to ensure the connection is reliably established
+    # before S3 writes baseline data that node-2 must receive.
+    sleep 15
 else
     echo "[light-netem] WARN: node-2 gossip not confirmed after 90s; proceeding."
 fi
