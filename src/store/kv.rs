@@ -1409,16 +1409,19 @@ mod tests {
     fn atomic_write_no_tmp_file_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.json");
-        let tmp_path = dir.path().join("store.tmp");
 
         let store = Store::new();
         store.save_snapshot(&path).unwrap();
 
         assert!(path.exists(), "final file should exist");
-        assert!(
-            !tmp_path.exists(),
-            "temp file should not persist on success"
-        );
+
+        // The tmp file is named `<filename>.<pid>.tmp` (not simply `store.tmp`).
+        // After a successful rename no `*.tmp` file should remain in the directory.
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temp file should not persist on success");
     }
 
     // ---------------------------------------------------------------

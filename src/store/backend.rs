@@ -63,7 +63,14 @@ impl StorageBackend for FileBackend {
         }
 
         // Atomic write: temp file -> fsync -> rename.
-        let tmp_path = self.path.with_extension("tmp");
+        // Use `<filename>.<pid>.tmp` rather than `with_extension("tmp")` so
+        // that paths that already end in `.tmp` (where `with_extension` is a
+        // no-op) still get a distinct temporary path.
+        let tmp_path = self.path.with_file_name(format!(
+            "{}.{}.tmp",
+            self.path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+        ));
         let mut file = File::create(&tmp_path)?;
         file.write_all(data)?;
         file.sync_all()?;
@@ -385,12 +392,22 @@ mod tests {
     fn file_backend_no_tmp_after_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.dat");
-        let tmp_path = dir.path().join("test.tmp");
         let backend = FileBackend::new(&path);
 
         backend.save(b"data").unwrap();
         assert!(path.exists());
-        assert!(!tmp_path.exists());
+
+        // The tmp file is named `<filename>.<pid>.tmp` (not simply `test.tmp`).
+        // After a successful save the rename removes it; verify no `*.tmp` file
+        // remains in the directory.
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !leftover_tmp,
+            "no .tmp file should remain after a successful save"
+        );
     }
 
     // ---------------------------------------------------------------

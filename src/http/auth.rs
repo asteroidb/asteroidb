@@ -3,7 +3,29 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
+
+/// Compare two byte slices in constant time, independent of their lengths.
+///
+/// Zero-pads both slices to `max(a.len(), b.len())` bytes so the content
+/// comparison always runs over the same number of bytes. Length equality is
+/// then AND-ed in via `subtle::Choice` so that different-length inputs are
+/// rejected without leaking which byte position diverged.
+fn ct_eq_tokens(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut buf_a = vec![0u8; max_len];
+    let mut buf_b = vec![0u8; max_len];
+    buf_a[..a.len()].copy_from_slice(a);
+    buf_b[..b.len()].copy_from_slice(b);
+    // Compare lengths in constant time: cast to u64 and use subtle::ct_eq on
+    // the byte representation. The plain `==` on usize is NOT constant-time
+    // (the compiler may emit a conditional branch), so we cannot use `as u8`.
+    let len_a = (a.len() as u64).to_le_bytes();
+    let len_b = (b.len() as u64).to_le_bytes();
+    let len_eq: Choice = len_a.ct_eq(&len_b);
+    let content_eq = buf_a.ct_eq(&buf_b);
+    (len_eq & content_eq).into()
+}
 
 /// Axum middleware that validates Bearer token authentication.
 ///
@@ -23,7 +45,7 @@ pub async fn require_bearer_token(
 
     match auth_header {
         Some(header) => match header.strip_prefix("Bearer ") {
-            Some(token) if token.as_bytes().ct_eq(expected_token.as_bytes()).into() => {
+            Some(token) if ct_eq_tokens(token.as_bytes(), expected_token.as_bytes()) => {
                 next.run(request).await
             }
             _ => StatusCode::UNAUTHORIZED.into_response(),
@@ -127,5 +149,54 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for ct_eq_tokens (timing side-channel fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ct_eq_tokens_equal_slices() {
+        assert!(ct_eq_tokens(b"secret", b"secret"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_different_content_same_length() {
+        assert!(!ct_eq_tokens(b"secret", b"notseq"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_different_lengths_both_wrong() {
+        // Tokens of different lengths must always be rejected, regardless of
+        // their content, to prevent a timing side-channel on length comparison.
+        assert!(!ct_eq_tokens(b"short", b"longer-token"));
+        assert!(!ct_eq_tokens(b"longer-token", b"short"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_length_mismatch_with_correct_prefix() {
+        // A prefix match must not cause acceptance when lengths differ.
+        assert!(!ct_eq_tokens(b"secret", b"secret-extra"));
+        assert!(!ct_eq_tokens(b"secret-extra", b"secret"));
+    }
+
+    #[test]
+    fn ct_eq_tokens_empty_vs_nonempty() {
+        assert!(!ct_eq_tokens(b"", b"token"));
+        assert!(!ct_eq_tokens(b"token", b""));
+    }
+
+    #[test]
+    fn ct_eq_tokens_both_empty() {
+        assert!(ct_eq_tokens(b"", b""));
+    }
+
+    #[test]
+    fn ct_eq_tokens_null_byte_padding_false_positive() {
+        // Zero-padding must not cause "secret" to match "secret\0\0":
+        // the shorter token padded to the same length would produce identical
+        // byte sequences without the length check, which ct_eq_tokens must reject.
+        assert!(!ct_eq_tokens(b"secret", b"secret\x00\x00"));
+        assert!(!ct_eq_tokens(b"secret\x00\x00", b"secret"));
     }
 }
