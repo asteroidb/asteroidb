@@ -47,6 +47,12 @@ pub struct TombstoneGc {
     pub retention_period: Duration,
     /// Wall-clock millisecond timestamp of the last GC run.
     last_gc_ms: u64,
+    /// Whether `gc_tombstones` has been called at least once.
+    ///
+    /// Separate from `last_gc_ms` so that a first call with `now_ms = 0`
+    /// (e.g. in unit tests) does not leave `last_gc_ms == 0` and cause every
+    /// subsequent call to re-enter the first-run bypass indefinitely.
+    has_run: bool,
     /// Cumulative count of tombstones removed across all GC runs.
     total_collected: u64,
 }
@@ -59,6 +65,7 @@ impl Default for TombstoneGc {
             gc_interval: Duration::from_secs(60),
             retention_period: Duration::from_secs(300),
             last_gc_ms: 0,
+            has_run: false,
             total_collected: 0,
         }
     }
@@ -73,6 +80,7 @@ impl TombstoneGc {
             gc_interval,
             retention_period,
             last_gc_ms: 0,
+            has_run: false,
             total_collected: 0,
         }
     }
@@ -123,9 +131,27 @@ impl TombstoneGc {
         self.total_collected
     }
 
-    /// Check whether enough time has elapsed since the last GC run.
+    /// Check whether enough time has elapsed since `last_gc_ms` was last set.
+    ///
+    /// `last_gc_ms` is set on the very first call to
+    /// [`gc_tombstones`](Self::gc_tombstones) (even with an empty store), and
+    /// thereafter only when at least one tombstone is actually collected.  On
+    /// no-op runs after the first, `last_gc_ms` is left unchanged so subsequent
+    /// calls to `should_run` return `true` again once `gc_interval` has elapsed
+    /// from the last successful collection.  This prevents the GC interval from
+    /// resetting on empty-store no-op runs and ensures the scheduler re-checks
+    /// promptly when the store is initially empty.
+    ///
+    /// **`gc_interval = 0` note**: the comparison uses a minimum of 1 ms to prevent
+    /// callers that loop on `should_run` from busy-polling at nanosecond cadence.
+    /// In tests that want "run immediately", set the interval to `Duration::from_millis(1)`.
+    ///
+    /// The `gc_interval` field controls *how often to attempt* a GC pass.
+    /// The `retention_period` field, checked inside `gc_tombstones`, controls
+    /// the *minimum quiet time* between successive actual collections.
     pub fn should_run(&self, now_ms: u64) -> bool {
         let interval_ms = self.gc_interval.as_millis() as u64;
+        let interval_ms = interval_ms.max(1);
         now_ms.saturating_sub(self.last_gc_ms) >= interval_ms
     }
 
@@ -136,11 +162,41 @@ impl TombstoneGc {
     /// that are below the node's known counter and not referenced by any live
     /// element.
     ///
+    /// # Timing semantics
+    ///
+    /// Two independent timing fields govern when collection actually happens:
+    ///
+    /// - **`gc_interval`** (checked by [`should_run`](Self::should_run)): how
+    ///   often the caller should *attempt* a GC pass. Callers are expected to
+    ///   call `should_run` before calling this method.
+    /// - **`retention_period`** (checked here): the minimum quiet time that must
+    ///   elapse between successive *successful* collections. This prevents
+    ///   premature GC of tombstones that slow replicas may not have merged yet.
+    ///
+    /// `last_gc_ms` is updated when at least one tombstone is collected, **or**
+    /// on the very first invocation (even with an empty store) to start the
+    /// retention clock. On subsequent no-op runs `last_gc_ms` is left unchanged
+    /// so that `should_run` continues to return `true` and the caller re-checks
+    /// promptly without waiting a full `gc_interval`.
+    ///
     /// Returns the number of tombstones removed in this run.
     pub fn gc_tombstones(&mut self, store: &mut Store, now_ms: u64) -> u64 {
-        // Check retention: if we haven't waited long enough since the last GC,
-        // skip this run. The first run (last_gc_ms == 0) always proceeds.
-        if self.last_gc_ms > 0 {
+        // Determine whether this is the very first invocation.
+        //
+        // On the first call we always proceed (bypass retention) so a freshly-started
+        // node can collect immediately. We also record now_ms as the retention baseline
+        // regardless of whether any tombstones exist. Without this, a node that starts
+        // with an empty store (last_gc_ms stays 0 across all no-op calls) would bypass
+        // the retention check the first time tombstones appear, potentially GC-ing them
+        // before slow replicas have had retention_period to merge them.
+        //
+        // `has_run` is used rather than `last_gc_ms == 0` to avoid an infinite
+        // first-run loop when `now_ms = 0` (e.g. in unit tests): without this flag,
+        // setting `last_gc_ms = 0` on the first call would leave the sentinel
+        // unchanged and every subsequent call would re-enter the first-run bypass.
+        let is_first_run = !self.has_run;
+
+        if !is_first_run {
             let retention_ms = self.retention_period.as_millis() as u64;
             if now_ms.saturating_sub(self.last_gc_ms) < retention_ms {
                 return 0;
@@ -180,8 +236,20 @@ impl TombstoneGc {
             }
         }
 
-        self.last_gc_ms = now_ms;
-        self.total_collected += collected;
+        // Advance the GC timestamp when tombstones were collected, OR on the very
+        // first run (even with an empty store) to start the retention clock.
+        // On subsequent no-op runs last_gc_ms is left unchanged so that should_run()
+        // keeps returning true, ensuring the scheduler re-checks promptly without
+        // waiting a full gc_interval. The two timing fields remain orthogonal:
+        // gc_interval = attempt cadence, retention_period = minimum gap between
+        // actual collections.
+        if collected > 0 {
+            self.total_collected += collected;
+        }
+        if collected > 0 || is_first_run {
+            self.last_gc_ms = now_ms;
+        }
+        self.has_run = true;
         collected
     }
 }
@@ -224,6 +292,21 @@ mod tests {
         // should_run(60000) should be true.
         assert!(gc.should_run(60_000));
         assert!(gc.should_run(100_000));
+    }
+
+    #[test]
+    fn should_run_zero_interval_not_busy_poll() {
+        // gc_interval=0 must be clamped to 1ms; should_run(0) must return false
+        // (elapsed=0 < 1) so callers that loop on should_run don't busy-poll.
+        let gc = TombstoneGc::new(Duration::ZERO, Duration::ZERO);
+        assert!(
+            !gc.should_run(0),
+            "should_run(0) must be false with gc_interval=0 (clamped to 1ms)"
+        );
+        assert!(
+            gc.should_run(1),
+            "should_run(1) must be true: elapsed 1 >= clamped interval 1"
+        );
     }
 
     #[test]
@@ -397,13 +480,91 @@ mod tests {
     }
 
     #[test]
-    fn gc_updates_last_gc_ms() {
+    fn gc_updates_last_gc_ms_on_first_run_and_on_collection() {
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
         let mut store = Store::new();
 
+        // First run on an empty store: last_gc_ms MUST advance to start the
+        // retention clock, even though no tombstones are collected.  Without
+        // this, tombstones created later would bypass the retention check
+        // because last_gc_ms would still be 0 when they first appear.
         assert_eq!(gc.last_gc_ms(), 0);
-        gc.gc_tombstones(&mut store, 5000);
-        assert_eq!(gc.last_gc_ms(), 5000);
+        let collected = gc.gc_tombstones(&mut store, 5000);
+        assert_eq!(collected, 0);
+        assert_eq!(
+            gc.last_gc_ms(),
+            5000,
+            "first run must advance last_gc_ms to start the retention clock"
+        );
+
+        // Add a tombstone-bearing OrSet; with retention=0 the second call collects.
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
+        store.put("s".into(), CrdtValue::Set(set));
+
+        let collected = gc.gc_tombstones(&mut store, 9000);
+        assert_eq!(collected, 1);
+        assert_eq!(
+            gc.last_gc_ms(),
+            9000,
+            "last_gc_ms must advance when tombstones are collected"
+        );
+
+        // Third call with empty deferred: last_gc_ms must NOT advance so
+        // should_run keeps returning true until the next collection.
+        let collected = gc.gc_tombstones(&mut store, 12_000);
+        assert_eq!(collected, 0);
+        assert_eq!(
+            gc.last_gc_ms(),
+            9000,
+            "last_gc_ms must not advance on subsequent no-op runs after first"
+        );
+    }
+
+    #[test]
+    fn gc_first_run_starts_retention_clock_for_late_tombstones() {
+        // Regression test: a node that starts with an empty store should NOT
+        // bypass the retention check when tombstones appear later.  Previously,
+        // last_gc_ms stayed 0 across all empty-store calls, so the first call
+        // with tombstones would see last_gc_ms==0 and skip the retention check.
+        let retention = Duration::from_secs(300);
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), retention);
+        let mut store = Store::new();
+        let n = node("A");
+
+        // First call at T=1000: empty store, starts the retention clock.
+        let collected = gc.gc_tombstones(&mut store, 1_000);
+        assert_eq!(collected, 0);
+        assert_eq!(
+            gc.last_gc_ms(),
+            1_000,
+            "first call must start retention clock"
+        );
+
+        // Tombstones appear shortly after at T=2000 (well within retention window).
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
+        store.put("s".into(), CrdtValue::Set(set));
+
+        // T=2001: retention=300s, elapsed=1001ms < 300_000ms → skip.
+        let collected = gc.gc_tombstones(&mut store, 2_001);
+        assert_eq!(
+            collected, 0,
+            "tombstones within retention window must not be collected"
+        );
+
+        // T=302001: 301001ms has elapsed since first run (T=1000);
+        // retention=300_000ms → collect the deferred tombstone.
+        let collected = gc.gc_tombstones(&mut store, 302_001);
+        assert_eq!(
+            collected, 1,
+            "tombstone must be collected after retention window expires"
+        );
     }
 
     /// P1-10 regression: using HLC physical timestamps (huge ms values) as
