@@ -118,6 +118,15 @@ mod tests {
     }
 
     #[test]
+    fn display_certification_timeout() {
+        let err = CrdtError::CertificationTimeout;
+        assert_eq!(
+            err.to_string(),
+            "certification timed out waiting for authority quorum"
+        );
+    }
+
+    #[test]
     fn display_internal() {
         let err = CrdtError::Internal("unexpected".into());
         assert_eq!(err.to_string(), "internal error: unexpected");

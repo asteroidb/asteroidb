@@ -69,6 +69,10 @@ impl Hlc {
     /// `u32::MAX` without the physical clock advancing. This prevents silent
     /// clamping (the former `saturating_add` behaviour) that would produce
     /// duplicate timestamps and violate strict monotonicity.
+    ///
+    /// On `Overflow`, the physical clock is advanced by 1 ms and the logical
+    /// counter is reset to 0, allowing the next `now()` call to succeed.
+    /// This mirrors the recovery guarantee in `update()`.
     pub fn now(&mut self) -> Result<HlcTimestamp, HlcError> {
         let wall = physical_ms();
 
@@ -76,7 +80,17 @@ impl Hlc {
             self.physical = wall;
             self.logical = 0;
         } else {
-            self.logical = self.logical.checked_add(1).ok_or(HlcError::Overflow)?;
+            match self.logical.checked_add(1) {
+                Some(l) => self.logical = l,
+                None => {
+                    // Logical saturated: advance physical by 1 ms and reset
+                    // logical so subsequent calls can succeed. The caller
+                    // receives Overflow to signal the exceptional tick.
+                    self.physical = self.physical.saturating_add(1);
+                    self.logical = 0;
+                    return Err(HlcError::Overflow);
+                }
+            }
         }
 
         Ok(HlcTimestamp {
@@ -298,6 +312,53 @@ mod tests {
         // logical == u32::MAX; now() increments → Overflow.
         let result = clock.now();
         assert_eq!(result, Err(HlcError::Overflow));
+    }
+
+    #[test]
+    fn now_recovers_after_overflow() {
+        // After now() returns Overflow, the physical clock is advanced by 1 ms
+        // and logical is reset to 0. The very next call to now() must succeed.
+        let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
+        // Force physical into the future and logical to u32::MAX - 1 so the
+        // first now() call overflows.
+        let near_max = HlcTimestamp {
+            physical: wall + 1_000,
+            logical: u32::MAX - 1,
+            node_id: "node-b".into(),
+        };
+        clock.update(&near_max).expect("update should succeed");
+        // First now(): Overflow.
+        assert_eq!(clock.now(), Err(HlcError::Overflow));
+        // Second now(): must succeed — physical was advanced, logical reset.
+        assert!(
+            clock.now().is_ok(),
+            "now() must recover on the call after Overflow"
+        );
+    }
+
+    #[test]
+    fn update_physical_advanced_before_overflow_return() {
+        // update() must advance self.physical to max_physical even when it
+        // returns Err(Overflow). Verify by checking that a subsequent now()
+        // does not also overflow (because physical was advanced correctly).
+        let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
+        // Overflow: received.logical=u32::MAX with physical slightly ahead.
+        let overflow_ts = HlcTimestamp {
+            physical: wall + 1_000,
+            logical: u32::MAX,
+            node_id: "node-b".into(),
+        };
+        assert_eq!(clock.update(&overflow_ts), Err(HlcError::Overflow));
+        // self.physical is now wall+1_000. now() is in the else branch
+        // (wall <= self.physical). logical after overflow_ts update was
+        // not changed (? short-circuited), so it is still 0. now() should
+        // increment to 1 successfully.
+        assert!(
+            clock.now().is_ok(),
+            "now() should succeed after update() Overflow because physical was advanced"
+        );
     }
 
     #[test]

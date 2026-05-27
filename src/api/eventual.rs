@@ -259,7 +259,12 @@ impl EventualApi {
         remote_value: &CrdtValue,
         hlc: HlcTimestamp,
     ) -> Result<(), CrdtError> {
-        self.clock.update(&hlc)?;
+        // Clock update errors (ClockSkew, Overflow) must NOT prevent the CRDT
+        // merge. Discarding the merge on ClockSkew causes permanent data loss
+        // because node_runner advances the peer frontier regardless of per-entry
+        // errors, so skipped entries are never re-requested. The clock update is
+        // advisory (ordering only); CRDT correctness does not depend on it.
+        let _ = self.clock.update(&hlc);
         self.store.merge_value(key.clone(), remote_value)?;
         // Always record the change using the maximum of the incoming HLC
         // and any existing timestamp for this key. This ensures that
