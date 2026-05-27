@@ -60,10 +60,19 @@ impl SystemNamespace {
 
     /// Adds or updates a placement policy, keyed by its key range prefix.
     /// Increments the namespace version.
-    pub fn set_placement_policy(&mut self, policy: PlacementPolicy) {
+    pub fn set_placement_policy(
+        &mut self,
+        policy: PlacementPolicy,
+    ) -> Result<(), crate::error::CrdtError> {
+        if policy.replica_count == 0 {
+            return Err(crate::error::CrdtError::InvalidArgument(
+                "replica_count must be at least 1".into(),
+            ));
+        }
         let prefix = policy.key_range.prefix.clone();
         self.placement_policies.insert(prefix, policy);
         self.bump_version();
+        Ok(())
     }
 
     /// Returns the placement policy for the given prefix, if any.
@@ -246,6 +255,21 @@ impl SystemNamespace {
         }
         let data = std::fs::read_to_string(path)?;
         let ns: Self = serde_json::from_str(&data)?;
+        // Reject persisted state that bypasses set_placement_policy's guard.
+        // A hand-crafted or corrupted file with replica_count=0 would cause
+        // recalculate_authorities to produce an empty authority set and
+        // is_satisfied() to return true (0 >= 0), silently breaking certified writes.
+        for policy in ns.placement_policies.values() {
+            if policy.replica_count == 0 {
+                return Err(PersistError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "placement policy '{}': replica_count must be at least 1",
+                        policy.key_range.prefix
+                    ),
+                )));
+            }
+        }
         Ok(Some(ns))
     }
 
@@ -322,7 +346,7 @@ mod tests {
     fn set_and_get_placement_policy() {
         let mut ns = SystemNamespace::new();
         let policy = make_policy("user/");
-        ns.set_placement_policy(policy);
+        ns.set_placement_policy(policy).unwrap();
 
         let got = ns.get_placement_policy("user/").unwrap();
         assert_eq!(got.key_range.prefix, "user/");
@@ -332,9 +356,9 @@ mod tests {
     #[test]
     fn set_placement_policy_overwrites() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         let updated = PlacementPolicy::new(PolicyVersion(2), key_range("user/"), 5);
-        ns.set_placement_policy(updated);
+        ns.set_placement_policy(updated).unwrap();
 
         let got = ns.get_placement_policy("user/").unwrap();
         assert_eq!(got.replica_count, 5);
@@ -349,7 +373,7 @@ mod tests {
     #[test]
     fn remove_placement_policy() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
 
         let removed = ns.remove_placement_policy("user/");
         assert!(removed.is_some());
@@ -363,10 +387,21 @@ mod tests {
     }
 
     #[test]
+    fn set_placement_policy_rejects_zero_replica_count() {
+        let mut ns = SystemNamespace::new();
+        let invalid = PlacementPolicy::new(PolicyVersion(1), key_range("user/"), 0);
+        let err = ns.set_placement_policy(invalid).unwrap_err();
+        assert!(
+            matches!(err, crate::error::CrdtError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
     fn all_placement_policies_lists_all() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
-        ns.set_placement_policy(make_policy("order/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
+        ns.set_placement_policy(make_policy("order/")).unwrap();
 
         let all = ns.all_placement_policies();
         assert_eq!(all.len(), 2);
@@ -379,17 +414,17 @@ mod tests {
         let mut ns = SystemNamespace::new();
         assert_eq!(*ns.version(), PolicyVersion(1));
 
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         assert_eq!(*ns.version(), PolicyVersion(2));
 
-        ns.set_placement_policy(make_policy("order/"));
+        ns.set_placement_policy(make_policy("order/")).unwrap();
         assert_eq!(*ns.version(), PolicyVersion(3));
     }
 
     #[test]
     fn version_increments_on_remove_policy() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         let v_before = ns.version().0;
         ns.remove_placement_policy("user/");
         assert_eq!(ns.version().0, v_before + 1);
@@ -413,7 +448,7 @@ mod tests {
     #[test]
     fn version_history_tracks_all_changes() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         ns.set_authority_definition(make_authority_def("user/", &["n1"]));
         ns.remove_placement_policy("user/");
 
@@ -526,7 +561,7 @@ mod tests {
     #[test]
     fn serde_system_namespace_round_trip() {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         ns.set_authority_definition(make_authority_def("user/", &["n1", "n2", "n3"]));
 
         let json = serde_json::to_string(&ns).unwrap();
@@ -546,8 +581,8 @@ mod tests {
         let path = dir.path().join("ns.json");
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
-        ns.set_placement_policy(make_policy("order/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
+        ns.set_placement_policy(make_policy("order/")).unwrap();
         ns.set_authority_definition(make_authority_def("user/", &["n1", "n2", "n3"]));
 
         ns.save(&path).unwrap();
@@ -594,14 +629,14 @@ mod tests {
         let path = dir.path().join("ns.json");
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         // version is now 2
         ns.save(&path).unwrap();
 
         let mut loaded = SystemNamespace::load(&path).unwrap().unwrap();
         assert_eq!(*loaded.version(), PolicyVersion(2));
 
-        loaded.set_placement_policy(make_policy("order/"));
+        loaded.set_placement_policy(make_policy("order/")).unwrap();
         assert_eq!(*loaded.version(), PolicyVersion(3));
         assert_eq!(
             loaded.version_history(),
@@ -615,10 +650,10 @@ mod tests {
         let path = dir.path().join("ns.json");
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         ns.save(&path).unwrap();
 
-        ns.set_placement_policy(make_policy("order/"));
+        ns.set_placement_policy(make_policy("order/")).unwrap();
         ns.save(&path).unwrap();
 
         let loaded = SystemNamespace::load(&path).unwrap().unwrap();
@@ -634,6 +669,33 @@ mod tests {
 
         let result = SystemNamespace::load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_rejects_zero_replica_count_policy() {
+        // A hand-crafted file with replica_count=0 must be rejected on load
+        // even though set_placement_policy guards against it at runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.json");
+        // Build a valid namespace, then serialize it with a patched replica_count.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/")).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ns).unwrap()).unwrap();
+        json["placement_policies"]["user/"]["replica_count"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = SystemNamespace::load(&path);
+        assert!(
+            result.is_err(),
+            "load() must reject replica_count=0 from persisted file"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("replica_count must be at least 1"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     // --- recalculate_authorities ---
@@ -661,7 +723,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -685,7 +748,7 @@ mod tests {
         let mut ns = SystemNamespace::new();
         let policy = PlacementPolicy::new(PolicyVersion(1), key_range("data/"), 3);
         // certified is false by default
-        ns.set_placement_policy(policy);
+        ns.set_placement_policy(policy).unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -702,7 +765,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         // Initial: 2 matching nodes
         let nodes_v1 = vec![
@@ -740,7 +804,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes_v1 = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -783,7 +848,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -804,7 +870,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[]));
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -830,7 +897,7 @@ mod tests {
             .with_certified(true)
             .with_required_tags([Tag("dc:tokyo".into())].into())
             .with_forbidden_tags([Tag("decommissioned".into())].into());
-        ns.set_placement_policy(policy);
+        ns.set_placement_policy(policy).unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -849,8 +916,10 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]));
-        ns.set_placement_policy(make_certified_policy("order/", &["dc:osaka"]));
+        ns.set_placement_policy(make_certified_policy("user/", &["dc:tokyo"]))
+            .unwrap();
+        ns.set_placement_policy(make_certified_policy("order/", &["dc:osaka"]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &["dc:tokyo"]),
@@ -877,8 +946,10 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[]));
-        ns.set_placement_policy(make_certified_policy("order/", &[]));
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
+        ns.set_placement_policy(make_certified_policy("order/", &[]))
+            .unwrap();
         let version_before = *ns.version();
 
         let nodes = vec![
@@ -897,7 +968,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[]));
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -924,7 +996,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("order/", &[]));
+        ns.set_placement_policy(make_certified_policy("order/", &[]))
+            .unwrap();
 
         let nodes = vec![
             make_node("n1", NodeMode::Store, &[]),
@@ -939,7 +1012,7 @@ mod tests {
         // Change the policy to certified=false, then recalculate.
         let non_certified =
             PlacementPolicy::new(PolicyVersion(1), key_range("order/"), 3).with_certified(false);
-        ns.set_placement_policy(non_certified);
+        ns.set_placement_policy(non_certified).unwrap();
         let changed = ns.recalculate_authorities(&nodes);
         assert_eq!(changed, 1);
         assert!(
@@ -990,7 +1063,8 @@ mod tests {
         let mut ns = SystemNamespace::new();
 
         // Add a certified policy for "data/" so recalculate creates an auto definition.
-        ns.set_placement_policy(make_certified_policy("data/", &[]));
+        ns.set_placement_policy(make_certified_policy("data/", &[]))
+            .unwrap();
 
         // Manually set a catch-all authority definition.
         ns.set_authority_definition(AuthorityDefinition {
@@ -1033,7 +1107,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_certified_policy("user/", &[]));
+        ns.set_placement_policy(make_certified_policy("user/", &[]))
+            .unwrap();
 
         let nodes = vec![make_node("n1", NodeMode::Store, &[])];
         ns.recalculate_authorities(&nodes);

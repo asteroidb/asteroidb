@@ -25,7 +25,7 @@ fn build_store(n: usize) -> (Store, Option<HlcTimestamp>) {
         let key = format!("key-{i:06}");
         let mut counter = PnCounter::new();
         counter.increment(&nid);
-        let ts = clock.now();
+        let ts = clock.now().expect("HLC overflow in bench setup");
         store.put(key.clone(), CrdtValue::Counter(counter));
         store.record_change(&key, ts);
     }
@@ -98,7 +98,7 @@ fn bench_entries_since(c: &mut Criterion) {
             let changed = total / 10;
             for i in 0..changed {
                 let key = format!("key-{i:06}");
-                let ts = clock.now();
+                let ts = clock.now().expect("HLC overflow in bench setup");
                 store.record_change(&key, ts);
             }
 

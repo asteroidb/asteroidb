@@ -1,5 +1,24 @@
 use thiserror::Error;
 
+/// Error type for Hybrid Logical Clock operations.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum HlcError {
+    #[error("HLC logical counter overflow: physical clock is not advancing fast enough")]
+    Overflow,
+    /// Received timestamp is too far ahead of local wall clock.
+    ///
+    /// Accepting it would set `self.physical` to a far-future value, causing
+    /// `now()` to stop advancing and eventually fail with Overflow (DoS vector).
+    #[error(
+        "HLC clock skew too large: received physical={received_ms}, wall={wall_ms}, max_skew_ms={max_skew_ms}"
+    )]
+    ClockSkew {
+        received_ms: u64,
+        wall_ms: u64,
+        max_skew_ms: u64,
+    },
+}
+
 /// Common error type for CRDT operations.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CrdtError {
@@ -24,6 +43,9 @@ pub enum CrdtError {
     #[error("timeout")]
     Timeout,
 
+    #[error("certification timed out waiting for authority quorum")]
+    CertificationTimeout,
+
     #[error("incompatible format version: data={data_version}, code={code_version}")]
     IncompatibleVersion {
         data_version: u32,
@@ -35,6 +57,12 @@ pub enum CrdtError {
 
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl From<HlcError> for CrdtError {
+    fn from(e: HlcError) -> Self {
+        CrdtError::Internal(format!("HLC error: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +115,15 @@ mod tests {
     fn display_timeout() {
         let err = CrdtError::Timeout;
         assert_eq!(err.to_string(), "timeout");
+    }
+
+    #[test]
+    fn display_certification_timeout() {
+        let err = CrdtError::CertificationTimeout;
+        assert_eq!(
+            err.to_string(),
+            "certification timed out waiting for authority quorum"
+        );
     }
 
     #[test]
