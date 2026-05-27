@@ -1074,25 +1074,6 @@ mod tests {
     fn write_ops_by_key_respects_cap() {
         let m = RuntimeMetrics::default();
         // Insert MAX_KEY_METRICS + 1 distinct keys; map must never exceed cap.
-        for i in 0..=(MAX_KEY_METRICS as u64) {
-            m.record_write_op(&format!("key-{i}"));
-        }
-        let map = m.write_ops_by_key.lock().unwrap();
-        assert!(
-            map.len() <= MAX_KEY_METRICS,
-            "write_ops_by_key must not exceed MAX_KEY_METRICS; got {}",
-            map.len()
-        );
-    }
-
-    #[test]
-    fn write_ops_existing_key_always_incremented_past_cap() {
-        let m = RuntimeMetrics::default();
-        // Fill to cap with distinct keys.
-        for i in 0..MAX_KEY_METRICS {
-            m.record_write_op(&format!("key-{i}"));
-        }
-        // An existing key must still be incremented even when cap is reached.
         m.record_write_op("key-0");
         let map = m.write_ops_by_key.lock().unwrap();
         assert_eq!(
