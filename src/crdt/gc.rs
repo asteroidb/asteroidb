@@ -284,8 +284,14 @@ mod tests {
         // gc_interval=0 must be clamped to 1ms; should_run(0) must return false
         // (elapsed=0 < 1) so callers that loop on should_run don't busy-poll.
         let gc = TombstoneGc::new(Duration::ZERO, Duration::ZERO);
-        assert!(!gc.should_run(0), "should_run(0) must be false with gc_interval=0 (clamped to 1ms)");
-        assert!(gc.should_run(1), "should_run(1) must be true: elapsed 1 >= clamped interval 1");
+        assert!(
+            !gc.should_run(0),
+            "should_run(0) must be false with gc_interval=0 (clamped to 1ms)"
+        );
+        assert!(
+            gc.should_run(1),
+            "should_run(1) must be true: elapsed 1 >= clamped interval 1"
+        );
     }
 
     #[test]
@@ -533,8 +539,7 @@ mod tests {
         // T=2001: retention=300s, elapsed=1001ms < 300_000ms → skip.
         let collected = gc.gc_tombstones(&mut store, 2_001);
         assert_eq!(
-            collected,
-            0,
+            collected, 0,
             "tombstones within retention window must not be collected"
         );
     }
