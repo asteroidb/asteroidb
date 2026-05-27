@@ -81,6 +81,11 @@ impl<T: Clone + Ord> LwwRegister<T> {
                 // when the same delta is applied twice (idempotent path) or in
                 // artificial test scenarios. The value tiebreaker ensures
                 // merge(a, b) == merge(b, a) even in those cases.
+                //
+                // The (None, Some(_)) branch is also unreachable in practice:
+                // new() initialises with physical=0, which is always less than
+                // any real write timestamp; matching Equal implies both registers
+                // hold Some. Kept for exhaustiveness.
                 match (&self.value, &other.value) {
                     (Some(s), Some(o)) if o > s => {
                         self.value = other.value.clone();
