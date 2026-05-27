@@ -32,21 +32,22 @@ fn parse_host(addr: &str) -> &str {
 /// Check whether an IPv4 address is dangerous (loopback or link-local/metadata).
 fn is_dangerous_v4(v4: std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
-    o[0] == 127 || (o[0] == 169 && o[1] == 254)
+    v4.is_unspecified() || o[0] == 127 || (o[0] == 169 && o[1] == 254)
 }
 
 /// Check whether a peer address is safe to connect to.
 ///
-/// Rejects loopback (`127.0.0.0/8`, `::1`), link-local IPv4 (`169.254.0.0/16`),
-/// IPv6 link-local (`fe80::/10`), and IPv4-mapped IPv6 equivalents of those
-/// ranges (e.g. `::ffff:169.254.169.254`). Used in HTTP handlers to guard
-/// against SSRF via injected inbound ping payloads.
+/// Rejects unspecified (`0.0.0.0`, `::`), loopback (`127.0.0.0/8`, `::1`),
+/// link-local IPv4 (`169.254.0.0/16`), IPv6 link-local (`fe80::/10`), and
+/// IPv4-mapped IPv6 equivalents of those ranges. Used in HTTP handlers and
+/// `reconcile_peers` to guard against SSRF via injected peer addresses, and
+/// to prevent wildcard bind addresses from corrupting the peer registry.
 pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
     let host = parse_host(addr);
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => !is_dangerous_v4(v4),
         Ok(IpAddr::V6(v6)) => {
-            if v6.is_loopback() {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return false;
             }
             let segments = v6.segments();
@@ -404,12 +405,14 @@ impl MembershipClient {
             }
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
-                // Update address if it changed (e.g. peer restarted with new IP).
-                // The link-local guard above already rejects dangerous addresses;
-                // peer_info.address is guaranteed safe here. Hostname addresses
-                // (e.g. Docker container names) are allowed for known peers so
-                // that gossip-based address refresh works in Docker deployments.
-                registry.update_address(&peer_nid, &peer_info.address);
+                // Update address for known peers only when it is a routable
+                // IP:port. Reject unspecified (0.0.0.0/::), loopback, and
+                // link-local via is_safe_peer_address so that a node that binds
+                // to 0.0.0.0 without ASTEROIDB_ADVERTISE_ADDR cannot overwrite
+                // a peer's correct static IP with an unroutable wildcard.
+                if is_safe_peer_address(&peer_info.address) {
+                    registry.update_address(&peer_nid, &peer_info.address);
+                }
             } else if added < MAX_NEW_PEERS {
                 // New peer: require a valid IP:port. Hostnames pass
                 // is_metadata_or_link_local (Err branch returns false) but
@@ -506,6 +509,20 @@ mod tests {
     fn safe_address_blocks_ipv4_mapped_loopback() {
         // ::ffff:127.0.0.1 is IPv4-mapped loopback.
         assert!(!is_safe_peer_address("[::ffff:127.0.0.1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_unspecified_ipv4() {
+        // 0.0.0.0 is the wildcard bind address — not a routable peer address.
+        // A node that binds to 0.0.0.0 without ASTEROIDB_ADVERTISE_ADDR would
+        // gossip this as its own address, corrupting the peer registry.
+        assert!(!is_safe_peer_address("0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_unspecified_ipv6() {
+        // [::] is the IPv6 wildcard — same reasoning as 0.0.0.0.
+        assert!(!is_safe_peer_address("[::]:3000"));
     }
 
     #[test]

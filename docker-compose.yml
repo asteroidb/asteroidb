@@ -8,6 +8,7 @@ services:
       - "3001:3000"
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_ADVERTISE_ADDR: "172.28.0.2:3000"
       ASTEROIDB_NODE_ID: "node-1"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
@@ -27,6 +28,7 @@ services:
       - "3002:3000"
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_ADVERTISE_ADDR: "172.28.0.3:3000"
       ASTEROIDB_NODE_ID: "node-2"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
@@ -46,6 +48,7 @@ services:
       - "3003:3000"
     environment:
       ASTEROIDB_BIND_ADDR: "0.0.0.0:3000"
+      ASTEROIDB_ADVERTISE_ADDR: "172.28.0.4:3000"
       ASTEROIDB_NODE_ID: "node-3"
       ASTEROIDB_INTERNAL_TOKEN: "${ASTEROIDB_INTERNAL_TOKEN}"
       ASTEROIDB_CONFIG: "/etc/asteroidb/config.json"
