@@ -311,9 +311,36 @@ impl Store {
                 },
             ));
         }
-        let (store, _len) =
+        let (store, _len): (Self, _) =
             bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Apply schema migrations when the stored version is older than the
+        // current format version, matching the behaviour of the JSON load path.
+        if version < CURRENT_FORMAT_VERSION {
+            // MAINTAINER WARNING — bincode→JSON→migration roundtrip structural fragility:
+            //
+            // This path decodes the bincode bytes into `Self` using the CURRENT struct
+            // layout, then re-serialises to JSON to run the migration registry. This only
+            // works safely when bincode and JSON field names agree AND the old schema is
+            // structurally compatible with the current struct (i.e. no field renames,
+            // removals, or type changes between `version` and `CURRENT_FORMAT_VERSION`).
+            //
+            // V1→V2 is safe today because the migration is a no-op. If a future
+            // migration renames, removes, or reinterprets a field, this approach will
+            // silently decode stale bincode into the wrong shape. When adding a new
+            // format version with a structural change, introduce a versioned decode
+            // type (e.g. `StoreV1`) and decode from bincode into that before migrating.
+            let store_value = serde_json::to_value(&store)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let registry = migration::default_registry();
+            let migrated = registry
+                .apply_migrations(store_value, version, CURRENT_FORMAT_VERSION)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            return serde_json::from_value(migrated)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+
         Ok(store)
     }
 
@@ -1906,5 +1933,92 @@ mod tests {
         assert!(loaded.contains_key("counter"));
         assert!(loaded.contains_key("set"));
         assert!(loaded.contains_key("reg"));
+    }
+
+    #[test]
+    fn bincode_v1_snapshot_migrates_on_load() {
+        use crate::store::backend::MemoryBackend;
+
+        // Build a v1 bincode snapshot: 4-byte LE version prefix = 1, followed by a
+        // bincode-encoded Store payload using the current (v2) struct layout.
+        // V1ToV2 is a no-op (schemas are identical), so this tests the
+        // version-routing logic only — not structural schema divergence between
+        // a true v1 layout and v2 (see MAINTAINER WARNING above load_from_backend_bincode).
+        let mut original = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        counter.increment(&node("A"));
+        original.put("hits".into(), CrdtValue::Counter(counter));
+        original.record_change("hits", ts(42, 0, "A"));
+
+        let mut set = OrSet::new();
+        set.add("alice".to_string(), &node("A"));
+        original.put("users".into(), CrdtValue::Set(set));
+
+        // Encode the store with bincode (no version prefix yet).
+        let payload = bincode::serde::encode_to_vec(&original, bincode::config::standard())
+            .expect("bincode encode failed");
+
+        // Prepend the v1 version prefix (little-endian u32 = 1).
+        let mut v1_bytes = Vec::with_capacity(4 + payload.len());
+        v1_bytes.extend_from_slice(&1u32.to_le_bytes());
+        v1_bytes.extend_from_slice(&payload);
+
+        // Store the crafted v1 snapshot in a MemoryBackend.
+        let backend = MemoryBackend::new();
+        backend.save(&v1_bytes).unwrap();
+
+        // load_from_backend_bincode must detect version 1 < 2, apply migrations,
+        // and return the data intact (V1ToV2 is a no-op, so nothing changes).
+        let loaded = Store::load_from_backend_bincode(&backend)
+            .expect("v1 bincode snapshot should migrate and load successfully");
+
+        assert_eq!(loaded.len(), 2, "all keys must survive migration");
+
+        // Verify counter value survived the migration roundtrip.
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+
+        // Verify set value survived the migration roundtrip.
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => assert!(s.contains(&"alice".to_string())),
+            other => panic!("expected Set, got {:?}", other),
+        }
+
+        // Verify timestamps are restored after migration.
+        assert_eq!(
+            loaded.timestamp_for("hits"),
+            Some(&ts(42, 0, "A")),
+            "timestamp must survive migration"
+        );
+    }
+
+    #[test]
+    fn bincode_load_future_version_returns_error() {
+        use crate::store::backend::MemoryBackend;
+        // Mirror of load_future_version_returns_error for the JSON path: a
+        // bincode snapshot with version > CURRENT_FORMAT_VERSION must be
+        // rejected with InvalidData so future schema incompatibilities are
+        // caught rather than silently decoded as the current layout.
+        let backend = MemoryBackend::new();
+        let future_version: u32 = 99;
+        let bytes = future_version.to_le_bytes().to_vec();
+
+        backend.save(&bytes).unwrap();
+
+        let result = Store::load_from_backend_bincode(&backend);
+        assert!(result.is_err(), "future-version bincode must be rejected");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "error kind must be InvalidData"
+        );
+        assert!(
+            err.to_string().contains("incompatible"),
+            "error message must mention 'incompatible'; got: {err}"
+        );
     }
 }
