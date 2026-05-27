@@ -1092,7 +1092,11 @@ mod tests {
         }
         m.record_write_op("key-0");
         let map = m.write_ops_by_key.lock().unwrap();
-        assert_eq!(*map.get("key-0").unwrap(), 2, "existing key must be incremented past cap");
+        assert_eq!(
+            *map.get("key-0").unwrap(),
+            2,
+            "existing key must be incremented past cap"
+        );
         assert!(map.len() <= MAX_KEY_METRICS);
     }
 }

@@ -1914,9 +1914,7 @@ mod tests {
         // caught rather than silently decoded as the current layout.
         let backend = MemoryBackend::new();
         let future_version: u32 = 99;
-        let mut bytes = future_version.to_le_bytes().to_vec();
-        // Append a minimal valid bincode payload (empty map) to pass length check.
-        bytes.extend_from_slice(&[0x00]); // bincode-encoded empty map
+        let bytes = future_version.to_le_bytes().to_vec();
 
         backend.save(&bytes).unwrap();
 
