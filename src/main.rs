@@ -399,6 +399,10 @@ async fn main() {
 
     // wait_for_signal() resolves on SIGINT (Ctrl-C) on all platforms, and
     // additionally on SIGTERM on Unix (Kubernetes/Docker graceful shutdown).
+    // TODO: axum::serve should use with_graceful_shutdown() so in-flight HTTP
+    // requests drain before the process exits. This requires restructuring the
+    // select! to pass a oneshot channel to axum and wait for it after signalling.
+    // Track as a follow-up issue.
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
