@@ -868,7 +868,7 @@ mod tests {
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());
         let result = api.certified_write("key1".into(), counter_value(1), OnTimeout::Error);
 
-        assert_eq!(result.unwrap_err(), CrdtError::Timeout);
+        assert_eq!(result.unwrap_err(), CrdtError::CertificationTimeout);
         // The write should still be tracked as pending.
         assert_eq!(api.pending_writes().len(), 1);
         assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);

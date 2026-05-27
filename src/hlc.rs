@@ -173,9 +173,9 @@ mod tests {
         let mut clock = Hlc::new("node-a".into());
         let local = clock.now().expect("HLC overflow");
 
-        // Simulate receiving a timestamp far in the future.
+        // Simulate receiving a timestamp within the allowed clock skew (10s ahead).
         let future = HlcTimestamp {
-            physical: local.physical + 100_000,
+            physical: local.physical + 10_000,
             logical: 5,
             node_id: "node-b".into(),
         };
