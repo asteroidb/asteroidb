@@ -30,12 +30,15 @@ pub struct TombstoneGc {
     /// A dot `(node_id, counter)` with `counter < version_floor[node_id]`
     /// is safe to garbage-collect (assuming it is not in any live element).
     version_floor: HashMap<NodeId, u64>,
-    /// Global version floor applied to ALL writer nodes.
+    /// Global version floor applied to ALL writer nodes, in **dot-counter units**.
     ///
-    /// Derived from the minimum acknowledged frontier HLC physical timestamp
-    /// across all authorities. When set, a dot `(node_id, counter)` with
-    /// `counter < global_floor` is considered safe to GC regardless of the
-    /// per-node floor entries.
+    /// When set, a dot `(node_id, counter)` with `counter < global_floor` is
+    /// considered safe to GC regardless of the per-node floor entries.
+    ///
+    /// **Units**: this must be a dot counter value (a small monotonic integer),
+    /// NOT an HLC physical timestamp (Unix milliseconds, ~10^12). Passing an
+    /// HLC-scale value causes every dot counter to appear below the floor and
+    /// bulk-GCs all tombstones. See `set_global_floor` for a guard.
     global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
@@ -100,11 +103,18 @@ impl TombstoneGc {
         self.version_floor.get(node_id).copied()
     }
 
-    /// Set the global version floor that applies to ALL writer nodes.
+    /// Set the global version floor (in dot-counter units) for ALL writer nodes.
     ///
-    /// Typically set to the minimum acknowledged frontier HLC physical
-    /// timestamp across all authorities.
+    /// `floor` must be a **dot counter** value — a small monotonic integer
+    /// incremented once per write operation per node. It must NOT be an HLC
+    /// physical timestamp (Unix milliseconds, ~10^12): dot counters are always
+    /// smaller than HLC timestamps, so an HLC-scale floor would mark every
+    /// tombstone as below the floor and bulk-GC them all.
     pub fn set_global_floor(&mut self, floor: u64) {
+        debug_assert!(
+            floor < 1_000_000_000_000,
+            "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
+        );
         self.global_floor = Some(floor);
     }
 

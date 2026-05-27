@@ -315,6 +315,11 @@ where
     /// The `floor` criterion alone can delete tombstones that have not yet
     /// reached all replicas. Ensure the floor value only reflects versions
     /// confirmed by all known replicas. Do not call during partial sync rounds.
+    ///
+    /// `global_floor` (and per-node floor values) must be in **dot-counter
+    /// units** (small monotonic integers), NOT HLC physical timestamps
+    /// (~10^12 ms). A floor larger than any dot counter would remove all
+    /// tombstones, including dots from nodes absent from `version_floor`.
     pub fn compact_deferred_with_floor(
         &mut self,
         version_floor: &std::collections::HashMap<NodeId, u64>,

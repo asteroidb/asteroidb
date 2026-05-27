@@ -337,6 +337,12 @@ where
     /// A dot is removed when it is not live AND at least one of the following
     /// holds: (1) locally dominated (`counter < max_counter`), or (2) below
     /// the cross-replica version floor (`counter < floor`).
+    ///
+    /// # Warning
+    /// Floor values must be in **dot-counter units** (small monotonic integers),
+    /// NOT HLC physical timestamps (~10^12 ms). An HLC-scale floor would mark
+    /// every tombstone as below the floor and bulk-GC them all. Do not call
+    /// during partial sync rounds.
     pub fn compact_deferred_with_floor(
         &mut self,
         version_floor: &std::collections::HashMap<crate::types::NodeId, u64>,
