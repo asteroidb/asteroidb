@@ -144,14 +144,14 @@ impl Hlc {
             Ok(0u32)
         };
 
-        // Always advance the physical clock before returning, even on overflow.
-        // Without this, a cascade of overflow errors in the same millisecond
-        // would prevent self.physical from advancing to the next millisecond,
-        // causing every subsequent update() call to also fail with Overflow.
-        // Post-error state: self.physical = max_physical, self.logical unchanged
-        // (the `?` below short-circuits before updating it). This is intentional:
-        // the caller discards the error, and the next now()/update() will see the
-        // advanced physical clock and reset logical to 0.
+        // Always advance the physical clock to max_physical before returning,
+        // even on overflow. When received.physical > self.physical, this ensures
+        // a subsequent now() call sees an already-advanced physical and resets
+        // logical to 0. In the all-three-equal case max_physical == self.physical
+        // (no change), but the wall clock advances naturally within one millisecond,
+        // so recovery still occurs on the next now() or update() once wall > self.physical.
+        // Post-error state: self.logical unchanged (the `?` short-circuits before
+        // updating it). The caller discards the error; subsequent calls recover.
         self.physical = max_physical;
 
         self.logical = logical_result?;

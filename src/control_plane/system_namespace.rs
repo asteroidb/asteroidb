@@ -255,6 +255,21 @@ impl SystemNamespace {
         }
         let data = std::fs::read_to_string(path)?;
         let ns: Self = serde_json::from_str(&data)?;
+        // Reject persisted state that bypasses set_placement_policy's guard.
+        // A hand-crafted or corrupted file with replica_count=0 would cause
+        // recalculate_authorities to produce an empty authority set and
+        // is_satisfied() to return true (0 >= 0), silently breaking certified writes.
+        for policy in ns.placement_policies.values() {
+            if policy.replica_count == 0 {
+                return Err(PersistError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "placement policy '{}': replica_count must be at least 1",
+                        policy.key_range.prefix
+                    ),
+                )));
+            }
+        }
         Ok(Some(ns))
     }
 
@@ -654,6 +669,32 @@ mod tests {
 
         let result = SystemNamespace::load(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_rejects_zero_replica_count_policy() {
+        // A hand-crafted file with replica_count=0 must be rejected on load
+        // even though set_placement_policy guards against it at runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ns.json");
+        // Build a valid namespace, then serialize it with a patched replica_count.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("user/")).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ns).unwrap()).unwrap();
+        json["placement_policies"]["user/"]["replica_count"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let result = SystemNamespace::load(&path);
+        assert!(
+            result.is_err(),
+            "load() must reject replica_count=0 from persisted file"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("replica_count must be at least 1"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     // --- recalculate_authorities ---
