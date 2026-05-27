@@ -75,8 +75,17 @@ impl<T: Clone + Ord> LwwRegister<T> {
                 self.timestamp = other.timestamp.clone();
             }
             std::cmp::Ordering::Equal => {
-                // Deterministic tiebreaker: keep the larger value so that
-                // merge(a, b) == merge(b, a) even when timestamps collide.
+                // HlcTimestamp has a total order (physical → logical → node_id),
+                // so two distinct writes from different nodes always produce
+                // different timestamps in practice. This arm is only reachable
+                // when the same delta is applied twice (idempotent path) or in
+                // artificial test scenarios. The value tiebreaker ensures
+                // merge(a, b) == merge(b, a) even in those cases.
+                //
+                // The (None, Some(_)) branch is also unreachable in practice:
+                // new() initialises with physical=0, which is always less than
+                // any real write timestamp; matching Equal implies both registers
+                // hold Some. Kept for exhaustiveness.
                 match (&self.value, &other.value) {
                     (Some(s), Some(o)) if o > s => {
                         self.value = other.value.clone();
