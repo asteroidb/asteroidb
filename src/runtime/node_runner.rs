@@ -2488,11 +2488,10 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3))
+            .unwrap();
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
-        // Compaction checkpoints are only created when an eventual_api is present.
-        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));
 
         let compaction_config = CompactionConfig {
             time_threshold_ms: 10,
