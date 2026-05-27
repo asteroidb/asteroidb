@@ -108,8 +108,9 @@ fi
 
 if ! $node3_converged; then
     # node-3 is non-blocking: jitter on node-2 disrupts all TCP gossip via
-    # congestion control. Warn but do not fail the scenario.
-    wait_for_convergence "$expected" "$NODE3_URL" "node-3" "$POST_JITTER_RETRIES" "$POST_JITTER_INTERVAL" "$KEY" || \
+    # congestion control. Cap retries to 10 (30s) to avoid exceeding the
+    # scenario timeout budget — node-2 already uses the full window above.
+    wait_for_convergence "$expected" "$NODE3_URL" "node-3" 10 "$POST_JITTER_INTERVAL" "$KEY" || \
         echo "  [WARN] node-3 did not converge post-jitter (non-blocking)."
 fi
 
