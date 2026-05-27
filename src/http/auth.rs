@@ -17,9 +17,12 @@ fn ct_eq_tokens(a: &[u8], b: &[u8]) -> bool {
     let mut buf_b = vec![0u8; max_len];
     buf_a[..a.len()].copy_from_slice(a);
     buf_b[..b.len()].copy_from_slice(b);
-    // Lengths must match AND content must match; both checked without
-    // short-circuiting so the total work is constant with respect to input.
-    let len_eq = Choice::from((a.len() == b.len()) as u8);
+    // Compare lengths in constant time: cast to u64 and use subtle::ct_eq on
+    // the byte representation. The plain `==` on usize is NOT constant-time
+    // (the compiler may emit a conditional branch), so we cannot use `as u8`.
+    let len_a = (a.len() as u64).to_le_bytes();
+    let len_b = (b.len() as u64).to_le_bytes();
+    let len_eq: Choice = len_a.ct_eq(&len_b);
     let content_eq = buf_a.ct_eq(&buf_b);
     (len_eq & content_eq).into()
 }
