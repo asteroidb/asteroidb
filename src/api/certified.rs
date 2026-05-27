@@ -14,7 +14,7 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// What to do when `certified_write` cannot achieve consensus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnTimeout {
-    /// Return `CrdtError::Timeout`.
+    /// Return `CrdtError::CertificationTimeout`.
     Error,
     /// Accept the write as `Pending` and let the caller poll status later.
     Pending,
@@ -359,7 +359,7 @@ impl CertifiedApi {
     /// If the write is already certified at the current scoped frontier,
     /// returns `Ok(CertificationStatus::Certified)`. Otherwise, behaviour
     /// depends on `on_timeout`:
-    /// - `OnTimeout::Error` — returns `Err(CrdtError::Timeout)`.
+    /// - `OnTimeout::Error` — returns `Err(CrdtError::CertificationTimeout)`.
     /// - `OnTimeout::Pending` — returns `Ok(CertificationStatus::Pending)`.
     ///
     /// Callers using `OnTimeout::Pending` can poll with
@@ -1030,11 +1030,10 @@ mod tests {
         api.cleanup_completed();
 
         // Only pending entries remain.
-        assert!(
-            api.pending_writes()
-                .iter()
-                .all(|pw| pw.status == CertificationStatus::Pending)
-        );
+        assert!(api
+            .pending_writes()
+            .iter()
+            .all(|pw| pw.status == CertificationStatus::Pending));
     }
 
     // ---------------------------------------------------------------
@@ -1133,11 +1132,10 @@ mod tests {
         // Certified entries (key1, key2) were cleaned up.
         // key3 (Pending) + key4 (new Pending) remain.
         assert!(api.pending_writes().len() <= 3);
-        assert!(
-            api.pending_writes()
-                .iter()
-                .any(|pw| pw.key == "key3" || pw.key == "key4")
-        );
+        assert!(api
+            .pending_writes()
+            .iter()
+            .any(|pw| pw.key == "key3" || pw.key == "key4"));
     }
 
     // ---------------------------------------------------------------

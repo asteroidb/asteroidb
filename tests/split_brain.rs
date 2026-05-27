@@ -20,8 +20,8 @@ use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use asteroidb_poc::authority::bls::{self, BlsKeypair};
 use asteroidb_poc::authority::certificate::{
-    AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate,
-    create_certificate_message, sign_message,
+    create_certificate_message, sign_message, AuthoritySignature, DualModeCertificate,
+    KeysetVersion, MajorityCertificate,
 };
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -155,7 +155,7 @@ fn minority_1_of_3_cannot_certify() {
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
     assert!(
-        matches!(result, Err(CrdtError::Timeout)),
+        matches!(result, Err(CrdtError::CertificationTimeout)),
         "minority (1/3) must not certify: got {result:?}"
     );
 }
@@ -231,7 +231,7 @@ fn minority_2_of_5_cannot_certify() {
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
     assert!(
-        matches!(result, Err(CrdtError::Timeout)),
+        matches!(result, Err(CrdtError::CertificationTimeout)),
         "minority (2/5) must not certify: got {result:?}"
     );
 }
@@ -271,7 +271,7 @@ fn exact_half_of_5_cannot_certify() {
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
-    assert!(matches!(result, Err(CrdtError::Timeout)));
+    assert!(matches!(result, Err(CrdtError::CertificationTimeout)));
 }
 
 // ===========================================================================
@@ -723,7 +723,7 @@ fn zero_authority_reachable_cannot_certify() {
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
-    assert!(matches!(result, Err(CrdtError::Timeout)));
+    assert!(matches!(result, Err(CrdtError::CertificationTimeout)));
 }
 
 #[test]
@@ -764,7 +764,7 @@ fn even_cluster_requires_strict_majority() {
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter.clone(), OnTimeout::Error);
     assert!(
-        matches!(result, Err(CrdtError::Timeout)),
+        matches!(result, Err(CrdtError::CertificationTimeout)),
         "2/4 should not certify"
     );
 
@@ -840,7 +840,7 @@ fn partition_with_different_key_ranges_independent() {
     // "users/" write should fail (minority for that range).
     let result1 = cert_api.certified_write("users/alice".into(), counter.clone(), OnTimeout::Error);
     assert!(
-        matches!(result1, Err(CrdtError::Timeout)),
+        matches!(result1, Err(CrdtError::CertificationTimeout)),
         "users/ should be in minority"
     );
 
