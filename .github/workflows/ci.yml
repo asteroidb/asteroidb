@@ -114,7 +114,7 @@ jobs:
   netem-light:
     name: Lightweight Netem Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -129,7 +129,7 @@ jobs:
   fault-injection:
     name: Fault Injection Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 

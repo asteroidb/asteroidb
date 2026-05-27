@@ -126,6 +126,6 @@ if $all_converged; then
     exit 0
 else
     echo ""
-    echo -e "${CLR_RED}[FAIL] jitter-latency: not all nodes converged.${CLR_RESET}"
+    echo -e "${CLR_RED}[FAIL] jitter-latency: required node convergence failed.${CLR_RESET}"
     exit 1
 fi
