@@ -239,9 +239,11 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
     # for up to 120s (40 × 3s); total wait including pre-sleep is 140s.
     sleep 20
     _sync_key="fault-inject-sync-$$-${scenario_name}"
-    curl -sf -X POST "http://localhost:3001/api/eventual/write" \
+    if ! curl -sf -X POST "http://localhost:3001/api/eventual/write" \
         -H "Content-Type: application/json" \
-        -d "{\"type\":\"counter_inc\",\"key\":\"${_sync_key}\"}" > /dev/null || true
+        -d "{\"type\":\"counter_inc\",\"key\":\"${_sync_key}\"}" > /dev/null; then
+        echo "[fault-inject] WARN: gossip-sync probe write to node-1 failed; poll will see null on all nodes."
+    fi
     _gossip_ok=false
     for _attempt in $(seq 1 40); do
         _v2=$(extract_value "$(read_counter "http://localhost:3002" "$_sync_key")" 2>/dev/null || echo "null")
