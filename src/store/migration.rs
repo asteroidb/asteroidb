@@ -50,8 +50,10 @@ impl MigrationRegistry {
             });
         }
 
-        // Nothing to do when versions already match — return immediately to
-        // prevent any chance of an infinite loop in a misconfigured registry.
+        // Nothing to do when versions already match. The while loop below
+        // also handles this (it never executes when current == to_version),
+        // but the early return makes the intent explicit and avoids a
+        // registry lookup when no migration is needed.
         if from_version == to_version {
             return Ok(data);
         }
@@ -197,6 +199,28 @@ mod tests {
         let data = json!({"data": {}});
         let result = registry.apply_migrations(data, 1, 2).unwrap();
         assert_eq!(result["migration_ran"], true, "migration must have been invoked");
+    }
+
+    /// Verify the infinite loop guard fires when a migration does not advance version.
+    #[test]
+    fn registry_rejects_stuck_migration() {
+        struct StuckMigration;
+        impl Migration for StuckMigration {
+            fn source_version(&self) -> u32 { 1 }
+            fn target_version(&self) -> u32 { 1 } // same as source — stuck!
+            fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+                Ok(data)
+            }
+        }
+
+        let mut registry = MigrationRegistry::new();
+        registry.register(Box::new(StuckMigration));
+
+        let result = registry.apply_migrations(json!({}), 1, 2);
+        match result.unwrap_err() {
+            CrdtError::MigrationFailed { from: 1, to: 1, .. } => {}
+            other => panic!("expected MigrationFailed(1→1), got {:?}", other),
+        }
     }
 
     /// Test a multi-step migration chain by adding a second migration.
