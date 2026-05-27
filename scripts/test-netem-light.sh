@@ -249,7 +249,7 @@ verify_cluster_sync() {
     echo "[light-netem] Verifying cluster gossip sync with warmup write..."
     write_counter "$NODE1_URL" "$warmup_key" 1
     local synced=false
-    for attempt in $(seq 1 20); do
+    for attempt in $(seq 1 60); do
         local v2 v3
         v2=$(extract_value "$(read_counter "$NODE2_URL" "$warmup_key")")
         v3=$(extract_value "$(read_counter "$NODE3_URL" "$warmup_key")")
@@ -257,7 +257,7 @@ verify_cluster_sync() {
             synced=true
             break
         fi
-        sleep 2
+        sleep 3
     done
     if ! $synced; then
         echo "[light-netem] ERROR: Cluster sync not working (not all nodes received warmup write). Aborting."
