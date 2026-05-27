@@ -242,7 +242,7 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
         -H "Content-Type: application/json" \
         -d "{\"type\":\"counter_inc\",\"key\":\"${_sync_key}\"}" > /dev/null || true
     _gossip_ok=false
-    for _attempt in $(seq 1 30); do
+    for _attempt in $(seq 1 20); do
         _v2=$(extract_value "$(read_counter "http://localhost:3002" "$_sync_key")" 2>/dev/null || echo "null")
         _v3=$(extract_value "$(read_counter "http://localhost:3003" "$_sync_key")" 2>/dev/null || echo "null")
         if [ "$_v2" = "1" ] && [ "$_v3" = "1" ]; then
@@ -254,7 +254,7 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
     if $_gossip_ok; then
         echo "[fault-inject] Cluster gossip sync verified."
     else
-        echo "[fault-inject] WARN: gossip sync not confirmed after 90s; proceeding anyway."
+        echo "[fault-inject] WARN: gossip sync not confirmed after 60s; proceeding anyway."
     fi
     echo ""
 done
