@@ -414,11 +414,7 @@ impl MembershipClient {
                 // New peer: require a valid IP:port. Hostnames pass
                 // is_metadata_or_link_local (Err branch returns false) but
                 // could allow SSRF-via-DNS when the node connects to the peer.
-                if peer_info
-                    .address
-                    .parse::<std::net::SocketAddr>()
-                    .is_err()
-                {
+                if peer_info.address.parse::<std::net::SocketAddr>().is_err() {
                     continue;
                 }
                 if registry
@@ -580,7 +576,10 @@ mod tests {
         ];
 
         let added = client.reconcile_peers(&remote_peers).await;
-        assert_eq!(added, 1, "hostname new-peer must be rejected; only IP peer should be added");
+        assert_eq!(
+            added, 1,
+            "hostname new-peer must be rejected; only IP peer should be added"
+        );
         assert_eq!(registry.lock().await.peer_count(), 1);
     }
 
