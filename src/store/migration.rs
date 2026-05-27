@@ -50,6 +50,14 @@ impl MigrationRegistry {
             });
         }
 
+        // Nothing to do when versions already match. The while loop below
+        // also handles this (it never executes when current == to_version),
+        // but the early return makes the intent explicit and avoids a
+        // registry lookup when no migration is needed.
+        if from_version == to_version {
+            return Ok(data);
+        }
+
         let mut current = from_version;
         while current < to_version {
             let migration = self
@@ -63,7 +71,17 @@ impl MigrationRegistry {
                 })?;
 
             data = migration.migrate(data)?;
-            current = migration.target_version();
+            let next = migration.target_version();
+            if next <= current {
+                return Err(CrdtError::MigrationFailed {
+                    from: current,
+                    to: next,
+                    reason: format!(
+                        "migration v{current}→v{next} does not advance version (infinite loop guard)"
+                    ),
+                });
+            }
+            current = next;
         }
 
         Ok(data)
@@ -158,6 +176,62 @@ mod tests {
         match result.unwrap_err() {
             CrdtError::MigrationFailed { from: 1, .. } => {}
             other => panic!("expected MigrationFailed, got {:?}", other),
+        }
+    }
+
+    /// Verify registry actually invokes a transforming migration (not just skips it).
+    /// Uses a mock V1→V2 that adds a sentinel field, proving the code path ran.
+    #[test]
+    fn registry_invokes_migration_with_transforming_mock() {
+        struct V1ToV2Transforming;
+        impl Migration for V1ToV2Transforming {
+            fn source_version(&self) -> u32 {
+                1
+            }
+            fn target_version(&self) -> u32 {
+                2
+            }
+            fn migrate(&self, mut data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+                data["migration_ran"] = serde_json::Value::Bool(true);
+                Ok(data)
+            }
+        }
+
+        let mut registry = MigrationRegistry::new();
+        registry.register(Box::new(V1ToV2Transforming));
+
+        let data = json!({"data": {}});
+        let result = registry.apply_migrations(data, 1, 2).unwrap();
+        assert_eq!(
+            result["migration_ran"], true,
+            "migration must have been invoked"
+        );
+    }
+
+    /// Verify the infinite loop guard fires when a migration does not advance version.
+    #[test]
+    fn registry_rejects_stuck_migration() {
+        struct StuckMigration;
+        impl Migration for StuckMigration {
+            fn source_version(&self) -> u32 {
+                1
+            }
+            // same as source — stuck!
+            fn target_version(&self) -> u32 {
+                1
+            }
+            fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+                Ok(data)
+            }
+        }
+
+        let mut registry = MigrationRegistry::new();
+        registry.register(Box::new(StuckMigration));
+
+        let result = registry.apply_migrations(json!({}), 1, 2);
+        match result.unwrap_err() {
+            CrdtError::MigrationFailed { from: 1, to: 1, .. } => {}
+            other => panic!("expected MigrationFailed(1→1), got {:?}", other),
         }
     }
 

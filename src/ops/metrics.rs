@@ -9,10 +9,11 @@ const WINDOW_SECS: u64 = 60;
 
 /// Maximum number of distinct keys tracked in `write_ops_by_key`.
 ///
-/// Once this limit is reached, a random existing entry is evicted before
-/// inserting the new key.  This bounds the map's memory footprint under
-/// high-cardinality write workloads while preserving approximate per-range
-/// compaction signal.
+/// Existing keys are always incremented regardless of the cap. New keys are
+/// silently dropped once the cap is reached, bounding peak memory under
+/// high-cardinality write workloads. The map is drained every
+/// `compaction_check_interval` (default 10 s), so the worst-case cardinality
+/// is proportional to the number of distinct keys written within that window.
 const MAX_KEY_METRICS: usize = 10_000;
 
 /// Aggregated benchmark result for a single measurement.
@@ -381,23 +382,11 @@ impl RuntimeMetrics {
     pub fn record_write_op(&self, key: &str) {
         self.write_ops_total.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut map) = self.write_ops_by_key.lock() {
-            // If the key already exists just increment — no eviction needed.
-            if map.contains_key(key) {
-                *map.get_mut(key).unwrap() += 1;
-                return;
+            if let Some(count) = map.get_mut(key) {
+                *count += 1;
+            } else if map.len() < MAX_KEY_METRICS {
+                map.insert(key.to_string(), 1);
             }
-            // Enforce the cardinality cap before inserting a new key.
-            if map.len() >= MAX_KEY_METRICS {
-                // Evicts the first entry in bucket iteration order (not random,
-                // but O(1)).  Rust's hashbrown HashMap iterates in bucket order,
-                // so within a single session the same key tends to be evicted
-                // first — there is a structural bias toward the first bucket's
-                // occupant, not uniform randomness.
-                if let Some(evict_key) = map.keys().next().cloned() {
-                    map.remove(&evict_key);
-                }
-            }
-            map.insert(key.to_string(), 1);
         }
     }
 
@@ -1081,24 +1070,33 @@ mod tests {
         assert_eq!(m.full_sync_fallback_count.load(Ordering::Relaxed), 0);
     }
 
-    // ---------------------------------------------------------------
-    // MAX_KEY_METRICS cap eviction test
-    // ---------------------------------------------------------------
-
     #[test]
     fn write_ops_by_key_respects_cap() {
         let m = RuntimeMetrics::default();
-        // Insert MAX_KEY_METRICS + 1 distinct keys; the map must never exceed
-        // MAX_KEY_METRICS entries.
         for i in 0..=(MAX_KEY_METRICS as u64) {
             m.record_write_op(&format!("key-{i}"));
         }
         let map = m.write_ops_by_key.lock().unwrap();
         assert!(
             map.len() <= MAX_KEY_METRICS,
-            "write_ops_by_key exceeded MAX_KEY_METRICS: {} > {}",
-            map.len(),
-            MAX_KEY_METRICS,
+            "write_ops_by_key must not exceed MAX_KEY_METRICS; got {}",
+            map.len()
         );
+    }
+
+    #[test]
+    fn write_ops_existing_key_always_incremented_past_cap() {
+        let m = RuntimeMetrics::default();
+        for i in 0..MAX_KEY_METRICS {
+            m.record_write_op(&format!("key-{i}"));
+        }
+        m.record_write_op("key-0");
+        let map = m.write_ops_by_key.lock().unwrap();
+        assert_eq!(
+            *map.get("key-0").unwrap(),
+            2,
+            "existing key must be incremented past cap"
+        );
+        assert!(map.len() <= MAX_KEY_METRICS);
     }
 }
