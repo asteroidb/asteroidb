@@ -15,7 +15,8 @@ services:
     volumes:
       - ./configs/node-1.json:/etc/asteroidb/config.json:ro
     networks:
-      - asteroidb
+      asteroidb:
+        ipv4_address: 172.28.0.2
 
   node-2:
     build: .
@@ -33,7 +34,8 @@ services:
     volumes:
       - ./configs/node-2.json:/etc/asteroidb/config.json:ro
     networks:
-      - asteroidb
+      asteroidb:
+        ipv4_address: 172.28.0.3
 
   node-3:
     build: .
@@ -51,8 +53,12 @@ services:
     volumes:
       - ./configs/node-3.json:/etc/asteroidb/config.json:ro
     networks:
-      - asteroidb
+      asteroidb:
+        ipv4_address: 172.28.0.4
 
 networks:
   asteroidb:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
