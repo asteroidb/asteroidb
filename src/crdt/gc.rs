@@ -30,12 +30,15 @@ pub struct TombstoneGc {
     /// A dot `(node_id, counter)` with `counter < version_floor[node_id]`
     /// is safe to garbage-collect (assuming it is not in any live element).
     version_floor: HashMap<NodeId, u64>,
-    /// Global version floor applied to ALL writer nodes.
+    /// Global version floor applied to ALL writer nodes, in **dot-counter units**.
     ///
-    /// Derived from the minimum acknowledged frontier HLC physical timestamp
-    /// across all authorities. When set, a dot `(node_id, counter)` with
-    /// `counter < global_floor` is considered safe to GC regardless of the
-    /// per-node floor entries.
+    /// When set, a dot `(node_id, counter)` with `counter < global_floor` is
+    /// considered safe to GC regardless of the per-node floor entries.
+    ///
+    /// **Units**: this must be a dot counter value (a small monotonic integer),
+    /// NOT an HLC physical timestamp (Unix milliseconds, ~10^12). Passing an
+    /// HLC-scale value causes every dot counter to appear below the floor and
+    /// bulk-GCs all tombstones. See `set_global_floor` for a guard.
     global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
@@ -108,11 +111,18 @@ impl TombstoneGc {
         self.version_floor.get(node_id).copied()
     }
 
-    /// Set the global version floor that applies to ALL writer nodes.
+    /// Set the global version floor (in dot-counter units) for ALL writer nodes.
     ///
-    /// Typically set to the minimum acknowledged frontier HLC physical
-    /// timestamp across all authorities.
+    /// `floor` must be a **dot counter** value — a small monotonic integer
+    /// incremented once per write operation per node. It must NOT be an HLC
+    /// physical timestamp (Unix milliseconds, ~10^12): dot counters are always
+    /// smaller than HLC timestamps, so an HLC-scale floor would mark every
+    /// tombstone as below the floor and bulk-GC them all.
     pub fn set_global_floor(&mut self, floor: u64) {
+        assert!(
+            floor < 1_000_000_000_000,
+            "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
+        );
         self.global_floor = Some(floor);
     }
 
@@ -613,6 +623,87 @@ mod tests {
             set2.deferred_len(),
             0,
             "counter-based GC should remove tombstone when counter < max"
+        );
+    }
+
+    /// Verify that compact_deferred_with_floor removes a tombstone via the
+    /// floor-only path: locally_dominated=false (no newer add), but
+    /// dot counter < global_floor (below_floor=true).
+    /// This exercises the OR-semantics new criterion 2 added by this PR.
+    #[test]
+    fn compact_deferred_with_floor_removes_tombstone_via_floor_only_path() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — max counter for A is still 1, so locally_dominated=false.
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // Set global_floor=2 > dot counter(1). floor-only path should remove it.
+        let empty_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_floor, Some(2));
+
+        assert_eq!(
+            set.deferred_len(),
+            0,
+            "floor-only path must remove tombstone when dot counter < global_floor"
+        );
+    }
+
+    /// Verify that compact_deferred_with_floor uses global_floor as a fallback
+    /// for nodes that are absent from version_floor.
+    ///
+    /// Semantic: global_floor represents the minimum version confirmed by ALL
+    /// known replicas for ALL writer nodes. A dot (X, counter) from a node X
+    /// that is absent from version_floor should still be GC'd if counter <
+    /// global_floor, because global_floor already covers X.
+    ///
+    /// The tombstone must NOT be locally dominated (no subsequent add after remove),
+    /// so removal is driven solely by global_floor — this distinguishes the new
+    /// "either criterion" logic from the old "both required" logic.
+    #[test]
+    fn compact_deferred_with_floor_uses_global_floor_for_absent_node() {
+        let n = node("A"); // node "A" will be absent from version_floor
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — counters["A"]=1, so locally_dominated=(1<1)=false.
+        // Removal must be driven by global_floor alone.
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // version_floor has no entry for node "A" (absent); global_floor=2 should apply.
+        let empty_version_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_version_floor, Some(2));
+
+        assert_eq!(
+            set.deferred_len(),
+            0,
+            "global_floor must GC dots from nodes absent from version_floor even when not locally dominated"
+        );
+    }
+
+    /// Verify that compact_deferred_with_floor retains tombstones from absent
+    /// nodes when global_floor does not cover them.
+    #[test]
+    fn compact_deferred_with_floor_retains_dot_above_global_floor_for_absent_node() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — locally_dominated=false (max counter still 1)
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // global_floor=1 does NOT cover dot counter=1 (strictly less-than check)
+        let empty_version_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_version_floor, Some(1));
+
+        assert_eq!(
+            set.deferred_len(),
+            1,
+            "tombstone must be retained when dot.counter >= global_floor"
         );
     }
 

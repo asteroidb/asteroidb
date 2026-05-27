@@ -459,7 +459,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
 
         let body = body_string(resp.into_body()).await;
-        assert!(body.contains("TIMEOUT"));
+        assert!(body.contains("CERTIFICATION_TIMEOUT"));
     }
 
     #[tokio::test]

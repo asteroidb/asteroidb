@@ -562,7 +562,7 @@ fn on_timeout_error_still_tracks_write() {
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err(),
-        asteroidb_poc::error::CrdtError::Timeout
+        asteroidb_poc::error::CrdtError::CertificationTimeout
     );
 
     // Despite error, write is in the store and tracked as pending

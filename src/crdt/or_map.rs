@@ -330,10 +330,19 @@ where
         });
     }
 
-    /// Remove tombstone dots from `deferred` that satisfy **both** the local
-    /// counter check and a cross-replica version floor check.
+    /// Remove tombstone dots from `deferred` that are safe to garbage-collect
+    /// according to local counter dominance or a cross-replica version floor.
     ///
     /// See [`OrSet::compact_deferred_with_floor`] for detailed semantics.
+    /// A dot is removed when it is not live AND at least one of the following
+    /// holds: (1) locally dominated (`counter < max_counter`), or (2) below
+    /// the cross-replica version floor (`counter < floor`).
+    ///
+    /// # Warning
+    /// Floor values must be in **dot-counter units** (small monotonic integers),
+    /// NOT HLC physical timestamps (~10^12 ms). An HLC-scale floor would mark
+    /// every tombstone as below the floor and bulk-GC them all. Do not call
+    /// during partial sync rounds.
     pub fn compact_deferred_with_floor(
         &mut self,
         version_floor: &std::collections::HashMap<crate::types::NodeId, u64>,
@@ -348,18 +357,20 @@ where
             if live_dots.contains(d) {
                 return true;
             }
+            // Criterion 1: locally dominated — counter superseded by a newer dot.
             let locally_dominated = match self.counters.get(&d.node_id) {
                 Some(&max_counter) => d.counter < max_counter,
                 None => false,
             };
-            if !locally_dominated {
-                return true;
-            }
+            // Criterion 2: below the cross-replica version floor — all replicas
+            // have confirmed they have processed at least this version.
             let effective_floor = version_floor.get(&d.node_id).copied().or(global_floor);
-            match effective_floor {
-                Some(floor) => d.counter >= floor,
-                None => true,
-            }
+            let below_floor = match effective_floor {
+                Some(floor) => d.counter < floor,
+                None => false,
+            };
+            // Remove if either criterion is satisfied; keep otherwise.
+            !(locally_dominated || below_floor)
         });
     }
 
