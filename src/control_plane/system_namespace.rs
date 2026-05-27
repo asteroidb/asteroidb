@@ -681,7 +681,8 @@ mod tests {
         // Build a valid namespace, then serialize it with a patched replica_count.
         let mut ns = SystemNamespace::new();
         ns.set_placement_policy(make_policy("user/")).unwrap();
-        let mut json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ns).unwrap()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&ns).unwrap()).unwrap();
         json["placement_policies"]["user/"]["replica_count"] = serde_json::json!(0);
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
 
