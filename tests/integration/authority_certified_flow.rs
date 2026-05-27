@@ -4,8 +4,8 @@ use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::status::{CertificationTracker, WriteId};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use asteroidb_poc::authority::certificate::{
-    AuthoritySignature, EpochConfig, KeysetVersion, MajorityCertificate,
-    create_certificate_message, sign_message,
+    create_certificate_message, sign_message, AuthoritySignature, EpochConfig, KeysetVersion,
+    MajorityCertificate,
 };
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -563,7 +563,7 @@ fn on_timeout_error_still_tracks_write() {
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err(),
-        asteroidb_poc::error::CrdtError::Timeout
+        asteroidb_poc::error::CrdtError::CertificationTimeout
     );
 
     // Despite error, write is in the store and tracked as pending
