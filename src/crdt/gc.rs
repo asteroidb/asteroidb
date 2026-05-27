@@ -123,15 +123,16 @@ impl TombstoneGc {
         self.total_collected
     }
 
-    /// Check whether enough time has elapsed since the last *successful* GC run.
+    /// Check whether enough time has elapsed since `last_gc_ms` was last set.
     ///
-    /// "Successful" means at least one tombstone was actually collected in the
-    /// previous call to [`gc_tombstones`](Self::gc_tombstones). When no tombstones
-    /// were found (after the first run), `last_gc_ms` is not updated, so subsequent
-    /// calls to `should_run` continue to return `true` until a collection actually
-    /// occurs. This prevents the GC interval from resetting on empty-store no-op
-    /// runs and ensures the scheduler re-checks promptly when the store is initially
-    /// empty.
+    /// `last_gc_ms` is set on the very first call to
+    /// [`gc_tombstones`](Self::gc_tombstones) (even with an empty store), and
+    /// thereafter only when at least one tombstone is actually collected.  On
+    /// no-op runs after the first, `last_gc_ms` is left unchanged so subsequent
+    /// calls to `should_run` continue to return `true` until a collection
+    /// actually occurs.  This prevents the GC interval from resetting on
+    /// empty-store no-op runs and ensures the scheduler re-checks promptly
+    /// when the store is initially empty.
     ///
     /// **`gc_interval = 0` note**: the comparison uses a minimum of 1 ms to prevent
     /// callers that loop on `should_run` from busy-polling at nanosecond cadence.
@@ -541,6 +542,14 @@ mod tests {
         assert_eq!(
             collected, 0,
             "tombstones within retention window must not be collected"
+        );
+
+        // T=302001: 301001ms has elapsed since first run (T=1000);
+        // retention=300_000ms → collect the deferred tombstone.
+        let collected = gc.gc_tombstones(&mut store, 302_001);
+        assert_eq!(
+            collected, 1,
+            "tombstone must be collected after retention window expires"
         );
     }
 
