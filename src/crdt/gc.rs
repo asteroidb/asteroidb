@@ -465,6 +465,31 @@ mod tests {
         );
     }
 
+    /// Verify that compact_deferred_with_floor removes a tombstone via the
+    /// floor-only path: locally_dominated=false (no newer add), but
+    /// dot counter < global_floor (below_floor=true).
+    /// This exercises the OR-semantics new criterion 2 added by this PR.
+    #[test]
+    fn compact_deferred_with_floor_removes_tombstone_via_floor_only_path() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — max counter for A is still 1, so locally_dominated=false.
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // Set global_floor=2 > dot counter(1). floor-only path should remove it.
+        let empty_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_floor, Some(2));
+
+        assert_eq!(
+            set.deferred_len(),
+            0,
+            "floor-only path must remove tombstone when dot counter < global_floor"
+        );
+    }
+
     /// Verify that compact_deferred without floor doesn't remove tombstones
     /// when the counter hasn't been superseded (no newer dots from that node).
     #[test]

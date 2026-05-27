@@ -101,6 +101,15 @@ mod tests {
     }
 
     #[test]
+    fn display_certification_timeout() {
+        let err = CrdtError::CertificationTimeout;
+        assert_eq!(
+            err.to_string(),
+            "certification timeout: local write committed but certification did not complete"
+        );
+    }
+
+    #[test]
     fn display_internal() {
         let err = CrdtError::Internal("unexpected".into());
         assert_eq!(err.to_string(), "internal error: unexpected");
