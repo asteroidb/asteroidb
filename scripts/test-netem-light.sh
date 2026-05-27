@@ -230,8 +230,10 @@ run_scenario_partition() {
     if ! check_convergence "5" "$key" "node-1:${NODE1_URL}"; then
         exit_code=1
     fi
-    check_convergence "5" "$key" "node-3:${NODE3_URL}" ||         echo "  [WARN] node-3 did not converge (gossip may still be recovering from S2 packet loss)"
-    check_convergence "5" "$key" "node-2:${NODE2_URL}" ||         echo "  [WARN] node-2 did not converge (may still be recovering from S2 packet loss)"
+    check_convergence "5" "$key" "node-3:${NODE3_URL}" || \
+        echo "  [WARN] node-3 did not converge (gossip may still be recovering from S2 packet loss)"
+    check_convergence "5" "$key" "node-2:${NODE2_URL}" || \
+        echo "  [WARN] node-2 did not converge (may still be recovering from S2 packet loss)"
 
     return "$exit_code"
 }
