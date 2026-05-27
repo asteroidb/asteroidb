@@ -87,10 +87,11 @@ fi
 log_step 5 "Remove jitter from node-2"
 "${NETEM_DIR}/remove-netem.sh" "$NODE2_CONTAINER"
 
-# Allow the sync layer to re-establish connections and push any missed updates
-# now that jitter is gone.  Two sync cycles (sync_interval=2s each) plus a
-# small buffer is sufficient for normal operation.
-sleep 6
+# Allow TCP connections to recover from jitter-induced RTO back-off before
+# the post-jitter convergence check.  Jitter of 50ms±30ms can double the RTO
+# and leave retransmit timers at 200-400ms; 20s covers the worst-case
+# exponential back-off cycle so the gossip stream is fully restored.
+sleep 20
 
 # === STEP 6: Final convergence check (post-jitter-removal) ===
 log_step 6 "Final convergence check (post-jitter-removal)"
