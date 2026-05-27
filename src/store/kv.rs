@@ -153,6 +153,11 @@ impl Store {
     /// delta sync. Use [`put_with_timestamp`](Self::put_with_timestamp) when
     /// the caller has an HLC timestamp available, or call
     /// [`record_change`](Self::record_change) immediately after.
+    ///
+    /// # Warning
+    /// This method does NOT update the `timestamps` map. Callers that hold
+    /// an `HlcTimestamp` MUST use `put_with_timestamp` instead — skipping it
+    /// causes the entry to be invisible to `delta_sync` / `entries_since`.
     pub fn put(&mut self, key: String, value: CrdtValue) {
         self.data.insert(key, value);
     }
