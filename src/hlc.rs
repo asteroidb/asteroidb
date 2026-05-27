@@ -90,25 +90,30 @@ impl Hlc {
         let wall = physical_ms();
         let max_physical = wall.max(self.physical).max(received.physical);
 
-        if max_physical == self.physical && max_physical == received.physical {
+        let logical_result = if max_physical == self.physical && max_physical == received.physical {
             // All three equal (or wall <= both): advance logical beyond both.
-            self.logical = self
-                .logical
+            self.logical
                 .max(received.logical)
                 .checked_add(1)
-                .ok_or(HlcError::Overflow)?;
+                .ok_or(HlcError::Overflow)
         } else if max_physical == self.physical {
             // Local physical is ahead: just bump logical.
-            self.logical = self.logical.checked_add(1).ok_or(HlcError::Overflow)?;
+            self.logical.checked_add(1).ok_or(HlcError::Overflow)
         } else if max_physical == received.physical {
             // Received physical is ahead: adopt its logical + 1.
-            self.logical = received.logical.checked_add(1).ok_or(HlcError::Overflow)?;
+            received.logical.checked_add(1).ok_or(HlcError::Overflow)
         } else {
             // Wall clock is ahead of both: reset logical.
-            self.logical = 0;
-        }
+            Ok(0u32)
+        };
 
+        // Always advance the physical clock before returning, even on overflow.
+        // Without this, a cascade of overflow errors in the same millisecond
+        // would prevent self.physical from advancing to the next millisecond,
+        // causing every subsequent update() call to also fail with Overflow.
         self.physical = max_physical;
+
+        self.logical = logical_result?;
         Ok(())
     }
 }
