@@ -396,7 +396,9 @@ mod tests {
         let mut clock = Hlc::new("node-a".into());
         let wall = physical_ms();
         let far_future = HlcTimestamp {
-            physical: wall + MAX_CLOCK_SKEW_MS + 1,
+            // Use +1_000ms margin so clock drift between sampling wall here and
+            // the internal re-sample inside update() doesn't flip the test.
+            physical: wall + MAX_CLOCK_SKEW_MS + 1_000,
             logical: 0,
             node_id: "malicious".into(),
         };
