@@ -144,18 +144,27 @@ impl Hlc {
             Ok(0u32)
         };
 
-        // Always advance the physical clock to max_physical before returning,
-        // even on overflow. When received.physical > self.physical, this ensures
-        // a subsequent now() call sees an already-advanced physical and resets
-        // logical to 0. In the all-three-equal case max_physical == self.physical
-        // (no change), but the wall clock advances naturally within one millisecond,
-        // so recovery still occurs on the next now() or update() once wall > self.physical.
-        // Post-error state: self.logical unchanged (the `?` short-circuits before
-        // updating it). The caller discards the error; subsequent calls recover.
+        // Advance the physical clock to max_physical, then handle the logical result.
         self.physical = max_physical;
 
-        self.logical = logical_result?;
-        Ok(())
+        match logical_result {
+            Ok(l) => {
+                self.logical = l;
+                Ok(())
+            }
+            Err(e) => {
+                // On overflow the logical counter cannot be expressed at the current
+                // physical time.  Advance physical by 1 ms and reset logical to 0 so
+                // that the next now() or update() call produces a timestamp strictly
+                // greater than any peer timestamp at max_physical (including one with
+                // logical == u32::MAX).  Without this reset, self.logical would retain
+                // its pre-call value and a subsequent now() could return a timestamp
+                // less than the overflowed peer timestamp, violating HLC causality.
+                self.physical = self.physical.saturating_add(1);
+                self.logical = 0;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -339,25 +348,25 @@ mod tests {
 
     #[test]
     fn update_physical_advanced_before_overflow_return() {
-        // update() must advance self.physical to max_physical even when it
-        // returns Err(Overflow). Verify by checking that a subsequent now()
-        // does not also overflow (because physical was advanced correctly).
+        // update() must advance self.physical and reset self.logical=0 when it
+        // returns Err(Overflow), so that subsequent now() calls produce timestamps
+        // strictly greater than the overflowed peer timestamp (HLC causality invariant).
         let mut clock = Hlc::new("node-a".into());
         let wall = physical_ms();
-        // Overflow: received.logical=u32::MAX with physical slightly ahead.
         let overflow_ts = HlcTimestamp {
             physical: wall + 1_000,
             logical: u32::MAX,
             node_id: "node-b".into(),
         };
         assert_eq!(clock.update(&overflow_ts), Err(HlcError::Overflow));
-        // self.physical is now wall+1_000. now() is in the else branch
-        // (wall <= self.physical). logical after overflow_ts update was
-        // not changed (? short-circuited), so it is still 0. now() should
-        // increment to 1 successfully.
+
+        // After overflow: self.physical = wall+1001 (advanced 1ms), self.logical = 0.
+        // now() succeeds and produces a timestamp strictly > overflow_ts.
+        let after = clock.now().expect("now() must succeed after update() Overflow");
         assert!(
-            clock.now().is_ok(),
-            "now() should succeed after update() Overflow because physical was advanced"
+            after > overflow_ts,
+            "now() after overflow must produce timestamp > the overflowed peer ts; \
+             got after={after:?}, overflow_ts={overflow_ts:?}"
         );
     }
 

@@ -32,10 +32,10 @@ pub struct TombstoneGc {
     version_floor: HashMap<NodeId, u64>,
     /// Global version floor applied to ALL writer nodes.
     ///
-    /// Derived from the minimum acknowledged frontier HLC physical timestamp
-    /// across all authorities. When set, a dot `(node_id, counter)` with
-    /// `counter < global_floor` is considered safe to GC regardless of the
-    /// per-node floor entries.
+    /// A small monotonic dot-counter value (NOT an HLC physical timestamp).
+    /// When set, a dot `(node_id, counter)` with `counter < global_floor` is
+    /// considered safe to GC regardless of the per-node floor entries.
+    /// See `set_global_floor` for the constraint on acceptable values.
     global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
@@ -102,8 +102,11 @@ impl TombstoneGc {
 
     /// Set the global version floor that applies to ALL writer nodes.
     ///
-    /// Typically set to the minimum acknowledged frontier HLC physical
-    /// timestamp across all authorities.
+    /// `floor` must be a **dot-counter value** (a small monotonic integer
+    /// such as a replica's OR-Set sequence number), NOT an HLC physical
+    /// timestamp. HLC timestamps are on the order of 10^12 ms; the assert
+    /// below panics on any value in that range to prevent silent bulk-GC of
+    /// all tombstones (since every dot counter would be less than an HLC value).
     pub fn set_global_floor(&mut self, floor: u64) {
         assert!(
             floor < 1_000_000_000_000,
