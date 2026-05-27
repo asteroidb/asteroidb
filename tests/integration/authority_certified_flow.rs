@@ -4,8 +4,8 @@ use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::status::{CertificationTracker, WriteId};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use asteroidb_poc::authority::certificate::{
-    create_certificate_message, sign_message, AuthoritySignature, EpochConfig, KeysetVersion,
-    MajorityCertificate,
+    AuthoritySignature, EpochConfig, KeysetVersion, MajorityCertificate,
+    create_certificate_message, sign_message,
 };
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
