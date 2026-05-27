@@ -409,11 +409,11 @@ impl CertifiedApi {
 
         let timestamp = self.clock.now();
 
-        // Write to the local store (eventual consistency path) and record the
-        // HLC timestamp so the entry is immediately visible to delta sync
-        // (`entries_since` / `delta_entries_since`).
-        self.store.put(key.clone(), value.clone());
-        self.store.record_change(&key, timestamp.clone());
+        // Write to the local store (eventual consistency path).
+        // Use put_with_timestamp so the entry is immediately visible to
+        // delta_sync without requiring a separate record_change call.
+        self.store
+            .put_with_timestamp(key.clone(), value.clone(), timestamp.clone());
 
         // Check if already certified at the current scoped frontier.
         let already_certified = self.frontiers.is_certified_at_for_scope(
@@ -2065,5 +2065,74 @@ mod tests {
         let result = api.get_certified("key1");
         assert_eq!(result.status, CertificationStatus::Certified);
         assert!(result.proof.is_some());
+    }
+
+    // ---------------------------------------------------------------
+    // Delta sync visibility (API layer)
+    // ---------------------------------------------------------------
+
+    /// Verify that `certified_write` produces an entry immediately visible
+    /// to delta sync (`entries_since` / `delta_entries_since`) at the API
+    /// layer — not just at the `Store` level.
+    #[test]
+    fn certified_write_is_visible_to_delta_sync() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        // Obtain a zero-valued frontier that precedes any write.
+        let frontier_before = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: "".into(),
+        };
+
+        // Write via certified_write — this must atomically record the HLC
+        // timestamp so that the entry is immediately visible to delta sync.
+        api.certified_write("key1".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        // The written key must appear in entries_since (the delta sync view).
+        let delta = api.store.entries_since(&frontier_before);
+        assert_eq!(
+            delta.len(),
+            1,
+            "certified_write must produce an entry visible to delta sync (entries_since)"
+        );
+        assert_eq!(delta[0].0, "key1");
+
+        // Also verify via delta_entries_since.
+        let delta2 = api.store.delta_entries_since(&frontier_before);
+        assert_eq!(delta2.len(), 1);
+        assert_eq!(delta2[0].0, "key1");
+    }
+
+    /// Verify that multiple `certified_write` calls each produce delta-visible
+    /// entries — all keys must appear in `entries_since`.
+    #[test]
+    fn certified_write_multiple_keys_all_visible_to_delta_sync() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+
+        let frontier_before = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: "".into(),
+        };
+
+        api.certified_write("key-a".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key-b".into(), counter_value(2), OnTimeout::Pending)
+            .unwrap();
+        api.certified_write("key-c".into(), counter_value(3), OnTimeout::Pending)
+            .unwrap();
+
+        let delta = api.store.entries_since(&frontier_before);
+        assert_eq!(
+            delta.len(),
+            3,
+            "all three certified_write calls must be visible to delta sync"
+        );
+
+        let mut keys: Vec<&str> = delta.iter().map(|(k, _, _)| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["key-a", "key-b", "key-c"]);
     }
 }

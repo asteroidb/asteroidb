@@ -704,11 +704,16 @@ fn retention_auto_cleanup_removes_completed_entries() {
             .unwrap();
     }
 
-    let ts_first = api.pending_writes()[0].timestamp.physical;
+    // Use the LAST write's timestamp so the frontier covers all 5 entries
+    // even if writes span multiple physical milliseconds. Using ts_first + 1
+    // would fail if the clock advanced during the write loop (later entries
+    // would have physical == ts_first + 1 but node_id "node-1" > "auth-1",
+    // making them NOT certifiable by HLC ordering).
+    let ts_last = api.pending_writes().last().unwrap().timestamp.physical;
 
     // Certify all entries by advancing frontier well past all timestamps
-    api.update_frontier(make_frontier("auth-1", ts_first + 1, 0, ""));
-    api.update_frontier(make_frontier("auth-2", ts_first + 1, 0, ""));
+    api.update_frontier(make_frontier("auth-1", ts_last + 1, 0, ""));
+    api.update_frontier(make_frontier("auth-2", ts_last + 1, 0, ""));
     api.process_certifications();
 
     // All 5 should be certified now

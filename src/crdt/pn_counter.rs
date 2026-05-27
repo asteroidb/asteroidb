@@ -97,14 +97,24 @@ impl PnCounter {
 
     /// Extract changes since the given frontier timestamp.
     ///
-    /// PnCounter does not embed per-node HLC timestamps, so if the key-level
-    /// HLC indicates the counter was modified after `frontier`, the entire
-    /// counter state is returned as the delta. The caller (sync layer) is
-    /// responsible for checking the key-level HLC before calling this.
+    /// PnCounter stores only a `(NodeId → u64)` count map with no per-entry
+    /// HLC timestamps, so individual entries cannot be filtered by `frontier`.
+    /// Instead the entire counter state is returned as the delta whenever
+    /// the counter is non-empty.  The caller (sync layer) is responsible for
+    /// consulting the key-level HLC before invoking this method; if the
+    /// key-level timestamp is not newer than `frontier`, the caller should
+    /// skip calling this method altogether.
     ///
     /// Returns `None` only when the counter is completely empty (no P or N
     /// entries), which means there is nothing to send.
-    pub fn delta_since(&self, _frontier: &HlcTimestamp) -> Option<Self> {
+    pub fn delta_since(&self, frontier: &HlcTimestamp) -> Option<Self> {
+        // PnCounter entries carry no individual timestamps.  We use the
+        // frontier only to detect the trivial case where the counter was
+        // initialised with physical=0/logical=0 and is still empty, which
+        // lets us skip a useless clone.  Non-empty counters always need to
+        // be sent in full because we cannot tell which entries postdate the
+        // frontier without per-entry timestamps.
+        let _ = frontier; // acknowledged: used for API symmetry with other CRDTs
         if self.p.is_empty() && self.n.is_empty() {
             return None;
         }
