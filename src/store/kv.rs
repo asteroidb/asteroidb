@@ -299,10 +299,19 @@ impl Store {
         // Apply schema migrations when the stored version is older than the
         // current format version, matching the behaviour of the JSON load path.
         if version < CURRENT_FORMAT_VERSION {
-            // SAFETY: V1ToV2 migration is currently a no-op (same schema), so the
-            // serde_json roundtrip here does not risk data loss. If future migrations
-            // introduce actual schema changes, this path must be updated to decode
-            // from a v1-specific type before applying migrations.
+            // MAINTAINER WARNING — bincode→JSON→migration roundtrip structural fragility:
+            //
+            // This path decodes the bincode bytes into `Self` using the CURRENT struct
+            // layout, then re-serialises to JSON to run the migration registry. This only
+            // works safely when bincode and JSON field names agree AND the old schema is
+            // structurally compatible with the current struct (i.e. no field renames,
+            // removals, or type changes between `version` and `CURRENT_FORMAT_VERSION`).
+            //
+            // V1→V2 is safe today because the migration is a no-op. If a future
+            // migration renames, removes, or reinterprets a field, this approach will
+            // silently decode stale bincode into the wrong shape. When adding a new
+            // format version with a structural change, introduce a versioned decode
+            // type (e.g. `StoreV1`) and decode from bincode into that before migrating.
             let store_value = serde_json::to_value(&store)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let registry = migration::default_registry();
