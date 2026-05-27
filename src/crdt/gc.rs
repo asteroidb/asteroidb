@@ -111,7 +111,7 @@ impl TombstoneGc {
     /// smaller than HLC timestamps, so an HLC-scale floor would mark every
     /// tombstone as below the floor and bulk-GC them all.
     pub fn set_global_floor(&mut self, floor: u64) {
-        debug_assert!(
+        assert!(
             floor < 1_000_000_000_000,
             "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
         );
