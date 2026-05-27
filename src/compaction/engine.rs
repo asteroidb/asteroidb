@@ -298,9 +298,9 @@ impl CompactionEngine {
     /// Verify the digest hash for a key range against the stored checkpoint.
     ///
     /// Returns `Ok(())` if the digests match, `Err(RevalidationTrigger::DigestMismatch)`
-    /// if they differ, or `Err(RevalidationTrigger::Manual)` if no checkpoint exists
-    /// (indicating a missing baseline — treat as a verification failure to prevent
-    /// silent acceptance of arbitrary hashes when no reference point is available).
+    /// if they differ, or `Err(RevalidationTrigger::DigestMismatch { expected: "", actual })`
+    /// if no checkpoint exists (indicating a missing baseline — treated as a mismatch to
+    /// prevent silent acceptance of arbitrary hashes when no reference point is available).
     pub fn verify_digest(
         &self,
         prefix: &str,
