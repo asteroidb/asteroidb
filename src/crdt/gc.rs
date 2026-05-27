@@ -105,6 +105,10 @@ impl TombstoneGc {
     /// Typically set to the minimum acknowledged frontier HLC physical
     /// timestamp across all authorities.
     pub fn set_global_floor(&mut self, floor: u64) {
+        assert!(
+            floor < 1_000_000_000_000,
+            "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
+        );
         self.global_floor = Some(floor);
     }
 
