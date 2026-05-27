@@ -37,6 +37,37 @@ fn authority_nodes() -> Vec<NodeId> {
     }
 }
 
+/// Wait for a shutdown signal.
+///
+/// On Unix, this resolves on either SIGINT (Ctrl-C) or SIGTERM (the default
+/// signal sent by `kubectl delete pod` / `docker stop`).  On non-Unix targets
+/// (e.g. Windows) only SIGINT is available, so we fall back to that alone.
+#[cfg(unix)]
+async fn wait_for_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            // SIGTERM registration can fail under restrictive seccomp profiles or
+            // when the process starts before the tokio runtime is fully active.
+            // Fall back to SIGINT-only shutdown to avoid a startup panic that
+            // would skip the graceful fan_out_leave membership announcement.
+            eprintln!("warn: SIGTERM handler registration failed ({e}); falling back to SIGINT");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize structured logging. Users control verbosity via RUST_LOG env var
@@ -377,6 +408,12 @@ async fn main() {
         MembershipClient::new(node_id, advertise_addr.clone(), Arc::clone(&shared_peers))
     };
 
+    // wait_for_signal() resolves on SIGINT (Ctrl-C) on all platforms, and
+    // additionally on SIGTERM on Unix (Kubernetes/Docker graceful shutdown).
+    // TODO: axum::serve should use with_graceful_shutdown() so in-flight HTTP
+    // requests drain before the process exits. This requires restructuring the
+    // select! to pass a oneshot channel to axum and wait for it after signalling.
+    // Track as a follow-up issue.
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {
@@ -386,7 +423,7 @@ async fn main() {
         _stats = runner.run() => {
             println!("NodeRunner exited.");
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = wait_for_signal() => {
             println!("\nShutting down...");
             // Announce departure to all peers before stopping (P1-1).
             let leave_count = shutdown_membership_client.fan_out_leave().await;
