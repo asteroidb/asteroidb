@@ -233,16 +233,17 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
     wait_for_cluster
 
     # Verify that gossip sync is actually working before the next scenario.
-    # Netem rules (jitter, packet loss) can leave TCP gossip connections in a
-    # broken state even after the tc rules are removed. Waiting here ensures
-    # all three nodes are actively exchanging gossip so that a broken
-    # connection from a previous scenario doesn't poison the next one.
+    # Partition and jitter scenarios can leave TCP gossip connections in a
+    # broken state even after the fault rules are removed. Allow 20s for
+    # initial TCP recovery (FIN_WAIT2 and retransmit back-off), then poll
+    # for up to 120s (40 × 3s) to confirm cross-node propagation.
+    sleep 20
     _sync_key="fault-inject-sync-$$-${scenario_name}"
     curl -sf -X POST "http://localhost:3001/api/eventual/write" \
         -H "Content-Type: application/json" \
         -d "{\"type\":\"counter_inc\",\"key\":\"${_sync_key}\"}" > /dev/null || true
     _gossip_ok=false
-    for _attempt in $(seq 1 20); do
+    for _attempt in $(seq 1 40); do
         _v2=$(extract_value "$(read_counter "http://localhost:3002" "$_sync_key")" 2>/dev/null || echo "null")
         _v3=$(extract_value "$(read_counter "http://localhost:3003" "$_sync_key")" 2>/dev/null || echo "null")
         if [ "$_v2" = "1" ] && [ "$_v3" = "1" ]; then
@@ -254,7 +255,7 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
     if $_gossip_ok; then
         echo "[fault-inject] Cluster gossip sync verified."
     else
-        echo "[fault-inject] WARN: gossip sync not confirmed after 60s; proceeding anyway."
+        echo "[fault-inject] WARN: gossip sync not confirmed after 140s; proceeding anyway."
     fi
     echo ""
 done
