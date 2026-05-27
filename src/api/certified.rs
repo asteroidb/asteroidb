@@ -673,15 +673,6 @@ impl CertifiedApi {
     pub fn frontier_count(&self) -> usize {
         self.frontiers.len()
     }
-
-    /// Return a reference to the underlying store.
-    ///
-    /// Used by the anti-entropy sync layer and delta sync components to
-    /// read all entries for push-based replication without requiring a
-    /// mutable borrow.
-    pub(crate) fn store(&self) -> &Store {
-        &self.store
-    }
 }
 
 #[cfg(test)]
@@ -1041,11 +1032,10 @@ mod tests {
         api.cleanup_completed();
 
         // Only pending entries remain.
-        assert!(
-            api.pending_writes()
-                .iter()
-                .all(|pw| pw.status == CertificationStatus::Pending)
-        );
+        assert!(api
+            .pending_writes()
+            .iter()
+            .all(|pw| pw.status == CertificationStatus::Pending));
     }
 
     // ---------------------------------------------------------------
@@ -1144,11 +1134,10 @@ mod tests {
         // Certified entries (key1, key2) were cleaned up.
         // key3 (Pending) + key4 (new Pending) remain.
         assert!(api.pending_writes().len() <= 3);
-        assert!(
-            api.pending_writes()
-                .iter()
-                .any(|pw| pw.key == "key3" || pw.key == "key4")
-        );
+        assert!(api
+            .pending_writes()
+            .iter()
+            .any(|pw| pw.key == "key3" || pw.key == "key4"));
     }
 
     // ---------------------------------------------------------------
