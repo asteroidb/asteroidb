@@ -126,8 +126,8 @@ done
 
 if $all_converged; then
     echo ""
-    echo -e "${CLR_GREEN}[PASS] jitter-latency: required nodes (node-1, node-2) converged.${CLR_RESET}"
-    echo "  (node-3 convergence is best-effort and may have logged [WARN] above)"
+    echo -e "${CLR_GREEN}[PASS] jitter-latency: node-2 (required) converged under or after jitter.${CLR_RESET}"
+    echo "  (node-1 is the write source and is not polled; node-3 is best-effort)"
     exit 0
 else
     echo ""
