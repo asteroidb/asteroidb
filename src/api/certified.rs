@@ -679,7 +679,7 @@ impl CertifiedApi {
     /// Used by the anti-entropy sync layer and delta sync components to
     /// read all entries for push-based replication without requiring a
     /// mutable borrow.
-    pub fn store(&self) -> &Store {
+    pub(crate) fn store(&self) -> &Store {
         &self.store
     }
 }
