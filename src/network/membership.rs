@@ -5,6 +5,7 @@
 //! about membership changes directly.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,87 @@ use tokio::sync::Mutex;
 use crate::http::types::{AnnounceRequest, AnnounceResponse, PeerInfo, PingRequest, PingResponse};
 use crate::network::peer::{PeerConfig, PeerRegistry};
 use crate::types::NodeId;
+
+/// Parse the host portion from a `host:port` address string.
+fn parse_host(addr: &str) -> &str {
+    if let Some(bracketed) = addr.strip_prefix('[') {
+        // IPv6 literal: `[::1]:port` → `::1`
+        bracketed.split(']').next().unwrap_or(addr)
+    } else {
+        // IPv4 / hostname: `192.0.2.1:port` or `example.com:port`
+        addr.rsplit(':')
+            .nth(1)
+            .map(|_| addr.rsplitn(2, ':').last().unwrap_or(addr))
+            .unwrap_or(addr)
+    }
+}
+
+/// Check whether an IPv4 address is dangerous (loopback or link-local/metadata).
+fn is_dangerous_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_unspecified() || o[0] == 127 || (o[0] == 169 && o[1] == 254)
+}
+
+/// Check whether a peer address is safe to connect to.
+///
+/// Rejects unspecified (`0.0.0.0`, `::`), loopback (`127.0.0.0/8`, `::1`),
+/// link-local IPv4 (`169.254.0.0/16`), IPv6 link-local (`fe80::/10`), and
+/// IPv4-mapped IPv6 equivalents of those ranges. Used in HTTP handlers and
+/// `reconcile_peers` to guard against SSRF via injected peer addresses, and
+/// to prevent wildcard bind addresses from corrupting the peer registry.
+pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
+    let host = parse_host(addr);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => !is_dangerous_v4(v4),
+        Ok(IpAddr::V6(v6)) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+            let segments = v6.segments();
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // Reject IPv4-mapped IPv6 (::ffff:x.x.x.x) if the mapped v4 is dangerous.
+            if v6.to_ipv4().is_some_and(is_dangerous_v4) {
+                return false;
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Returns `true` if the address is a cloud metadata or link-local endpoint.
+///
+/// Used in join/announce handlers and [`MembershipClient::reconcile_peers`]
+/// where loopback is allowed (local cluster deployments and tests use
+/// `127.x.x.x`), but cloud metadata endpoints (`169.254.x.x`, `fe80::/10`)
+/// must be rejected unconditionally. Also catches IPv4-mapped IPv6 variants.
+pub(crate) fn is_metadata_or_link_local(addr: &str) -> bool {
+    let host = parse_host(addr);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            o[0] == 169 && o[1] == 254
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let segments = v6.segments();
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Catch ::ffff:169.254.x.x (cloud metadata in IPv4-mapped form).
+            // Note: ::ffff:127.x.x.x (loopback) is intentionally NOT blocked
+            // here — local cluster deployments use loopback addresses and
+            // is_metadata_or_link_local must allow them.
+            if let Some(v4) = v6.to_ipv4() {
+                let o = v4.octets();
+                return o[0] == 169 && o[1] == 254;
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
 
 /// Number of consecutive ping failures before a peer is automatically evicted.
 const MAX_PING_FAILURES: u32 = 3;
@@ -313,19 +395,40 @@ impl MembershipClient {
         let mut added = 0;
 
         for peer_info in remote_peers {
+            // Reject cloud metadata / link-local targets to prevent peer-list
+            // poisoning SSRF. Loopback is intentionally allowed here so that
+            // local cluster deployments (and tests) work correctly; the full
+            // `is_safe_peer_address` check (including loopback) is enforced at
+            // the HTTP handler boundary on inbound ping requests.
+            if is_metadata_or_link_local(&peer_info.address) {
+                continue;
+            }
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
-                // Update address if it changed (e.g. peer restarted with new IP).
-                registry.update_address(&peer_nid, &peer_info.address);
-            } else if added < MAX_NEW_PEERS
-                && registry
+                // Update address for known peers only when it is a routable
+                // IP:port. Reject unspecified (0.0.0.0/::), loopback, and
+                // link-local via is_safe_peer_address so that a node that binds
+                // to 0.0.0.0 without ASTEROIDB_ADVERTISE_ADDR cannot overwrite
+                // a peer's correct static IP with an unroutable wildcard.
+                if is_safe_peer_address(&peer_info.address) {
+                    registry.update_address(&peer_nid, &peer_info.address);
+                }
+            } else if added < MAX_NEW_PEERS {
+                // New peer: require a valid IP:port. Hostnames pass
+                // is_metadata_or_link_local (Err branch returns false) but
+                // could allow SSRF-via-DNS when the node connects to the peer.
+                if peer_info.address.parse::<std::net::SocketAddr>().is_err() {
+                    continue;
+                }
+                if registry
                     .add_peer(PeerConfig {
                         node_id: peer_nid,
                         addr: peer_info.address.clone(),
                     })
                     .is_ok()
-            {
-                added += 1;
+                {
+                    added += 1;
+                }
             }
         }
 
@@ -344,6 +447,157 @@ mod tests {
 
     fn nid(s: &str) -> NodeId {
         NodeId(s.into())
+    }
+
+    // ── is_safe_peer_address ────────────────────────────────────────────────
+
+    #[test]
+    fn safe_address_allows_public_ipv4() {
+        assert!(is_safe_peer_address("203.0.113.10:4000"));
+    }
+
+    #[test]
+    fn safe_address_rejects_hostname() {
+        // Peer addresses must be IP literals; hostnames cannot be validated
+        // against the dangerous-range blocklist and may resolve to internal
+        // addresses (e.g. metadata.internal → 169.254.169.254). Reject them.
+        assert!(!is_safe_peer_address("peer.example.com:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_link_local_metadata_endpoint() {
+        // AWS / GCP / Azure instance-metadata service
+        assert!(!is_safe_peer_address("169.254.169.254:80"));
+    }
+
+    #[test]
+    fn safe_address_blocks_link_local_ipv4_range() {
+        assert!(!is_safe_peer_address("169.254.0.1:4000"));
+        assert!(!is_safe_peer_address("169.254.255.255:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_loopback() {
+        assert!(!is_safe_peer_address("127.0.0.1:4000"));
+        assert!(!is_safe_peer_address("127.1.2.3:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv6_loopback() {
+        assert!(!is_safe_peer_address("[::1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv6_link_local() {
+        assert!(!is_safe_peer_address("[fe80::1]:4000"));
+        assert!(!is_safe_peer_address("[fe80::dead:beef]:4000"));
+    }
+
+    #[test]
+    fn safe_address_allows_public_ipv6() {
+        assert!(is_safe_peer_address("[2001:db8::1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_mapped_metadata_endpoint() {
+        // ::ffff:169.254.169.254 encodes the cloud metadata address in IPv6.
+        // Without to_ipv4() check this would bypass the link-local guard.
+        assert!(!is_safe_peer_address("[::ffff:169.254.169.254]:80"));
+    }
+
+    #[test]
+    fn safe_address_blocks_ipv4_mapped_loopback() {
+        // ::ffff:127.0.0.1 is IPv4-mapped loopback.
+        assert!(!is_safe_peer_address("[::ffff:127.0.0.1]:4000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_unspecified_ipv4() {
+        // 0.0.0.0 is the wildcard bind address — not a routable peer address.
+        // A node that binds to 0.0.0.0 without ASTEROIDB_ADVERTISE_ADDR would
+        // gossip this as its own address, corrupting the peer registry.
+        assert!(!is_safe_peer_address("0.0.0.0:3000"));
+    }
+
+    #[test]
+    fn safe_address_blocks_unspecified_ipv6() {
+        // [::] is the IPv6 wildcard — same reasoning as 0.0.0.0.
+        assert!(!is_safe_peer_address("[::]:3000"));
+    }
+
+    #[test]
+    fn metadata_or_link_local_blocks_ipv4_mapped_metadata() {
+        // ::ffff:169.254.169.254 must be caught by is_metadata_or_link_local too.
+        assert!(is_metadata_or_link_local("[::ffff:169.254.169.254]:80"));
+    }
+
+    #[test]
+    fn metadata_or_link_local_allows_loopback() {
+        // Loopback is allowed in contexts that use is_metadata_or_link_local
+        // (join/announce/reconcile) so that local cluster deployments work.
+        assert!(!is_metadata_or_link_local("127.0.0.1:3000"));
+        assert!(!is_metadata_or_link_local("[::1]:3000"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_link_local_metadata_address() {
+        let registry = Arc::new(Mutex::new(
+            PeerRegistry::new(nid("node-1"), vec![]).unwrap(),
+        ));
+        let client = MembershipClient::new(
+            nid("node-1"),
+            "10.0.0.1:3000".to_string(),
+            Arc::clone(&registry),
+        );
+
+        let remote_peers = vec![
+            PeerInfo {
+                node_id: "attacker".into(),
+                // AWS metadata endpoint — must be rejected
+                address: "169.254.169.254:80".into(),
+            },
+            PeerInfo {
+                node_id: "node-2".into(),
+                address: "10.0.0.2:3001".into(),
+            },
+        ];
+
+        let added = client.reconcile_peers(&remote_peers).await;
+        // Only the legitimate peer should be added
+        assert_eq!(added, 1);
+        assert_eq!(registry.lock().await.peer_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_hostname_new_peer() {
+        // A hostname address passes is_metadata_or_link_local (Err→false) but
+        // must be rejected for NEW peers to prevent SSRF-via-DNS.
+        let registry = Arc::new(Mutex::new(
+            PeerRegistry::new(nid("node-1"), vec![]).unwrap(),
+        ));
+        let client = MembershipClient::new(
+            nid("node-1"),
+            "10.0.0.1:3000".to_string(),
+            Arc::clone(&registry),
+        );
+
+        let remote_peers = vec![
+            PeerInfo {
+                node_id: "attacker".into(),
+                address: "metadata.internal:80".into(),
+            },
+            PeerInfo {
+                node_id: "node-2".into(),
+                address: "10.0.0.2:3001".into(),
+            },
+        ];
+
+        let added = client.reconcile_peers(&remote_peers).await;
+        assert_eq!(
+            added, 1,
+            "hostname new-peer must be rejected; only IP peer should be added"
+        );
+        assert_eq!(registry.lock().await.peer_count(), 1);
     }
 
     #[tokio::test]
@@ -436,18 +690,20 @@ mod tests {
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 (203.0.113.0/24) documentation addresses — these are
+        // routable-looking IPs that pass the SSRF guard (not loopback or link-local).
         let remote_peers = vec![
             PeerInfo {
                 node_id: "node-2".into(),
-                address: "127.0.0.1:3001".into(),
+                address: "203.0.113.1:3001".into(),
             },
             PeerInfo {
                 node_id: "node-3".into(),
-                address: "127.0.0.1:3002".into(),
+                address: "203.0.113.2:3002".into(),
             },
         ];
 
@@ -463,20 +719,21 @@ mod tests {
                 nid("node-1"),
                 vec![PeerConfig {
                     node_id: nid("node-2"),
-                    addr: "127.0.0.1:3001".into(),
+                    addr: "203.0.113.1:3001".into(),
                 }],
             )
             .unwrap(),
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 addresses so the SSRF guard passes.
         let remote_peers = vec![PeerInfo {
             node_id: "node-2".into(),
-            address: "127.0.0.1:3001".into(),
+            address: "203.0.113.1:3001".into(),
         }];
 
         let added = client.reconcile_peers(&remote_peers).await;
@@ -491,13 +748,14 @@ mod tests {
         ));
         let client = MembershipClient::new(
             nid("node-1"),
-            "127.0.0.1:3000".to_string(),
+            "203.0.113.0:3000".to_string(),
             Arc::clone(&registry),
         );
 
+        // Use TEST-NET-3 addresses so the SSRF guard passes.
         let remote_peers = vec![PeerInfo {
             node_id: "node-1".into(),
-            address: "127.0.0.1:3000".into(),
+            address: "203.0.113.0:3000".into(),
         }];
 
         let added = client.reconcile_peers(&remote_peers).await;

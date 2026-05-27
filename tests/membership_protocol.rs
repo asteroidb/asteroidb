@@ -426,12 +426,13 @@ async fn ping_endpoint_exchanges_peer_lists() {
 
     // Pre-register node-2 as a known peer of node-1 so the ping handler
     // treats it as a trusted sender and reconciles the peer list.
+    // Use TEST-NET-3 addresses (203.0.113.x) so the SSRF guard passes.
     {
         let mut registry = state1.peers.as_ref().unwrap().lock().await;
         registry
             .add_peer(PeerConfig {
                 node_id: node_id("node-2"),
-                addr: "127.0.0.1:4001".into(),
+                addr: "203.0.113.1:4001".into(),
             })
             .unwrap();
     }
@@ -444,15 +445,15 @@ async fn ping_endpoint_exchanges_peer_lists() {
         .post(format!("http://{addr1}/api/internal/ping"))
         .json(&PingRequest {
             sender_id: "node-2".into(),
-            sender_addr: "127.0.0.1:4001".into(),
+            sender_addr: "203.0.113.1:4001".into(),
             known_peers: vec![
                 PeerInfo {
                     node_id: "node-2".into(),
-                    address: "127.0.0.1:4001".into(),
+                    address: "203.0.113.1:4001".into(),
                 },
                 PeerInfo {
                     node_id: "node-3".into(),
-                    address: "127.0.0.1:4002".into(),
+                    address: "203.0.113.2:4002".into(),
                 },
             ],
         })
