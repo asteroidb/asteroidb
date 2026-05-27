@@ -1904,4 +1904,33 @@ mod tests {
             "timestamp must survive migration"
         );
     }
+
+    #[test]
+    fn bincode_load_future_version_returns_error() {
+        use crate::store::backend::MemoryBackend;
+        // Mirror of load_future_version_returns_error for the JSON path: a
+        // bincode snapshot with version > CURRENT_FORMAT_VERSION must be
+        // rejected with InvalidData so future schema incompatibilities are
+        // caught rather than silently decoded as the current layout.
+        let backend = MemoryBackend::new();
+        let future_version: u32 = 99;
+        let mut bytes = future_version.to_le_bytes().to_vec();
+        // Append a minimal valid bincode payload (empty map) to pass length check.
+        bytes.extend_from_slice(&[0x00]); // bincode-encoded empty map
+
+        backend.save(&bytes).unwrap();
+
+        let result = Store::load_from_backend_bincode(&backend);
+        assert!(result.is_err(), "future-version bincode must be rejected");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "error kind must be InvalidData"
+        );
+        assert!(
+            err.to_string().contains("incompatible"),
+            "error message must mention 'incompatible'; got: {err}"
+        );
+    }
 }
