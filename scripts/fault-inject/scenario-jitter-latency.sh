@@ -22,9 +22,10 @@ KEY="fault-jitter-$$"
 
 CONVERGENCE_RETRIES=20
 CONVERGENCE_INTERVAL=3
-# Post-jitter convergence check: retries after removing jitter to handle CI
-# environments where the netem delay is particularly disruptive.
-POST_JITTER_RETRIES=40
+# Post-jitter retry window for node-2 only. node-3 uses a hardcoded shorter
+# window (10 retries) because combining both full retry paths would exceed
+# the scenario timeout. See the node-3 branch in Step 6 for details.
+NODE2_POST_JITTER_RETRIES=40
 POST_JITTER_INTERVAL=3
 
 # Trap: remove netem on exit.
@@ -100,7 +101,7 @@ all_converged=true
 # If node-2 did not converge under jitter, retry now without jitter.
 if ! $node2_converged_under_jitter; then
     echo "  Retrying node-2 convergence after jitter removal..."
-    if ! wait_for_convergence "$expected" "$NODE2_URL" "node-2" "$POST_JITTER_RETRIES" "$POST_JITTER_INTERVAL" "$KEY"; then
+    if ! wait_for_convergence "$expected" "$NODE2_URL" "node-2" "$NODE2_POST_JITTER_RETRIES" "$POST_JITTER_INTERVAL" "$KEY"; then
         all_converged=false
     fi
 fi
@@ -108,7 +109,7 @@ fi
 if ! $node3_converged; then
     # node-3 is non-blocking: jitter on node-2 disrupts all TCP gossip via
     # congestion control. Use a shorter retry window (10×3s=30s) because the
-    # full POST_JITTER_RETRIES window (40×3s=120s) risks exceeding the scenario
+    # full NODE2_POST_JITTER_RETRIES window (40×3s=120s) risks exceeding the scenario
     # timeout when both node-2 and node-3 miss the under-jitter convergence window.
     wait_for_convergence "$expected" "$NODE3_URL" "node-3" "10" "$POST_JITTER_INTERVAL" "$KEY" || \
         echo "  [WARN] node-3 did not converge post-jitter (non-blocking)."
