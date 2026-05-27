@@ -236,7 +236,7 @@ for scenario_name in "${SCENARIOS_TO_RUN[@]}"; do
     # Partition and jitter scenarios can leave TCP gossip connections in a
     # broken state even after the fault rules are removed. Allow 20s for
     # initial TCP recovery (FIN_WAIT2 and retransmit back-off), then poll
-    # for up to 120s (40 × 3s) to confirm cross-node propagation.
+    # for up to 120s (40 × 3s); total wait including pre-sleep is 140s.
     sleep 20
     _sync_key="fault-inject-sync-$$-${scenario_name}"
     curl -sf -X POST "http://localhost:3001/api/eventual/write" \
