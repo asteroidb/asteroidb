@@ -206,8 +206,12 @@ run_scenario_partition() {
     echo "[scenario] Writing 2 increments to node-1 (baseline)..."
     write_counter "$NODE1_URL" "$key" 2
 
-    # Wait for node-3 to receive the baseline before partitioning it.
-    echo "[scenario] Waiting for all nodes to see baseline..."
+    # Best-effort wait: try to ensure all nodes see the baseline before the
+    # partition. In cascade scenarios (S1/S2 gossip disruption) node-2 or
+    # node-3 may not have synced; the || true prevents an early exit so that
+    # S3 always exercises node-1's write-durability invariant regardless.
+    # The final blocking check (node-1 must have all 5 values) is unaffected.
+    echo "[scenario] Waiting for all nodes to see baseline (best-effort)..."
     check_convergence "2" "$key" \
         "node-1:${NODE1_URL}" "node-2:${NODE2_URL}" "node-3:${NODE3_URL}" || true
 
