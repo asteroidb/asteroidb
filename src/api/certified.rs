@@ -2069,7 +2069,7 @@ mod tests {
             .unwrap();
 
         // The written key must appear in entries_since (the delta sync view).
-        let delta = api.store().entries_since(&frontier_before);
+        let delta = api.store.entries_since(&frontier_before);
         assert_eq!(
             delta.len(),
             1,
@@ -2078,7 +2078,7 @@ mod tests {
         assert_eq!(delta[0].0, "key1");
 
         // Also verify via delta_entries_since.
-        let delta2 = api.store().delta_entries_since(&frontier_before);
+        let delta2 = api.store.delta_entries_since(&frontier_before);
         assert_eq!(delta2.len(), 1);
         assert_eq!(delta2[0].0, "key1");
     }
@@ -2102,7 +2102,7 @@ mod tests {
         api.certified_write("key-c".into(), counter_value(3), OnTimeout::Pending)
             .unwrap();
 
-        let delta = api.store().entries_since(&frontier_before);
+        let delta = api.store.entries_since(&frontier_before);
         assert_eq!(
             delta.len(),
             3,
