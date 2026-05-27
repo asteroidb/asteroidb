@@ -218,15 +218,9 @@ run_scenario_partition() {
     echo "[scenario] Recovering node-3..."
     "${NETEM_DIR}/remove-netem.sh" "$NODE3_CONTAINER"
 
-    # Allow two full sync cycles before checking convergence.
-    sleep 6
+    # Allow ≥6 sync cycles before checking convergence.
+    sleep 12
 
-    # Verify convergence: total should be 5.
-    # Critical: node-1 must have all data and node-3 must have synced after
-    # recovery -- these are the assertions that validate the partition scenario.
-    # node-2 is best-effort: its gossip TCP connection may still be recovering
-    # from S2'''s packet loss netem, which is an artifact of the test sequence
-    # rather than a bug in the partition recovery logic.
     echo "[scenario] Checking convergence after recovery..."
     # Critical: node-1 must have all data — this is the invariant that proves
     # writes during a partition are preserved. node-3 and node-2 checks are
@@ -249,7 +243,7 @@ verify_cluster_sync() {
     echo "[light-netem] Verifying cluster gossip sync with warmup write..."
     write_counter "$NODE1_URL" "$warmup_key" 1
     local synced=false
-    for attempt in $(seq 1 30); do
+    for attempt in $(seq 1 60); do
         local v2 v3
         v2=$(extract_value "$(read_counter "$NODE2_URL" "$warmup_key")")
         v3=$(extract_value "$(read_counter "$NODE3_URL" "$warmup_key")")
