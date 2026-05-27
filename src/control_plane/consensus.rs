@@ -227,12 +227,12 @@ mod tests {
 
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         assert_eq!(*ns.version(), PolicyVersion(2));
 
         c.propose_policy_update(make_policy("order/"), &approvals)
             .unwrap();
-        ns.set_placement_policy(make_policy("order/"));
+        ns.set_placement_policy(make_policy("order/")).unwrap();
         assert_eq!(*ns.version(), PolicyVersion(3));
     }
 
@@ -267,7 +267,7 @@ mod tests {
 
         c.propose_policy_update(make_policy("user/"), &approvals)
             .unwrap();
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
 
         c.propose_authority_update(make_authority_def("user/", &["a1", "a2"]), &approvals)
             .unwrap();

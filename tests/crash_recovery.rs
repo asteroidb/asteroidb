@@ -175,10 +175,11 @@ fn system_namespace_policy_survives_crash() {
         let mut ns = SystemNamespace::new();
 
         // Add placement policies
-        ns.set_placement_policy(make_policy("user/"));
+        ns.set_placement_policy(make_policy("user/")).unwrap();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(2), kr("order/"), 5).with_certified(true),
-        );
+        )
+        .unwrap();
 
         // Add authority definitions
         ns.set_authority_definition(make_authority_def("user/", &["n1", "n2", "n3"]));
@@ -230,8 +231,8 @@ fn system_namespace_version_continues_after_recovery() {
     // Save at version 3 (new=1 + 2 mutations)
     {
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(make_policy("a/"));
-        ns.set_placement_policy(make_policy("b/"));
+        ns.set_placement_policy(make_policy("a/")).unwrap();
+        ns.set_placement_policy(make_policy("b/")).unwrap();
         ns.save(&path).unwrap();
     }
 
@@ -239,7 +240,7 @@ fn system_namespace_version_continues_after_recovery() {
     let mut recovered = SystemNamespace::load(&path).unwrap().unwrap();
     assert_eq!(*recovered.version(), PolicyVersion(3));
 
-    recovered.set_placement_policy(make_policy("c/"));
+    recovered.set_placement_policy(make_policy("c/")).unwrap();
     assert_eq!(*recovered.version(), PolicyVersion(4));
 }
 
@@ -504,7 +505,8 @@ fn composite_all_components_crash_recovery() {
         let mut ns = SystemNamespace::new();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3).with_certified(true),
-        );
+        )
+        .unwrap();
         ns.set_authority_definition(make_authority_def("user/", &["auth-1", "auth-2", "auth-3"]));
         ns.save(&ns_path).unwrap();
 

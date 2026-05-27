@@ -32,10 +32,10 @@ pub struct TombstoneGc {
     version_floor: HashMap<NodeId, u64>,
     /// Global version floor applied to ALL writer nodes.
     ///
-    /// Derived from the minimum acknowledged frontier HLC physical timestamp
-    /// across all authorities. When set, a dot `(node_id, counter)` with
-    /// `counter < global_floor` is considered safe to GC regardless of the
-    /// per-node floor entries.
+    /// A small monotonic dot-counter value (NOT an HLC physical timestamp).
+    /// When set, a dot `(node_id, counter)` with `counter < global_floor` is
+    /// considered safe to GC regardless of the per-node floor entries.
+    /// See `set_global_floor` for the constraint on acceptable values.
     global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
@@ -110,9 +110,16 @@ impl TombstoneGc {
 
     /// Set the global version floor that applies to ALL writer nodes.
     ///
-    /// Typically set to the minimum acknowledged frontier HLC physical
-    /// timestamp across all authorities.
+    /// `floor` must be a **dot-counter value** (a small monotonic integer
+    /// such as a replica's OR-Set sequence number), NOT an HLC physical
+    /// timestamp. HLC timestamps are on the order of 10^12 ms; the assert
+    /// below panics on any value in that range to prevent silent bulk-GC of
+    /// all tombstones (since every dot counter would be less than an HLC value).
     pub fn set_global_floor(&mut self, floor: u64) {
+        assert!(
+            floor < 1_000_000_000_000,
+            "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
+        );
         self.global_floor = Some(floor);
     }
 
@@ -565,6 +572,29 @@ mod tests {
             collected, 1,
             "tombstone must be collected after retention window expires"
         );
+    }
+
+    #[test]
+    fn set_global_floor_rejects_hlc_scale_values() {
+        // set_global_floor must panic when given an HLC physical timestamp
+        // (~10^12 ms) instead of a dot-counter value (small int). Without this
+        // guard, an HLC-scale floor would mark every tombstone as below the
+        // floor and bulk-GC them all.
+        let result = std::panic::catch_unwind(|| {
+            let mut gc = TombstoneGc::default();
+            gc.set_global_floor(1_700_000_000_000u64); // ~2023 in ms (HLC scale)
+        });
+        assert!(
+            result.is_err(),
+            "set_global_floor should panic on HLC-scale values"
+        );
+    }
+
+    #[test]
+    fn set_global_floor_accepts_dot_counter_values() {
+        let mut gc = TombstoneGc::default();
+        gc.set_global_floor(42); // small monotonic integer, OK
+        assert_eq!(gc.global_floor(), Some(42));
     }
 
     /// P1-10 regression: using HLC physical timestamps (huge ms values) as

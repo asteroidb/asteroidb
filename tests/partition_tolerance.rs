@@ -70,7 +70,8 @@ fn default_namespace() -> Arc<RwLock<SystemNamespace>> {
         PolicyVersion(1),
         KeyRange { prefix: "".into() },
         3,
-    ));
+    ))
+    .unwrap();
     wrap_ns(ns)
 }
 
@@ -184,7 +185,7 @@ fn partition_certified_write_fails_without_majority() {
     // certified_write with OnTimeout::Error should fail.
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_c.certified_write("key1".into(), counter, OnTimeout::Error);
-    assert!(matches!(result, Err(CrdtError::Timeout)));
+    assert!(matches!(result, Err(CrdtError::CertificationTimeout)));
 }
 
 #[test]

@@ -127,7 +127,7 @@ async fn add_authority_while_writes_in_flight() {
     // PlacementPolicy stores its own version (PolicyVersion(1)), which is
     // what resolve_scope returns and PendingWrite records.
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let mut api = CertifiedApi::new(node_id("auth-1"), shared_ns.clone());
@@ -193,7 +193,7 @@ async fn remove_authority_quorum_still_works() {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-3"]));
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let shared_ns = wrap_ns(ns);
     let mut api = CertifiedApi::new(node_id("auth-1"), shared_ns.clone());
@@ -296,7 +296,7 @@ fn rapid_add_remove_cycles() {
     let policy = PlacementPolicy::new(PolicyVersion(1), kr("data/"), 10)
         .with_certified(true)
         .with_required_tags(tag_set);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
 
     let base_nodes = vec![
         make_node("n1", NodeMode::Store, &["region:us"]),
@@ -349,7 +349,7 @@ fn rapid_add_remove_cycles() {
 async fn authority_change_during_certification() {
     let mut ns = SystemNamespace::new();
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
     ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-3"]));
 
     let shared_ns = wrap_ns(ns);
@@ -466,7 +466,8 @@ fn policy_version_increments_on_authority_changes() {
 #[test]
 fn recalculate_authorities_after_tag_change() {
     let mut ns = SystemNamespace::new();
-    ns.set_placement_policy(make_certified_policy("data/", &["region:eu"]));
+    ns.set_placement_policy(make_certified_policy("data/", &["region:eu"]))
+        .unwrap();
 
     // Initial: n1 and n2 have region:eu, n3 does not.
     let nodes_v1 = vec![
@@ -556,7 +557,7 @@ fn empty_authority_set_rejects_certification() {
 async fn concurrent_add_with_runner_frontier() {
     let mut ns = SystemNamespace::new();
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
     ns.set_authority_definition(make_authority_def("", &["auth-1"]));
 
     let shared_ns = wrap_ns(ns);
@@ -620,7 +621,7 @@ async fn partition_during_authority_change_then_converge() {
 
     let mut ns = SystemNamespace::new();
     let policy = PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true);
-    ns.set_placement_policy(policy);
+    ns.set_placement_policy(policy).unwrap();
     ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-3"]));
 
     let shared_ns = wrap_ns(ns);

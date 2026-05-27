@@ -225,7 +225,7 @@ fn bench_entries_since_delta(c: &mut Criterion) {
             let key = format!("key-{i:06}");
             let mut counter = PnCounter::new();
             counter.increment(&nid);
-            let ts = clock.now();
+            let ts = clock.now().expect("HLC overflow in bench setup");
             store.put(key.clone(), CrdtValue::Counter(counter));
             store.record_change(&key, ts);
         }
@@ -239,7 +239,7 @@ fn bench_entries_since_delta(c: &mut Criterion) {
             if let Some(CrdtValue::Counter(c)) = store.get_mut(&key) {
                 c.increment(&nid);
             }
-            let ts = clock.now();
+            let ts = clock.now().expect("HLC overflow in bench setup");
             store.record_change(&key, ts);
         }
 

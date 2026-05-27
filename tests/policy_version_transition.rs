@@ -125,7 +125,8 @@ fn full_version_switch_with_certified_api() {
     // Start at policy version 1.
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3).with_certified(true),
-    );
+    )
+    .unwrap();
 
     let shared_ns = wrap_ns(ns);
     let mut api = CertifiedApi::new(node("node-1"), shared_ns.clone());
@@ -151,7 +152,8 @@ fn full_version_switch_with_certified_api() {
         let mut ns = shared_ns.write().unwrap();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3).with_certified(true),
-        );
+        )
+        .unwrap();
     }
 
     // Fence v1.
@@ -236,7 +238,8 @@ fn cross_version_frontier_pollution_prevented() {
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3).with_certified(true),
-    );
+    )
+    .unwrap();
 
     let shared_ns = wrap_ns(ns);
     let mut api = CertifiedApi::new(node("node-1"), shared_ns.clone());
@@ -246,7 +249,8 @@ fn cross_version_frontier_pollution_prevented() {
         let mut ns = shared_ns.write().unwrap();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3).with_certified(true),
-        );
+        )
+        .unwrap();
     }
     api.fence_version(&kr("data/"), PolicyVersion(1));
 
@@ -297,7 +301,8 @@ async fn node_runner_auto_detects_version_changes() {
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 1).with_certified(true),
-    );
+    )
+    .unwrap();
 
     let shared_ns = wrap_ns(ns);
     let api = CertifiedApi::new(node("auth-1"), shared_ns.clone());
@@ -331,7 +336,8 @@ async fn node_runner_auto_detects_version_changes() {
             let mut ns = ns_clone.write().unwrap();
             ns.set_placement_policy(
                 PlacementPolicy::new(PolicyVersion(2), kr("data/"), 1).with_certified(true),
-            );
+            )
+            .unwrap();
         }
 
         // Wait for detection.
@@ -365,7 +371,8 @@ fn multiple_version_transitions() {
     });
     ns.set_placement_policy(
         PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3).with_certified(true),
-    );
+    )
+    .unwrap();
 
     let shared_ns = wrap_ns(ns);
     let mut api = CertifiedApi::new(node("node-1"), shared_ns.clone());
@@ -388,7 +395,8 @@ fn multiple_version_transitions() {
         let mut ns = shared_ns.write().unwrap();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3).with_certified(true),
-        );
+        )
+        .unwrap();
     }
     api.fence_version(&kr("data/"), PolicyVersion(1));
 
@@ -415,7 +423,8 @@ fn multiple_version_transitions() {
         let mut ns = shared_ns.write().unwrap();
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(3), kr("data/"), 3).with_certified(true),
-        );
+        )
+        .unwrap();
     }
     api.fence_version(&kr("data/"), PolicyVersion(2));
 

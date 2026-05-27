@@ -52,7 +52,8 @@ fn default_namespace() -> SystemNamespace {
             prefix: String::new(),
         },
         3,
-    ));
+    ))
+    .unwrap();
     ns
 }
 

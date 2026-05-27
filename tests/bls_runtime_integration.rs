@@ -73,7 +73,8 @@ fn three_authority_namespace() -> SystemNamespace {
         authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
         auto_generated: false,
     });
-    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
+    ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3))
+        .unwrap();
     ns
 }
 

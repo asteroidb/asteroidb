@@ -231,7 +231,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     let policy_v1 = PlacementPolicy::new(PolicyVersion(1), kr("sensor/"), 2)
         .with_certified(true)
         .with_required_tags([tag("dc:tokyo")].into());
-    ns.set_placement_policy(policy_v1);
+    ns.set_placement_policy(policy_v1).unwrap();
 
     // Manually set the initial authority definition for the 3 nodes.
     ns.set_authority_definition(AuthorityDefinition {
@@ -428,7 +428,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         let policy_v2 = PlacementPolicy::new(PolicyVersion(2), kr("sensor/"), 2)
             .with_certified(true)
             .with_required_tags([tag("dc:tokyo"), tag("tier:primary")].into());
-        ns.set_placement_policy(policy_v2);
+        ns.set_placement_policy(policy_v2).unwrap();
 
         // Recalculate authorities based on new policy + cluster nodes.
         let nodes = cluster_nodes.read().unwrap().clone();
@@ -861,7 +861,7 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
     let policy_v1 = PlacementPolicy::new(PolicyVersion(1), kr("data/"), 2)
         .with_certified(true)
         .with_required_tags([tag("active")].into());
-    ns.set_placement_policy(policy_v1);
+    ns.set_placement_policy(policy_v1).unwrap();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: kr("data/"),
         authority_nodes: vec![node_id("n1")],
@@ -929,7 +929,7 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
             let policy_v2 = PlacementPolicy::new(PolicyVersion(2), kr("data/"), 2)
                 .with_certified(true)
                 .with_required_tags([tag("active")].into());
-            ns.set_placement_policy(policy_v2);
+            ns.set_placement_policy(policy_v2).unwrap();
         }
 
         // Also add n2 to the cluster (membership change).
