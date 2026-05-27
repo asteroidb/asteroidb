@@ -47,6 +47,12 @@ pub struct TombstoneGc {
     pub retention_period: Duration,
     /// Wall-clock millisecond timestamp of the last GC run.
     last_gc_ms: u64,
+    /// Whether `gc_tombstones` has been called at least once.
+    ///
+    /// Separate from `last_gc_ms` so that a first call with `now_ms = 0`
+    /// (e.g. in unit tests) does not leave `last_gc_ms == 0` and cause every
+    /// subsequent call to re-enter the first-run bypass indefinitely.
+    has_run: bool,
     /// Cumulative count of tombstones removed across all GC runs.
     total_collected: u64,
 }
@@ -59,6 +65,7 @@ impl Default for TombstoneGc {
             gc_interval: Duration::from_secs(60),
             retention_period: Duration::from_secs(300),
             last_gc_ms: 0,
+            has_run: false,
             total_collected: 0,
         }
     }
@@ -73,6 +80,7 @@ impl TombstoneGc {
             gc_interval,
             retention_period,
             last_gc_ms: 0,
+            has_run: false,
             total_collected: 0,
         }
     }
@@ -129,10 +137,10 @@ impl TombstoneGc {
     /// [`gc_tombstones`](Self::gc_tombstones) (even with an empty store), and
     /// thereafter only when at least one tombstone is actually collected.  On
     /// no-op runs after the first, `last_gc_ms` is left unchanged so subsequent
-    /// calls to `should_run` continue to return `true` until a collection
-    /// actually occurs.  This prevents the GC interval from resetting on
-    /// empty-store no-op runs and ensures the scheduler re-checks promptly
-    /// when the store is initially empty.
+    /// calls to `should_run` return `true` again once `gc_interval` has elapsed
+    /// from the last successful collection.  This prevents the GC interval from
+    /// resetting on empty-store no-op runs and ensures the scheduler re-checks
+    /// promptly when the store is initially empty.
     ///
     /// **`gc_interval = 0` note**: the comparison uses a minimum of 1 ms to prevent
     /// callers that loop on `should_run` from busy-polling at nanosecond cadence.
@@ -181,7 +189,12 @@ impl TombstoneGc {
         // with an empty store (last_gc_ms stays 0 across all no-op calls) would bypass
         // the retention check the first time tombstones appear, potentially GC-ing them
         // before slow replicas have had retention_period to merge them.
-        let is_first_run = self.last_gc_ms == 0;
+        //
+        // `has_run` is used rather than `last_gc_ms == 0` to avoid an infinite
+        // first-run loop when `now_ms = 0` (e.g. in unit tests): without this flag,
+        // setting `last_gc_ms = 0` on the first call would leave the sentinel
+        // unchanged and every subsequent call would re-enter the first-run bypass.
+        let is_first_run = !self.has_run;
 
         if !is_first_run {
             let retention_ms = self.retention_period.as_millis() as u64;
@@ -236,6 +249,7 @@ impl TombstoneGc {
         if collected > 0 || is_first_run {
             self.last_gc_ms = now_ms;
         }
+        self.has_run = true;
         collected
     }
 }
