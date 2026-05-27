@@ -59,7 +59,7 @@ pub(crate) fn is_safe_peer_address(addr: &str) -> bool {
             }
             true
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -445,8 +445,11 @@ mod tests {
     }
 
     #[test]
-    fn safe_address_allows_hostname() {
-        assert!(is_safe_peer_address("peer.example.com:4000"));
+    fn safe_address_rejects_hostname() {
+        // Peer addresses must be IP literals; hostnames cannot be validated
+        // against the dangerous-range blocklist and may resolve to internal
+        // addresses (e.g. metadata.internal → 169.254.169.254). Reject them.
+        assert!(!is_safe_peer_address("peer.example.com:4000"));
     }
 
     #[test]
