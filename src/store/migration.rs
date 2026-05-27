@@ -177,6 +177,28 @@ mod tests {
         }
     }
 
+    /// Verify registry actually invokes a transforming migration (not just skips it).
+    /// Uses a mock V1→V2 that adds a sentinel field, proving the code path ran.
+    #[test]
+    fn registry_invokes_migration_with_transforming_mock() {
+        struct V1ToV2Transforming;
+        impl Migration for V1ToV2Transforming {
+            fn source_version(&self) -> u32 { 1 }
+            fn target_version(&self) -> u32 { 2 }
+            fn migrate(&self, mut data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+                data["migration_ran"] = serde_json::Value::Bool(true);
+                Ok(data)
+            }
+        }
+
+        let mut registry = MigrationRegistry::new();
+        registry.register(Box::new(V1ToV2Transforming));
+
+        let data = json!({"data": {}});
+        let result = registry.apply_migrations(data, 1, 2).unwrap();
+        assert_eq!(result["migration_ran"], true, "migration must have been invoked");
+    }
+
     /// Test a multi-step migration chain by adding a second migration.
     #[test]
     fn registry_applies_chain_v1_to_v3() {
