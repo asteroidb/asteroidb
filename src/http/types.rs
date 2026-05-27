@@ -496,8 +496,7 @@ impl IntoResponse for ApiError {
             CrdtError::CertificationTimeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "CERTIFICATION_TIMEOUT",
-                "local write committed but certification timed out waiting for authority quorum"
-                    .to_string(),
+                CrdtError::CertificationTimeout.to_string(),
             ),
         };
 

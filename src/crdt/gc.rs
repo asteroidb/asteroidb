@@ -497,13 +497,18 @@ mod tests {
     /// known replicas for ALL writer nodes. A dot (X, counter) from a node X
     /// that is absent from version_floor should still be GC'd if counter <
     /// global_floor, because global_floor already covers X.
+    ///
+    /// The tombstone must NOT be locally dominated (no subsequent add after remove),
+    /// so removal is driven solely by global_floor — this distinguishes the new
+    /// "either criterion" logic from the old "both required" logic.
     #[test]
     fn compact_deferred_with_floor_uses_global_floor_for_absent_node() {
         let n = node("A"); // node "A" will be absent from version_floor
         let mut set = OrSet::new();
         set.add("x".to_string(), &n); // counter=1 for A
         set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
+        // No further adds — counters["A"]=1, so locally_dominated=(1<1)=false.
+        // Removal must be driven by global_floor alone.
 
         assert_eq!(set.deferred_len(), 1);
 
@@ -514,7 +519,7 @@ mod tests {
         assert_eq!(
             set.deferred_len(),
             0,
-            "global_floor must GC dots from nodes absent from version_floor"
+            "global_floor must GC dots from nodes absent from version_floor even when not locally dominated"
         );
     }
 
