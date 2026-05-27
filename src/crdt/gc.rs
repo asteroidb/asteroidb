@@ -490,6 +490,57 @@ mod tests {
         );
     }
 
+    /// Verify that compact_deferred_with_floor uses global_floor as a fallback
+    /// for nodes that are absent from version_floor.
+    ///
+    /// Semantic: global_floor represents the minimum version confirmed by ALL
+    /// known replicas for ALL writer nodes. A dot (X, counter) from a node X
+    /// that is absent from version_floor should still be GC'd if counter <
+    /// global_floor, because global_floor already covers X.
+    #[test]
+    fn compact_deferred_with_floor_uses_global_floor_for_absent_node() {
+        let n = node("A"); // node "A" will be absent from version_floor
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // version_floor has no entry for node "A" (absent); global_floor=2 should apply.
+        let empty_version_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_version_floor, Some(2));
+
+        assert_eq!(
+            set.deferred_len(),
+            0,
+            "global_floor must GC dots from nodes absent from version_floor"
+        );
+    }
+
+    /// Verify that compact_deferred_with_floor retains tombstones from absent
+    /// nodes when global_floor does not cover them.
+    #[test]
+    fn compact_deferred_with_floor_retains_dot_above_global_floor_for_absent_node() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // counter=1 for A
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        // No further adds — locally_dominated=false (max counter still 1)
+
+        assert_eq!(set.deferred_len(), 1);
+
+        // global_floor=1 does NOT cover dot counter=1 (strictly less-than check)
+        let empty_version_floor = std::collections::HashMap::new();
+        set.compact_deferred_with_floor(&empty_version_floor, Some(1));
+
+        assert_eq!(
+            set.deferred_len(),
+            1,
+            "tombstone must be retained when dot.counter >= global_floor"
+        );
+    }
+
     /// Verify that compact_deferred without floor doesn't remove tombstones
     /// when the counter hasn't been superseded (no newer dots from that node).
     #[test]

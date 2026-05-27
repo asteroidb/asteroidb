@@ -123,10 +123,11 @@ done
 
 if $all_converged; then
     echo ""
-    echo -e "${CLR_GREEN}[PASS] jitter-latency: all nodes converged.${CLR_RESET}"
+    echo -e "${CLR_GREEN}[PASS] jitter-latency: required nodes (node-1, node-2) converged.${CLR_RESET}"
+    echo "  (node-3 convergence is best-effort and may have logged [WARN] above)"
     exit 0
 else
     echo ""
-    echo -e "${CLR_RED}[FAIL] jitter-latency: not all nodes converged.${CLR_RESET}"
+    echo -e "${CLR_RED}[FAIL] jitter-latency: required node convergence failed.${CLR_RESET}"
     exit 1
 fi
