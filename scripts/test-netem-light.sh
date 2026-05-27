@@ -306,6 +306,10 @@ for _attempt in $(seq 1 10); do
 done
 if $_delay_ok; then
     echo "[light-netem] Gossip recovered after delay scenario."
+    # Allow TCP congestion-control to stabilize after the abrupt RTT change.
+    # A freshly-recovered connection is fragile: 5% packet loss in S2 can
+    # cause the retransmit window to collapse immediately if applied too soon.
+    sleep 10
 else
     echo "[light-netem] WARN: gossip not confirmed after 40s post-delay; proceeding."
 fi
