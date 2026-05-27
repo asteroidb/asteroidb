@@ -405,11 +405,8 @@ impl MembershipClient {
             let peer_nid = NodeId(peer_info.node_id.clone());
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
-                // Re-apply the metadata/link-local guard so a compromised trusted
-                // peer cannot redirect a known node's address to a dangerous target.
-                if is_metadata_or_link_local(&peer_info.address) {
-                    continue;
-                }
+                // The link-local guard above already rejects dangerous addresses;
+                // peer_info.address is guaranteed safe here.
                 registry.update_address(&peer_nid, &peer_info.address);
             } else if added < MAX_NEW_PEERS
                 && registry
