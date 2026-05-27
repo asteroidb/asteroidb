@@ -507,7 +507,11 @@ mod tests {
         // First call at T=1000: empty store, starts the retention clock.
         let collected = gc.gc_tombstones(&mut store, 1_000);
         assert_eq!(collected, 0);
-        assert_eq!(gc.last_gc_ms(), 1_000, "first call must start retention clock");
+        assert_eq!(
+            gc.last_gc_ms(),
+            1_000,
+            "first call must start retention clock"
+        );
 
         // Tombstones appear shortly after at T=2000 (well within retention window).
         let mut set = OrSet::new();
@@ -518,7 +522,11 @@ mod tests {
 
         // T=2001: retention=300s, elapsed=1001ms < 300_000ms → skip.
         let collected = gc.gc_tombstones(&mut store, 2_001);
-        assert_eq!(collected, 0, "tombstones within retention window must not be collected");
+        assert_eq!(
+            collected,
+            0,
+            "tombstones within retention window must not be collected"
+        );
     }
 
     /// P1-10 regression: using HLC physical timestamps (huge ms values) as
