@@ -1851,9 +1851,11 @@ mod tests {
     fn bincode_v1_snapshot_migrates_on_load() {
         use crate::store::backend::MemoryBackend;
 
-        // Build a v1 bincode snapshot by hand:
-        //   - 4-byte LE version prefix set to 1 (version 1)
-        //   - bincode-encoded Store payload (same schema as v2; V1ToV2 is a no-op)
+        // Build a v1 bincode snapshot: 4-byte LE version prefix = 1, followed by a
+        // bincode-encoded Store payload using the current (v2) struct layout.
+        // V1ToV2 is a no-op (schemas are identical), so this tests the
+        // version-routing logic only — not structural schema divergence between
+        // a true v1 layout and v2 (see MAINTAINER WARNING above load_from_backend_bincode).
         let mut original = Store::new();
         let mut counter = PnCounter::new();
         counter.increment(&node("A"));
