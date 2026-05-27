@@ -24,6 +24,17 @@ pub enum CrdtError {
     #[error("timeout")]
     Timeout,
 
+    /// The local write succeeded and is durably stored, but the authority
+    /// majority could not be reached in time to certify it.
+    ///
+    /// Callers can distinguish this from a generic [`Timeout`] to know that
+    /// the value IS present in the local store and will eventually propagate
+    /// to other replicas.  Certification can be retried by calling
+    /// `process_certifications` once more authorities report their frontiers,
+    /// without re-issuing the write.
+    #[error("certification timeout: local write committed but certification did not complete")]
+    CertificationTimeout,
+
     #[error("incompatible format version: data={data_version}, code={code_version}")]
     IncompatibleVersion {
         data_version: u32,
@@ -87,6 +98,15 @@ mod tests {
     fn display_timeout() {
         let err = CrdtError::Timeout;
         assert_eq!(err.to_string(), "timeout");
+    }
+
+    #[test]
+    fn display_certification_timeout() {
+        let err = CrdtError::CertificationTimeout;
+        assert_eq!(
+            err.to_string(),
+            "certification timeout: local write committed but certification did not complete"
+        );
     }
 
     #[test]

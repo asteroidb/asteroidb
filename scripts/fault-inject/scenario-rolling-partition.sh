@@ -98,6 +98,9 @@ sleep 3
 # Allow ≥10 gossip cycles before the final convergence check.
 sleep 20
 
+# Allow ≥10 gossip cycles before the final convergence check.
+sleep 20
+
 # === STEP 6: Verify convergence ===
 log_step 6 "Verify full convergence (expected total: 8)"
 

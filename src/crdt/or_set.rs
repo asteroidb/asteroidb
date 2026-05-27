@@ -288,15 +288,38 @@ where
         });
     }
 
-    /// Remove tombstone dots from `deferred` that satisfy **both** the local
-    /// counter check and a cross-replica version floor check.
+    /// Remove tombstone dots from `deferred` that are safe to garbage-collect
+    /// according to local counter dominance or a cross-replica version floor.
     ///
-    /// A dot `(node_id, counter)` is removed when:
-    /// 1. It is not referenced by any live element, AND
-    /// 2. `counter < max_counter` for that node (local dominance), AND
-    /// 3. `counter < floor` where `floor` is the per-node floor from
-    ///    `version_floor`, falling back to `global_floor` if no per-node
-    ///    entry exists.
+    /// A dot `(node_id, counter)` is removed when it is not referenced by any
+    /// live element AND **at least one** of the following holds:
+    ///
+    /// 1. **Locally dominated**: `counter < max_counter` for that node.
+    ///    Any future dot for the node will have a strictly higher counter,
+    ///    so the old tombstone can never collide with a new add.  This
+    ///    matches the criterion used by [`compact_deferred`].
+    ///
+    /// 2. **Below the version floor**: `counter < floor` where `floor` is
+    ///    the per-node entry from `version_floor`, falling back to
+    ///    `global_floor`.  The floor is the minimum version confirmed by all
+    ///    known replicas, so every replica has already incorporated the
+    ///    tombstone and it no longer needs to be retained for propagation.
+    ///    This allows GC of non-dominated tombstones that have been
+    ///    universally acknowledged.
+    ///
+    /// When neither condition holds the dot is retained.  Callers that do
+    /// not yet have reliable floor data should use [`compact_deferred`]
+    /// instead, which applies only criterion (1).
+    ///
+    /// # Warning
+    /// The `floor` criterion alone can delete tombstones that have not yet
+    /// reached all replicas. Ensure the floor value only reflects versions
+    /// confirmed by all known replicas. Do not call during partial sync rounds.
+    ///
+    /// `global_floor` (and per-node floor values) must be in **dot-counter
+    /// units** (small monotonic integers), NOT HLC physical timestamps
+    /// (~10^12 ms). A floor larger than any dot counter would remove all
+    /// tombstones, including dots from nodes absent from `version_floor`.
     pub fn compact_deferred_with_floor(
         &mut self,
         version_floor: &std::collections::HashMap<NodeId, u64>,
@@ -311,18 +334,22 @@ where
             if live_dots.contains(d) {
                 return true;
             }
+            // Criterion 1: locally dominated — a newer dot has been issued for
+            // this node, so the tombstone can never collide with a future add.
             let locally_dominated = match self.counters.get(&d.node_id) {
                 Some(&max_counter) => d.counter < max_counter,
                 None => false,
             };
-            if !locally_dominated {
-                return true;
-            }
+            // Criterion 2: below the cross-replica version floor — all replicas
+            // have confirmed they have processed at least this version for the
+            // node, so the tombstone no longer needs to be kept for propagation.
             let effective_floor = version_floor.get(&d.node_id).copied().or(global_floor);
-            match effective_floor {
-                Some(floor) => d.counter >= floor,
-                None => true,
-            }
+            let below_floor = match effective_floor {
+                Some(floor) => d.counter < floor,
+                None => false,
+            };
+            // Remove if either criterion is satisfied; keep otherwise.
+            !(locally_dominated || below_floor)
         });
     }
 }
