@@ -2002,20 +2002,10 @@ impl NodeRunner {
             }
         }
 
-        for (i, (key_range, _total_authorities)) in defs.iter().enumerate() {
-            if self.compaction_engine.should_checkpoint(key_range, &now) {
-                let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                self.compaction_engine.create_checkpoint(
-                    key_range.clone(),
-                    now.clone(),
-                    digest,
-                    policy_versions[i],
-                );
-            }
-        }
-
-        // Phase 3: Run compaction to prune old timestamps. Acquire eventual_api
-        // lock only for the duration needed, with no other locks held.
+        // Phase 3: Run compaction to prune old timestamps. Only runs when
+        // eventual_api is available — without a real store there is nothing to
+        // checkpoint or prune. Running against a temporary empty store would
+        // accumulate empty checkpoints and waste state-machine cycles.
         if let Some(ref eventual_api) = self.eventual_api {
             let mut ev_api = eventual_api.lock().await;
             let store = ev_api.store_mut();
@@ -2438,6 +2428,7 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
 
@@ -2459,8 +2450,14 @@ mod tests {
             ..NodeRunnerConfig::default()
         };
 
+        // Compaction now requires an eventual_api — without it, checkpoints are
+        // not created (running against an empty store accumulates stale entries).
+        let eventual_api = crate::api::eventual::EventualApi::new(node_id("node-1"));
+        let eventual_api = Arc::new(Mutex::new(eventual_api));
+
         let mut runner =
             NodeRunner::new(node_id("node-1"), api, engine, config, default_metrics()).await;
+        runner.set_eventual_api(eventual_api);
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {

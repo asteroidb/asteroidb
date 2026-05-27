@@ -10,11 +10,11 @@
     "peers": {
       "node-2": {
         "node_id": "node-2",
-        "addr": "asteroidb-node-2:3000"
+        "addr": "172.28.0.3:3000"
       },
       "node-3": {
         "node_id": "node-3",
-        "addr": "asteroidb-node-3:3000"
+        "addr": "172.28.0.4:3000"
       }
     }
   }

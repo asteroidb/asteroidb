@@ -27,6 +27,7 @@ use crate::store::kv::CrdtValue;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use crate::network::PeerRegistry;
+use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
 use crate::network::sync::{
     DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
     SyncResponse,
@@ -853,8 +854,15 @@ pub async fn internal_join(
 ) -> Result<Json<JoinResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the caller-supplied address to prevent SSRF.
+    // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    // Reject cloud metadata / link-local targets even if format is valid.
+    if is_metadata_or_link_local(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "peer address is a reserved link-local endpoint: {}",
+            req.address
+        ))));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1008,8 +1016,15 @@ pub async fn internal_announce(
 ) -> Result<Json<AnnounceResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the caller-supplied address to prevent SSRF.
+    // Validate the caller-supplied address format to prevent SSRF.
     validate_peer_address(&req.address).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
+    // Reject cloud metadata / link-local targets even if format is valid.
+    if is_metadata_or_link_local(&req.address) {
+        return Err(ApiError(CrdtError::InvalidArgument(format!(
+            "peer address is a reserved link-local endpoint: {}",
+            req.address
+        ))));
+    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1103,14 +1118,8 @@ pub async fn internal_ping(
 ) -> Result<Json<PingResponse>, ApiError> {
     use crate::network::PeerConfig;
 
-    // Validate the sender's address to prevent SSRF.
+    // Validate the sender's address format.
     validate_peer_address(&req.sender_addr).map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-
-    // Validate all peer addresses in the known_peers list.
-    for peer in &req.known_peers {
-        validate_peer_address(&peer.address)
-            .map_err(|e| ApiError(CrdtError::InvalidArgument(e)))?;
-    }
 
     let peers_registry = state.peers.as_ref().ok_or_else(|| {
         ApiError(CrdtError::Internal(
@@ -1138,19 +1147,21 @@ pub async fn internal_ping(
         // is configured and was validated by the middleware). Without auth,
         // unknown nodes must not be able to inject themselves into the
         // registry via a bare ping.
+        // Apply the SSRF guard before writing sender_addr into the registry.
         if registry.get_peer(&sender_nid).is_some() {
-            if registry.update_address(&sender_nid, &req.sender_addr) {
+            if is_safe_peer_address(&req.sender_addr)
+                && registry.update_address(&sender_nid, &req.sender_addr)
+            {
                 changed = true;
             }
         } else if state.internal_token.as_ref().is_some_and(|t| !t.is_empty()) {
-            // The request reached us through the auth middleware, so the
-            // sender has a valid token — safe to add as a new peer.
-            if registry
-                .add_peer(PeerConfig {
-                    node_id: sender_nid.clone(),
-                    addr: req.sender_addr.clone(),
-                })
-                .is_ok()
+            if is_safe_peer_address(&req.sender_addr)
+                && registry
+                    .add_peer(PeerConfig {
+                        node_id: sender_nid.clone(),
+                        addr: req.sender_addr.clone(),
+                    })
+                    .is_ok()
             {
                 changed = true;
             }
@@ -1165,13 +1176,36 @@ pub async fn internal_ping(
         if sender_is_known {
             let mut new_peers_added: usize = 0;
             for peer_info in &req.known_peers {
+                // Validate address format first.
+                if validate_peer_address(&peer_info.address).is_err() {
+                    continue;
+                }
                 let peer_nid = NodeId(peer_info.node_id.clone());
+                // Determine whether the address is IP-format (vs. hostname).
+                // Docker deployments often use hostname addresses (e.g.
+                // "asteroidb-node-2:3000") loaded from config files. Those
+                // hostnames are safe within Docker's network but is_safe_peer_address
+                // cannot distinguish them from cloud-metadata hostnames. For IP
+                // addresses the SSRF check is always applied; for hostnames of
+                // EXISTING peers we allow updates (the peer was already trusted
+                // when it was added). New peer additions always require the full
+                // SSRF check regardless of address format.
+                let is_ip_addr = peer_info.address.parse::<std::net::SocketAddr>().is_ok();
                 if registry.get_peer(&peer_nid).is_some() {
-                    // Update address if it changed.
+                    // Existing peer: block only if address is an IP that fails SSRF.
+                    // Hostname addresses for existing peers are passed through to
+                    // preserve gossip-based address refresh in Docker deployments.
+                    if is_ip_addr && !is_safe_peer_address(&peer_info.address) {
+                        continue;
+                    }
                     if registry.update_address(&peer_nid, &peer_info.address) {
                         changed = true;
                     }
                 } else if new_peers_added < MAX_NEW_PEERS_PER_PING {
+                    // New peer: full SSRF check to prevent injecting unknown endpoints.
+                    if !is_safe_peer_address(&peer_info.address) {
+                        continue;
+                    }
                     // Ignore errors (e.g. self-in-peer-list, duplicates).
                     if registry
                         .add_peer(PeerConfig {
@@ -1343,6 +1377,14 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
     // Must not contain scheme indicators.
     if addr.contains("://") {
         return Err(format!("address must not contain a scheme: {addr}"));
+    }
+    // Must not contain userinfo (the '@' character is used in RFC 3986 authority
+    // as "userinfo@host". Allowing it lets an attacker craft addresses like
+    // "attacker@169.254.169.254:80" where parse_host returns "attacker@169.254.169.254",
+    // which fails IpAddr parsing (Err => safe), but reqwest resolves it as
+    // host=169.254.169.254 — defeating all IP-level SSRF guards.
+    if addr.contains('@') {
+        return Err(format!("address must not contain '@': {addr}"));
     }
     // Must not contain path or query components.
     if addr.contains('/') || addr.contains('?') || addr.contains('#') {
@@ -1647,6 +1689,15 @@ mod tests {
     #[test]
     fn validate_peer_address_accepts_ipv6() {
         assert!(validate_peer_address("[::1]:3000").is_ok());
+    }
+
+    #[test]
+    fn validate_peer_address_rejects_userinfo_at_sign() {
+        // @ in address allows userinfo injection: attacker@169.254.169.254:80
+        // passes IP parsing (Err->safe) but reqwest connects to 169.254.169.254.
+        assert!(validate_peer_address("attacker@169.254.169.254:80").is_err());
+        assert!(validate_peer_address("user@host:3000").is_err());
+        assert!(validate_peer_address("user@127.0.0.1:80").is_err());
     }
 
     #[test]
