@@ -185,8 +185,12 @@ mod tests {
     fn registry_invokes_migration_with_transforming_mock() {
         struct V1ToV2Transforming;
         impl Migration for V1ToV2Transforming {
-            fn source_version(&self) -> u32 { 1 }
-            fn target_version(&self) -> u32 { 2 }
+            fn source_version(&self) -> u32 {
+                1
+            }
+            fn target_version(&self) -> u32 {
+                2
+            }
             fn migrate(&self, mut data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
                 data["migration_ran"] = serde_json::Value::Bool(true);
                 Ok(data)
@@ -198,7 +202,10 @@ mod tests {
 
         let data = json!({"data": {}});
         let result = registry.apply_migrations(data, 1, 2).unwrap();
-        assert_eq!(result["migration_ran"], true, "migration must have been invoked");
+        assert_eq!(
+            result["migration_ran"], true,
+            "migration must have been invoked"
+        );
     }
 
     /// Verify the infinite loop guard fires when a migration does not advance version.
@@ -206,8 +213,13 @@ mod tests {
     fn registry_rejects_stuck_migration() {
         struct StuckMigration;
         impl Migration for StuckMigration {
-            fn source_version(&self) -> u32 { 1 }
-            fn target_version(&self) -> u32 { 1 } // same as source — stuck!
+            fn source_version(&self) -> u32 {
+                1
+            }
+            // same as source — stuck!
+            fn target_version(&self) -> u32 {
+                1
+            }
             fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
                 Ok(data)
             }
