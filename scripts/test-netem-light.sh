@@ -347,11 +347,28 @@ for _attempt in $(seq 1 40); do
 done
 if $_gossip_ok; then
     echo "[light-netem] node-2 and node-3 gossip recovered."
-    # Extra stabilization: one successful propagation confirms reconnection but
-    # the TCP gossip may still be in slow-start. Wait ~8 more gossip cycles
-    # (sync_interval=2s) to ensure the connection is reliably established
-    # before S3 writes baseline data that all nodes must receive.
     sleep 15
+    # Second verification: confirm gossip is still stable after the initial
+    # TCP slow-start period. One successful propagation can be a transient
+    # spike; writing a second key (from node-1) and requiring node-3 to see
+    # it ensures the connection is reliably established before S3 isolates
+    # node-3 and relies on post-partition gossip resync.
+    _sync_key2="netem-light-stability-$$"
+    write_counter "$NODE1_URL" "$_sync_key2" 1
+    _stable=false
+    for _attempt in $(seq 1 20); do
+        _v3=$(extract_value "$(read_counter "$NODE3_URL" "$_sync_key2")" 2>/dev/null || echo "null")
+        if [ "$_v3" = "1" ]; then
+            _stable=true
+            break
+        fi
+        sleep 3
+    done
+    if $_stable; then
+        echo "[light-netem] Gossip connection confirmed stable for S3."
+    else
+        echo "[light-netem] WARN: gossip stability not confirmed after 60s; S3 may fail."
+    fi
 else
     echo "[light-netem] WARN: gossip recovery not confirmed after 120s; proceeding."
 fi
