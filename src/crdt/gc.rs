@@ -164,10 +164,11 @@ impl TombstoneGc {
     ///   elapse between successive *successful* collections. This prevents
     ///   premature GC of tombstones that slow replicas may not have merged yet.
     ///
-    /// `last_gc_ms` is updated **only** when at least one tombstone is actually
-    /// collected. If no tombstones are found (store is empty, or all dots are
-    /// still live), the timestamp is left unchanged so that `should_run` continues
-    /// to return `true` on the next tick and the caller re-checks promptly.
+    /// `last_gc_ms` is updated when at least one tombstone is collected, **or**
+    /// on the very first invocation (even with an empty store) to start the
+    /// retention clock. On subsequent no-op runs `last_gc_ms` is left unchanged
+    /// so that `should_run` continues to return `true` and the caller re-checks
+    /// promptly without waiting a full `gc_interval`.
     ///
     /// Returns the number of tombstones removed in this run.
     pub fn gc_tombstones(&mut self, store: &mut Store, now_ms: u64) -> u64 {
@@ -276,6 +277,15 @@ mod tests {
         // should_run(60000) should be true.
         assert!(gc.should_run(60_000));
         assert!(gc.should_run(100_000));
+    }
+
+    #[test]
+    fn should_run_zero_interval_not_busy_poll() {
+        // gc_interval=0 must be clamped to 1ms; should_run(0) must return false
+        // (elapsed=0 < 1) so callers that loop on should_run don't busy-poll.
+        let gc = TombstoneGc::new(Duration::ZERO, Duration::ZERO);
+        assert!(!gc.should_run(0), "should_run(0) must be false with gc_interval=0 (clamped to 1ms)");
+        assert!(gc.should_run(1), "should_run(1) must be true: elapsed 1 >= clamped interval 1");
     }
 
     #[test]
