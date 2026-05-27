@@ -43,9 +43,10 @@ impl EventualApi {
     /// to other nodes asynchronously. Atomically records the HLC timestamp
     /// for delta sync tracking so the entry is immediately visible to
     /// `delta_sync` without a separate `record_change` call.
-    pub fn eventual_write(&mut self, key: String, value: CrdtValue) {
-        let ts = self.clock.now();
+    pub fn eventual_write(&mut self, key: String, value: CrdtValue) -> Result<(), CrdtError> {
+        let ts = self.clock.now()?;
         self.store.put_with_timestamp(key, value, ts);
+        Ok(())
     }
 
     /// Increment a PN-Counter at the given key.
@@ -70,7 +71,7 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.increment(&self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -96,7 +97,7 @@ impl EventualApi {
         if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
             c.decrement(&self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -122,7 +123,7 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.add(element, &self.node_id);
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -147,7 +148,7 @@ impl EventualApi {
         if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
             s.remove(&element.to_string());
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -175,12 +176,11 @@ impl EventualApi {
                     .put(key.to_string(), CrdtValue::Map(OrMap::new()));
             }
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
-            m.set(map_key, map_value, ts, &self.node_id);
+            m.set(map_key, map_value, ts.clone(), &self.node_id);
         }
-        let change_ts = self.clock.now();
-        self.store.record_change(key, change_ts);
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -204,7 +204,7 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.delete(&map_key.to_string());
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(key, ts);
         Ok(())
     }
@@ -227,12 +227,11 @@ impl EventualApi {
                     .put(key.to_string(), CrdtValue::Register(LwwRegister::new()));
             }
         }
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
-            r.set(value, ts);
+            r.set(value, ts.clone());
         }
-        let change_ts = self.clock.now();
-        self.store.record_change(key, change_ts);
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -243,7 +242,7 @@ impl EventualApi {
     /// for delta sync tracking.
     pub fn merge_remote(&mut self, key: String, remote_value: &CrdtValue) -> Result<(), CrdtError> {
         self.store.merge_value(key.clone(), remote_value)?;
-        let ts = self.clock.now();
+        let ts = self.clock.now()?;
         self.store.record_change(&key, ts);
         Ok(())
     }
@@ -260,7 +259,12 @@ impl EventualApi {
         remote_value: &CrdtValue,
         hlc: HlcTimestamp,
     ) -> Result<(), CrdtError> {
-        self.clock.update(&hlc);
+        // Clock update errors (ClockSkew, Overflow) must NOT prevent the CRDT
+        // merge. Discarding the merge on ClockSkew causes permanent data loss
+        // because node_runner advances the peer frontier regardless of per-entry
+        // errors, so skipped entries are never re-requested. The clock update is
+        // advisory (ordering only); CRDT correctness does not depend on it.
+        let _ = self.clock.update(&hlc);
         self.store.merge_value(key.clone(), remote_value)?;
         // Always record the change using the maximum of the incoming HLC
         // and any existing timestamp for this key. This ensures that
@@ -329,7 +333,8 @@ mod tests {
 
         let mut counter = PnCounter::new();
         counter.increment(&node("node-a"));
-        api.eventual_write("hits".into(), CrdtValue::Counter(counter));
+        api.eventual_write("hits".into(), CrdtValue::Counter(counter))
+            .unwrap();
 
         match api.get_eventual("hits") {
             Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
@@ -343,12 +348,14 @@ mod tests {
 
         let mut c1 = PnCounter::new();
         c1.increment(&node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(c1));
+        api.eventual_write("k".into(), CrdtValue::Counter(c1))
+            .unwrap();
 
         let mut c2 = PnCounter::new();
         c2.increment(&node("node-a"));
         c2.increment(&node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(c2));
+        api.eventual_write("k".into(), CrdtValue::Counter(c2))
+            .unwrap();
 
         match api.get_eventual("k") {
             Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
@@ -402,7 +409,8 @@ mod tests {
     #[test]
     fn counter_inc_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()));
+        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
 
         let err = api.eventual_counter_inc("k").unwrap_err();
         assert_eq!(
@@ -417,7 +425,8 @@ mod tests {
     #[test]
     fn counter_dec_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Register(LwwRegister::new()));
+        api.eventual_write("k".into(), CrdtValue::Register(LwwRegister::new()))
+            .unwrap();
 
         let err = api.eventual_counter_dec("k").unwrap_err();
         assert_eq!(
@@ -476,7 +485,8 @@ mod tests {
     #[test]
     fn set_add_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()));
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api.eventual_set_add("k", "x".into()).unwrap_err();
         assert_eq!(
@@ -550,7 +560,8 @@ mod tests {
     #[test]
     fn map_set_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()));
+        api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
 
         let err = api
             .eventual_map_set("k", "key".into(), "val".into())
@@ -601,7 +612,8 @@ mod tests {
     #[test]
     fn register_set_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()));
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api.eventual_register_set("k", "val".into()).unwrap_err();
         assert_eq!(
@@ -656,7 +668,8 @@ mod tests {
     #[test]
     fn merge_remote_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
-        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()));
+        api.eventual_write("k".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
 
         let err = api
             .merge_remote("k".into(), &CrdtValue::Set(OrSet::new()))
@@ -732,7 +745,8 @@ mod tests {
         // Write a value via the EventualApi.
         let mut counter = PnCounter::new();
         counter.increment(&node("node-a"));
-        api.eventual_write("hits".into(), CrdtValue::Counter(counter));
+        api.eventual_write("hits".into(), CrdtValue::Counter(counter))
+            .unwrap();
 
         // The written key must appear in entries_since (the delta sync view).
         let delta = api.store().entries_since(&frontier_before);
@@ -761,9 +775,12 @@ mod tests {
             node_id: "".into(),
         };
 
-        api.eventual_write("key1".into(), CrdtValue::Counter(PnCounter::new()));
-        api.eventual_write("key2".into(), CrdtValue::Set(OrSet::new()));
-        api.eventual_write("key3".into(), CrdtValue::Register(LwwRegister::new()));
+        api.eventual_write("key1".into(), CrdtValue::Counter(PnCounter::new()))
+            .unwrap();
+        api.eventual_write("key2".into(), CrdtValue::Set(OrSet::new()))
+            .unwrap();
+        api.eventual_write("key3".into(), CrdtValue::Register(LwwRegister::new()))
+            .unwrap();
 
         let delta = api.store().entries_since(&frontier_before);
         assert_eq!(

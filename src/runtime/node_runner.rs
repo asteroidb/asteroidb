@@ -41,10 +41,18 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// Requires the `native-crypto` feature for actual BLS key generation.
 /// Without that feature, `BlsConfig` can still be provided but will be
 /// silently ignored (Ed25519-only mode is used).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BlsConfig {
     /// 32-byte seed (IKM) for BLS key generation.
     pub seed: [u8; 32],
+}
+
+impl std::fmt::Debug for BlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlsConfig")
+            .field("seed", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Configuration for the background processing intervals of [`NodeRunner`].
@@ -1204,7 +1212,13 @@ impl NodeRunner {
     }
 
     async fn process_certifications(&mut self) {
-        let now = self.clock.now();
+        let now = match self.clock.now() {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in process_certifications; skipping");
+                return;
+            }
+        };
         let now_ms = now.physical;
 
         let mut api = self.certified_api.lock().await;
@@ -1267,7 +1281,13 @@ impl NodeRunner {
     }
 
     async fn run_cleanup(&mut self) {
-        let now_ms = self.clock.now().physical;
+        let now_ms = match self.clock.now() {
+            Ok(ts) => ts.physical,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in run_cleanup; skipping");
+                return;
+            }
+        };
         let mut api = self.certified_api.lock().await;
         api.cleanup(now_ms);
     }
@@ -1299,10 +1319,19 @@ impl NodeRunner {
     /// Generate and apply frontier reports for this authority node.
     async fn report_frontiers(&mut self) {
         if let Some(reporter) = &self.frontier_reporter {
-            let frontiers = reporter.report_frontiers(&mut self.clock);
-            let mut api = self.certified_api.lock().await;
-            for f in frontiers {
-                api.update_frontier(f);
+            match reporter.report_frontiers(&mut self.clock) {
+                Ok(frontiers) => {
+                    let mut api = self.certified_api.lock().await;
+                    for f in frontiers {
+                        api.update_frontier(f);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "HLC overflow in report_frontiers; skipping frontier update"
+                    );
+                }
             }
         }
 
@@ -1561,14 +1590,24 @@ impl NodeRunner {
                                     // Record replication convergence SLO: time from
                                     // entry write (HLC physical) to push completion.
                                     if let Some(slo) = &self.slo_tracker {
-                                        let now_ms = self.clock.now().physical;
-                                        for hlc in hlc_vec.iter().take(pushed) {
-                                            let convergence_ms =
-                                                now_ms.saturating_sub(hlc.physical) as f64;
-                                            slo.record_observation(
-                                                SLO_REPLICATION_CONVERGENCE,
-                                                convergence_ms,
-                                            );
+                                        match self.clock.now() {
+                                            Ok(ts) => {
+                                                let now_ms = ts.physical;
+                                                for hlc in hlc_vec.iter().take(pushed) {
+                                                    let convergence_ms =
+                                                        now_ms.saturating_sub(hlc.physical) as f64;
+                                                    slo.record_observation(
+                                                        SLO_REPLICATION_CONVERGENCE,
+                                                        convergence_ms,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "HLC overflow recording SLO convergence; skipping"
+                                                );
+                                            }
                                         }
                                     }
                                     // Advance peer frontier to the max HLC of the
@@ -1939,7 +1978,13 @@ impl NodeRunner {
     }
 
     async fn check_compaction(&mut self) {
-        let now = self.clock.now();
+        let now = match self.clock.now() {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::error!(error = %e, "HLC overflow in check_compaction; skipping");
+                return;
+            }
+        };
 
         // Drain per-key write ops recorded by HTTP handlers and aggregate
         // by key range prefix so that hot ranges trigger compaction
@@ -2002,11 +2047,25 @@ impl NodeRunner {
             }
         }
 
-        // Phase 3: Run compaction to prune old timestamps. Only runs when
-        // eventual_api is available — without a real store there is nothing to
-        // checkpoint or prune. Running against a temporary empty store would
-        // accumulate empty checkpoints and waste state-machine cycles.
+        // Phase 3: Run compaction (checkpoint evaluation + pruning). Only
+        // execute when eventual_api is available — without a real store there
+        // is nothing to checkpoint or prune, and creating checkpoints against
+        // an empty store would accumulate stale entries.
         if let Some(ref eventual_api) = self.eventual_api {
+            // Evaluate checkpoint eligibility for each key range.
+            for (i, (key_range, _total_authorities)) in defs.iter().enumerate() {
+                if self.compaction_engine.should_checkpoint(key_range, &now) {
+                    let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
+                    self.compaction_engine.create_checkpoint(
+                        key_range.clone(),
+                        now.clone(),
+                        digest,
+                        policy_versions[i],
+                    );
+                }
+            }
+
+            // Prune old timestamps from the store.
             let mut ev_api = eventual_api.lock().await;
             let store = ev_api.store_mut();
             for (i, (key_range, total_authorities)) in defs.iter().enumerate() {
@@ -2244,7 +2303,8 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3))
+            .unwrap();
         wrap_ns(ns)
     }
 
@@ -2428,7 +2488,8 @@ mod tests {
             authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3))
+            .unwrap();
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
 
@@ -2721,7 +2782,8 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1))
+            .unwrap();
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
         api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
@@ -2856,7 +2918,8 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        )
+        .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -2965,7 +3028,8 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        )
+        .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3128,7 +3192,8 @@ mod tests {
                 PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                     .with_certified(true)
                     .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-            );
+            )
+            .unwrap();
         }
 
         let handle = runner.shutdown_handle();
@@ -3163,7 +3228,8 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        )
+        .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3236,7 +3302,8 @@ mod tests {
             PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2)
                 .with_certified(true)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        )
+        .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3297,7 +3364,8 @@ mod tests {
                 PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
                     .with_certified(true)
                     .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-            );
+            )
+            .unwrap();
         }
 
         // Call detect_version_changes directly.
@@ -3339,7 +3407,8 @@ mod tests {
         ns.set_placement_policy(
             PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
                 .with_required_tags([crate::types::Tag("dc:tokyo".into())].into()),
-        );
+        )
+        .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3369,7 +3438,8 @@ mod tests {
             let mut ea = eventual_api.lock().await;
             let mut counter = crate::crdt::pn_counter::PnCounter::new();
             counter.increment(&node_id("node-1"));
-            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
         }
 
         let mut runner = NodeRunner::with_cluster_nodes(
@@ -3397,7 +3467,8 @@ mod tests {
                 .namespace()
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3));
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3))
+                .unwrap();
         }
 
         // Detect version changes, which should compute a rebalance plan.
@@ -3470,7 +3541,8 @@ mod tests {
         use crate::types::NodeMode;
 
         let mut ns = SystemNamespace::new();
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3))
+            .unwrap();
         let shared_ns = wrap_ns(ns);
 
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
@@ -3496,7 +3568,8 @@ mod tests {
             let mut ea = eventual_api.lock().await;
             let mut counter = crate::crdt::pn_counter::PnCounter::new();
             counter.increment(&node_id("node-1"));
-            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
         }
 
         let mut runner = NodeRunner::with_cluster_nodes(
