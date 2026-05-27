@@ -1030,10 +1030,11 @@ mod tests {
         api.cleanup_completed();
 
         // Only pending entries remain.
-        assert!(api
-            .pending_writes()
-            .iter()
-            .all(|pw| pw.status == CertificationStatus::Pending));
+        assert!(
+            api.pending_writes()
+                .iter()
+                .all(|pw| pw.status == CertificationStatus::Pending)
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1132,10 +1133,11 @@ mod tests {
         // Certified entries (key1, key2) were cleaned up.
         // key3 (Pending) + key4 (new Pending) remain.
         assert!(api.pending_writes().len() <= 3);
-        assert!(api
-            .pending_writes()
-            .iter()
-            .any(|pw| pw.key == "key3" || pw.key == "key4"));
+        assert!(
+            api.pending_writes()
+                .iter()
+                .any(|pw| pw.key == "key3" || pw.key == "key4")
+        );
     }
 
     // ---------------------------------------------------------------
