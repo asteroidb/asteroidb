@@ -362,7 +362,9 @@ mod tests {
 
         // After overflow: self.physical = wall+1001 (advanced 1ms), self.logical = 0.
         // now() succeeds and produces a timestamp strictly > overflow_ts.
-        let after = clock.now().expect("now() must succeed after update() Overflow");
+        let after = clock
+            .now()
+            .expect("now() must succeed after update() Overflow");
         assert!(
             after > overflow_ts,
             "now() after overflow must produce timestamp > the overflowed peer ts; \
