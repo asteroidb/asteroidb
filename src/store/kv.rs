@@ -148,8 +148,27 @@ impl Store {
     }
 
     /// Insert or replace a value for the given key.
+    ///
+    /// # Warning
+    /// This method does NOT update the `timestamps` map. Callers that hold
+    /// an `HlcTimestamp` MUST use `put_with_timestamp` instead — skipping it
+    /// causes the entry to be invisible to `delta_sync` / `entries_since`.
+    /// When no HLC is available, call [`record_change`](Self::record_change)
+    /// immediately after this method.
     pub fn put(&mut self, key: String, value: CrdtValue) {
         self.data.insert(key, value);
+    }
+
+    /// Insert or replace a value for the given key, atomically recording the
+    /// HLC timestamp used for delta sync.
+    ///
+    /// This is the preferred variant when the caller already holds an
+    /// `HlcTimestamp` — it guarantees that the `timestamps` map is always
+    /// up-to-date after the write, so `delta_sync` will immediately see the
+    /// new entry without a separate `record_change` call.
+    pub fn put_with_timestamp(&mut self, key: String, value: CrdtValue, hlc: HlcTimestamp) {
+        self.data.insert(key.clone(), value);
+        self.timestamps.insert(key, hlc);
     }
 
     /// Remove and return the value for the given key.
@@ -1742,6 +1761,72 @@ mod tests {
 
         store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
         store.record_change("k", ts(100, 0, "n"));
+        assert_eq!(store.timestamp_count(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // put_with_timestamp — atomic write + timestamp update
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn put_with_timestamp_stores_value_and_timestamp() {
+        let mut store = Store::new();
+        store.put_with_timestamp(
+            "k".into(),
+            CrdtValue::Counter(PnCounter::new()),
+            ts(100, 0, "n1"),
+        );
+
+        assert!(store.contains_key("k"));
+        assert_eq!(store.timestamp_for("k"), Some(&ts(100, 0, "n1")));
+    }
+
+    #[test]
+    fn put_with_timestamp_visible_to_entries_since() {
+        let mut store = Store::new();
+        store.put_with_timestamp(
+            "key".into(),
+            CrdtValue::Counter(PnCounter::new()),
+            ts(200, 0, "n1"),
+        );
+
+        // Should be visible to delta sync without calling record_change.
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "key");
+        assert_eq!(entries[0].2, ts(200, 0, "n1"));
+    }
+
+    #[test]
+    fn put_without_timestamp_not_visible_to_entries_since() {
+        let mut store = Store::new();
+        // Plain put() does NOT update timestamps; delta sync cannot see this entry.
+        store.put("key".into(), CrdtValue::Counter(PnCounter::new()));
+
+        let frontier = ts(0, 0, "");
+        let entries = store.entries_since(&frontier);
+        assert!(
+            entries.is_empty(),
+            "put() without a timestamp must not appear in delta sync"
+        );
+    }
+
+    #[test]
+    fn put_with_timestamp_overwrites_existing_timestamp() {
+        let mut store = Store::new();
+        store.put_with_timestamp(
+            "k".into(),
+            CrdtValue::Counter(PnCounter::new()),
+            ts(100, 0, "n1"),
+        );
+        store.put_with_timestamp(
+            "k".into(),
+            CrdtValue::Counter(PnCounter::new()),
+            ts(200, 0, "n1"),
+        );
+
+        assert_eq!(store.timestamp_for("k"), Some(&ts(200, 0, "n1")));
         assert_eq!(store.timestamp_count(), 1);
     }
 
