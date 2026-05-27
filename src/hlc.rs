@@ -128,7 +128,7 @@ impl Hlc {
         let max_physical = wall.max(self.physical).max(received.physical);
 
         let logical_result = if max_physical == self.physical && max_physical == received.physical {
-            // All three equal (or wall <= both): advance logical beyond both.
+            // Local and received physical are equal and dominate wall; advance logical beyond both.
             self.logical
                 .max(received.logical)
                 .checked_add(1)
@@ -307,13 +307,16 @@ mod tests {
     #[test]
     fn now_returns_overflow_error_when_logical_is_at_max() {
         // Drive logical to u32::MAX using a peer timestamp within the allowed
-        // clock skew range (wall + 1s), so the skew guard does not reject it.
+        // clock skew range. Use +30s (half of MAX_CLOCK_SKEW_MS) so the skew
+        // guard does not reject it; the 30s gap also ensures the real wall clock
+        // cannot advance past self.physical during the test, which would reset
+        // logical to 0 and cause now() to return Ok instead of Overflow.
         // received.logical = u32::MAX - 1 → local logical = u32::MAX after update.
         // Then now() tries to increment past u32::MAX → Overflow.
         let mut clock = Hlc::new("node-a".into());
         let wall = physical_ms();
         let near_max = HlcTimestamp {
-            physical: wall + 1_000, // 1s ahead, within MAX_CLOCK_SKEW_MS
+            physical: wall + 30_000, // 30s ahead, within MAX_CLOCK_SKEW_MS (60s)
             logical: u32::MAX - 1,
             node_id: "node-b".into(),
         };
@@ -329,10 +332,12 @@ mod tests {
         // and logical is reset to 0. The very next call to now() must succeed.
         let mut clock = Hlc::new("node-a".into());
         let wall = physical_ms();
-        // Force physical into the future and logical to u32::MAX - 1 so the
-        // first now() call overflows.
+        // Force physical 30s into the future (within MAX_CLOCK_SKEW_MS) and
+        // logical to u32::MAX - 1 so the first now() call overflows. The 30s
+        // margin prevents the wall clock from advancing past self.physical
+        // during the test, which would otherwise reset logical and avoid Overflow.
         let near_max = HlcTimestamp {
-            physical: wall + 1_000,
+            physical: wall + 30_000,
             logical: u32::MAX - 1,
             node_id: "node-b".into(),
         };
@@ -351,16 +356,18 @@ mod tests {
         // update() must advance self.physical and reset self.logical=0 when it
         // returns Err(Overflow), so that subsequent now() calls produce timestamps
         // strictly greater than the overflowed peer timestamp (HLC causality invariant).
+        // Use +30s (within MAX_CLOCK_SKEW_MS) to prevent the real wall clock from
+        // catching up to self.physical during the test.
         let mut clock = Hlc::new("node-a".into());
         let wall = physical_ms();
         let overflow_ts = HlcTimestamp {
-            physical: wall + 1_000,
+            physical: wall + 30_000,
             logical: u32::MAX,
             node_id: "node-b".into(),
         };
         assert_eq!(clock.update(&overflow_ts), Err(HlcError::Overflow));
 
-        // After overflow: self.physical = wall+1001 (advanced 1ms), self.logical = 0.
+        // After overflow: self.physical = wall+30001 (advanced 1ms), self.logical = 0.
         // now() succeeds and produces a timestamp strictly > overflow_ts.
         let after = clock
             .now()
