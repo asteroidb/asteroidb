@@ -69,7 +69,17 @@ impl MigrationRegistry {
                 })?;
 
             data = migration.migrate(data)?;
-            current = migration.target_version();
+            let next = migration.target_version();
+            if next <= current {
+                return Err(CrdtError::MigrationFailed {
+                    from: current,
+                    to: next,
+                    reason: format!(
+                        "migration v{current}→v{next} does not advance version (infinite loop guard)"
+                    ),
+                });
+            }
+            current = next;
         }
 
         Ok(data)
