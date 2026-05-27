@@ -178,10 +178,9 @@ impl EventualApi {
         }
         let ts = self.clock.now()?;
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
-            m.set(map_key, map_value, ts, &self.node_id);
+            m.set(map_key, map_value, ts.clone(), &self.node_id);
         }
-        let change_ts = self.clock.now()?;
-        self.store.record_change(key, change_ts);
+        self.store.record_change(key, ts);
         Ok(())
     }
 
@@ -230,10 +229,9 @@ impl EventualApi {
         }
         let ts = self.clock.now()?;
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
-            r.set(value, ts);
+            r.set(value, ts.clone());
         }
-        let change_ts = self.clock.now()?;
-        self.store.record_change(key, change_ts);
+        self.store.record_change(key, ts);
         Ok(())
     }
 

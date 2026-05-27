@@ -5,6 +5,16 @@ use thiserror::Error;
 pub enum HlcError {
     #[error("HLC logical counter overflow: physical clock is not advancing fast enough")]
     Overflow,
+    /// Received timestamp is too far ahead of local wall clock.
+    ///
+    /// Accepting it would set `self.physical` to a far-future value, causing
+    /// `now()` to stop advancing and eventually fail with Overflow (DoS vector).
+    #[error("HLC clock skew too large: received physical={received_ms}, wall={wall_ms}, max_skew_ms={max_skew_ms}")]
+    ClockSkew {
+        received_ms: u64,
+        wall_ms: u64,
+        max_skew_ms: u64,
+    },
 }
 
 /// Common error type for CRDT operations.

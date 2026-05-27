@@ -441,7 +441,7 @@ impl CertifiedApi {
         }
 
         match on_timeout {
-            OnTimeout::Error => Err(CrdtError::Timeout),
+            OnTimeout::Error => Err(CrdtError::CertificationTimeout),
             OnTimeout::Pending => Ok(CertificationStatus::Pending),
         }
     }

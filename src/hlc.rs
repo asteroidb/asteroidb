@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HlcError;
 
+/// Maximum acceptable clock skew from a remote peer, in milliseconds (60 seconds).
+///
+/// `update()` rejects received timestamps whose `physical` field exceeds
+/// `wall_clock + MAX_CLOCK_SKEW_MS`. A far-future physical timestamp would
+/// advance `self.physical` beyond the real wall clock, causing `now()` to
+/// stop advancing and eventually fail with `Overflow` — a DoS vector.
+const MAX_CLOCK_SKEW_MS: u64 = 60_000;
+
 /// A snapshot of the Hybrid Logical Clock at a point in time.
 ///
 /// Ordering: physical time first, then logical counter, then node_id for total ordering.
@@ -86,8 +94,23 @@ impl Hlc {
     /// Returns `Err(HlcError::Overflow)` if the logical counter would overflow
     /// `u32::MAX`. This surfaces clearly instead of silently clamping (the former
     /// `saturating_add` behaviour), which could produce duplicate timestamps.
+    ///
+    /// Returns `Err(HlcError::ClockSkew)` if `received.physical` is more than
+    /// [`MAX_CLOCK_SKEW_MS`] ahead of the local wall clock. Accepting a far-future
+    /// physical timestamp would set `self.physical` to that value, causing `now()`
+    /// to stop advancing and eventually return `Overflow` indefinitely (DoS vector).
     pub fn update(&mut self, received: &HlcTimestamp) -> Result<(), HlcError> {
         let wall = physical_ms();
+
+        // Reject timestamps from peers that are too far in the future.
+        if received.physical > wall.saturating_add(MAX_CLOCK_SKEW_MS) {
+            return Err(HlcError::ClockSkew {
+                received_ms: received.physical,
+                wall_ms: wall,
+                max_skew_ms: MAX_CLOCK_SKEW_MS,
+            });
+        }
+
         let max_physical = wall.max(self.physical).max(received.physical);
 
         let logical_result = if max_physical == self.physical && max_physical == received.physical {
@@ -260,36 +283,72 @@ mod tests {
 
     #[test]
     fn now_returns_overflow_error_when_logical_is_at_max() {
-        // Drive the clock to physical=u64::MAX, logical=u32::MAX by first
-        // doing an update() with a far-future peer timestamp (logical=u32::MAX-1),
-        // which sets local logical to u32::MAX without itself overflowing.
-        // Then calling now() increments logical past u32::MAX → Overflow.
+        // Drive logical to u32::MAX using a peer timestamp within the allowed
+        // clock skew range (wall + 1s), so the skew guard does not reject it.
+        // received.logical = u32::MAX - 1 → local logical = u32::MAX after update.
+        // Then now() tries to increment past u32::MAX → Overflow.
         let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
         let near_max = HlcTimestamp {
-            physical: u64::MAX,
+            physical: wall + 1_000, // 1s ahead, within MAX_CLOCK_SKEW_MS
             logical: u32::MAX - 1,
             node_id: "node-b".into(),
         };
         clock.update(&near_max).expect("should not overflow yet");
-        // Now logical == u32::MAX, physical == u64::MAX.
-        // next now() must return Overflow.
+        // logical == u32::MAX; now() increments → Overflow.
         let result = clock.now();
         assert_eq!(result, Err(HlcError::Overflow));
     }
 
     #[test]
     fn update_returns_overflow_error_when_logical_would_overflow() {
-        // A peer sends logical=u32::MAX with a physical timestamp far in the
-        // future.  The "received physical is ahead" branch attempts
-        // received.logical.checked_add(1) which overflows → Err.
+        // A peer sends logical=u32::MAX with a physical timestamp 1s in the
+        // future (within skew limit). The "received physical is ahead" branch
+        // attempts received.logical.checked_add(1) which overflows → Err.
         let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
         let overflow_ts = HlcTimestamp {
-            physical: u64::MAX,
+            physical: wall + 1_000,
             logical: u32::MAX,
             node_id: "node-b".into(),
         };
         let result = clock.update(&overflow_ts);
         assert_eq!(result, Err(HlcError::Overflow));
+    }
+
+    #[test]
+    fn update_rejects_far_future_timestamp() {
+        // A peer sends physical = wall + MAX_CLOCK_SKEW_MS + 1 (just over the
+        // limit). update() must return ClockSkew without touching self.physical,
+        // so that now() continues to work normally after the bad update.
+        let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
+        let far_future = HlcTimestamp {
+            physical: wall + MAX_CLOCK_SKEW_MS + 1,
+            logical: 0,
+            node_id: "malicious".into(),
+        };
+        let result = clock.update(&far_future);
+        assert!(
+            matches!(result, Err(HlcError::ClockSkew { .. })),
+            "expected ClockSkew, got {:?}",
+            result
+        );
+        // The local clock must still be usable after rejecting the bad update.
+        assert!(clock.now().is_ok(), "now() must work after rejected update");
+    }
+
+    #[test]
+    fn update_accepts_timestamp_at_skew_boundary() {
+        // A timestamp exactly at MAX_CLOCK_SKEW_MS ahead should be accepted.
+        let mut clock = Hlc::new("node-a".into());
+        let wall = physical_ms();
+        let at_boundary = HlcTimestamp {
+            physical: wall + MAX_CLOCK_SKEW_MS,
+            logical: 0,
+            node_id: "peer".into(),
+        };
+        assert!(clock.update(&at_boundary).is_ok());
     }
 
     #[test]
