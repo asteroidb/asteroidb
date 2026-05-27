@@ -618,14 +618,14 @@ fn lww_register_with_live_hlc_clocks() {
 
     // Node A writes first.
     let mut reg_a = LwwRegister::new();
-    let ts_a = clock_a.now();
+    let ts_a = clock_a.now().expect("HLC overflow");
     reg_a.set("from_A".to_string(), ts_a.clone());
     store_a.put("reg".into(), CrdtValue::Register(reg_a));
 
     // Node B sees A's timestamp and writes later.
-    clock_b.update(&ts_a);
+    clock_b.update(&ts_a).expect("HLC overflow");
     let mut reg_b = LwwRegister::new();
-    let ts_b = clock_b.now();
+    let ts_b = clock_b.now().expect("HLC overflow");
     reg_b.set("from_B".to_string(), ts_b);
     store_b.put("reg".into(), CrdtValue::Register(reg_b));
 
@@ -1087,14 +1087,14 @@ fn hlc_timestamps_advance_monotonically_across_stores() {
     let mut store_b = Store::new();
 
     // A writes a register.
-    let ts_a1 = clock_a.now();
+    let ts_a1 = clock_a.now().expect("HLC overflow");
     let mut reg_a = LwwRegister::new();
     reg_a.set("v1".to_string(), ts_a1.clone());
     store_a.put("r".into(), CrdtValue::Register(reg_a));
 
     // B sees A's clock, advances, and writes.
-    clock_b.update(&ts_a1);
-    let ts_b1 = clock_b.now();
+    clock_b.update(&ts_a1).expect("HLC overflow");
+    let ts_b1 = clock_b.now().expect("HLC overflow");
     assert!(ts_b1 > ts_a1, "B's timestamp should be after A's");
 
     let mut reg_b = LwwRegister::new();
@@ -1110,8 +1110,8 @@ fn hlc_timestamps_advance_monotonically_across_stores() {
     assert_eq!(register_value(&store_a, "r"), Some(&"v2".to_string()));
 
     // A advances clock past B's timestamp.
-    clock_a.update(&ts_b1);
-    let ts_a2 = clock_a.now();
+    clock_a.update(&ts_b1).expect("HLC overflow");
+    let ts_a2 = clock_a.now().expect("HLC overflow");
     assert!(ts_a2 > ts_b1, "A's new timestamp should be after B's");
 
     // A writes again with later timestamp.

@@ -473,7 +473,8 @@ async fn three_node_convergence_via_sync() {
         let mut c = PnCounter::new();
         c.increment(&node_id("node-1"));
         c.increment(&node_id("node-1"));
-        api.eventual_write("score".into(), CrdtValue::Counter(c));
+        api.eventual_write("score".into(), CrdtValue::Counter(c))
+            .unwrap();
     }
     {
         let mut api = states[1].eventual.lock().await;
@@ -481,13 +482,15 @@ async fn three_node_convergence_via_sync() {
         c.increment(&node_id("node-2"));
         c.increment(&node_id("node-2"));
         c.increment(&node_id("node-2"));
-        api.eventual_write("score".into(), CrdtValue::Counter(c));
+        api.eventual_write("score".into(), CrdtValue::Counter(c))
+            .unwrap();
     }
     {
         let mut api = states[2].eventual.lock().await;
         let mut c = PnCounter::new();
         c.increment(&node_id("node-3"));
-        api.eventual_write("score".into(), CrdtValue::Counter(c));
+        api.eventual_write("score".into(), CrdtValue::Counter(c))
+            .unwrap();
     }
 
     // Start servers.

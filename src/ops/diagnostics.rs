@@ -262,7 +262,8 @@ mod tests {
             authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
             auto_generated: false,
         });
-        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3));
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 3))
+            .unwrap();
         wrap_ns(ns)
     }
 

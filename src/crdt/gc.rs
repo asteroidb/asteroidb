@@ -577,6 +577,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn set_global_floor_rejects_hlc_scale_values() {
+        // set_global_floor must panic when given an HLC physical timestamp
+        // (~10^12 ms) instead of a dot-counter value (small int). Without this
+        // guard, an HLC-scale floor would mark every tombstone as below the
+        // floor and bulk-GC them all.
+        let result = std::panic::catch_unwind(|| {
+            let mut gc = TombstoneGc::default();
+            gc.set_global_floor(1_700_000_000_000u64); // ~2023 in ms (HLC scale)
+        });
+        assert!(
+            result.is_err(),
+            "set_global_floor should panic on HLC-scale values"
+        );
+    }
+
+    #[test]
+    fn set_global_floor_accepts_dot_counter_values() {
+        let mut gc = TombstoneGc::default();
+        gc.set_global_floor(42); // small monotonic integer, OK
+        assert_eq!(gc.global_floor(), Some(42));
+    }
+
     /// P1-10 regression: using HLC physical timestamps (huge ms values) as
     /// the global_floor for compact_deferred_with_floor causes all tombstones
     /// to be removed because dot counters (small integers) are always below

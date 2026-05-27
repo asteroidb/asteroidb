@@ -90,7 +90,8 @@ fn namespace_with_authorities(n: usize) -> Arc<RwLock<SystemNamespace>> {
         PolicyVersion(1),
         KeyRange { prefix: "".into() },
         n,
-    ));
+    ))
+    .unwrap();
     wrap_ns(ns)
 }
 
@@ -802,7 +803,8 @@ fn partition_with_different_key_ranges_independent() {
             prefix: "users/".into(),
         },
         3,
-    ));
+    ))
+    .unwrap();
     ns.set_authority_definition(AuthorityDefinition {
         key_range: KeyRange {
             prefix: "orders/".into(),
@@ -816,7 +818,8 @@ fn partition_with_different_key_ranges_independent() {
             prefix: "orders/".into(),
         },
         3,
-    ));
+    ))
+    .unwrap();
     let ns = wrap_ns(ns);
 
     let mut cert_api = CertifiedApi::new(node("node-a"), ns);
