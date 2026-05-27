@@ -221,12 +221,6 @@ run_scenario_partition() {
     # Allow two full sync cycles before checking convergence.
     sleep 6
 
-    # Verify convergence: total should be 5.
-    # Critical: node-1 must have all data and node-3 must have synced after
-    # recovery -- these are the assertions that validate the partition scenario.
-    # node-2 is best-effort: its gossip TCP connection may still be recovering
-    # from S2'''s packet loss netem, which is an artifact of the test sequence
-    # rather than a bug in the partition recovery logic.
     echo "[scenario] Checking convergence after recovery..."
     # Critical: node-1 must have all data — this is the invariant that proves
     # writes during a partition are preserved. node-3 and node-2 checks are
@@ -236,8 +230,10 @@ run_scenario_partition() {
     if ! check_convergence "5" "$key" "node-1:${NODE1_URL}"; then
         exit_code=1
     fi
-    check_convergence "5" "$key" "node-3:${NODE3_URL}" ||         echo "  [WARN] node-3 did not converge (gossip may still be recovering from S2 packet loss)"
-    check_convergence "5" "$key" "node-2:${NODE2_URL}" ||         echo "  [WARN] node-2 did not converge (may still be recovering from S2 packet loss)"
+    check_convergence "5" "$key" "node-3:${NODE3_URL}" || \
+        echo "  [WARN] node-3 did not converge (gossip may still be recovering from S2 packet loss)"
+    check_convergence "5" "$key" "node-2:${NODE2_URL}" || \
+        echo "  [WARN] node-2 did not converge (may still be recovering from S2 packet loss)"
 
     return "$exit_code"
 }
