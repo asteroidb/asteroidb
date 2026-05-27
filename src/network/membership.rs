@@ -406,17 +406,30 @@ impl MembershipClient {
             if registry.get_peer(&peer_nid).is_some() {
                 // Update address if it changed (e.g. peer restarted with new IP).
                 // The link-local guard above already rejects dangerous addresses;
-                // peer_info.address is guaranteed safe here.
+                // peer_info.address is guaranteed safe here. Hostname addresses
+                // (e.g. Docker container names) are allowed for known peers so
+                // that gossip-based address refresh works in Docker deployments.
                 registry.update_address(&peer_nid, &peer_info.address);
-            } else if added < MAX_NEW_PEERS
-                && registry
+            } else if added < MAX_NEW_PEERS {
+                // New peer: require a valid IP:port. Hostnames pass
+                // is_metadata_or_link_local (Err branch returns false) but
+                // could allow SSRF-via-DNS when the node connects to the peer.
+                if peer_info
+                    .address
+                    .parse::<std::net::SocketAddr>()
+                    .is_err()
+                {
+                    continue;
+                }
+                if registry
                     .add_peer(PeerConfig {
                         node_id: peer_nid,
                         addr: peer_info.address.clone(),
                     })
                     .is_ok()
-            {
-                added += 1;
+                {
+                    added += 1;
+                }
             }
         }
 
@@ -539,6 +552,35 @@ mod tests {
         let added = client.reconcile_peers(&remote_peers).await;
         // Only the legitimate peer should be added
         assert_eq!(added, 1);
+        assert_eq!(registry.lock().await.peer_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_hostname_new_peer() {
+        // A hostname address passes is_metadata_or_link_local (Err→false) but
+        // must be rejected for NEW peers to prevent SSRF-via-DNS.
+        let registry = Arc::new(Mutex::new(
+            PeerRegistry::new(nid("node-1"), vec![]).unwrap(),
+        ));
+        let client = MembershipClient::new(
+            nid("node-1"),
+            "10.0.0.1:3000".to_string(),
+            Arc::clone(&registry),
+        );
+
+        let remote_peers = vec![
+            PeerInfo {
+                node_id: "attacker".into(),
+                address: "metadata.internal:80".into(),
+            },
+            PeerInfo {
+                node_id: "node-2".into(),
+                address: "10.0.0.2:3001".into(),
+            },
+        ];
+
+        let added = client.reconcile_peers(&remote_peers).await;
+        assert_eq!(added, 1, "hostname new-peer must be rejected; only IP peer should be added");
         assert_eq!(registry.lock().await.peer_count(), 1);
     }
 
