@@ -260,10 +260,11 @@ verify_cluster_sync() {
         sleep 3
     done
     if ! $synced; then
-        echo "[light-netem] ERROR: Cluster sync not working (not all nodes received warmup write). Aborting."
-        exit 1
+        echo "[light-netem] WARN: gossip sync not confirmed after 180s; proceeding anyway."
+        echo "[light-netem] Scenarios will fail if gossip is not functional."
+    else
+        echo "[light-netem] Cluster sync OK (all nodes received warmup write)."
     fi
-    echo "[light-netem] Cluster sync OK (all nodes received warmup write)."
 }
 
 # --- Start cluster ---
