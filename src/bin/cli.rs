@@ -25,6 +25,20 @@ enum Commands {
     Get {
         /// The key to retrieve.
         key: String,
+        /// Session token from a previous `put` or `get` (read-your-writes /
+        /// monotonic reads). The read fails with HTTP 412 when this replica
+        /// has not caught up to the token yet.
+        #[arg(long)]
+        session_token: Option<String>,
+        /// Start a session without a precondition: ask the server to return
+        /// a session token with the response (equivalent to an empty
+        /// --session-token).
+        #[arg(long)]
+        session: bool,
+        /// Maximum time (ms, server-capped at 5000) to wait for the replica
+        /// to catch up before the server answers 412.
+        #[arg(long)]
+        wait_ms: Option<u64>,
     },
     /// Put a value into the eventual store (register type).
     Put {
@@ -54,7 +68,12 @@ fn main() {
 
     match cli.command {
         Commands::Status => cmd_status(&client, &base),
-        Commands::Get { key } => cmd_get(&client, &base, &key),
+        Commands::Get {
+            key,
+            session_token,
+            session,
+            wait_ms,
+        } => cmd_get(&client, &base, &key, session_token, session, wait_ms),
         Commands::Put { key, value } => cmd_put(&client, &base, &key, &value),
         Commands::Metrics => cmd_metrics(&client, &base),
         Commands::Slo => cmd_slo(&client, &base),
@@ -117,12 +136,36 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str) {
     }
 }
 
-fn cmd_get(client: &reqwest::blocking::Client, base: &str, key: &str) {
+fn cmd_get(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    key: &str,
+    session_token: Option<String>,
+    session: bool,
+    wait_ms: Option<u64>,
+) {
     let url = format!("{base}/api/eventual/{key}");
-    match client.get(&url).send() {
+    // --session is shorthand for an empty session token: no precondition,
+    // but the server issues an observed-position token with the response.
+    let token = session_token.or_else(|| session.then(String::new));
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(token) = token {
+        query.push(("session_token", token));
+    }
+    if let Some(ms) = wait_ms {
+        query.push(("wait_ms", ms.to_string()));
+    }
+    match client.get(&url).query(&query).send() {
         Ok(resp) => {
-            if !resp.status().is_success() {
-                eprintln!("Error: HTTP {}", resp.status());
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().unwrap_or_default();
+                eprintln!("Error: HTTP {status}: {text}");
+                if status.as_u16() == 412 {
+                    eprintln!(
+                        "hint: replica not caught up; retry with the same token or add --wait-ms"
+                    );
+                }
                 std::process::exit(1);
             }
             let body: serde_json::Value = resp.json().unwrap_or_default();
@@ -150,7 +193,13 @@ fn cmd_put(client: &reqwest::blocking::Client, base: &str, key: &str, value: &st
                 eprintln!("Error: HTTP {status}: {text}");
                 std::process::exit(1);
             }
+            let body: serde_json::Value = resp.json().unwrap_or_default();
             println!("OK");
+            // Print the session token on its own line so existing scripts
+            // that grep for "OK" keep working.
+            if let Some(token) = body.get("session_token").and_then(|v| v.as_str()) {
+                println!("session_token: {token}");
+            }
         }
         Err(e) => {
             eprintln!("Error: {e}");

@@ -15,6 +15,7 @@ AsteroidDB は、Eventual（結果整合性）と Certified（確定整合性）
   - [3.1 Eventual Read / Write](#31-eventual-read--write)
   - [3.2 Certified Read / Write](#32-certified-read--write)
   - [3.3 CLI を使った操作](#33-cli-を使った操作)
+  - [3.4 セッション保証 (read-your-writes / monotonic reads)](#34-セッション保証-read-your-writes--monotonic-reads)
 - [4. ユースケースチュートリアル](#4-ユースケースチュートリアル)
   - [4.1 カウンタ: ページビュー集計](#41-カウンタ-ページビュー集計)
   - [4.2 セット操作: タグ管理](#42-セット操作-タグ管理)
@@ -501,6 +502,89 @@ asteroidb-cli status
 ```
 
 ---
+
+### 3.4 セッション保証 (read-your-writes / monotonic reads)
+
+Eventual モードは結果整合のため、そのままでは古典的な 2 つの問題があります:
+
+1. **自分の書き込みが読めない**: node-1 に書いた直後に node-2 から読むと、
+   複製がまだ届いておらず古い値（または `null`）が返ることがある
+2. **読み取りの巻き戻り**: node-2 で新しい値を読んだ後、複製が遅れている
+   node-3 に切り替えると、さっき見たはずの値より古い値が返ることがある
+
+セッショントークンを使うと、この 2 つを Eventual のまま防げます。サーバは
+セッション状態を持たず、トークンはクライアントが持ち回る不透明な文字列です。
+
+#### read-your-writes: 書き込みトークンを次の読み取りに添付する
+
+```bash
+# 1. node-1 に書き込み、応答から session_token を取り出す
+TOKEN=$(curl -s -X POST http://localhost:3001/api/eventual/write \
+  -H "Content-Type: application/json" \
+  -d '{"type":"counter_inc","key":"page-views"}' | jq -r .session_token)
+
+# 2. 別ノード (node-2) にトークン付きで読み取り
+curl -s "http://localhost:3002/api/eventual/page-views?session_token=$TOKEN"
+# 複製が届いていれば 200 と最新値。届いていなければ:
+# => HTTP 412 {"error_code":"SESSION_NOT_SATISFIED", ...}（Retry-After: 1 付き）
+# 412 は「嘘の古い値を返す代わりの明示的な拒否」です
+
+# 3. wait_ms を付けると、追いつくまで最大 3 秒待ってから応答する
+curl -s "http://localhost:3002/api/eventual/page-views?session_token=$TOKEN&wait_ms=3000"
+# => {"key":"page-views","value":{"type":"counter","value":1},"session_token":"v1:..."}
+```
+
+#### monotonic reads: 応答トークンを持ち回る
+
+read 応答の `session_token` は「このセッションが観測した位置」を表します。
+これを次の read に添付し続ける限り、どのレプリカに切り替えても読み取りは
+巻き戻りません（追いついていないレプリカは 412 を返します）。ただしトークンの
+エントリ数には上限（64 origin）があり、書き込み origin がそれを超えるクラスタ
+では古い origin から間引かれ、間引かれた origin については保証が弱まります
+（詳細は API リファレンスの「保証の限界」参照）。
+
+```bash
+# write なしでセッションを開始する場合は空トークンを送る
+TOKEN=$(curl -s "http://localhost:3002/api/eventual/page-views?session_token=" \
+  | jq -r .session_token)
+
+# 以後、応答のトークンで上書きしながら持ち回る
+RESP=$(curl -s "http://localhost:3003/api/eventual/page-views?session_token=$TOKEN&wait_ms=3000")
+TOKEN=$(echo "$RESP" | jq -r .session_token)
+```
+
+#### CLI での利用
+
+```bash
+# put はトークンを表示する
+asteroidb-cli --host 127.0.0.1:3001 put greeting "hello"
+# => OK
+# => session_token: v1:19704a1b2c3.0.6e6f64652d31
+
+# 別ノードでトークン付き get（412 なら exit 1 とリトライのヒントを表示）
+asteroidb-cli --host 127.0.0.1:3002 get greeting \
+  --session-token "v1:19704a1b2c3.0.6e6f64652d31" --wait-ms 3000
+
+# write なしでセッション開始（応答トークンのみ受け取る）
+asteroidb-cli --host 127.0.0.1:3002 get greeting --session
+```
+
+#### 知っておくべき制限
+
+- トークン無しのリクエストは完全に従来動作で、追加コストはゼロです
+- 412 は失敗ではなく「まだ追いついていない」の明示です。リトライ、
+  `--wait-ms` の増加、別レプリカへの問い合わせのいずれでも解決できます
+- Counter / Set のキーは push 型複製だけが届いた区間では 412 になり得ます
+  （pull 同期周期、デフォルト 2 秒で解消）。Register のキー（CLI の `put`）は
+  値レベル判定により即時充足しやすいです
+- 読み取りに使うレプリカ自身が書き込みを行っても、トークン充足は次の pull
+  周期（デフォルト 2 秒）で回復します（pull は検証済み受信位置から要求される
+  ため）。412 が返るのは「まだ追いついていない」区間だけです
+- 書き込み origin が 64 を超えるクラスタでは応答トークンが間引かれ、間引かれた
+  origin については monotonic reads が弱まります（上記参照）
+- 保証されるのは可視性の順序であり、耐久性ではありません。詳細な保証内容と
+  限界は [API リファレンスのセッショントークン節](api-reference.md#セッショントークン)
+  を参照してください
 
 ## 4. ユースケースチュートリアル
 

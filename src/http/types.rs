@@ -113,12 +113,40 @@ fn default_on_timeout() -> String {
 pub struct EventualReadResponse {
     pub key: String,
     pub value: Option<CrdtValueJson>,
+    /// Session token covering this read's observed position (monotonic
+    /// reads). Only present when the request carried a `session_token`
+    /// query parameter (possibly empty); absent responses are
+    /// byte-compatible with the pre-session wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 /// Response for a successful write.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResponse {
     pub ok: bool,
+    /// Session token encoding this write's HLC position. Present the next
+    /// eventual read as `?session_token=...` for read-your-writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
+/// Query parameters for `GET /api/eventual/:key`.
+///
+/// All fields optional: a request without `session_token` behaves exactly
+/// like the pre-session API (no checks, no token in the response).
+#[derive(Debug, Default, Deserialize)]
+pub struct EventualReadQuery {
+    /// Session token from a previous write/read. Empty string means "no
+    /// precondition, but start a session: return an observed-position
+    /// token with the response".
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// Maximum time (ms, capped at 5000) to wait for the local replica to
+    /// catch up before answering 412. Only meaningful with a non-empty
+    /// `session_token`.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 /// Response for `GET /api/certified/:key`.
@@ -544,14 +572,30 @@ impl IntoResponse for ApiError {
                 "CERTIFICATION_TIMEOUT",
                 CrdtError::CertificationTimeout.to_string(),
             ),
+            CrdtError::SessionNotSatisfied { key } => (
+                StatusCode::PRECONDITION_FAILED,
+                "SESSION_NOT_SATISFIED",
+                format!(
+                    "session token not satisfied for key {key}; \
+                     retry, increase wait_ms, or try another replica"
+                ),
+            ),
         };
+        let retry_after = matches!(&self.0, CrdtError::SessionNotSatisfied { .. });
 
         let body = ErrorResponse {
             error_code: code.to_string(),
             message,
         };
 
-        (status, axum::Json(body)).into_response()
+        let mut resp = (status, axum::Json(body)).into_response();
+        if retry_after {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        resp
     }
 }
 
@@ -689,5 +733,91 @@ mod tests {
         let json = r#"{"key":"sensor","value":{"type":"counter","value":42}}"#;
         let req: CertifiedWriteRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.on_timeout, "pending");
+    }
+
+    // ---------------------------------------------------------------
+    // Session-token response compatibility and error mapping
+    // ---------------------------------------------------------------
+
+    /// Pre-session JSON (`{"ok":true}`) must still deserialize into
+    /// `WriteResponse`.
+    #[test]
+    fn write_response_legacy_json_deserialises() {
+        let resp: WriteResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(resp.ok);
+        assert!(resp.session_token.is_none());
+    }
+
+    /// Pre-session eventual read JSON must still deserialize, and a
+    /// response without a token must serialize WITHOUT the field (byte
+    /// compatibility for token-less requests).
+    #[test]
+    fn eventual_read_response_token_field_is_omitted_when_none() {
+        let resp: EventualReadResponse =
+            serde_json::from_str(r#"{"key":"k","value":null}"#).unwrap();
+        assert!(resp.session_token.is_none());
+
+        let json = serde_json::to_string(&EventualReadResponse {
+            key: "k".into(),
+            value: None,
+            session_token: None,
+        })
+        .unwrap();
+        assert!(
+            !json.contains("session_token"),
+            "None token must not appear in the wire format: {json}"
+        );
+
+        let json = serde_json::to_string(&WriteResponse {
+            ok: true,
+            session_token: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"ok":true}"#);
+    }
+
+    /// `SessionNotSatisfied` must map to 412 with a `Retry-After: 1`
+    /// header and the `SESSION_NOT_SATISFIED` error code.
+    #[tokio::test]
+    async fn session_not_satisfied_maps_to_412_with_retry_after() {
+        use http_body_util::BodyExt;
+
+        let resp = ApiError(CrdtError::SessionNotSatisfied { key: "k1".into() }).into_response();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error_code"], "SESSION_NOT_SATISFIED");
+        assert!(body["message"].as_str().unwrap().contains("k1"));
+    }
+
+    /// Other errors must not grow a Retry-After header.
+    #[test]
+    fn non_session_errors_have_no_retry_after() {
+        let resp = ApiError(CrdtError::Timeout).into_response();
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+    }
+
+    /// Query type: both fields optional with defaults.
+    #[test]
+    fn eventual_read_query_defaults() {
+        let q: EventualReadQuery = serde_json::from_str("{}").unwrap();
+        assert!(q.session_token.is_none());
+        assert!(q.wait_ms.is_none());
+
+        let q: EventualReadQuery =
+            serde_json::from_str(r#"{"session_token":"","wait_ms":100}"#).unwrap();
+        assert_eq!(q.session_token.as_deref(), Some(""));
+        assert_eq!(q.wait_ms, Some(100));
     }
 }

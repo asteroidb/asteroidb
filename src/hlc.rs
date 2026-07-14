@@ -11,7 +11,10 @@ use crate::error::HlcError;
 /// `wall_clock + MAX_CLOCK_SKEW_MS`. A far-future physical timestamp would
 /// advance `self.physical` beyond the real wall clock, causing `now()` to
 /// stop advancing and eventually fail with `Overflow` — a DoS vector.
-const MAX_CLOCK_SKEW_MS: u64 = 60_000;
+///
+/// Public so that session-token bounds checking (`SessionToken::validate_bounds`)
+/// shares the same skew limit as the HLC itself.
+pub const MAX_CLOCK_SKEW_MS: u64 = 60_000;
 
 /// A snapshot of the Hybrid Logical Clock at a point in time.
 ///

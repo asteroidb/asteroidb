@@ -62,6 +62,10 @@ fn build_delta_response(n: usize) -> DeltaSyncResponse {
             logical: 0,
             node_id: "bench-node".into(),
         }),
+        applied_origins: std::collections::HashMap::new(),
+        merge_failed_keys: vec![],
+        pruned_floor: None,
+        visible_origins: std::collections::HashMap::new(),
     }
 }
 

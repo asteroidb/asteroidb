@@ -187,7 +187,23 @@ pub struct NodeRunner {
     tracked_policy_versions: HashMap<String, PolicyVersion>,
     /// Per-peer last known frontier for delta sync.
     /// Maps peer address string to its last known frontier.
+    ///
+    /// NOTE: this frontier also advances on successful PUSHES, so it is
+    /// NOT a proof of what this node has received — see
+    /// `pull_verified_frontiers` for the session-guarantee counterpart.
     peer_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer verified received prefix for session guarantees.
+    ///
+    /// `pull_verified_frontiers[peer] = f` means this node has received
+    /// EVERYTHING the peer's store contained up to HLC `f`, established
+    /// exclusively by complete pulls (delta pulls whose request frontier
+    /// was covered by the previous verified value, and full dumps).
+    /// Unlike `peer_frontiers` it never advances on pushes; per-origin
+    /// session claims (`note_applied` / applied-origins adoption) are
+    /// only made for deltas requested at or below this frontier —
+    /// otherwise a push-advanced request frontier would hide sender
+    /// entries this node never received and the claim would be a lie.
+    pull_verified_frontiers: HashMap<String, HlcTimestamp>,
     /// Per-peer exponential backoff state for sync retries.
     /// Tracks consecutive failures and gates retry attempts.
     peer_backoffs: HashMap<String, PeerBackoff>,
@@ -298,6 +314,21 @@ pub struct RunLoopStats {
     pub gc_ticks: u64,
     /// Number of ack-frontier GC ticks executed.
     pub frontier_gc_ticks: u64,
+}
+
+/// Outcome of applying one delta sync response
+/// (see [`NodeRunner::apply_delta_response`]).
+struct DeltaApplyOutcome {
+    /// Number of per-key merge errors (logged; frontier advances anyway).
+    #[allow(dead_code)]
+    merge_errors: u64,
+    /// Whether session claims (adoption of the sender's `applied_origins`)
+    /// could be made. `false` means the delta may be incomplete relative
+    /// to this node's verified received prefix (e.g. the sender pruned
+    /// past the request frontier); the caller should fall back to a full
+    /// sync — a full dump is unconditionally complete — so claims do not
+    /// stay suppressed indefinitely.
+    claims_ok: bool,
 }
 
 impl NodeRunner {
@@ -420,6 +451,7 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
@@ -521,6 +553,7 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick,
@@ -1982,38 +2015,67 @@ impl NodeRunner {
             }
 
             // --- Pull phase: pull delta (or full) from peer ---
-            if let Some(frontier) = self.peer_frontiers.get(&peer_key).cloned() {
+            // The request frontier is the VERIFIED received prefix, never
+            // the push-advanced peer frontier: pulling from a frontier that
+            // pushes advanced past the verified prefix would keep
+            // `request > verified` forever, permanently suppressing session
+            // claims (pull_verified only advances on claimed pulls). See
+            // `pull_request_frontier`.
+            if let Some(frontier) = Self::pull_request_frontier(
+                &self.peer_frontiers,
+                &self.pull_verified_frontiers,
+                &peer_key,
+            ) {
                 let delta_result = sync_client
                     .pull_delta(&peer.addr, &self.node_id.0, &frontier)
                     .await;
 
                 match delta_result {
                     PullDeltaResult::Ok(delta_resp) => {
-                        let _error_count = Self::apply_delta_response(
+                        let outcome = Self::apply_delta_response(
                             &mut self.peer_frontiers,
+                            &mut self.pull_verified_frontiers,
                             &delta_resp,
                             &peer.node_id.0,
                             &peer_key,
                             eventual_api,
+                            &frontier,
                             "delta pull",
                         )
                         .await;
 
-                        any_success = true;
-                        let elapsed = peer_start.elapsed();
-                        self.record_peer_rtt(&peer.node_id, elapsed);
-                        self.metrics.record_peer_sync_success(peer_id, elapsed);
-                        self.peer_backoffs
-                            .entry(peer_key.clone())
-                            .or_default()
-                            .record_success();
-                        tracing::debug!(
+                        if outcome.claims_ok {
+                            any_success = true;
+                            let elapsed = peer_start.elapsed();
+                            self.record_peer_rtt(&peer.node_id, elapsed);
+                            self.metrics.record_peer_sync_success(peer_id, elapsed);
+                            self.peer_backoffs
+                                .entry(peer_key.clone())
+                                .or_default()
+                                .record_success();
+                            tracing::debug!(
+                                peer = %peer.node_id.0,
+                                delta_entries = delta_resp.entries.len(),
+                                rtt_ms = elapsed.as_secs_f64() * 1000.0,
+                                "delta sync pull succeeded"
+                            );
+                            continue;
+                        }
+                        // Data was merged, but session claims could not be
+                        // made (e.g. the sender pruned past our verified
+                        // prefix). A full dump is unconditionally complete,
+                        // so fall through to full sync to re-establish
+                        // verified coverage instead of staying unclaimed
+                        // forever.
+                        tracing::info!(
                             peer = %peer.node_id.0,
-                            delta_entries = delta_resp.entries.len(),
-                            rtt_ms = elapsed.as_secs_f64() * 1000.0,
-                            "delta sync pull succeeded"
+                            "delta pull merged without session claims; \
+                             falling back to full sync to re-establish verified coverage"
                         );
-                        continue;
+                        self.metrics
+                            .sync_fallback_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Fall through to full sync below.
                     }
                     PullDeltaResult::DeserializationError => {
                         // Payload was corrupted (e.g. by network jitter).
@@ -2036,30 +2098,43 @@ impl NodeRunner {
 
                         match retry_result {
                             PullDeltaResult::Ok(delta_resp) => {
-                                let _error_count = Self::apply_delta_response(
+                                let outcome = Self::apply_delta_response(
                                     &mut self.peer_frontiers,
+                                    &mut self.pull_verified_frontiers,
                                     &delta_resp,
                                     &peer.node_id.0,
                                     &peer_key,
                                     eventual_api,
+                                    &frontier,
                                     "delta pull retry",
                                 )
                                 .await;
 
-                                any_success = true;
-                                let elapsed = peer_start.elapsed();
-                                self.record_peer_rtt(&peer.node_id, elapsed);
-                                self.metrics.record_peer_sync_success(peer_id, elapsed);
-                                self.peer_backoffs
-                                    .entry(peer_key.clone())
-                                    .or_default()
-                                    .record_success();
-                                tracing::debug!(
+                                if outcome.claims_ok {
+                                    any_success = true;
+                                    let elapsed = peer_start.elapsed();
+                                    self.record_peer_rtt(&peer.node_id, elapsed);
+                                    self.metrics.record_peer_sync_success(peer_id, elapsed);
+                                    self.peer_backoffs
+                                        .entry(peer_key.clone())
+                                        .or_default()
+                                        .record_success();
+                                    tracing::debug!(
+                                        peer = %peer.node_id.0,
+                                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
+                                        "delta sync retry succeeded"
+                                    );
+                                    continue;
+                                }
+                                tracing::info!(
                                     peer = %peer.node_id.0,
-                                    rtt_ms = elapsed.as_secs_f64() * 1000.0,
-                                    "delta sync retry succeeded"
+                                    "delta pull retry merged without session claims; \
+                                     falling back to full sync to re-establish verified coverage"
                                 );
-                                continue;
+                                self.metrics
+                                    .sync_fallback_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                // Fall through to full sync below.
                             }
                             _ => {
                                 // Retry also failed; fall through to full sync.
@@ -2098,6 +2173,21 @@ impl NodeRunner {
                         );
                     }
                 }
+                // Frontier adoption (session guarantees): a full dump is
+                // the sender's complete state (pruned keys are still
+                // present in `entries`), so adopting its applied_origins
+                // is unconditionally sound after merging all entries.
+                // The sender's poisoned keys are unioned so its dropped
+                // contributions are not claimed as present here.
+                if !dump.applied_origins.is_empty() || !dump.merge_failed_keys.is_empty() {
+                    let store = api.store_mut();
+                    store.merge_applied_origins(&dump.applied_origins);
+                    store.merge_failed_extend(dump.merge_failed_keys.iter().cloned());
+                }
+                // The sender's visible frontier is merged unconditionally:
+                // merged values may embed contributions the per-key HLCs
+                // do not name, and response tokens must cover them.
+                api.store_mut().merge_visible_origins(&dump.visible_origins);
                 drop(api);
 
                 if full_sync_errors > 0 {
@@ -2113,6 +2203,17 @@ impl NodeRunner {
                     // full-sync to be retried endlessly without progress.
                 }
                 if let Some(remote_frontier) = dump.frontier {
+                    // A full dump is the peer's complete state: the verified
+                    // received prefix (session guarantees) advances to the
+                    // remote frontier along with the delta-sync frontier.
+                    if self
+                        .pull_verified_frontiers
+                        .get(&peer_key)
+                        .is_none_or(|existing| remote_frontier > *existing)
+                    {
+                        self.pull_verified_frontiers
+                            .insert(peer_key.clone(), remote_frontier.clone());
+                    }
                     // Update the peer frontier from the *remote* peer's frontier.
                     // We must NOT use our local store frontier here because the local
                     // store may be ahead of the remote; using it would cause subsequent
@@ -2165,6 +2266,8 @@ impl NodeRunner {
         let active_addrs: std::collections::HashSet<&String> =
             peers.iter().map(|p| &p.addr).collect();
         self.peer_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.pull_verified_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
         self.peer_backoffs
             .retain(|addr, _| active_addrs.contains(addr));
@@ -2402,25 +2505,113 @@ impl NodeRunner {
         }
     }
 
+    /// Choose the delta-pull request frontier for a peer.
+    ///
+    /// Returns `None` when no frontier is known yet (initial sync handles
+    /// that case in the push phase).
+    ///
+    /// `peer_frontiers` advances on successful PUSHES, which proves
+    /// nothing about what this node has RECEIVED from the peer. Pulling
+    /// from a push-advanced frontier makes `request_frontier >
+    /// pull_verified_frontiers[peer]` — and since the verified prefix
+    /// only advances on claimed pulls, one push would suppress session
+    /// claims (adoption of the sender's `applied_origins`) for the rest
+    /// of the process lifetime. Requesting from the VERIFIED received
+    /// prefix instead (never ahead of the push-advanced frontier) keeps
+    /// claims flowing every cycle, at the cost of occasionally re-pulling
+    /// entries a push already echoed back (CRDT merges are idempotent).
+    fn pull_request_frontier(
+        peer_frontiers: &HashMap<String, HlcTimestamp>,
+        pull_verified_frontiers: &HashMap<String, HlcTimestamp>,
+        peer_key: &str,
+    ) -> Option<HlcTimestamp> {
+        let pushed = peer_frontiers.get(peer_key)?;
+        let zero = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
+        let verified = pull_verified_frontiers.get(peer_key).unwrap_or(&zero);
+        Some(if verified < pushed {
+            verified.clone()
+        } else {
+            pushed.clone()
+        })
+    }
+
     /// Apply a delta sync response by merging all entries into the eventual store.
     ///
-    /// Returns the number of per-key merge errors. The peer frontier is
-    /// advanced regardless of per-key errors so that successfully merged
-    /// entries are not re-pulled and permanently-failing keys (e.g. type
-    /// mismatches) do not stall the entire sync pipeline.
+    /// The peer frontier is advanced regardless of per-key errors so that
+    /// successfully merged entries are not re-pulled and permanently-failing
+    /// keys (e.g. type mismatches) do not stall the entire sync pipeline.
+    ///
+    /// Session guarantees: claims are made EXCLUSIVELY by adopting the
+    /// sender's transmitted `applied_origins` map — never per entry. A
+    /// per-entry claim on the entry's HLC origin would be unsound: even a
+    /// transfer that is complete relative to the sender only proves
+    /// "receiver ⊇ sender", not that the sender holds the entry origin's
+    /// full write prefix (third-party writes can reach the sender through
+    /// gappy deltas). Adoption itself is only sound when the delta is
+    /// provably a complete diff of the sender's state relative to what
+    /// this node already holds:
+    ///
+    /// 1. `request_frontier <= pull_verified_frontiers[peer]` — everything
+    ///    at or below the request frontier has actually been RECEIVED from
+    ///    this peer. `peer_frontiers` alone is insufficient: it advances
+    ///    on successful pushes, and the sender may hold entries below a
+    ///    push-advanced frontier (e.g. old-timestamped writes learned from
+    ///    a third node) that this node has never seen.
+    /// 2. `request_frontier >= sender pruned_floor` — keys pruned on the
+    ///    sender are absent from the delta, so a lower request frontier
+    ///    cannot prove completeness.
+    ///
+    /// When either condition fails, entries are still merged (data
+    /// convergence is unaffected) but no claims are made — a false
+    /// negative for session reads, never a false success — and the caller
+    /// is told via [`DeltaApplyOutcome::claims_ok`] so it can fall back to
+    /// a full sync (unconditionally complete) to re-establish coverage.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_delta_response(
         peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        pull_verified_frontiers: &mut HashMap<String, HlcTimestamp>,
         delta_resp: &crate::network::sync::DeltaSyncResponse,
         peer_id: &str,
         peer_key: &str,
         eventual_api: &Arc<Mutex<EventualApi>>,
+        request_frontier: &HlcTimestamp,
         label: &str,
-    ) -> u64 {
+    ) -> DeltaApplyOutcome {
+        let zero = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
+        let verified = pull_verified_frontiers.get(peer_key).unwrap_or(&zero);
+        let coverage_ok = request_frontier <= verified;
+        let floor_ok = delta_resp
+            .pruned_floor
+            .as_ref()
+            .is_none_or(|floor| request_frontier >= floor);
+        let claims_ok = coverage_ok && floor_ok;
+        if !claims_ok {
+            tracing::debug!(
+                peer = %peer_id,
+                coverage_ok,
+                floor_ok,
+                "delta may be incomplete; merging without session claims"
+            );
+        }
+
         let mut api = eventual_api.lock().await;
         let mut last_success_hlc: Option<HlcTimestamp> = None;
         let mut error_count = 0u64;
         for entry in &delta_resp.entries {
-            match api.merge_remote_with_hlc(entry.key.clone(), &entry.value, entry.hlc.clone()) {
+            // merge_remote_with_hlc never claims the entry origin; it
+            // records the position in the store's visible frontier so
+            // response tokens cover it.
+            let result =
+                api.merge_remote_with_hlc(entry.key.clone(), &entry.value, entry.hlc.clone());
+            match result {
                 Ok(()) => last_success_hlc = Some(entry.hlc.clone()),
                 Err(e) => {
                     error_count += 1;
@@ -2433,6 +2624,27 @@ impl NodeRunner {
                 }
             }
         }
+
+        // Frontier adoption (session guarantees): a delta entry's CRDT
+        // value can embed contributions from origins other than the
+        // entry's own HLC origin, so the local applied_origins alone does
+        // not dominate the now-visible state. Adopting the sender's
+        // applied_origins closes that gap — and is the ONLY way claims
+        // are made on this path. The sender's poisoned keys are unioned
+        // whenever claims are made, so contributions dropped on the
+        // sender are not claimed as present here.
+        if claims_ok {
+            let store = api.store_mut();
+            store.merge_failed_extend(delta_resp.merge_failed_keys.iter().cloned());
+            store.merge_applied_origins(&delta_resp.applied_origins);
+        }
+        // The sender's VISIBLE frontier is merged UNCONDITIONALLY (claims
+        // or not): merged entry values may embed contributions from
+        // origins their HLCs do not name, and the response session tokens
+        // issued here must cover everything a reader can now observe.
+        // Over-covering is safe (false-negative direction only).
+        api.store_mut()
+            .merge_visible_origins(&delta_resp.visible_origins);
         drop(api);
 
         if error_count > 0 {
@@ -2451,13 +2663,29 @@ impl NodeRunner {
         // stalling progress. By advancing past them, successfully merged entries
         // are not re-transmitted and the failing keys will be retried naturally
         // when the remote peer updates them (creating a new HLC > our frontier).
-        if let Some(ref new_frontier) = delta_resp.sender_frontier {
-            peer_frontiers.insert(peer_key.to_string(), new_frontier.clone());
-        } else if let Some(hlc) = last_success_hlc {
-            peer_frontiers.insert(peer_key.to_string(), hlc);
+        let new_frontier = if let Some(ref f) = delta_resp.sender_frontier {
+            Some(f.clone())
+        } else {
+            last_success_hlc
+        };
+        if let Some(f) = new_frontier {
+            // A complete pull extends the verified received prefix: this
+            // node held everything <= request_frontier and now also holds
+            // (request_frontier, f]. Incomplete pulls leave it unchanged.
+            if claims_ok
+                && pull_verified_frontiers
+                    .get(peer_key)
+                    .is_none_or(|existing| f > *existing)
+            {
+                pull_verified_frontiers.insert(peer_key.to_string(), f.clone());
+            }
+            peer_frontiers.insert(peer_key.to_string(), f);
         }
 
-        error_count
+        DeltaApplyOutcome {
+            merge_errors: error_count,
+            claims_ok,
+        }
     }
 
     /// Run garbage collection on stale ack-frontier entries.
@@ -4300,7 +4528,9 @@ mod tests {
         // receive path — a restart (the likely operator response to a key
         // compromise) must not wipe the proof.
         let mut persisted = false;
-        for _ in 0..250 {
+        // Generous window: the blocking pool can lag well past a few
+        // seconds when the whole test suite runs in parallel.
+        for _ in 0..3_000 {
             if path.exists() {
                 persisted = true;
                 break;
@@ -4521,6 +4751,343 @@ mod tests {
             runner.certificate_mode(),
             crate::authority::certificate::CertificateMode::Ed25519,
             "BLS keypair without registry registration falls back to Ed25519"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Session guarantees: frontier adoption in apply_delta_response
+    // ---------------------------------------------------------------
+
+    fn hlc_ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical,
+            node_id: node.into(),
+        }
+    }
+
+    /// A delta response's applied_origins is adopted when the request
+    /// frontier is at or above the sender's pruned floor (or the sender
+    /// never pruned).
+    #[tokio::test]
+    async fn apply_delta_response_adopts_applied_origins_when_floor_ok() {
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        let mut counter = crate::crdt::pn_counter::PnCounter::new();
+        counter.increment(&node_id("origin-a"));
+        let mut applied_origins = HashMap::new();
+        // The sender has applied origin-a up to 300 (the entry's value
+        // embeds contributions the entry HLC alone would not cover).
+        applied_origins.insert("origin-a".to_string(), hlc_ts(300, 0, "origin-a"));
+        let delta_resp = crate::network::sync::DeltaSyncResponse {
+            entries: vec![crate::network::sync::DeltaEntry {
+                key: "k".into(),
+                value: CrdtValue::Counter(counter),
+                hlc: hlc_ts(200, 0, "origin-b"),
+            }],
+            sender_frontier: Some(hlc_ts(200, 0, "origin-b")),
+            applied_origins,
+            merge_failed_keys: vec!["poisoned-on-sender".into()],
+            pruned_floor: Some(hlc_ts(100, 0, "origin-a")),
+            visible_origins: HashMap::new(),
+        };
+
+        // Coverage: everything up to 150 was previously received via pulls.
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+        pull_verified.insert("peer-1:8000".to_string(), hlc_ts(150, 0, "origin-b"));
+
+        // Request frontier (150) >= pruned floor (100) and <= verified
+        // coverage (150): claims and adoption are sound.
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &delta_resp,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &hlc_ts(150, 0, "origin-b"),
+            "test",
+        )
+        .await;
+        assert_eq!(outcome.merge_errors, 0);
+        assert!(outcome.claims_ok);
+
+        let api = eventual_api.lock().await;
+        assert_eq!(
+            api.store().applied_origin("origin-a"),
+            Some(&hlc_ts(300, 0, "origin-a")),
+            "sender applied_origins must be adopted"
+        );
+        // Regression (per-entry claim unsoundness): the entry's own HLC
+        // origin must NOT be claimed — sender completeness only proves
+        // "receiver ⊇ sender", never that the sender holds origin-b's
+        // full write prefix. origin-b is absent from the sender's
+        // applied_origins, so it must stay unclaimed here.
+        assert!(
+            api.store().applied_origin("origin-b").is_none(),
+            "per-entry origin claims are unsound and must not be made"
+        );
+        // The merged position is still visible (response-token coverage).
+        assert_eq!(
+            api.store().visible_origins().get("origin-b"),
+            Some(&hlc_ts(200, 0, "origin-b"))
+        );
+        // The sender's poisoned keys must be unioned.
+        assert!(api.store().merge_failed_contains("poisoned-on-sender"));
+        drop(api);
+        // The verified received prefix advances to the sender frontier.
+        assert_eq!(
+            pull_verified.get("peer-1:8000"),
+            Some(&hlc_ts(200, 0, "origin-b"))
+        );
+    }
+
+    /// Adoption must be skipped when the request frontier is below the
+    /// sender's pruned floor: pruned entries are absent from the delta, so
+    /// the sender's applied_origins does not describe the received state.
+    /// Skipping is a false negative only — never a false success.
+    #[tokio::test]
+    async fn apply_delta_response_skips_adoption_below_pruned_floor() {
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        let mut applied_origins = HashMap::new();
+        applied_origins.insert("origin-a".to_string(), hlc_ts(300, 0, "origin-a"));
+        let delta_resp = crate::network::sync::DeltaSyncResponse {
+            entries: vec![],
+            sender_frontier: Some(hlc_ts(300, 0, "origin-a")),
+            applied_origins,
+            merge_failed_keys: vec![],
+            pruned_floor: Some(hlc_ts(200, 0, "origin-a")),
+            visible_origins: HashMap::new(),
+        };
+
+        // Coverage would allow claims (request 50 <= verified 60), but the
+        // request frontier is below the sender's pruned floor (200):
+        // adoption must be skipped.
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+        pull_verified.insert("peer-1:8000".to_string(), hlc_ts(60, 0, "origin-a"));
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &delta_resp,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &hlc_ts(50, 0, "receiver"),
+            "test",
+        )
+        .await;
+        assert!(
+            !outcome.claims_ok,
+            "caller must be told to fall back to full sync"
+        );
+
+        let api = eventual_api.lock().await;
+        assert!(
+            api.store().applied_origin("origin-a").is_none(),
+            "adoption must be skipped below the sender's pruned floor"
+        );
+        drop(api);
+        // An incomplete pull must not advance the verified prefix.
+        assert_eq!(
+            pull_verified.get("peer-1:8000"),
+            Some(&hlc_ts(60, 0, "origin-a"))
+        );
+    }
+
+    /// Per-origin claims must be suppressed when the request frontier
+    /// exceeds the verified received prefix: `peer_frontiers` advances on
+    /// pushes, and the sender may hold entries below a push-advanced
+    /// frontier (e.g. an old-timestamped write learned from a third node)
+    /// that this node never received. Claiming an origin prefix from such
+    /// a delta would be a false session success.
+    #[tokio::test]
+    async fn apply_delta_response_skips_claims_beyond_verified_coverage() {
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        let mut counter = crate::crdt::pn_counter::PnCounter::new();
+        counter.increment(&node_id("origin-a"));
+        let mut applied_origins = HashMap::new();
+        applied_origins.insert("origin-a".to_string(), hlc_ts(300, 0, "origin-a"));
+        let delta_resp = crate::network::sync::DeltaSyncResponse {
+            entries: vec![crate::network::sync::DeltaEntry {
+                key: "k".into(),
+                value: CrdtValue::Counter(counter),
+                hlc: hlc_ts(300, 0, "origin-a"),
+            }],
+            sender_frontier: Some(hlc_ts(300, 0, "origin-a")),
+            applied_origins,
+            merge_failed_keys: vec![],
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+        };
+
+        // Verified coverage is 100, but the request frontier is 200
+        // (advanced by a push): the (100, 200] gap may hide sender
+        // entries this node never received.
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+        pull_verified.insert("peer-1:8000".to_string(), hlc_ts(100, 0, "origin-a"));
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &delta_resp,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &hlc_ts(200, 0, "receiver"),
+            "test",
+        )
+        .await;
+        assert!(!outcome.claims_ok);
+
+        let api = eventual_api.lock().await;
+        // The DATA is merged (convergence unaffected)...
+        match api.get_eventual("k") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+        // ...but no session claim is made for the origin.
+        assert!(
+            api.store().applied_origin("origin-a").is_none(),
+            "claims must be suppressed when request frontier exceeds verified coverage"
+        );
+        drop(api);
+        // The verified prefix must not advance; the delta-sync frontier does.
+        assert_eq!(
+            pull_verified.get("peer-1:8000"),
+            Some(&hlc_ts(100, 0, "origin-a"))
+        );
+        assert_eq!(
+            peer_frontiers.get("peer-1:8000"),
+            Some(&hlc_ts(300, 0, "origin-a"))
+        );
+    }
+
+    /// Pulls must request from the VERIFIED received prefix, not the
+    /// push-advanced peer frontier. Regression for the permanent claims
+    /// ratchet: after one successful push, `peer_frontiers` outruns
+    /// `pull_verified_frontiers`; if the pull requested from
+    /// `peer_frontiers`, `request > verified` would hold forever (verified
+    /// only advances on claimed pulls), suppressing session claims for
+    /// the rest of the process lifetime.
+    #[test]
+    fn pull_request_frontier_uses_verified_prefix_after_push() {
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        // No frontier known yet: no pull (initial push phase handles it).
+        assert!(NodeRunner::pull_request_frontier(&peer_frontiers, &pull_verified, "p").is_none());
+
+        // Initial state after the first full push: frontier zero.
+        peer_frontiers.insert("p".to_string(), hlc_ts(0, 0, ""));
+        assert_eq!(
+            NodeRunner::pull_request_frontier(&peer_frontiers, &pull_verified, "p"),
+            Some(hlc_ts(0, 0, ""))
+        );
+
+        // A claimed pull established verified == peer == S0.
+        peer_frontiers.insert("p".to_string(), hlc_ts(100, 0, "sender"));
+        pull_verified.insert("p".to_string(), hlc_ts(100, 0, "sender"));
+        assert_eq!(
+            NodeRunner::pull_request_frontier(&peer_frontiers, &pull_verified, "p"),
+            Some(hlc_ts(100, 0, "sender"))
+        );
+
+        // A successful push advances peer_frontiers past verified. The
+        // request must stick to the verified prefix so the next pull can
+        // claim (coverage: request <= verified holds again).
+        peer_frontiers.insert("p".to_string(), hlc_ts(500, 0, "local"));
+        assert_eq!(
+            NodeRunner::pull_request_frontier(&peer_frontiers, &pull_verified, "p"),
+            Some(hlc_ts(100, 0, "sender")),
+            "request frontier must not outrun the verified prefix"
+        );
+    }
+
+    /// End-to-end ratchet recovery at the apply level: after a push
+    /// advanced peer_frontiers, the next pull (requested from the
+    /// verified prefix) makes claims again and re-synchronises both maps
+    /// with the sender frontier — applied_origins keeps advancing.
+    #[tokio::test]
+    async fn claims_recover_after_push_advances_peer_frontier() {
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        // Cycle 1: initial claimed pull at frontier zero.
+        let mut applied = HashMap::new();
+        applied.insert("origin-a".to_string(), hlc_ts(100, 0, "origin-a"));
+        let resp1 = crate::network::sync::DeltaSyncResponse {
+            entries: vec![],
+            sender_frontier: Some(hlc_ts(100, 0, "origin-a")),
+            applied_origins: applied,
+            merge_failed_keys: vec![],
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+        };
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &resp1,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &hlc_ts(0, 0, ""),
+            "test",
+        )
+        .await;
+        assert!(outcome.claims_ok);
+
+        // Cycle 2: a successful push advanced peer_frontiers past the
+        // verified prefix (this is what run_sync does after a delta push).
+        peer_frontiers.insert("peer-1:8000".to_string(), hlc_ts(900, 0, "receiver"));
+
+        // The pull requests from the verified prefix (100), so the claim
+        // condition holds and adoption continues.
+        let request =
+            NodeRunner::pull_request_frontier(&peer_frontiers, &pull_verified, "peer-1:8000")
+                .expect("frontier known");
+        assert_eq!(request, hlc_ts(100, 0, "origin-a"));
+
+        let mut applied = HashMap::new();
+        applied.insert("origin-a".to_string(), hlc_ts(1_000, 0, "origin-a"));
+        let resp2 = crate::network::sync::DeltaSyncResponse {
+            entries: vec![],
+            sender_frontier: Some(hlc_ts(1_000, 0, "origin-a")),
+            applied_origins: applied,
+            merge_failed_keys: vec![],
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+        };
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &resp2,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &request,
+            "test",
+        )
+        .await;
+        assert!(
+            outcome.claims_ok,
+            "claims must recover after a push advanced peer_frontiers"
+        );
+
+        let api = eventual_api.lock().await;
+        assert_eq!(
+            api.store().applied_origin("origin-a"),
+            Some(&hlc_ts(1_000, 0, "origin-a")),
+            "adoption must keep advancing applied_origins"
+        );
+        drop(api);
+        assert_eq!(
+            pull_verified.get("peer-1:8000"),
+            Some(&hlc_ts(1_000, 0, "origin-a"))
         );
     }
 }

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use tokio::sync::Mutex;
@@ -41,14 +41,16 @@ use crate::network::sync::{
     SyncResponse,
 };
 
+use crate::session::SessionToken;
+
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EquivocationReport, EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest,
-    JoinResponse, LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse,
-    PlacementPolicyResponse, ProofBundleJson, RemovePolicyRequest, SetAuthorityDefinitionRequest,
-    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
-    VersionHistoryResponse, WriteResponse,
+    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteRequest,
+    FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, PeerInfo, PingRequest,
+    PingResponse, PlacementPolicyResponse, ProofBundleJson, RemovePolicyRequest,
+    SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest,
+    VerifyProofResponse, VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -126,58 +128,120 @@ pub async fn eventual_write(
 
     let mut api = state.eventual.lock().await;
 
-    match req {
-        EventualWriteRequest::CounterInc { key } => {
-            api.eventual_counter_inc(&key)?;
-        }
-        EventualWriteRequest::CounterDec { key } => {
-            api.eventual_counter_dec(&key)?;
-        }
-        EventualWriteRequest::SetAdd { key, element } => {
-            api.eventual_set_add(&key, element)?;
-        }
+    let ts = match req {
+        EventualWriteRequest::CounterInc { key } => api.eventual_counter_inc(&key)?,
+        EventualWriteRequest::CounterDec { key } => api.eventual_counter_dec(&key)?,
+        EventualWriteRequest::SetAdd { key, element } => api.eventual_set_add(&key, element)?,
         EventualWriteRequest::SetRemove { key, element } => {
-            api.eventual_set_remove(&key, &element)?;
+            api.eventual_set_remove(&key, &element)?
         }
         EventualWriteRequest::MapSet {
             key,
             map_key,
             map_value,
-        } => {
-            api.eventual_map_set(&key, map_key, map_value)?;
-        }
+        } => api.eventual_map_set(&key, map_key, map_value)?,
         EventualWriteRequest::MapDelete { key, map_key } => {
-            api.eventual_map_delete(&key, &map_key)?;
+            api.eventual_map_delete(&key, &map_key)?
         }
         EventualWriteRequest::RegisterSet { key, value } => {
-            api.eventual_register_set(&key, value)?;
+            api.eventual_register_set(&key, value)?
         }
-    }
+    };
 
     state.metrics.record_write_op(&written_key);
 
-    Ok(Json(WriteResponse { ok: true }))
+    Ok(Json(WriteResponse {
+        ok: true,
+        session_token: Some(SessionToken::from_hlc(&ts).encode()),
+    }))
 }
+
+/// Upper bound for the `wait_ms` query parameter of `GET /api/eventual/:key`.
+pub const MAX_SESSION_WAIT_MS: u64 = 5_000;
+
+/// Polling interval while waiting for a session precondition.
+const SESSION_POLL_INTERVAL_MS: u64 = 50;
 
 /// `GET /api/eventual/:key`
 ///
 /// Returns the local CRDT value for the given key.
+///
+/// Optional session guarantees (read-your-writes / monotonic reads): when
+/// the request carries a `session_token` query parameter, the value is only
+/// returned if the local replica provably contains all writes covered by
+/// the token; otherwise the handler polls for up to `wait_ms` (capped at
+/// [`MAX_SESSION_WAIT_MS`]) and then answers 412 `SESSION_NOT_SATISFIED`.
+/// Without the parameter the behaviour and response bytes are identical to
+/// the pre-session API (no extra cost for token-less reads).
 pub async fn get_eventual(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-) -> Json<EventualReadResponse> {
+    Query(query): Query<EventualReadQuery>,
+) -> Result<Json<EventualReadResponse>, ApiError> {
     let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let start = Instant::now();
-    let api = state.eventual.lock().await;
-    let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
-    drop(api);
+    let want_session = query.session_token.is_some();
+    // SECURITY: the client-supplied token must NEVER be fed into
+    // `Hlc::update` — a forged far-future physical would poison the local
+    // clock (clock-advance attack). It is parsed, bounds-checked, and used
+    // for comparison only.
+    let token = match query.session_token.as_deref() {
+        // Absent → legacy behaviour; empty → no precondition, token issuance only.
+        None | Some("") => None,
+        Some(s) => {
+            let token = SessionToken::parse(s)?;
+            token.validate_bounds(crate::hlc::wall_clock_ms())?;
+            Some(token)
+        }
+    };
+    let deadline = start
+        + std::time::Duration::from_millis(query.wait_ms.unwrap_or(0).min(MAX_SESSION_WAIT_MS));
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    state
-        .slo_tracker
-        .record_observation(SLO_EVENTUAL_READ_P99, elapsed_ms);
+    loop {
+        let api = state.eventual.lock().await;
+        let satisfied = token.as_ref().is_none_or(|t| api.session_check(&key, t));
+        if satisfied {
+            // Check-then-read under the same lock so the state cannot
+            // change between the session check and the value read.
+            let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
+            let session_token = want_session.then(|| {
+                let mut response_token = token.clone().unwrap_or_default();
+                // The read key's own change position is merged FIRST so it
+                // counts as request-derived and survives the entry cap —
+                // the origin contributing the observed value must not be
+                // silently thinned away (monotonic reads).
+                if let Some(key_ts) = api.store().timestamp_for(&key) {
+                    response_token.merge_hlc(key_ts);
+                }
+                // Cover the full VISIBLE state, not just applied_origins:
+                // contributions merged through possibly-incomplete
+                // (unclaimed) deltas are readable here but make no applied
+                // claim; a token that omitted them would let a stale
+                // replica satisfy it while serving an older value — a
+                // monotonic-reads lie. Over-covering is safe (412s only).
+                response_token.merge_frontiers(api.store().visible_origins());
+                response_token.encode()
+            });
+            drop(api);
 
-    Json(EventualReadResponse { key, value })
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            state
+                .slo_tracker
+                .record_observation(SLO_EVENTUAL_READ_P99, elapsed_ms);
+
+            return Ok(Json(EventualReadResponse {
+                key,
+                value,
+                session_token,
+            }));
+        }
+        // Release the lock while sleeping so writes and sync can progress.
+        drop(api);
+        if Instant::now() >= deadline {
+            return Err(CrdtError::SessionNotSatisfied { key }.into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(SESSION_POLL_INTERVAL_MS)).await;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -1247,11 +1311,20 @@ pub async fn internal_keys(
         }
     }
     let frontier = store.current_frontier();
+    // Session-guarantee metadata must be snapshotted in the same lock
+    // scope as `entries`/`frontier`: adoption on the receiving side is
+    // only sound when the applied frontier describes exactly this state.
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let visible_origins = store.visible_origins().clone();
 
     let resp = KeyDumpResponse {
         entries,
         frontier,
         timestamps,
+        applied_origins,
+        merge_failed_keys,
+        visible_origins,
     };
     internal_response(&resp, accept)
 }
@@ -1281,10 +1354,21 @@ pub async fn internal_delta_sync(
         .collect();
 
     let sender_frontier = store.current_frontier();
+    // Snapshot the session-guarantee metadata in the same lock scope as
+    // the delta entries (see internal_keys). `pruned_floor` lets the
+    // receiver decide whether adopting `applied_origins` is sound.
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let pruned_floor = store.pruned_floor().cloned();
+    let visible_origins = store.visible_origins().clone();
 
     let resp = DeltaSyncResponse {
         entries,
         sender_frontier,
+        applied_origins,
+        merge_failed_keys,
+        pruned_floor,
+        visible_origins,
     };
     internal_response(&resp, accept)
 }

@@ -2583,4 +2583,406 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------
+    // Session guarantees (read-your-writes / monotonic reads)
+    // ---------------------------------------------------------------
+
+    /// A write response must carry a parseable single-entry session token
+    /// originating from this node.
+    #[tokio::test]
+    async fn eventual_write_returns_session_token() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"hits"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let write_resp: WriteResponse = serde_json::from_str(&body).unwrap();
+        assert!(write_resp.ok);
+        let token =
+            crate::session::SessionToken::parse(&write_resp.session_token.unwrap()).unwrap();
+        assert_eq!(token.entries().len(), 1);
+        assert_eq!(token.entries()[0].node_id, "test-node");
+    }
+
+    /// Backward compatibility: without the session_token query parameter
+    /// the raw response JSON must not contain a session_token key.
+    #[tokio::test]
+    async fn eventual_read_without_token_param_is_byte_compatible() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/eventual/somekey")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 2, "only key and value expected: {body}");
+        assert!(json.get("session_token").is_none());
+    }
+
+    /// Read-your-writes on the same node: write → read with the write's
+    /// token → 200 with the value and a response token that dominates the
+    /// request token.
+    #[tokio::test]
+    async fn eventual_read_with_own_write_token_succeeds() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"register_set","key":"greeting","value":"hello"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let write_resp: WriteResponse = serde_json::from_str(&body).unwrap();
+        let write_token_str = write_resp.session_token.unwrap();
+        let write_token = crate::session::SessionToken::parse(&write_token_str).unwrap();
+
+        let req = Request::builder()
+            .uri(format!(
+                "/api/eventual/greeting?session_token={write_token_str}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            read_resp.value,
+            Some(CrdtValueJson::Register {
+                value: Some("hello".into())
+            })
+        );
+        // The response token must dominate the request token (monotonic reads).
+        let response_token =
+            crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        for entry in write_token.entries() {
+            assert!(
+                response_token
+                    .entries()
+                    .iter()
+                    .any(|e| e.node_id == entry.node_id && e >= entry),
+                "response token must cover {entry:?}"
+            );
+        }
+    }
+
+    /// A token from an unknown origin must yield 412 (fail closed), with
+    /// the Retry-After header and error code, immediately when wait_ms is
+    /// zero or absent.
+    #[tokio::test]
+    async fn eventual_read_with_unknown_origin_token_returns_412() {
+        let state = test_state();
+        let app = router(state);
+
+        // counter key: register path B cannot fire.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"cnt"}"#))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let token = crate::session::SessionToken::from_hlc(&crate::hlc::HlcTimestamp {
+            physical: 1,
+            logical: 0,
+            node_id: "other-node".into(),
+        })
+        .encode();
+        let req = Request::builder()
+            .uri(format!("/api/eventual/cnt?session_token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SESSION_NOT_SATISFIED"), "{body}");
+    }
+
+    /// wait_ms: a background merge that lands during the wait window turns
+    /// the 412 into a 200.
+    #[tokio::test]
+    async fn eventual_read_wait_ms_succeeds_after_background_merge() {
+        let state = test_state();
+        let app = router(Arc::clone(&state));
+
+        let write_hlc = crate::hlc::HlcTimestamp {
+            physical: 1_000,
+            logical: 0,
+            node_id: "origin-x".into(),
+        };
+        let token = crate::session::SessionToken::from_hlc(&write_hlc).encode();
+
+        // Background task simulating a CLAIMED delta pull landing after
+        // 100ms: entries are merged and the sender's applied_origins is
+        // adopted (merges alone never claim an origin).
+        let bg_state = Arc::clone(&state);
+        let bg_hlc = write_hlc.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut c = crate::crdt::pn_counter::PnCounter::new();
+            c.increment(&NodeId("origin-x".into()));
+            let mut api = bg_state.eventual.lock().await;
+            api.merge_remote_with_hlc(
+                "waited".into(),
+                &crate::store::kv::CrdtValue::Counter(c),
+                bg_hlc.clone(),
+            )
+            .unwrap();
+            let mut sender_applied = std::collections::HashMap::new();
+            sender_applied.insert("origin-x".to_string(), bg_hlc);
+            api.store_mut().merge_applied_origins(&sender_applied);
+        });
+
+        let req = Request::builder()
+            .uri(format!(
+                "/api/eventual/waited?session_token={token}&wait_ms=3000"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.value, Some(CrdtValueJson::Counter { value: 1 }));
+    }
+
+    /// Malformed tokens and far-future tokens must be rejected with 400.
+    #[tokio::test]
+    async fn eventual_read_invalid_or_future_token_returns_400() {
+        let state = test_state();
+        let app = router(state);
+
+        for bad in ["not-a-token", "v2:1.0.61", "v1:zz.0.61"] {
+            let req = Request::builder()
+                .uri(format!("/api/eventual/k?session_token={bad}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "token {bad:?} must be rejected"
+            );
+        }
+
+        // Clock-advance attack: physical 61s beyond the wall clock.
+        let future = crate::session::SessionToken::from_hlc(&crate::hlc::HlcTimestamp {
+            physical: crate::hlc::wall_clock_ms() + 61_000,
+            logical: 0,
+            node_id: "evil".into(),
+        })
+        .encode();
+        let req = Request::builder()
+            .uri(format!("/api/eventual/k?session_token={future}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An empty session_token means "no precondition, start a session":
+    /// 200 plus a response token even for a missing key.
+    #[tokio::test]
+    async fn eventual_read_empty_token_starts_session() {
+        let state = test_state();
+        let app = router(state);
+
+        // Seed the applied frontier with one write.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"seed"}"#))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let req = Request::builder()
+            .uri("/api/eventual/missing?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert!(read_resp.value.is_none());
+        let token = crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        assert_eq!(token.entries().len(), 1);
+        assert_eq!(token.entries()[0].node_id, "test-node");
+    }
+
+    /// An empty session_token on a COMPLETELY FRESH node (no writes, no
+    /// visible origins) issues an empty token ("v1:") — and that token
+    /// must round-trip: the client carries it to the next read, which
+    /// must answer 200, not 400.
+    #[tokio::test]
+    async fn eventual_read_empty_token_on_fresh_node_round_trips() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/eventual/missing?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        let issued = read_resp.session_token.unwrap();
+        assert_eq!(issued, "v1:", "fresh node issues the empty token");
+
+        // Carrying the server-issued token back must not be rejected.
+        let req = Request::builder()
+            .uri(format!("/api/eventual/missing?session_token={issued}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "server-issued empty token must round-trip"
+        );
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.session_token.unwrap(), "v1:");
+    }
+
+    /// The response token must cover contributions that became visible
+    /// through UNCLAIMED merges (no applied claim): a reader that
+    /// observed such a value and then hops to a stale replica must get
+    /// 412 there, not an older value (monotonic reads).
+    #[tokio::test]
+    async fn eventual_read_response_token_covers_unclaimed_merges() {
+        let state = test_state();
+
+        // An unclaimed delta merge lands a foreign contribution.
+        let foreign_hlc = crate::hlc::HlcTimestamp {
+            physical: 2_000,
+            logical: 0,
+            node_id: "origin-z".into(),
+        };
+        {
+            let mut api = state.eventual.lock().await;
+            let mut c = crate::crdt::pn_counter::PnCounter::new();
+            c.increment(&NodeId("origin-z".into()));
+            api.merge_remote_with_hlc(
+                "cnt".into(),
+                &crate::store::kv::CrdtValue::Counter(c),
+                foreign_hlc.clone(),
+            )
+            .unwrap();
+            // No adoption: origin-z stays unclaimed.
+            assert!(api.store().applied_origin("origin-z").is_none());
+        }
+
+        let app = router(state);
+        let req = Request::builder()
+            .uri("/api/eventual/cnt?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.value, Some(CrdtValueJson::Counter { value: 1 }));
+
+        // The token covers the observed (unclaimed) contribution.
+        let token = crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        assert!(
+            token
+                .entries()
+                .iter()
+                .any(|e| e.node_id == "origin-z" && *e >= foreign_hlc),
+            "response token must cover the unclaimed observation: {token:?}"
+        );
+
+        // A stale replica (never saw origin-z) must refuse this token.
+        let stale = crate::api::eventual::EventualApi::new(NodeId("stale".into()));
+        assert!(
+            !token.is_satisfied(stale.store(), "cnt"),
+            "stale replica must refuse the token (no monotonic-reads lie)"
+        );
+    }
+
+    /// Internal sync responses must carry the session-guarantee metadata
+    /// (frontier adoption inputs).
+    #[tokio::test]
+    async fn internal_sync_responses_include_session_metadata() {
+        let state = test_state();
+
+        {
+            let mut api = state.eventual.lock().await;
+            api.eventual_counter_inc("k").unwrap();
+        }
+        let app = router(state);
+
+        // Delta sync response.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/sync/delta")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let delta: crate::network::sync::DeltaSyncResponse = serde_json::from_str(&body).unwrap();
+        assert!(delta.applied_origins.contains_key("test-node"));
+        assert!(delta.merge_failed_keys.is_empty());
+        assert!(delta.pruned_floor.is_none());
+        assert!(
+            delta.visible_origins.contains_key("test-node"),
+            "delta responses must carry the visible frontier"
+        );
+
+        // Full key dump.
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let dump: crate::network::sync::KeyDumpResponse = serde_json::from_str(&body).unwrap();
+        assert!(dump.applied_origins.contains_key("test-node"));
+        assert!(dump.merge_failed_keys.is_empty());
+        assert!(
+            dump.visible_origins.contains_key("test-node"),
+            "key dumps must carry the visible frontier"
+        );
+    }
 }

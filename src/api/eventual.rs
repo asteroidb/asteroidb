@@ -1,5 +1,6 @@
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
+use crate::session::SessionToken;
 use crate::store::kv::{CrdtValue, Store};
 use crate::types::NodeId;
 
@@ -43,17 +44,22 @@ impl EventualApi {
     /// to other nodes asynchronously. Atomically records the HLC timestamp
     /// for delta sync tracking so the entry is immediately visible to
     /// `delta_sync` without a separate `record_change` call.
-    pub fn eventual_write(&mut self, key: String, value: CrdtValue) -> Result<(), CrdtError> {
+    pub fn eventual_write(
+        &mut self,
+        key: String,
+        value: CrdtValue,
+    ) -> Result<HlcTimestamp, CrdtError> {
         let ts = self.clock.now()?;
-        self.store.put_with_timestamp(key, value, ts);
-        Ok(())
+        self.store.put_with_timestamp(key, value, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Increment a PN-Counter at the given key.
     ///
     /// Creates the counter if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
-    pub fn eventual_counter_inc(&mut self, key: &str) -> Result<(), CrdtError> {
+    pub fn eventual_counter_inc(&mut self, key: &str) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Counter(_)) => {}
             Some(other) => {
@@ -72,15 +78,16 @@ impl EventualApi {
             c.increment(&self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Decrement a PN-Counter at the given key.
     ///
     /// Creates the counter if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
-    pub fn eventual_counter_dec(&mut self, key: &str) -> Result<(), CrdtError> {
+    pub fn eventual_counter_dec(&mut self, key: &str) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Counter(_)) => {}
             Some(other) => {
@@ -98,15 +105,20 @@ impl EventualApi {
             c.decrement(&self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Add an element to an OR-Set at the given key.
     ///
     /// Creates the set if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
-    pub fn eventual_set_add(&mut self, key: &str, element: String) -> Result<(), CrdtError> {
+    pub fn eventual_set_add(
+        &mut self,
+        key: &str,
+        element: String,
+    ) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Set(_)) => {}
             Some(other) => {
@@ -124,15 +136,20 @@ impl EventualApi {
             s.add(element, &self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Remove an element from an OR-Set at the given key.
     ///
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
     /// Returns `KeyNotFound` if the key does not exist.
-    pub fn eventual_set_remove(&mut self, key: &str, element: &str) -> Result<(), CrdtError> {
+    pub fn eventual_set_remove(
+        &mut self,
+        key: &str,
+        element: &str,
+    ) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Set(_)) => {}
             Some(other) => {
@@ -149,8 +166,9 @@ impl EventualApi {
             s.remove(&element.to_string());
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Set a key-value pair in an OR-Map at the given key.
@@ -162,7 +180,7 @@ impl EventualApi {
         key: &str,
         map_key: String,
         map_value: String,
-    ) -> Result<(), CrdtError> {
+    ) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Map(_)) => {}
             Some(other) => {
@@ -180,15 +198,20 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.set(map_key, map_value, ts.clone(), &self.node_id);
         }
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Delete a key from an OR-Map at the given key.
     ///
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
     /// Returns `KeyNotFound` if the key does not exist.
-    pub fn eventual_map_delete(&mut self, key: &str, map_key: &str) -> Result<(), CrdtError> {
+    pub fn eventual_map_delete(
+        &mut self,
+        key: &str,
+        map_key: &str,
+    ) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Map(_)) => {}
             Some(other) => {
@@ -205,15 +228,20 @@ impl EventualApi {
             m.delete(&map_key.to_string());
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Set a LWW-Register value at the given key.
     ///
     /// Creates the register if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
-    pub fn eventual_register_set(&mut self, key: &str, value: String) -> Result<(), CrdtError> {
+    pub fn eventual_register_set(
+        &mut self,
+        key: &str,
+        value: String,
+    ) -> Result<HlcTimestamp, CrdtError> {
         match self.store.get(key) {
             Some(CrdtValue::Register(_)) => {}
             Some(other) => {
@@ -231,8 +259,9 @@ impl EventualApi {
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
             r.set(value, ts.clone());
         }
-        self.store.record_change(key, ts);
-        Ok(())
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(&ts);
+        Ok(ts)
     }
 
     /// Merge a CRDT value received from a remote node.
@@ -241,9 +270,20 @@ impl EventualApi {
     /// and CRDT-specific merge semantics. Records the HLC timestamp
     /// for delta sync tracking.
     pub fn merge_remote(&mut self, key: String, remote_value: &CrdtValue) -> Result<(), CrdtError> {
-        self.store.merge_value(key.clone(), remote_value)?;
+        if let Err(e) = self.store.merge_value(key.clone(), remote_value) {
+            // Poison the key for session checks: a remote contribution was
+            // dropped, so the applied_origins invariant no longer holds
+            // for this key (the frontier may advance via other keys).
+            self.store.note_merge_failed(&key);
+            return Err(e);
+        }
         let ts = self.clock.now()?;
-        self.store.record_change(&key, ts);
+        self.store.record_change(&key, ts.clone());
+        // The push path carries no origin HLC; the merged state is
+        // re-stamped with a local timestamp, so only the LOCAL origin
+        // frontier may advance. Claiming the remote origin here would be
+        // unsound (push batches are partial, not a complete prefix).
+        self.store.note_applied(&ts);
         Ok(())
     }
 
@@ -253,6 +293,20 @@ impl EventualApi {
     /// Only updates the change timestamp if the incoming HLC is newer than
     /// the existing one for that key, preventing an older remote timestamp
     /// from overwriting a newer local one.
+    ///
+    /// Session guarantees: this method makes **no per-origin claim**
+    /// (`applied_origins` is untouched). A per-entry claim on the entry's
+    /// origin would be unsound: even a transfer that is complete relative
+    /// to the SENDER's state does not prove the sender itself holds the
+    /// entry origin's full write prefix (the entry may be a third-party
+    /// write the sender received through a gappy delta). Claims are made
+    /// exclusively by adopting the sender's transmitted `applied_origins`
+    /// map ([`Store::merge_applied_origins`]) when the transfer is
+    /// provably complete — see `NodeRunner::apply_delta_response`.
+    ///
+    /// The entry's origin position IS recorded in the store's visible
+    /// frontier ([`Store::note_visible`]) so response session tokens
+    /// cover everything a reader can observe here.
     pub fn merge_remote_with_hlc(
         &mut self,
         key: String,
@@ -265,7 +319,14 @@ impl EventualApi {
         // errors, so skipped entries are never re-requested. The clock update is
         // advisory (ordering only); CRDT correctness does not depend on it.
         let _ = self.clock.update(&hlc);
-        self.store.merge_value(key.clone(), remote_value)?;
+        if let Err(e) = self.store.merge_value(key.clone(), remote_value) {
+            // Poison the key for session checks (see merge_remote).
+            self.store.note_merge_failed(&key);
+            return Err(e);
+        }
+        // The merged contribution is now visible; response tokens must
+        // cover it even though no applied claim is made.
+        self.store.note_visible(&hlc);
         // Always record the change using the maximum of the incoming HLC
         // and any existing timestamp for this key. This ensures that
         // merges are never silently dropped from the change log, which
@@ -276,6 +337,15 @@ impl EventualApi {
         };
         self.store.record_change(&key, record_hlc);
         Ok(())
+    }
+
+    /// Check whether the local store satisfies a session token for `key`.
+    ///
+    /// Delegates to [`SessionToken::is_satisfied`]; see there for the
+    /// soundness argument. Returns `false` when the replica cannot prove
+    /// it has caught up (fail-closed — never a false success).
+    pub fn session_check(&self, key: &str, token: &SessionToken) -> bool {
+        token.is_satisfied(&self.store, key)
     }
 
     /// Return all keys in the store.
@@ -792,5 +862,267 @@ mod tests {
         let mut keys: Vec<&str> = delta.iter().map(|(k, _, _)| k.as_str()).collect();
         keys.sort();
         assert_eq!(keys, vec!["key1", "key2", "key3"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Session guarantees (read-your-writes / monotonic reads)
+    // ---------------------------------------------------------------
+
+    fn hlc_ts(physical: u64, logical: u32, node: &str) -> crate::hlc::HlcTimestamp {
+        crate::hlc::HlcTimestamp {
+            physical,
+            logical,
+            node_id: node.into(),
+        }
+    }
+
+    /// Every mutation must return an HLC that immediately satisfies a
+    /// session check on the same node (read-your-writes locally).
+    #[test]
+    fn mutations_return_hlc_that_satisfies_local_session_check() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        let checks: Vec<(String, crate::hlc::HlcTimestamp)> = vec![
+            ("cnt".into(), api.eventual_counter_inc("cnt").unwrap()),
+            ("cnt".into(), api.eventual_counter_dec("cnt").unwrap()),
+            (
+                "set".into(),
+                api.eventual_set_add("set", "x".into()).unwrap(),
+            ),
+            ("set".into(), api.eventual_set_remove("set", "x").unwrap()),
+            (
+                "map".into(),
+                api.eventual_map_set("map", "k".into(), "v".into()).unwrap(),
+            ),
+            ("map".into(), api.eventual_map_delete("map", "k").unwrap()),
+            (
+                "reg".into(),
+                api.eventual_register_set("reg", "v".into()).unwrap(),
+            ),
+            (
+                "raw".into(),
+                api.eventual_write("raw".into(), CrdtValue::Counter(PnCounter::new()))
+                    .unwrap(),
+            ),
+        ];
+
+        for (key, ts) in checks {
+            assert_eq!(ts.node_id, "node-a");
+            assert!(
+                api.store().applied_origin("node-a").unwrap() >= &ts,
+                "applied frontier must cover the returned HLC"
+            );
+            let token = SessionToken::from_hlc(&ts);
+            assert!(
+                api.session_check(&key, &token),
+                "write to {key} must satisfy its own token locally"
+            );
+        }
+    }
+
+    /// Fail-closed: a token from another origin is unsatisfied before any
+    /// merge from that origin.
+    #[test]
+    fn foreign_token_unsatisfied_before_merge() {
+        let mut api = EventualApi::new(node("node-b"));
+        api.eventual_counter_inc("k").unwrap();
+
+        let token = SessionToken::from_hlc(&hlc_ts(1, 0, "node-a"));
+        assert!(!api.session_check("k", &token));
+    }
+
+    /// Regression test for the "false success" trap: a concurrent LOCAL
+    /// write advances the per-key timestamp past the token, but the
+    /// token's origin write has NOT been applied. `timestamp_for(key) >=
+    /// token` would wrongly answer true here; the session check must not.
+    #[test]
+    fn concurrent_local_write_does_not_fake_satisfaction() {
+        let mut api = EventualApi::new(node("node-b"));
+        api.eventual_counter_inc("k").unwrap();
+        api.eventual_counter_inc("k").unwrap();
+
+        // Token from node-a, older than node-b's per-key timestamp.
+        let token_hlc = hlc_ts(1, 0, "node-a");
+        assert!(
+            api.store().timestamp_for("k").unwrap() > &token_hlc,
+            "precondition: per-key ts is past the token"
+        );
+        let token = SessionToken::from_hlc(&token_hlc);
+        assert!(
+            !api.session_check("k", &token),
+            "per-key timestamp alone must not satisfy a foreign token"
+        );
+    }
+
+    /// merge_remote_with_hlc (pull path) must NOT claim the entry's
+    /// origin by itself — even a sender-complete delta does not prove the
+    /// sender holds the entry origin's full write prefix. Claims come
+    /// only from adopting the sender's applied_origins; the merged
+    /// position is still recorded in the visible frontier for response
+    /// tokens.
+    #[test]
+    fn merge_with_hlc_makes_no_claim_adoption_does() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        let write_hlc = hlc_ts(100, 0, "node-a");
+        api.merge_remote_with_hlc("k".into(), &CrdtValue::Counter(remote), write_hlc.clone())
+            .unwrap();
+
+        // No per-entry claim (would be a potential false success)...
+        assert!(api.store().applied_origin("node-a").is_none());
+        assert!(!api.session_check("k", &SessionToken::from_hlc(&write_hlc)));
+        // ...but the visible frontier covers the merged contribution.
+        assert_eq!(
+            api.store().visible_origins().get("node-a"),
+            Some(&write_hlc)
+        );
+
+        // Adoption of the sender's applied_origins makes the claim.
+        let mut sender_applied = std::collections::HashMap::new();
+        sender_applied.insert("node-a".to_string(), write_hlc.clone());
+        api.store_mut().merge_applied_origins(&sender_applied);
+
+        assert!(api.session_check("k", &SessionToken::from_hlc(&write_hlc)));
+        assert!(api.session_check("k", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+        assert!(!api.session_check("k", &SessionToken::from_hlc(&hlc_ts(101, 0, "node-a"))));
+    }
+
+    /// A failed merge (type mismatch) must not advance the applied
+    /// frontier and must poison the key.
+    #[test]
+    fn failed_merge_poisons_key_without_advancing_frontier() {
+        let mut api = EventualApi::new(node("node-b"));
+        api.eventual_counter_inc("k").unwrap();
+
+        let err = api
+            .merge_remote_with_hlc(
+                "k".into(),
+                &CrdtValue::Set(OrSet::new()),
+                hlc_ts(100, 0, "node-a"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CrdtError::TypeMismatch { .. }));
+        assert!(api.store().applied_origin("node-a").is_none());
+        assert!(api.store().merge_failed_contains("k"));
+    }
+
+    /// Poison soundness: origin frontier advanced by adoption after a
+    /// successful merge on k2 must not satisfy tokens for the poisoned
+    /// key k1 — not even after later successful merges on k1 (poison is
+    /// permanent).
+    #[test]
+    fn poisoned_key_never_satisfied_via_applied_origins() {
+        let mut api = EventualApi::new(node("node-b"));
+        api.eventual_counter_inc("k1").unwrap();
+
+        // node-a's write to k1 fails to merge (type mismatch) → poison.
+        let failed_hlc = hlc_ts(100, 0, "node-a");
+        api.merge_remote_with_hlc(
+            "k1".into(),
+            &CrdtValue::Set(OrSet::new()),
+            failed_hlc.clone(),
+        )
+        .unwrap_err();
+
+        // node-a's later write to k2 merges fine and the sender's
+        // applied_origins is adopted → applied[node-a] = 200.
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        api.merge_remote_with_hlc(
+            "k2".into(),
+            &CrdtValue::Counter(c),
+            hlc_ts(200, 0, "node-a"),
+        )
+        .unwrap();
+        let mut sender_applied = std::collections::HashMap::new();
+        sender_applied.insert("node-a".to_string(), hlc_ts(200, 0, "node-a"));
+        api.store_mut().merge_applied_origins(&sender_applied);
+        assert_eq!(
+            api.store().applied_origin("node-a"),
+            Some(&hlc_ts(200, 0, "node-a"))
+        );
+
+        // k1's token must stay unsatisfied even though applied >= token.
+        let token = SessionToken::from_hlc(&failed_hlc);
+        assert!(!api.session_check("k1", &token), "poisoned key must fail");
+        assert!(api.session_check("k2", &token), "k2 is not poisoned");
+
+        // A later successful counter merge on k1 must NOT clear the poison
+        // (the dropped set contribution is still missing).
+        let mut c2 = PnCounter::new();
+        c2.increment(&node("node-a"));
+        api.merge_remote_with_hlc(
+            "k1".into(),
+            &CrdtValue::Counter(c2),
+            hlc_ts(300, 0, "node-a"),
+        )
+        .unwrap();
+        assert!(!api.session_check("k1", &token), "poison must be permanent");
+    }
+
+    /// Path B: register value evidence satisfies a token when the LWW
+    /// timestamp dominates it, independently of applied_origins — and
+    /// even on a poisoned key (value-level evidence stays sound).
+    #[test]
+    fn register_value_evidence_path() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        let mut reg = LwwRegister::new();
+        reg.set("v".to_string(), hlc_ts(100, 0, "node-c"));
+        // Merge WITHOUT origin HLC (push path) so applied_origins does not
+        // cover node-a or node-c.
+        api.merge_remote("reg".into(), &CrdtValue::Register(reg))
+            .unwrap();
+        assert!(api.store().applied_origin("node-a").is_none());
+
+        // Register internal ts (100@node-c) dominates a token at 50@node-a.
+        assert!(api.session_check("reg", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+        // ...but not a token above it.
+        assert!(!api.session_check("reg", &SessionToken::from_hlc(&hlc_ts(101, 0, "node-a"))));
+
+        // Path B must not fire for non-register types.
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        api.merge_remote("cnt".into(), &CrdtValue::Counter(c))
+            .unwrap();
+        assert!(!api.session_check("cnt", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+
+        // Path B stays sound on a poisoned key.
+        api.merge_remote("reg".into(), &CrdtValue::Counter(PnCounter::new()))
+            .unwrap_err();
+        assert!(api.store().merge_failed_contains("reg"));
+        assert!(api.session_check("reg", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+    }
+
+    /// The push path (merge_remote, no origin HLC) must only advance the
+    /// LOCAL origin frontier — never the remote value's origins.
+    #[test]
+    fn merge_remote_advances_only_local_origin() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        api.merge_remote("k".into(), &CrdtValue::Counter(remote))
+            .unwrap();
+
+        assert!(
+            api.store().applied_origin("node-a").is_none(),
+            "push path must not claim the remote origin"
+        );
+        assert!(api.store().applied_origin("node-b").is_some());
+    }
+
+    /// merge_remote failure must also poison the key (full-sync fallback
+    /// path without per-key HLC).
+    #[test]
+    fn merge_remote_failure_poisons_key() {
+        let mut api = EventualApi::new(node("node-b"));
+        api.eventual_counter_inc("k").unwrap();
+
+        api.merge_remote("k".into(), &CrdtValue::Set(OrSet::new()))
+            .unwrap_err();
+        assert!(api.store().merge_failed_contains("k"));
     }
 }

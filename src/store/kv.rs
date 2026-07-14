@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -17,7 +17,12 @@ use crate::store::backend::StorageBackend;
 use crate::store::migration;
 
 /// Current persistence format version written by this code.
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+///
+/// v3: added the session-guarantee fields (`applied_origins`,
+/// `merge_failed_keys`, `pruned_floor`, `visible_origins`) to [`Store`].
+/// v1/v2 snapshots contain only `data` + `timestamps` and are migrated on
+/// load (JSON via the migration registry, bincode via [`StoreV2Layout`]).
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 
 /// Versioned envelope for persisted store data.
 ///
@@ -109,6 +114,93 @@ pub struct Store {
     /// Per-key HLC timestamp of the last modification, used for delta sync.
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
+    /// Per-origin applied frontier used for session guarantees
+    /// (read-your-writes / monotonic reads).
+    ///
+    /// Invariant: `applied_origins[o] = h` means this store contains the
+    /// effects of ALL writes by origin node `o` with HLC `<= h` (or a CRDT
+    /// state that dominates them), except for keys in `merge_failed_keys`.
+    /// The map is max-monotone and is deliberately NOT touched by
+    /// `prune_timestamps_before` or `delete`, so old session tokens remain
+    /// satisfiable after compaction.
+    #[serde(default)]
+    applied_origins: HashMap<String, HlcTimestamp>,
+    /// Keys permanently poisoned by a failed remote merge (type mismatch).
+    ///
+    /// For these keys the `applied_origins` invariant does not hold — a
+    /// remote contribution was dropped — so session checks must not rely
+    /// on path A for them. Persisted together with `applied_origins`:
+    /// losing the poison set while keeping the frontier would produce
+    /// false session successes after restart.
+    #[serde(default)]
+    merge_failed_keys: HashSet<String>,
+    /// Highest frontier ever passed to `prune_timestamps_before` that
+    /// actually pruned entries. Used ONLY as a guard for delta-sync
+    /// frontier adoption (a receiver may adopt this sender's
+    /// `applied_origins` only if it requested a delta from a frontier at
+    /// or above this floor); never consulted for session satisfaction.
+    #[serde(default)]
+    pruned_floor: Option<HlcTimestamp>,
+    /// Per-origin max HLC of ANY contribution merged into visible state —
+    /// claimed or not. Always a superset (per-origin max) of
+    /// `applied_origins`.
+    ///
+    /// Used ONLY to build response session tokens: the token must cover
+    /// everything the client may have observed, including contributions
+    /// that arrived through possibly-incomplete (unclaimed) deltas.
+    /// Over-covering is safe (a later replica merely answers 412 more
+    /// often — the false-negative direction); under-covering would let a
+    /// stale replica satisfy the token while serving an older value (a
+    /// monotonic-reads lie). Never consulted by `is_satisfied`.
+    #[serde(default)]
+    visible_origins: HashMap<String, HlcTimestamp>,
+}
+
+/// Structural layout of `Store` persisted by format versions 1 and 2
+/// (bincode is positional and non-self-describing, so old snapshots must
+/// be decoded with the exact old field layout — `#[serde(default)]` on
+/// the current struct cannot rescue missing trailing fields).
+#[derive(Debug, Deserialize)]
+struct StoreV2Layout {
+    data: BTreeMap<String, CrdtValue>,
+    #[serde(default)]
+    timestamps: HashMap<String, HlcTimestamp>,
+}
+
+impl From<StoreV2Layout> for Store {
+    fn from(old: StoreV2Layout) -> Self {
+        let mut store = Store {
+            data: old.data,
+            timestamps: old.timestamps,
+            applied_origins: HashMap::new(),
+            merge_failed_keys: HashSet::new(),
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+        };
+        store.rebuild_visible_origins();
+        store
+    }
+}
+
+/// Max-merge `hlc` into a per-origin frontier map.
+///
+/// Entries with an empty node id (e.g. zero sentinel frontiers) are
+/// ignored: they name no origin, and a session-token entry with an empty
+/// node id would be rejected on parse.
+fn max_merge_origin(map: &mut HashMap<String, HlcTimestamp>, hlc: &HlcTimestamp) {
+    if hlc.node_id.is_empty() {
+        return;
+    }
+    match map.get_mut(&hlc.node_id) {
+        Some(existing) => {
+            if *hlc > *existing {
+                *existing = hlc.clone();
+            }
+        }
+        None => {
+            map.insert(hlc.node_id.clone(), hlc.clone());
+        }
+    }
 }
 
 /// Compute the exclusive upper bound for a BTreeMap range scan.
@@ -134,6 +226,10 @@ impl Store {
         Self {
             data: BTreeMap::new(),
             timestamps: HashMap::new(),
+            applied_origins: HashMap::new(),
+            merge_failed_keys: HashSet::new(),
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
         }
     }
 
@@ -311,36 +407,29 @@ impl Store {
                 },
             ));
         }
-        let (store, _len): (Self, _) =
-            bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Apply schema migrations when the stored version is older than the
-        // current format version, matching the behaviour of the JSON load path.
-        if version < CURRENT_FORMAT_VERSION {
-            // MAINTAINER WARNING — bincode→JSON→migration roundtrip structural fragility:
-            //
-            // This path decodes the bincode bytes into `Self` using the CURRENT struct
-            // layout, then re-serialises to JSON to run the migration registry. This only
-            // works safely when bincode and JSON field names agree AND the old schema is
-            // structurally compatible with the current struct (i.e. no field renames,
-            // removals, or type changes between `version` and `CURRENT_FORMAT_VERSION`).
-            //
-            // V1→V2 is safe today because the migration is a no-op. If a future
-            // migration renames, removes, or reinterprets a field, this approach will
-            // silently decode stale bincode into the wrong shape. When adding a new
-            // format version with a structural change, introduce a versioned decode
-            // type (e.g. `StoreV1`) and decode from bincode into that before migrating.
-            let store_value = serde_json::to_value(&store)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let registry = migration::default_registry();
-            let migrated = registry
-                .apply_migrations(store_value, version, CURRENT_FORMAT_VERSION)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            return serde_json::from_value(migrated)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-
+        // MAINTAINER WARNING — bincode is positional and non-self-describing:
+        // `#[serde(default)]` cannot rescue fields missing from an old
+        // snapshot. Every persisted format version whose STRUCT LAYOUT
+        // differs from the current one needs its own versioned decode type
+        // below (see `StoreV2Layout` for v1/v2). When you add a field to
+        // `Store`, bump `CURRENT_FORMAT_VERSION` and add a decode arm here.
+        let mut store: Self = match version {
+            // v1 and v2 share the {data, timestamps} layout; the session
+            // fields introduced in v3 are filled with defaults.
+            1 | 2 => {
+                let (old, _len): (StoreV2Layout, _) =
+                    bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                old.into()
+            }
+            _ => {
+                let (store, _len): (Self, _) =
+                    bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                store
+            }
+        };
+        store.rebuild_visible_origins();
         Ok(store)
     }
 
@@ -412,7 +501,12 @@ impl Store {
             .apply_migrations(store_data, data_version, CURRENT_FORMAT_VERSION)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        serde_json::from_value(migrated).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut store: Self = serde_json::from_value(migrated)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Pre-v3 snapshots did not persist visible_origins; restore the
+        // `visible ⊇ applied` invariant conservatively.
+        store.rebuild_visible_origins();
+        Ok(store)
     }
 
     /// Load a store from a snapshot, falling back to an empty store only when
@@ -565,7 +659,150 @@ impl Store {
             }
         }
 
+        // Record the pruned floor for delta-sync frontier adoption. The
+        // session-guarantee metadata (applied_origins / merge_failed_keys)
+        // is deliberately left untouched: it is max-monotone, so old
+        // session tokens stay satisfiable after compaction.
+        if count > 0
+            && self
+                .pruned_floor
+                .as_ref()
+                .is_none_or(|floor| frontier > floor)
+        {
+            self.pruned_floor = Some(frontier.clone());
+        }
+
         count
+    }
+
+    // ---------------------------------------------------------------
+    // Session-guarantee metadata (read-your-writes / monotonic reads)
+    // ---------------------------------------------------------------
+
+    /// Advance the applied frontier for the origin of `hlc` (max-monotone).
+    ///
+    /// Callers must only invoke this when the store now contains the full
+    /// write prefix of `hlc.node_id` up to `hlc` (see the invariant on
+    /// [`Store::applied_origins`]): a local mutation, a complete delta
+    /// pull entry, or a full-state merge stamped with the local node id.
+    pub fn note_applied(&mut self, hlc: &HlcTimestamp) {
+        max_merge_origin(&mut self.applied_origins, hlc);
+        // Invariant: visible_origins is a per-origin superset of
+        // applied_origins (anything claimed is also visible).
+        max_merge_origin(&mut self.visible_origins, hlc);
+    }
+
+    /// Record that a contribution stamped `hlc` is now part of the visible
+    /// state WITHOUT claiming the origin's write prefix (max-monotone).
+    ///
+    /// Called for every successful remote merge that carries an origin
+    /// HLC, including possibly-incomplete (unclaimed) deltas. Response
+    /// session tokens are built from this map so they always cover what a
+    /// reader may have observed (see [`Store::visible_origins`]).
+    pub fn note_visible(&mut self, hlc: &HlcTimestamp) {
+        max_merge_origin(&mut self.visible_origins, hlc);
+    }
+
+    /// Return the per-origin visible frontier map (superset of
+    /// [`applied_origins`](Self::applied_origins); response-token input).
+    pub fn visible_origins(&self) -> &HashMap<String, HlcTimestamp> {
+        &self.visible_origins
+    }
+
+    /// Max-merge a remote visible-origins snapshot into the local map.
+    ///
+    /// Unlike [`merge_applied_origins`](Self::merge_applied_origins) this
+    /// needs NO completeness precondition: a delta entry's CRDT value can
+    /// embed contributions from origins the entry HLC does not name, so
+    /// after merging ANY entries from a sender the local visible state
+    /// may reflect anything the sender could see. Over-covering the
+    /// visible frontier is always safe — it only widens response tokens
+    /// (false-negative direction); it never fabricates an applied claim.
+    pub fn merge_visible_origins(&mut self, remote: &HashMap<String, HlcTimestamp>) {
+        for hlc in remote.values() {
+            max_merge_origin(&mut self.visible_origins, hlc);
+        }
+    }
+
+    /// Rebuild `visible_origins` conservatively from persisted state.
+    ///
+    /// Called after loading a snapshot: pre-v3 snapshots did not persist
+    /// `visible_origins`, so it is reconstructed as the per-origin max of
+    /// `applied_origins` and the per-key change timestamps. This may still
+    /// under-cover contributions whose per-key timestamp was later
+    /// superseded before the upgrade, but it restores the
+    /// `visible ⊇ applied` invariant and covers everything the change log
+    /// still knows about.
+    fn rebuild_visible_origins(&mut self) {
+        let applied: Vec<HlcTimestamp> = self.applied_origins.values().cloned().collect();
+        for hlc in &applied {
+            max_merge_origin(&mut self.visible_origins, hlc);
+        }
+        let tracked: Vec<HlcTimestamp> = self.timestamps.values().cloned().collect();
+        for hlc in &tracked {
+            max_merge_origin(&mut self.visible_origins, hlc);
+        }
+    }
+
+    /// Return the per-origin applied frontier map.
+    pub fn applied_origins(&self) -> &HashMap<String, HlcTimestamp> {
+        &self.applied_origins
+    }
+
+    /// Return the applied frontier for a single origin node, if tracked.
+    pub fn applied_origin(&self, node_id: &str) -> Option<&HlcTimestamp> {
+        self.applied_origins.get(node_id)
+    }
+
+    /// Max-merge a remote applied-origins snapshot into the local map
+    /// (frontier adoption).
+    ///
+    /// Sound only when the caller has verified the completeness condition:
+    /// a full dump was applied (unconditionally complete), or a delta was
+    /// requested from a frontier at or above the sender's
+    /// [`pruned_floor`](Self::pruned_floor).
+    pub fn merge_applied_origins(&mut self, remote: &HashMap<String, HlcTimestamp>) {
+        for hlc in remote.values() {
+            self.note_applied(hlc);
+        }
+    }
+
+    /// Mark a key as poisoned by a failed remote merge (type mismatch).
+    ///
+    /// Poisoning is permanent: a later successful merge is not guaranteed
+    /// to carry the contribution that was dropped, so clearing the mark
+    /// would be unsound for session checks.
+    pub fn note_merge_failed(&mut self, key: &str) {
+        self.merge_failed_keys.insert(key.to_string());
+        if self.merge_failed_keys.len() > 10_000 {
+            tracing::warn!(
+                poisoned_keys = self.merge_failed_keys.len(),
+                "merge_failed_keys is growing large; check for systematic CRDT type conflicts"
+            );
+        }
+    }
+
+    /// Check whether a key is poisoned by a failed remote merge.
+    pub fn merge_failed_contains(&self, key: &str) -> bool {
+        self.merge_failed_keys.contains(key)
+    }
+
+    /// Return the set of keys poisoned by failed remote merges.
+    pub fn merge_failed_keys(&self) -> &HashSet<String> {
+        &self.merge_failed_keys
+    }
+
+    /// Union a set of poisoned keys into the local set (frontier adoption:
+    /// the sender's dropped contributions must not be claimed as present here).
+    pub fn merge_failed_extend<I: IntoIterator<Item = String>>(&mut self, keys: I) {
+        for key in keys {
+            self.note_merge_failed(&key);
+        }
+    }
+
+    /// Return the highest frontier that pruning has been performed at.
+    pub fn pruned_floor(&self) -> Option<&HlcTimestamp> {
+        self.pruned_floor.as_ref()
     }
 
     /// Return the number of change-tracking timestamps currently stored.
@@ -1935,64 +2172,100 @@ mod tests {
         assert!(loaded.contains_key("reg"));
     }
 
-    #[test]
-    fn bincode_v1_snapshot_migrates_on_load() {
-        use crate::store::backend::MemoryBackend;
+    /// Serialisable mirror of the exact struct layout persisted by format
+    /// versions 1 and 2 ({data, timestamps} only), used to craft genuine
+    /// old-format snapshots in tests.
+    #[derive(serde::Serialize)]
+    struct OldStoreLayoutV2 {
+        data: BTreeMap<String, CrdtValue>,
+        timestamps: HashMap<String, HlcTimestamp>,
+    }
 
-        // Build a v1 bincode snapshot: 4-byte LE version prefix = 1, followed by a
-        // bincode-encoded Store payload using the current (v2) struct layout.
-        // V1ToV2 is a no-op (schemas are identical), so this tests the
-        // version-routing logic only — not structural schema divergence between
-        // a true v1 layout and v2 (see MAINTAINER WARNING above load_from_backend_bincode).
-        let mut original = Store::new();
+    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
         let mut counter = PnCounter::new();
         counter.increment(&node("A"));
         counter.increment(&node("A"));
-        original.put("hits".into(), CrdtValue::Counter(counter));
-        original.record_change("hits", ts(42, 0, "A"));
-
         let mut set = OrSet::new();
         set.add("alice".to_string(), &node("A"));
-        original.put("users".into(), CrdtValue::Set(set));
 
-        // Encode the store with bincode (no version prefix yet).
-        let payload = bincode::serde::encode_to_vec(&original, bincode::config::standard())
+        let mut data = BTreeMap::new();
+        data.insert("hits".to_string(), CrdtValue::Counter(counter));
+        data.insert("users".to_string(), CrdtValue::Set(set));
+        let mut timestamps = HashMap::new();
+        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
+
+        let old = OldStoreLayoutV2 { data, timestamps };
+        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
             .expect("bincode encode failed");
 
-        // Prepend the v1 version prefix (little-endian u32 = 1).
-        let mut v1_bytes = Vec::with_capacity(4 + payload.len());
-        v1_bytes.extend_from_slice(&1u32.to_le_bytes());
-        v1_bytes.extend_from_slice(&payload);
+        let mut bytes = Vec::with_capacity(4 + payload.len());
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
 
-        // Store the crafted v1 snapshot in a MemoryBackend.
+    /// v1/v2 bincode snapshots use the old {data, timestamps} layout;
+    /// loading them must decode via the versioned layout (bincode is
+    /// positional — serde defaults cannot rescue missing trailing fields)
+    /// and fill the v3 session fields with defaults.
+    #[test]
+    fn bincode_v1_and_v2_snapshots_migrate_on_load() {
+        use crate::store::backend::MemoryBackend;
+
+        for version in [1u32, 2] {
+            let backend = MemoryBackend::new();
+            backend.save(&old_layout_bincode_snapshot(version)).unwrap();
+
+            let loaded = Store::load_from_backend_bincode(&backend).unwrap_or_else(|e| {
+                panic!("v{version} bincode snapshot should migrate and load: {e}")
+            });
+
+            assert_eq!(loaded.len(), 2, "all keys must survive migration");
+            match loaded.get("hits") {
+                Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+                other => panic!("expected Counter, got {:?}", other),
+            }
+            match loaded.get("users") {
+                Some(CrdtValue::Set(s)) => assert!(s.contains(&"alice".to_string())),
+                other => panic!("expected Set, got {:?}", other),
+            }
+            assert_eq!(
+                loaded.timestamp_for("hits"),
+                Some(&ts(42, 0, "A")),
+                "timestamp must survive migration"
+            );
+
+            // Session fields default; visible_origins is rebuilt from the
+            // change timestamps so response tokens keep covering the data.
+            assert!(loaded.applied_origins().is_empty());
+            assert!(loaded.merge_failed_keys().is_empty());
+            assert!(loaded.pruned_floor().is_none());
+            assert_eq!(loaded.visible_origins().get("A"), Some(&ts(42, 0, "A")));
+        }
+    }
+
+    /// Round-trip at the CURRENT version must preserve the session fields
+    /// verbatim in bincode form.
+    #[test]
+    fn bincode_snapshot_preserves_session_metadata() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "a"));
+        store.note_applied(&ts(100, 0, "a"));
+        store.note_visible(&ts(200, 0, "b"));
+        store.note_merge_failed("bad");
+        store.prune_timestamps_before("", &ts(150, 0, "a"));
+
         let backend = MemoryBackend::new();
-        backend.save(&v1_bytes).unwrap();
+        store.save_to_backend_bincode(&backend).unwrap();
+        let loaded = Store::load_from_backend_bincode(&backend).unwrap();
 
-        // load_from_backend_bincode must detect version 1 < 2, apply migrations,
-        // and return the data intact (V1ToV2 is a no-op, so nothing changes).
-        let loaded = Store::load_from_backend_bincode(&backend)
-            .expect("v1 bincode snapshot should migrate and load successfully");
-
-        assert_eq!(loaded.len(), 2, "all keys must survive migration");
-
-        // Verify counter value survived the migration roundtrip.
-        match loaded.get("hits") {
-            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
-            other => panic!("expected Counter, got {:?}", other),
-        }
-
-        // Verify set value survived the migration roundtrip.
-        match loaded.get("users") {
-            Some(CrdtValue::Set(s)) => assert!(s.contains(&"alice".to_string())),
-            other => panic!("expected Set, got {:?}", other),
-        }
-
-        // Verify timestamps are restored after migration.
-        assert_eq!(
-            loaded.timestamp_for("hits"),
-            Some(&ts(42, 0, "A")),
-            "timestamp must survive migration"
-        );
+        assert_eq!(loaded.applied_origin("a"), Some(&ts(100, 0, "a")));
+        assert_eq!(loaded.visible_origins().get("b"), Some(&ts(200, 0, "b")));
+        assert!(loaded.merge_failed_contains("bad"));
+        assert_eq!(loaded.pruned_floor(), Some(&ts(150, 0, "a")));
     }
 
     #[test]
@@ -2020,5 +2293,183 @@ mod tests {
             err.to_string().contains("incompatible"),
             "error message must mention 'incompatible'; got: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Session-guarantee metadata (applied_origins / merge_failed_keys /
+    // pruned_floor)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn note_applied_is_max_monotone() {
+        let mut store = Store::new();
+        store.note_applied(&ts(100, 0, "a"));
+        assert_eq!(store.applied_origin("a"), Some(&ts(100, 0, "a")));
+
+        // Older timestamp must not regress the frontier.
+        store.note_applied(&ts(50, 9, "a"));
+        assert_eq!(store.applied_origin("a"), Some(&ts(100, 0, "a")));
+
+        // Newer timestamp advances it; other origins are independent.
+        store.note_applied(&ts(200, 0, "a"));
+        store.note_applied(&ts(10, 0, "b"));
+        assert_eq!(store.applied_origin("a"), Some(&ts(200, 0, "a")));
+        assert_eq!(store.applied_origin("b"), Some(&ts(10, 0, "b")));
+    }
+
+    /// visible_origins is a per-origin superset of applied_origins:
+    /// note_applied feeds it, and note_visible advances it WITHOUT
+    /// advancing applied_origins (unclaimed merges must never claim).
+    #[test]
+    fn visible_origins_superset_of_applied() {
+        let mut store = Store::new();
+        store.note_applied(&ts(100, 0, "a"));
+        assert_eq!(store.visible_origins().get("a"), Some(&ts(100, 0, "a")));
+
+        store.note_visible(&ts(200, 0, "b"));
+        assert_eq!(store.visible_origins().get("b"), Some(&ts(200, 0, "b")));
+        assert!(
+            store.applied_origin("b").is_none(),
+            "note_visible must not claim the origin"
+        );
+
+        // Max-monotone; empty node ids are ignored (zero sentinels).
+        store.note_visible(&ts(150, 0, "b"));
+        assert_eq!(store.visible_origins().get("b"), Some(&ts(200, 0, "b")));
+        store.note_visible(&ts(999, 0, ""));
+        assert!(!store.visible_origins().contains_key(""));
+    }
+
+    #[test]
+    fn merge_applied_origins_is_max_merge() {
+        let mut store = Store::new();
+        store.note_applied(&ts(100, 0, "a"));
+        store.note_applied(&ts(300, 0, "b"));
+
+        let mut remote = HashMap::new();
+        remote.insert("a".to_string(), ts(200, 0, "a")); // newer — adopts
+        remote.insert("b".to_string(), ts(100, 0, "b")); // older — keeps 300
+        remote.insert("c".to_string(), ts(50, 0, "c")); // new origin
+        store.merge_applied_origins(&remote);
+
+        assert_eq!(store.applied_origin("a"), Some(&ts(200, 0, "a")));
+        assert_eq!(store.applied_origin("b"), Some(&ts(300, 0, "b")));
+        assert_eq!(store.applied_origin("c"), Some(&ts(50, 0, "c")));
+    }
+
+    #[test]
+    fn merge_failed_keys_tracking() {
+        let mut store = Store::new();
+        assert!(!store.merge_failed_contains("k"));
+        store.note_merge_failed("k");
+        assert!(store.merge_failed_contains("k"));
+
+        store.merge_failed_extend(vec!["x".to_string(), "y".to_string()]);
+        assert!(store.merge_failed_contains("x"));
+        assert!(store.merge_failed_contains("y"));
+        assert_eq!(store.merge_failed_keys().len(), 3);
+    }
+
+    #[test]
+    fn prune_preserves_session_metadata_and_updates_floor() {
+        let mut store = Store::new();
+        store.put("k1".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k1", ts(100, 0, "a"));
+        store.note_applied(&ts(100, 0, "a"));
+        store.note_merge_failed("poisoned");
+
+        let pruned = store.prune_timestamps_before("", &ts(150, 0, "a"));
+        assert_eq!(pruned, 1);
+        assert!(store.timestamp_for("k1").is_none(), "per-key ts pruned");
+
+        // Session metadata must be untouched (old tokens stay satisfiable).
+        assert_eq!(store.applied_origin("a"), Some(&ts(100, 0, "a")));
+        assert!(store.merge_failed_contains("poisoned"));
+        // The pruned floor advanced to the prune frontier.
+        assert_eq!(store.pruned_floor(), Some(&ts(150, 0, "a")));
+
+        // A lower later prune must not regress the floor; a no-op prune
+        // (nothing removed) must not advance it.
+        let pruned = store.prune_timestamps_before("", &ts(120, 0, "a"));
+        assert_eq!(pruned, 0);
+        assert_eq!(store.pruned_floor(), Some(&ts(150, 0, "a")));
+    }
+
+    #[test]
+    fn delete_preserves_session_metadata() {
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "a"));
+        store.note_applied(&ts(100, 0, "a"));
+
+        store.delete("k");
+        assert_eq!(
+            store.applied_origin("a"),
+            Some(&ts(100, 0, "a")),
+            "applied_origins must survive delete"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_session_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.json");
+
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(100, 0, "a"));
+        store.note_applied(&ts(100, 0, "a"));
+        store.note_merge_failed("bad");
+        store.prune_timestamps_before("", &ts(200, 0, "a"));
+
+        store.save_snapshot(&path).unwrap();
+        let loaded = Store::load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.applied_origin("a"), Some(&ts(100, 0, "a")));
+        assert!(loaded.merge_failed_contains("bad"));
+        assert_eq!(loaded.pruned_floor(), Some(&ts(200, 0, "a")));
+    }
+
+    #[test]
+    fn snapshot_without_session_fields_loads_with_defaults() {
+        // Snapshots written before the session-guarantee fields existed
+        // must load with empty defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+
+        let json = serde_json::json!({
+            "format_version": 2,
+            "store": { "data": {}, "timestamps": {} }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert!(loaded.applied_origins().is_empty());
+        assert!(loaded.merge_failed_keys().is_empty());
+        assert!(loaded.pruned_floor().is_none());
+        assert!(loaded.visible_origins().is_empty());
+    }
+
+    /// Pre-v3 snapshots have no visible_origins; loading must rebuild it
+    /// conservatively from applied_origins and the change timestamps so
+    /// response tokens keep covering persisted data after an upgrade.
+    #[test]
+    fn snapshot_load_rebuilds_visible_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-with-data.json");
+
+        let json = serde_json::json!({
+            "format_version": 2,
+            "store": {
+                "data": {},
+                "timestamps": { "k": { "physical": 70, "logical": 0, "node_id": "c" } },
+                "applied_origins": { "a": { "physical": 50, "logical": 0, "node_id": "a" } }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let loaded = Store::load_snapshot(&path).unwrap();
+        assert_eq!(loaded.visible_origins().get("a"), Some(&ts(50, 0, "a")));
+        assert_eq!(loaded.visible_origins().get("c"), Some(&ts(70, 0, "c")));
     }
 }

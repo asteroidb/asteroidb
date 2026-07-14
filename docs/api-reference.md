@@ -13,6 +13,7 @@
 4. [エラーレスポンス](#エラーレスポンス)
 5. [Public API](#public-api)
    - [Eventual API](#eventual-api)
+   - [セッショントークン](#セッショントークン)
    - [Certified API](#certified-api)
    - [Status API](#status-api)
    - [Control Plane API (読み取り)](#control-plane-api-読み取り)
@@ -154,7 +155,10 @@ HTTP ステータスコードはエラー種別に応じて設定される。詳
 
 - **認証**: 不要
 - **パスパラメータ**: `key` - 取得対象のキー
-- **レスポンス**: `200 OK`
+- **クエリパラメータ** (省略可、[セッショントークン](#セッショントークン) 参照):
+  - `session_token` - 過去の write/read が返したトークン。ローカルレプリカがトークンの示す書き込みまで追いついている場合のみ値を返す（read-your-writes / monotonic reads）。空文字を渡すと前提条件なしでセッションを開始し、応答トークンのみ受け取る
+  - `wait_ms` - 追いつくまで待機する最大時間（ミリ秒、サーバ側上限 5000）。超過時は 412
+- **レスポンス**: `200 OK`、トークン不充足時 `412 Precondition Failed`、不正トークン時 `400 Bad Request`
 
 **レスポンスボディ:**
 
@@ -177,6 +181,27 @@ HTTP ステータスコードはエラー種別に応じて設定される。詳
 }
 ```
 
+`session_token` クエリパラメータを付けた場合のみ、応答に `session_token` フィールドが追加される（付けない場合の応答バイト列は完全に従来通り）:
+
+```json
+{
+  "key": "hits",
+  "value": { "type": "counter", "value": 42 },
+  "session_token": "v1:19704a1b2c3.0.6e6f64652d61"
+}
+```
+
+ローカルレプリカがトークンの示す書き込みまで追いついていない場合、`wait_ms` の待機後も不充足なら 412 を返す（嘘の成功は返さない）:
+
+```json
+// HTTP 412 Precondition Failed
+// Retry-After: 1
+{
+  "error_code": "SESSION_NOT_SATISFIED",
+  "message": "session token not satisfied for key hits; retry, increase wait_ms, or try another replica"
+}
+```
+
 **curl 例:**
 
 ```bash
@@ -185,6 +210,15 @@ curl http://localhost:3000/api/eventual/hits
 
 # ネストしたキーの取得
 curl http://localhost:3000/api/eventual/users/alice/profile
+
+# write が返したトークン付きで読む（read-your-writes）
+curl "http://localhost:3000/api/eventual/hits?session_token=v1:19704a1b2c3.0.6e6f64652d61"
+
+# 追いつくまで最大 3 秒待つ
+curl "http://localhost:3000/api/eventual/hits?session_token=v1:19704a1b2c3.0.6e6f64652d61&wait_ms=3000"
+
+# write なしでセッション開始（応答トークンのみ受け取る）
+curl "http://localhost:3000/api/eventual/hits?session_token="
 ```
 
 ---
@@ -276,9 +310,14 @@ CRDT 操作をローカルの eventual ストアに適用する。
 
 ```json
 {
-  "ok": true
+  "ok": true,
+  "session_token": "v1:19704a1b2c3.0.6e6f64652d61"
 }
 ```
+
+`session_token` はこの書き込みの HLC 位置を表す（常に返却される）。次の
+`GET /api/eventual/{key}?session_token=...` に添付すると read-your-writes が保証される。
+詳細は [セッショントークン](#セッショントークン) を参照。
 
 **curl 例:**
 
@@ -320,6 +359,125 @@ curl -X POST http://localhost:3000/api/eventual/write \
   "error_code": "TYPE_MISMATCH",
   "message": "expected Set, got Counter"
 }
+```
+
+---
+
+### セッショントークン
+
+Eventual API のオプション拡張として、クライアントセッション保証
+（read-your-writes / monotonic reads）を提供する。サーバはセッション状態を
+一切持たない（ステートレス）: 書き込み応答が返す不透明なトークンをクライアント
+が次の読み取りに添付する方式である。
+
+#### 保証内容
+
+- **read-your-writes**: write が返したトークン付きの read が `200` を返すなら、
+  応答値はその write を適用済み（または LWW 順序で支配済み）の状態から読まれて
+  いる。追いついていないレプリカは `412` を返す — **嘘の成功は絶対に返さない**
+  （不要な 412 = 偽陰性はあり得る）
+- **monotonic reads**: read 応答のトークン（観測位置）を次の read に持ち回る
+  ことで、別レプリカに切り替えても読み取りが時間的に巻き戻らない
+
+#### トークン形式 (v1)
+
+```text
+token   := "v1:" entry ("," entry)*
+entry   := physical-hex "." logical-hex "." nodeid-hex
+```
+
+- `physical`: u64 の 16 進表現（書き込み HLC の物理時刻 ms）
+- `logical`: u32 の 16 進表現
+- `nodeid-hex`: 起点ノード ID の UTF-8 バイト列の 16 進表現
+
+例: `v1:19704a1b2c3.2.6e6f64652d61,19704b00000.0.6e6f64652d62`
+
+文字集合は `[0-9a-f.,:v]` のみで URL エンコード不要。クライアントはトークンを
+**不透明な文字列として扱う**こと（中身に依存しない）。
+
+制約: 全長 8192 バイト以下、エントリ数 64 以下、ノード ID 128 バイト以下。
+サーバが発行する応答トークンはこの制限内に収まるよう間引かれる（古い HLC の
+エントリから削除）ため、**サーバ発行のトークンは常に次のリクエストでパース可能**。
+エントリ 0 個の `v1:` は有効な空トークン（前提条件なし）で、可視 origin の
+無い起動直後のレプリカが発行し得る。
+`physical` がサーバ時計 + 60 秒を超えるトークンは 400 で拒否される
+（クロック前進攻撃対策。トークンがサーバの HLC に取り込まれることはない）。
+
+#### 寿命
+
+トークンに有効期限はない。判定材料（origin 別適用済みフロンティア）は単調増加
+かつ compaction の対象外のため、**古いトークンほど充足しやすい**。再起動後も
+スナップショットに永続化される。
+
+#### 保証の限界（重要）
+
+- 保証は「トークンに記載された各 origin ノードの書き込み prefix の包含」のみの
+  **保守的判定**である。線形化可能性や完全な因果一貫性は主張しない
+  （HLC スカラ列による判定は過剰包含になり得る）
+- Counter / Set キーは push 型複製のみの区間では pull 同期周期
+  （デフォルト 2 秒）ぶんの 412 が発生し得る。Register キーは値レベル判定
+  （LWW タイムスタンプ比較）により即時充足しやすい
+- origin フロンティアの前進（applied claim）は「完全な受信」を証明できる
+  転送に限られる: 送信側の `applied_origins` の養子縁組（要求 frontier が
+  検証済み受信 prefix 以下、かつ送信側の prune フロア以上の pull）とフル
+  ダンプのみ。**delta エントリ単体から entry の origin を claim することは
+  ない**（送信側完全性は「受信側 ⊇ 送信側」しか証明せず、第三者 origin の
+  prefix 保持を証明しないため）
+- pull の要求 frontier は検証済み受信 prefix を基準にするため、push で
+  同期フロンティアが先行しても claim は次の pull 周期（デフォルト 2 秒）で
+  回復する。claim が作れない pull（送信側が prune 済み等）は同一周期内に
+  フルシンクへフォールバックして検証済み受信 prefix を再確立する
+- CRDT 型衝突（`TYPE_MISMATCH`）が発生したキーはセッション保証の対象外となる
+  （恒久的に 412。トークン無しの read は引き続き可能）
+- 可視性順序の保証であり**耐久性の保証ではない**（WAL 未実装のため、再起動で
+  スナップショット以降の書き込みが失われた場合、トークンでは検出できない —
+  自レプリカでは 412 になるだけで嘘は返さない）
+- トークンは eventual ストア専用。certified read に流用しても充足しない
+  （412 になるだけで害はない）
+- 応答トークンはエントリ数上限 64・全長 8192 バイトで間引かれ得る（古い HLC
+  のエントリから削除。直前に読んだキーの変更位置はリクエスト由来として優先
+  保持される）。間引き後は記載されている origin についてのみ monotonic reads
+  を保証する（保証の弱化であり嘘ではない）。書き込み origin が 64 を超える
+  クラスタでは、間引かれた origin の書き込みについて読み取りが巻き戻る可能性
+  がある — 完全な monotonic reads が必要な場合は origin 数を 64 以下に保つこと
+- 応答トークンは applied claim 済みの origin だけでなく**可視状態全体**
+  （unclaimed マージで見えるようになった寄与を含む）を被覆する。観測した値を
+  被覆しないトークンを発行すると、別レプリカでの巻き戻り（monotonic reads の
+  嘘）につながるため。過剰被覆は偽陰性（412）方向にしか作用しない
+- トークンは無署名である。偽造・改竄されたトークンは自分の read が 412/400 に
+  なるだけで他クライアントやサーバに害を与えない（BFT 拡張時に Ed25519 署名を
+  検討予定）
+
+#### 内部プロトコル互換性(運用注意)
+
+セッション保証の導入で `DeltaSyncResponse` / `KeyDumpResponse`(Internal API)に
+フィールドが追加された。JSON では後方互換だが、bincode
+(`application/octet-stream`)は位置依存のため旧ノードの bincode 応答は新ノード
+でデコードできない。新ノードの pull はデコード失敗時に **JSON で自動リトライ**
+するため、ローリングアップグレード中も pull ベースの anti-entropy は JSON
+経路で継続する(帯域効率は落ちる)。混在期間を短くするためアップグレードは
+ロックステップ推奨(`KeyDumpResponse.timestamps` 追加時と同じ前例)。
+
+スナップショット形式もバージョン 3 に更新された(セッション関連フィールドの
+追加)。v1/v2 スナップショット(JSON / bincode とも)はロード時に自動マイグレー
+ションされるが、v3 スナップショットを旧バージョンのコードで読むことはできない
+(ダウングレード時はスナップショットの取り直しが必要)。
+
+#### 利用例
+
+```bash
+# 1. 書き込み → トークンを得る
+TOKEN=$(curl -s -X POST http://node-a:3000/api/eventual/write \
+  -H "Content-Type: application/json" \
+  -d '{"type":"register_set","key":"greeting","value":"hello"}' | jq -r .session_token)
+
+# 2. 別ノードでトークン付き read（追いついていなければ 412）
+curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN"
+
+# 3. 412 の場合: wait_ms 付きでリトライ（複製が届き次第 200）
+curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN&wait_ms=3000"
+
+# 4. 応答の session_token を次の read に持ち回る（monotonic reads）
 ```
 
 ---
@@ -1006,6 +1164,14 @@ curl -X POST http://localhost:3000/api/internal/sync \
     "physical": 1700000001000,
     "logical": 0,
     "node_id": "node-1"
+  },
+  "applied_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "merge_failed_keys": [],
+  "pruned_floor": null,
+  "visible_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
   }
 }
 ```
@@ -1014,6 +1180,10 @@ curl -X POST http://localhost:3000/api/internal/sync \
 |-----------|-----|------|
 | `entries` | array | frontier 以降に変更されたエントリ |
 | `sender_frontier` | HlcTimestamp \| null | 送信元の現在の frontier |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の origin 別適用済みフロンティア（セッション保証のフロンティア養子縁組に使用） |
+| `merge_failed_keys` | array<string> | 応答側でマージ失敗（型衝突）したキー |
+| `pruned_floor` | HlcTimestamp \| null | 応答側の prune 済みフロンティア。要求 frontier がこれ未満の場合、受信側は `applied_origins` を採用しない |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の origin 別**可視**フロンティア（`applied_origins` の上位集合）。受信側は無条件に max マージし、応答セッショントークンの被覆に使う |
 
 **curl 例:**
 
@@ -1050,6 +1220,13 @@ eventual ストアの全キーバリューペアを、ストアの現在 frontie
   },
   "timestamps": {
     "hits": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "applied_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "merge_failed_keys": [],
+  "visible_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
   }
 }
 ```
@@ -1059,6 +1236,9 @@ eventual ストアの全キーバリューペアを、ストアの現在 frontie
 | `entries` | map<string, CrdtValue> | 全キーバリューペア |
 | `frontier` | HlcTimestamp \| null | ストアの現在 frontier |
 | `timestamps` | map<string, HlcTimestamp> | キーごとの HLC タイムスタンプ |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の origin 別適用済みフロンティア。フルダンプは完全状態のため、受信側は全エントリ適用後に無条件で採用してよい |
+| `merge_failed_keys` | array<string> | 応答側でマージ失敗（型衝突）したキー |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の origin 別可視フロンティア（`applied_origins` の上位集合、応答セッショントークンの被覆に使用） |
 
 **curl 例:**
 
@@ -1545,6 +1725,7 @@ curl -X DELETE http://localhost:3000/api/control-plane/policies/user%2F \
 | `STALE_VERSION` | 409 Conflict | 古いバージョンでの書き込み | 最新値を再取得してリトライする |
 | `POLICY_DENIED` | 403 Forbidden | 配置ポリシーによる拒否 | 対象キー範囲の配置ポリシーを確認する |
 | `TIMEOUT` | 504 Gateway Timeout | Authority 合意がタイムアウト | Authority ノードの稼働状況を確認する。`on_timeout=pending` で再試行可能 |
+| `SESSION_NOT_SATISFIED` | 412 Precondition Failed | セッショントークンの示す書き込みまでローカルレプリカが追いついていない | `Retry-After` に従いリトライ、`wait_ms` を増やす、または別レプリカに問い合わせる |
 | `INCOMPATIBLE_VERSION` | 500 Internal Server Error | データバージョンとコードバージョンの不整合 | AsteroidDB を最新版に更新するか、データマイグレーションを実行する |
 | `MIGRATION_FAILED` | 500 Internal Server Error | データマイグレーション失敗 | ログを確認し、データの整合性を検証する |
 | `INTERNAL` | 500 Internal Server Error | 内部エラー | サーバーログを確認する |
@@ -1623,8 +1804,8 @@ Last-Writer-Wins セマンティクスのレジスタ。
 | CLI コマンド | HTTP メソッド | エンドポイント | 説明 |
 |-------------|-------------|---------------|------|
 | `asteroidb-cli status` | GET | `/api/metrics` | ノードステータスのサマリ表示 |
-| `asteroidb-cli get <key>` | GET | `/api/eventual/{key}` | eventual ストアからの値取得 |
-| `asteroidb-cli put <key> <value>` | POST | `/api/eventual/write` | LWW-Register への値書き込み |
+| `asteroidb-cli get <key>` | GET | `/api/eventual/{key}` | eventual ストアからの値取得。`--session-token <tok>` / `--session` / `--wait-ms <n>` でセッション保証付き読み取り |
+| `asteroidb-cli put <key> <value>` | POST | `/api/eventual/write` | LWW-Register への値書き込み。`OK` の次行に `session_token: <tok>` を表示 |
 | `asteroidb-cli metrics` | GET | `/api/metrics` | 詳細ランタイムメトリクス |
 | `asteroidb-cli slo` | GET | `/api/slo` | SLO バジェット状況 |
 

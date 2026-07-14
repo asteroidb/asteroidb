@@ -92,6 +92,10 @@ fn main() {
     let delta_response = DeltaSyncResponse {
         entries: delta_entries,
         sender_frontier: store.current_frontier(),
+        applied_origins: std::collections::HashMap::new(),
+        merge_failed_keys: vec![],
+        pruned_floor: None,
+        visible_origins: HashMap::new(),
     };
 
     let start = Instant::now();

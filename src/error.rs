@@ -54,6 +54,17 @@ pub enum CrdtError {
     #[error("certification timeout: local write committed but certification did not complete")]
     CertificationTimeout,
 
+    /// A session-token-guarded read could not be satisfied: the local
+    /// replica has not (provably) applied all writes covered by the token.
+    ///
+    /// This is a fail-closed refusal, never a stale answer: the client can
+    /// retry, wait longer (`wait_ms`), or try another replica. Maps to
+    /// HTTP 412 PRECONDITION_FAILED with a `Retry-After` header.
+    #[error(
+        "session token not satisfied for key {key}: local replica has not applied the requested writes yet"
+    )]
+    SessionNotSatisfied { key: String },
+
     #[error("incompatible format version: data={data_version}, code={code_version}")]
     IncompatibleVersion {
         data_version: u32,

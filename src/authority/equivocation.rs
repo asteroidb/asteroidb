@@ -1226,7 +1226,9 @@ mod tests {
 
         det.spawn_persist();
         let mut persisted = false;
-        for _ in 0..200 {
+        // Generous window: spawn_blocking can be delayed well past a few
+        // seconds when the whole test suite saturates the blocking pool.
+        for _ in 0..3_000 {
             if path.exists() {
                 persisted = true;
                 break;

@@ -251,6 +251,10 @@ mod tests {
                 hlc: hlc(200, 0, "node-1"),
             }],
             sender_frontier: Some(hlc(200, 0, "node-1")),
+            applied_origins: HashMap::new(),
+            merge_failed_keys: vec![],
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
         };
 
         let (bytes, _) = serialize_internal(&resp, Some(CONTENT_TYPE_BINCODE)).unwrap();
@@ -275,6 +279,9 @@ mod tests {
             entries,
             frontier: Some(hlc(500, 0, "node-1")),
             timestamps,
+            applied_origins: HashMap::new(),
+            merge_failed_keys: vec![],
+            visible_origins: HashMap::new(),
         };
 
         let (bytes, _) = serialize_internal(&resp, Some(CONTENT_TYPE_BINCODE)).unwrap();

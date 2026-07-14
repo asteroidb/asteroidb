@@ -323,6 +323,87 @@ async fn cli_put_then_get_multiple_keys() {
 }
 
 #[tokio::test]
+async fn cli_session_token_flow() {
+    let (addr, server) = spawn_server().await;
+    let host = format!("127.0.0.1:{}", addr.port());
+
+    // put prints "OK" plus a session_token line (scripts grepping "OK"
+    // keep working).
+    let out = run_cli(&host, &["put", "sess-key", "v1"]).await;
+    assert!(
+        out.status.success(),
+        "put should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("OK"));
+    let token = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("session_token: "))
+        .expect("put output should include a session_token line")
+        .to_string();
+
+    // get --session-token with the write token on the same node → 200,
+    // value present, response token included in the JSON.
+    let out = run_cli(&host, &["get", "sess-key", "--session-token", &token]).await;
+    assert!(
+        out.status.success(),
+        "session get should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(body["value"]["value"], "v1");
+    assert!(
+        body["session_token"].is_string(),
+        "response should carry a session token: {body}"
+    );
+
+    // A token from an origin this node never saw → 412 → exit 1 + hint.
+    // Use a key that is not a register so the LWW value-evidence path
+    // cannot satisfy the token. (--wait-ms 0 keeps the test fast; the
+    // flag must pass through.)
+    let foreign = "v1:1.0.6f746865722d6e6f6465"; // physical=1 @ "other-node"
+    let out = run_cli(
+        &host,
+        &[
+            "get",
+            "unsynced-key",
+            "--session-token",
+            foreign,
+            "--wait-ms",
+            "0",
+        ],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "unsatisfied session get must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("412"),
+        "stderr should mention 412: {stderr}"
+    );
+    assert!(
+        stderr.contains("replica not caught up"),
+        "stderr should contain the retry hint: {stderr}"
+    );
+
+    // --session (empty token) starts a session without a precondition.
+    let out = run_cli(&host, &["get", "sess-key", "--session"]).await;
+    assert!(out.status.success());
+    let body: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(
+        body["session_token"].is_string(),
+        "--session should return a token: {body}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn cli_connection_refused_exits_nonzero() {
     // Attempt to connect to a port where nothing is listening.
     let out = run_cli("127.0.0.1:1", &["status"]).await;

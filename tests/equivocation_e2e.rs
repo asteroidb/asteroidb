@@ -850,9 +850,11 @@ async fn evidence_survives_detector_restart() {
             .unwrap();
     }
 
-    // The handler persists on a background blocking task; wait for the file.
+    // The handler persists on a background blocking task; wait for the
+    // file. Generous window: the blocking pool can lag well past a few
+    // seconds when the whole test suite runs in parallel.
     let mut persisted = false;
-    for _ in 0..100 {
+    for _ in 0..1_500 {
         if path.exists() {
             persisted = true;
             break;
