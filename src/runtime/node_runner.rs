@@ -11,6 +11,7 @@ use crate::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use crate::authority::bls::BlsKeypair;
 use crate::authority::certificate::{EpochConfig, EpochManager, KeysetRegistry, KeysetVersion};
+use crate::authority::equivocation::{EquivocationDetector, GOSSIP_SAMPLE_MAX, ObserveOutcome};
 use crate::authority::frontier_reporter::FrontierReporter;
 use crate::authority::frontier_sig::{FrontierSignature, NodeSigner};
 use crate::compaction::CompactionEngine;
@@ -118,6 +119,11 @@ pub struct NodeRunnerConfig {
     /// Shared current-epoch counter — the same `Arc` as
     /// `AppState.current_epoch`, refreshed on each epoch check tick.
     pub current_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared equivocation detector — must be the *same* `Arc` as
+    /// `AppState.equivocation`, so evidence detected on the HTTP receive
+    /// path rides this runner's gossip (and self-signed reports feed the
+    /// same index).
+    pub equivocation: Option<Arc<EquivocationDetector>>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -141,6 +147,7 @@ impl Default for NodeRunnerConfig {
             keyset_registry: None,
             internal_token: None,
             current_epoch: None,
+            equivocation: None,
         }
     }
 }
@@ -253,6 +260,10 @@ pub struct NodeRunner {
     /// Shared current-epoch counter (same `Arc` as `AppState.current_epoch`),
     /// refreshed by the epoch check tick.
     current_epoch_shared: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared equivocation detector (same `Arc` as `AppState.equivocation`).
+    /// Feeds self-signed attestations into the index and samples gossip
+    /// summaries for outgoing frontier pushes.
+    equivocation: Option<Arc<EquivocationDetector>>,
 }
 
 /// State for an in-progress rebalance operation.
@@ -385,6 +396,12 @@ impl NodeRunner {
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
         let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Initialize the accused-authorities gauge from evidence restored
+        // at startup, so a restart does not reset gauge-based alerting
+        // while GET /api/authority/equivocations still shows accusations.
+        if let Some(detector) = &config.equivocation {
+            metrics.set_accused_authorities(detector.accused_count());
+        }
         Self {
             clock: Hlc::new(node_id.0.clone()),
             node_id,
@@ -393,6 +410,7 @@ impl NodeRunner {
             node_signer: config.node_signer.clone(),
             shared_keyset_registry: config.keyset_registry.clone(),
             current_epoch_shared: config.current_epoch.clone(),
+            equivocation: config.equivocation.clone(),
             config,
             frontier_reporter,
             shutdown_tx,
@@ -480,6 +498,11 @@ impl NodeRunner {
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
         let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Initialize the accused-authorities gauge from evidence restored
+        // at startup (see `with_cluster_nodes` for rationale).
+        if let Some(detector) = &config.equivocation {
+            metrics.set_accused_authorities(detector.accused_count());
+        }
         Self {
             clock: Hlc::new(node_id.0.clone()),
             node_id,
@@ -488,6 +511,7 @@ impl NodeRunner {
             node_signer: config.node_signer.clone(),
             shared_keyset_registry: config.keyset_registry.clone(),
             current_epoch_shared: config.current_epoch.clone(),
+            equivocation: config.equivocation.clone(),
             config,
             frontier_reporter,
             shutdown_tx,
@@ -1416,6 +1440,45 @@ impl NodeRunner {
                         None => frontiers.iter().map(|_| None).collect(),
                     };
 
+                    // Feed our own signed reports into the equivocation
+                    // index. An honest node can never conflict with itself
+                    // (the HLC is monotone and the digest deterministic), so
+                    // a self-equivocation signals a compromised key or a
+                    // duplicate process sharing this key seed.
+                    if let Some(detector) = &self.equivocation {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let mut evidence_dirty = false;
+                        for (f, sig) in frontiers.iter().zip(signatures.iter()) {
+                            if let Some(sig) = sig
+                                && let ObserveOutcome::Equivocation(ev) =
+                                    detector.observe(f, sig, now_ms)
+                            {
+                                tracing::warn!(
+                                    authority = %ev.authority_id.0,
+                                    key_range = %ev.key_range.prefix,
+                                    digest_first = %ev.first.frontier.digest_hash,
+                                    digest_second = %ev.second.frontier.digest_hash,
+                                    "self-attestation equivocation: possible key compromise or \
+                                     duplicate process sharing this signing key"
+                                );
+                                self.metrics.record_equivocation_at(now_ms);
+                                self.metrics
+                                    .set_accused_authorities(detector.accused_count());
+                                evidence_dirty = true;
+                            }
+                        }
+                        // Persist exactly like the HTTP receive path does:
+                        // a self-detected equivocation signals a possible
+                        // key compromise, and the operator's likely response
+                        // (a restart) must not wipe the only evidence.
+                        if evidence_dirty {
+                            detector.spawn_persist();
+                        }
+                    }
+
                     {
                         let mut api = self.certified_api.lock().await;
                         for (f, sig) in frontiers.iter().zip(signatures.iter()) {
@@ -1432,7 +1495,16 @@ impl NodeRunner {
                         }
                     }
 
-                    self.push_frontiers_to_peers(frontiers, signatures).await;
+                    // Attach the split-view gossip sample (evidence pairs
+                    // first, then newest observed heads) to the same push —
+                    // no new protocol, no extra periodic task.
+                    let observed = self
+                        .equivocation
+                        .as_ref()
+                        .map(|d| d.gossip_summaries(GOSSIP_SAMPLE_MAX))
+                        .unwrap_or_default();
+                    self.push_frontiers_to_peers(frontiers, signatures, observed)
+                        .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1474,6 +1546,7 @@ impl NodeRunner {
         &self,
         frontiers: Vec<crate::authority::ack_frontier::AckFrontier>,
         signatures: Vec<Option<FrontierSignature>>,
+        observed: Vec<crate::authority::equivocation::ObservedAttestation>,
     ) {
         let Some(client) = &self.frontier_sync_client else {
             return;
@@ -1493,7 +1566,12 @@ impl NodeRunner {
         tokio::spawn(async move {
             for peer in peers {
                 match client
-                    .push_signed_frontiers(&peer.addr, frontiers.clone(), signatures.clone())
+                    .push_frontiers_with_observations(
+                        &peer.addr,
+                        frontiers.clone(),
+                        signatures.clone(),
+                        observed.clone(),
+                    )
                     .await
                 {
                     Ok(resp) => {
@@ -4090,6 +4168,208 @@ mod tests {
             !api.all_frontiers().is_empty(),
             "signed reports must still update the frontier set"
         );
+    }
+
+    #[tokio::test]
+    async fn report_frontiers_feeds_equivocation_detector_for_gossip() {
+        let signer = make_signer("auth-1", 45);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        runner.report_frontiers().await;
+
+        // The self-signed report was fed into the shared detector, so the
+        // next push's gossip lane carries it (split-view seed).
+        let sample = detector.gossip_summaries(crate::authority::equivocation::GOSSIP_SAMPLE_MAX);
+        assert!(
+            !sample.is_empty(),
+            "self-signed reports must enter the gossip sample"
+        );
+        assert!(
+            sample
+                .iter()
+                .all(|o| o.frontier.authority_id == node_id("auth-1"))
+        );
+
+        // Honest self-reporting never accuses: the HLC is monotone and the
+        // digest deterministic, so repeated ticks stay clean.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        runner.report_frontiers().await;
+        assert_eq!(detector.accused_count(), 0);
+        assert!(detector.evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn self_equivocation_detected_in_report_tick_is_persisted() {
+        use crate::authority::equivocation::MAX_OBSERVED_PER_SCOPE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("equivocation_evidence.json");
+
+        let signer = make_signer("auth-1", 46);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            Some(path.clone()),
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        // Simulate a duplicate process sharing this signing key: conflicting
+        // attestations (a different digest) are already indexed for the HLCs
+        // the next report tick will use, so the runner's *own* report
+        // triggers the self-equivocation path.
+        // `observe()` never verifies signatures itself (its documented
+        // precondition), so one signature is reused across the seeded twin
+        // attestations — signing 128 frontiers per attempt would take longer
+        // than the seeded HLC window and the tick would miss it.
+        let twin_sig = {
+            let f = AckFrontier {
+                authority_id: node_id("auth-1"),
+                frontier_hlc: HlcTimestamp {
+                    physical: 0,
+                    logical: 0,
+                    node_id: "auth-1".into(),
+                },
+                key_range: kr(""),
+                policy_version: PolicyVersion(1),
+                digest_hash: "twin-process-digest".into(),
+            };
+            signer.sign_frontier(&f, KeysetVersion(1))
+        };
+        for attempt in 0..20 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            for off in 0..(MAX_OBSERVED_PER_SCOPE as u64) {
+                let frontier = AckFrontier {
+                    authority_id: node_id("auth-1"),
+                    frontier_hlc: HlcTimestamp {
+                        physical: now_ms + off,
+                        logical: 0,
+                        node_id: "auth-1".into(),
+                    },
+                    key_range: kr(""),
+                    policy_version: PolicyVersion(1),
+                    digest_hash: "twin-process-digest".into(),
+                };
+                detector.observe(&frontier, &twin_sig, now_ms);
+            }
+            runner.report_frontiers().await;
+            if detector.accused_count() > 0 {
+                break;
+            }
+            assert!(attempt < 19, "self-equivocation was never detected");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(detector.is_accused(&node_id("auth-1")));
+
+        // The runner path must persist the evidence just like the HTTP
+        // receive path — a restart (the likely operator response to a key
+        // compromise) must not wipe the proof.
+        let mut persisted = false;
+        for _ in 0..250 {
+            if path.exists() {
+                persisted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            persisted,
+            "runner-detected evidence must be written to equivocation_evidence.json"
+        );
+        let restored =
+            crate::authority::equivocation::EquivocationDetector::new(Some(path.clone()));
+        assert!(
+            restored.is_accused(&node_id("auth-1")),
+            "accusation must survive a restart"
+        );
+        assert!(!restored.evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runner_construction_initializes_accused_gauge_from_restored_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("equivocation_evidence.json");
+
+        // Record an equivocation and persist it, then "restart".
+        let signer = make_signer("auth-1", 47);
+        {
+            let det = crate::authority::equivocation::EquivocationDetector::new(Some(path.clone()));
+            for digest in ["digest-a", "digest-b"] {
+                let frontier = AckFrontier {
+                    authority_id: node_id("auth-1"),
+                    frontier_hlc: HlcTimestamp {
+                        physical: 4_000,
+                        logical: 0,
+                        node_id: "auth-1".into(),
+                    },
+                    key_range: kr(""),
+                    policy_version: PolicyVersion(1),
+                    digest_hash: digest.into(),
+                };
+                let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+                det.observe(&frontier, &sig, 5_000);
+            }
+            assert_eq!(det.accused_count(), 1);
+            let (out_path, bytes) = det.persist_payload().expect("persist path configured");
+            std::fs::write(&out_path, &bytes).unwrap();
+        }
+
+        let restored = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            Some(path),
+        ));
+        let metrics = default_metrics();
+        let config = NodeRunnerConfig {
+            equivocation: Some(Arc::clone(&restored)),
+            ..NodeRunnerConfig::default()
+        };
+        let _runner = NodeRunner::new(
+            node_id("auth-1"),
+            wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            Arc::clone(&metrics),
+        )
+        .await;
+
+        // The gauge must reflect the restored accusations immediately, not
+        // only after the next new detection — dashboards keyed on it would
+        // otherwise report a cleared incident after every restart.
+        assert_eq!(metrics.snapshot().equivocation_accused_authorities, 1);
     }
 
     #[tokio::test]

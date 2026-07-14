@@ -319,6 +319,19 @@ pub struct RuntimeMetrics {
     /// during periodic checkpoint checks.
     pub write_ops_total: AtomicU64,
 
+    /// Cumulative count of newly detected equivocation evidence pairs.
+    pub equivocation_detected_total: AtomicU64,
+
+    /// Timestamp (ms) of the last equivocation detection (0 if none).
+    pub equivocation_last_detected_ms: AtomicU64,
+
+    /// Gauge: number of authorities with stored equivocation evidence.
+    pub equivocation_accused_authorities: AtomicU64,
+
+    /// Cumulative count of relayed attestations verified and cross-checked
+    /// via the split-view gossip lane.
+    pub split_view_observations_total: AtomicU64,
+
     /// Per-key write operation counts for accurate per-range compaction tracking.
     ///
     /// Maps written keys to their cumulative op count since last drain.
@@ -358,6 +371,10 @@ impl Default for RuntimeMetrics {
             key_rotation_last_version: AtomicU64::default(),
             key_rotation_last_time_ms: AtomicU64::default(),
             write_ops_total: AtomicU64::default(),
+            equivocation_detected_total: AtomicU64::default(),
+            equivocation_last_detected_ms: AtomicU64::default(),
+            equivocation_accused_authorities: AtomicU64::default(),
+            split_view_observations_total: AtomicU64::default(),
             write_ops_by_key: Mutex::new(HashMap::new()),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
@@ -525,6 +542,26 @@ impl RuntimeMetrics {
             .store(time_ms, Ordering::Relaxed);
     }
 
+    /// Record a newly detected equivocation evidence pair.
+    pub fn record_equivocation_at(&self, now_ms: u64) {
+        self.equivocation_detected_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.equivocation_last_detected_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Update the gauge of authorities with stored equivocation evidence.
+    pub fn set_accused_authorities(&self, n: u64) {
+        self.equivocation_accused_authorities
+            .store(n, Ordering::Relaxed);
+    }
+
+    /// Record one relayed attestation processed via the split-view gossip lane.
+    pub fn record_split_view_observation(&self) {
+        self.split_view_observations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the completion of a rebalance operation.
     pub fn record_rebalance_complete(&self, _key_range: &str, duration: Duration) {
         self.rebalance_complete_total
@@ -583,6 +620,16 @@ impl RuntimeMetrics {
             key_rotation_last_version: self.key_rotation_last_version.load(Ordering::Relaxed),
             key_rotation_last_time_ms: self.key_rotation_last_time_ms.load(Ordering::Relaxed),
             write_ops_total: self.write_ops_total.load(Ordering::Relaxed),
+            equivocation_detected_total: self.equivocation_detected_total.load(Ordering::Relaxed),
+            equivocation_last_detected_ms: self
+                .equivocation_last_detected_ms
+                .load(Ordering::Relaxed),
+            equivocation_accused_authorities: self
+                .equivocation_accused_authorities
+                .load(Ordering::Relaxed),
+            split_view_observations_total: self
+                .split_view_observations_total
+                .load(Ordering::Relaxed),
             delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
             full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
             full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
@@ -653,6 +700,14 @@ pub struct MetricsSnapshot {
     pub key_rotation_last_time_ms: u64,
     /// Cumulative write operations (eventual + certified) for compaction tracking.
     pub write_ops_total: u64,
+    /// Cumulative count of newly detected equivocation evidence pairs.
+    pub equivocation_detected_total: u64,
+    /// Timestamp (ms) of the last equivocation detection (0 if none).
+    pub equivocation_last_detected_ms: u64,
+    /// Gauge: number of authorities with stored equivocation evidence.
+    pub equivocation_accused_authorities: u64,
+    /// Cumulative relayed attestations processed via the split-view gossip lane.
+    pub split_view_observations_total: u64,
     /// Cumulative number of delta syncs performed (push phase).
     pub delta_sync_count: u64,
     /// Cumulative number of full sync fallbacks triggered by high change rate.
@@ -664,6 +719,27 @@ pub struct MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equivocation_metrics_default_zero_and_record() {
+        let metrics = RuntimeMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.equivocation_detected_total, 0);
+        assert_eq!(snap.equivocation_last_detected_ms, 0);
+        assert_eq!(snap.equivocation_accused_authorities, 0);
+        assert_eq!(snap.split_view_observations_total, 0);
+
+        metrics.record_equivocation_at(1_234);
+        metrics.record_equivocation_at(5_678);
+        metrics.set_accused_authorities(2);
+        metrics.record_split_view_observation();
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.equivocation_detected_total, 2);
+        assert_eq!(snap.equivocation_last_detected_ms, 5_678);
+        assert_eq!(snap.equivocation_accused_authorities, 2);
+        assert_eq!(snap.split_view_observations_total, 1);
+    }
 
     #[test]
     fn collect_single_duration() {

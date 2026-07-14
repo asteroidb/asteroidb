@@ -69,6 +69,10 @@ fn test_state() -> Arc<AppState> {
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
     })
 }
 

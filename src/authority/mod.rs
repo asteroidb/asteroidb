@@ -5,6 +5,7 @@ pub mod bls;
 #[cfg(not(feature = "native-crypto"))]
 pub mod bls_stub;
 pub mod certificate;
+pub mod equivocation;
 pub mod frontier_reporter;
 pub mod frontier_sig;
 pub mod verifier;
@@ -14,6 +15,9 @@ pub use attestation_pool::AttestationPool;
 pub use certificate::{
     CURRENT_FORMAT_VERSION, EpochConfig, EpochManager, FormatVersionConfig, KeysetRegistry,
     KeysetVersion, SignatureAlgorithm,
+};
+pub use equivocation::{
+    EquivocationDetector, EquivocationEvidence, ObserveOutcome, ObservedAttestation,
 };
 pub use frontier_reporter::FrontierReporter;
 pub use frontier_sig::{

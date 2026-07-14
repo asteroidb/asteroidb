@@ -276,6 +276,24 @@ pub struct StatusResponse {
     pub status: CertificationStatus,
 }
 
+/// Response for `GET /api/authority/equivocations`.
+///
+/// The `evidence` entries carry both conflicting signed attestations
+/// verbatim (hex-encoded signatures included), so a third party can
+/// re-verify each pair against the registry keys — the report is a
+/// portable proof-of-misbehaviour bundle, not just a status summary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EquivocationReport {
+    /// Authorities with at least one recorded equivocation.
+    pub accused_authorities: Vec<String>,
+    /// Number of stored evidence entries.
+    pub evidence_count: usize,
+    /// Conflicts detected beyond the per-authority storage cap (not stored).
+    pub evidence_overflow_total: u64,
+    /// The raw evidence pairs.
+    pub evidence: Vec<crate::authority::equivocation::EquivocationEvidence>,
+}
+
 // ---------------------------------------------------------------
 // Control-plane request types
 // ---------------------------------------------------------------

@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::authority::ack_frontier::AckFrontier;
+use crate::authority::equivocation::ObservedAttestation;
 use crate::authority::frontier_sig::FrontierSignature;
 use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 
@@ -18,6 +19,18 @@ pub struct FrontierPushRequest {
     /// the excess frontiers are treated as unsigned.
     #[serde(default)]
     pub signatures: Vec<Option<FrontierSignature>>,
+    /// CT-gossip Protocol 2 style lane: signed attestations the *sender* has
+    /// observed, relayed so the receiver can cross-check them against its own
+    /// observations (split-view / equivocation detection). Not applied to
+    /// frontier state — evidence only.
+    ///
+    /// Old-format JSON payloads without this field decode as an empty list;
+    /// new-to-old bincode pushes are rescued by the JSON fallback in
+    /// [`FrontierSyncClient::send_with_json_fallback`]. Deliberately *not*
+    /// `skip_serializing_if`: bincode is field-order dependent and must
+    /// always encode the field.
+    #[serde(default)]
+    pub observed: Vec<ObservedAttestation>,
 }
 
 /// Response from a frontier push operation.
@@ -186,10 +199,27 @@ impl FrontierSyncClient {
         frontiers: Vec<AckFrontier>,
         signatures: Vec<Option<FrontierSignature>>,
     ) -> Result<FrontierPushResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.push_frontiers_with_observations(peer_addr, frontiers, signatures, Vec::new())
+            .await
+    }
+
+    /// Push frontier updates, signatures, and relayed split-view observations.
+    ///
+    /// `observed` carries signed attestations this node has seen (its own and
+    /// relayed ones), letting the peer detect equivocations that were only
+    /// visible from this node's vantage point (CT-gossip Protocol 2).
+    pub async fn push_frontiers_with_observations(
+        &self,
+        peer_addr: &str,
+        frontiers: Vec<AckFrontier>,
+        signatures: Vec<Option<FrontierSignature>>,
+        observed: Vec<ObservedAttestation>,
+    ) -> Result<FrontierPushResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("http://{peer_addr}/api/internal/frontiers");
         let body = FrontierPushRequest {
             frontiers,
             signatures,
+            observed,
         };
 
         let resp = self
@@ -273,6 +303,7 @@ mod tests {
                 make_frontier("auth-2", 200, "user/"),
             ],
             signatures: vec![],
+            observed: vec![],
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -321,6 +352,7 @@ mod tests {
         let req = FrontierPushRequest {
             frontiers: vec![frontier, make_frontier("auth-2", 6_000, "user/")],
             signatures: vec![Some(sig.clone()), None],
+            observed: vec![],
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -354,10 +386,74 @@ mod tests {
         let req = FrontierPushRequest {
             frontiers: vec![],
             signatures: vec![],
+            observed: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: FrontierPushRequest = serde_json::from_str(&json).unwrap();
         assert!(back.frontiers.is_empty());
+    }
+
+    #[test]
+    fn old_format_json_without_observed_decodes() {
+        // A payload from an old node that predates the observed field.
+        let json = serde_json::json!({
+            "frontiers": [{
+                "authority_id": "auth-1",
+                "frontier_hlc": { "physical": 100, "logical": 0, "node_id": "auth-1" },
+                "key_range": { "prefix": "user/" },
+                "policy_version": 1,
+                "digest_hash": "auth-1-100"
+            }],
+            "signatures": [null]
+        })
+        .to_string();
+
+        let back: FrontierPushRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.frontiers.len(), 1);
+        assert!(
+            back.observed.is_empty(),
+            "missing observed field must default to empty"
+        );
+    }
+
+    #[test]
+    fn push_request_roundtrip_with_observed() {
+        use crate::authority::certificate::KeysetVersion;
+        use crate::authority::frontier_sig::NodeSigner;
+
+        let seed = [9u8; 32];
+        #[cfg(feature = "native-crypto")]
+        let signer = NodeSigner::from_seed(NodeId("auth-1".into()), &seed, false);
+        #[cfg(not(feature = "native-crypto"))]
+        let signer = NodeSigner::from_seed(NodeId("auth-1".into()), &seed);
+
+        let frontier = make_frontier("auth-1", 5_000, "user/");
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        let obs = ObservedAttestation {
+            frontier: frontier.clone(),
+            signature: sig,
+        };
+
+        // With and without observations, both JSON and bincode must
+        // round-trip. This fixes the "no skip_serializing_if" invariant:
+        // bincode is field-order dependent, so the field must always encode.
+        for observed in [vec![], vec![obs.clone()]] {
+            let req = FrontierPushRequest {
+                frontiers: vec![frontier.clone()],
+                signatures: vec![],
+                observed: observed.clone(),
+            };
+
+            let json = serde_json::to_string(&req).unwrap();
+            let back: FrontierPushRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.observed, observed);
+
+            let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+            let (back, _): (FrontierPushRequest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(back.observed, observed);
+            assert_eq!(back.frontiers.len(), 1);
+        }
     }
 
     #[test]

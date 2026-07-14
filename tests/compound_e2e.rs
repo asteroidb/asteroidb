@@ -160,6 +160,10 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
     })
 }
 
@@ -1198,6 +1202,10 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
     });
 
     // Write data to the legacy peer.

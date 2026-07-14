@@ -51,6 +51,95 @@
      -d @/tmp/dump.json
    ```
 
+## Authority Equivocation Detected
+
+### Symptoms
+
+- `equivocation_detected_total` metric is greater than 0 (P1 — respond
+  immediately).
+- `EQUIVOCATION DETECTED` warning in the logs, with structured fields
+  (`authority`, `key_range`, `digest_first`, `digest_second`).
+- `equivocation_accused_authorities` gauge is non-zero.
+- A `self-attestation equivocation` warning indicates this node's *own*
+  signing key produced conflicting reports — a strong signal of key
+  compromise or two processes misconfigured with the same key seed.
+
+### Diagnosis
+
+1. Fetch the evidence bundle from the detecting node:
+
+   ```bash
+   curl -s http://node:3000/api/authority/equivocations | jq .
+   ```
+
+   Each evidence entry contains **both conflicting signed attestations
+   verbatim** (`first` / `second`, hex signatures included). The pair is a
+   non-repudiable proof of misbehaviour: the report signature covers every
+   frontier field including `digest_hash`, so two valid signatures over the
+   same `(authority, key_range, policy_version, frontier_hlc)` with
+   different digests cannot both be honest.
+
+2. Re-verify both report signatures offline against the registry key for
+   the accused authority (the key distributed via
+   `ASTEROIDB_AUTHORITY_KEYS`). If either signature does not verify, the
+   evidence is invalid and must be discarded — the detector only records
+   verified pairs, so this indicates tampering with the evidence file.
+
+3. Cross-check other nodes: query `/api/authority/equivocations` on every
+   node. Evidence propagates via the frontier-push gossip lane, so multiple
+   nodes typically converge on the same accusation within a few report
+   ticks.
+
+4. Distinguish key compromise from a malicious operator:
+   - Check the accused authority's own logs for `self-attestation
+     equivocation` warnings (suggests a leaked key or duplicated seed).
+   - Check whether two processes were started with the same
+     `ASTEROIDB_BLS_SEED` (a common misconfiguration that produces genuine
+     conflicting signatures without malice).
+
+### Resolution
+
+1. **Preserve the evidence.** Save the JSON response and the node's
+   `equivocation_evidence.json` (in `ASTEROIDB_DATA_DIR`). The evidence is
+   third-party verifiable and survives restarts, but keep an offline copy
+   before any remediation.
+
+2. **No automatic quarantine happens** — by design. Detection is local and
+   cheap; *excluding* an authority is an enforcement decision that
+   requires cluster-level agreement, so the node only warns, records and
+   reports. Do not expect the cluster to fence the authority on its own.
+
+3. Optional local mitigation: set `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1`
+   and restart. The node then drops the accused authority's attestations
+   from certificate assembly (frontiers still advance; the majority
+   denominator is unchanged, so this is always fail-safe). **Availability
+   cost**: if exclusion drops a scope below majority, certificate
+   production for that scope stalls until the authority set is fixed.
+
+4. Permanent removal: update the authority set through control-plane
+   consensus (majority approval required):
+
+   ```bash
+   curl -X PUT http://node:3000/api/control-plane/authorities \
+     -H 'Content-Type: application/json' \
+     -d '{"key_range_prefix":"", "authority_nodes":["auth-1","auth-2"],
+          "approvals":["auth-1","auth-2"]}'
+   ```
+
+5. If the cause is key compromise rather than malice, rotate the affected
+   key (see `key-rotation.md`) and redistribute
+   `ASTEROIDB_AUTHORITY_KEYS`.
+
+### Limitations to keep in mind
+
+- Detection is **reactive**, not preventive: conflicting reports may have
+  been accepted and distributed before detection.
+- A colluding *majority* that tells every node the same lie is
+  undetectable by this mechanism.
+- The local observation window is ~2 minutes (128 entries per scope);
+  conflicts against older heads are only caught if another node still
+  gossips them. Recorded evidence itself is never evicted.
+
 ## Compaction Issues
 
 ### Symptoms

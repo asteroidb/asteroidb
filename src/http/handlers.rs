@@ -18,12 +18,16 @@ use crate::authority::bls::{BlsPublicKey, BlsSignature};
 #[cfg(not(feature = "native-crypto"))]
 use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{EpochConfig, KeysetRegistry};
+use crate::authority::equivocation::{
+    EquivocationDetector, MAX_OBSERVED_PER_REQUEST, ObserveOutcome,
+};
 use crate::control_plane::consensus::ControlPlaneConsensus;
 use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
 use crate::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloSnapshot, SloTracker};
+use crate::ops::write_atomic;
 use crate::placement::PlacementPolicy;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
@@ -40,10 +44,11 @@ use crate::network::sync::{
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
-    LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
-    ProofBundleJson, RemovePolicyRequest, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest,
-    StatusResponse, VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
+    EquivocationReport, EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest,
+    JoinResponse, LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse,
+    PlacementPolicyResponse, ProofBundleJson, RemovePolicyRequest, SetAuthorityDefinitionRequest,
+    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
+    VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -93,6 +98,17 @@ pub struct AppState {
     /// frontiers that fail verification are always rejected regardless of
     /// this flag.
     pub require_signed_frontiers: bool,
+    /// Equivocation detector and evidence store. Shared (same `Arc`) with
+    /// `NodeRunner` so that evidence detected on the HTTP receive path is
+    /// gossiped by the runner's frontier push, and vice versa.
+    pub equivocation: Arc<EquivocationDetector>,
+    /// When `true`, attestations from authorities with recorded equivocation
+    /// evidence are excluded from certificate assembly (their frontiers still
+    /// advance — the max-monotone frontier value itself is low-poison).
+    /// Opt-in (`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES`); the safe-by-default
+    /// posture is detect-and-warn only, because exclusion can drop a scope
+    /// below majority and stall certificate production.
+    pub exclude_accused_authorities: bool,
 }
 
 // ---------------------------------------------------------------
@@ -369,14 +385,27 @@ pub async fn post_internal_frontiers(
 
     let req: crate::network::frontier_sync::FrontierPushRequest =
         deserialize_internal(&body, content_type)?;
+    let crate::network::frontier_sync::FrontierPushRequest {
+        frontiers,
+        signatures,
+        observed,
+    } = req;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // Set when new equivocation evidence was recorded, so the evidence store
+    // is re-persisted after all sync guards are released.
+    let mut evidence_dirty = false;
 
     // Verify signatures BEFORE taking the certified lock — signature
     // verification is CPU-heavy and must not serialize with other handlers.
-    let mut signatures = req.signatures.into_iter();
+    let mut signatures = signatures.into_iter();
     let mut to_apply: Vec<(
         crate::authority::ack_frontier::AckFrontier,
         Option<VerifiedAttestation>,
-    )> = Vec::with_capacity(req.frontiers.len());
+    )> = Vec::with_capacity(frontiers.len());
 
     {
         // Authority-set membership gate (FR-008): the sender must be one of
@@ -394,7 +423,10 @@ pub async fn post_internal_frontiers(
 
         match &state.keyset_registry {
             None => {
-                for frontier in req.frontiers {
+                // Without a registry, relayed observations cannot be
+                // verified — and unverifiable pairs must never become
+                // evidence (they could frame an honest authority).
+                for frontier in frontiers {
                     if state.require_signed_frontiers {
                         // Strict mode without a registry must fail closed:
                         // there is no key material to verify any signature,
@@ -423,7 +455,7 @@ pub async fn post_internal_frontiers(
                 let current_epoch = state
                     .current_epoch
                     .load(std::sync::atomic::Ordering::Relaxed);
-                for frontier in req.frontiers {
+                for frontier in frontiers {
                     let signature = signatures.next().flatten();
                     if !is_range_authority(&frontier) {
                         tracing::warn!(
@@ -441,7 +473,37 @@ pub async fn post_internal_frontiers(
                             current_epoch,
                             &state.epoch_config,
                         ) {
-                            Ok(att) => to_apply.push((frontier, Some(att))),
+                            Ok(att) => {
+                                // Equivocation check on the verified raw
+                                // (frontier, signature) pair — the report
+                                // signature binds digest_hash, so a
+                                // conflicting pair is non-repudiable.
+                                if let ObserveOutcome::Equivocation(ev) =
+                                    state.equivocation.observe(&frontier, &sig, now_ms)
+                                {
+                                    warn_equivocation(&ev);
+                                    state.metrics.record_equivocation_at(now_ms);
+                                    state.metrics.set_accused_authorities(
+                                        state.equivocation.accused_count(),
+                                    );
+                                    evidence_dirty = true;
+                                }
+                                // Optional exclusion from certificate assembly
+                                // (detect-only by default): the frontier value
+                                // itself still advances — it is a monotone max
+                                // and thus low-poison — but the attestation is
+                                // dropped so it cannot contribute to a
+                                // certificate. The majority denominator is
+                                // unchanged, so this only errs safe.
+                                let att = if state.exclude_accused_authorities
+                                    && state.equivocation.is_accused(&frontier.authority_id)
+                                {
+                                    None
+                                } else {
+                                    Some(att)
+                                };
+                                to_apply.push((frontier, att));
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     authority = %frontier.authority_id.0,
@@ -466,8 +528,65 @@ pub async fn post_internal_frontiers(
                         }
                     }
                 }
+
+                // Split-view lane (CT-gossip Protocol 2): attestations the
+                // sender observed elsewhere, relayed for cross-checking.
+                // Evidence only — never applied to frontier state. Each
+                // relayed pair is re-verified against the registry before it
+                // is allowed to become evidence, so a malicious relayer
+                // cannot frame an honest authority; a failed verification is
+                // *not* an accusation either, because the relayer of a
+                // forged pair cannot be identified from the payload.
+                for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
+                    if !is_range_authority(&obs.frontier) {
+                        continue;
+                    }
+                    // Byte-equivalent echoes skip re-verification (CPU DoS
+                    // mitigation): the exact (scope, hlc, digest) is already
+                    // indexed and would compare Consistent anyway.
+                    if state.equivocation.is_known_exact(&obs.frontier) {
+                        continue;
+                    }
+                    match verify_frontier_signature(
+                        &obs.frontier,
+                        &obs.signature,
+                        &registry,
+                        current_epoch,
+                        &state.epoch_config,
+                    ) {
+                        Ok(_) => {
+                            state.metrics.record_split_view_observation();
+                            if let ObserveOutcome::Equivocation(ev) =
+                                state
+                                    .equivocation
+                                    .observe(&obs.frontier, &obs.signature, now_ms)
+                            {
+                                warn_equivocation(&ev);
+                                state.metrics.record_equivocation_at(now_ms);
+                                state
+                                    .metrics
+                                    .set_accused_authorities(state.equivocation.accused_count());
+                                evidence_dirty = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "ignoring relayed observation with invalid signature"
+                            );
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Persist new evidence after every sync guard is released; the write
+    // itself happens on a blocking thread (never inside the detector lock)
+    // and concurrent writers are serialized inside `spawn_persist` so an
+    // older snapshot can never overwrite a newer one.
+    if evidence_dirty {
+        state.equivocation.spawn_persist();
     }
 
     let mut api = state.certified.lock().await;
@@ -479,6 +598,41 @@ pub async fn post_internal_frontiers(
     }
     let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
     internal_response(&resp, accept)
+}
+
+/// Structured operator warning for a newly detected equivocation.
+fn warn_equivocation(ev: &crate::authority::equivocation::EquivocationEvidence) {
+    tracing::warn!(
+        authority = %ev.authority_id.0,
+        key_range = %ev.key_range.prefix,
+        policy_version = ev.policy_version.0,
+        frontier_hlc_physical = ev.frontier_hlc.physical,
+        frontier_hlc_logical = ev.frontier_hlc.logical,
+        digest_first = %ev.first.frontier.digest_hash,
+        digest_second = %ev.second.frontier.digest_hash,
+        "EQUIVOCATION DETECTED: authority signed conflicting frontier attestations; evidence stored"
+    );
+}
+
+/// `GET /api/authority/equivocations`
+///
+/// Operator-facing read-only endpoint returning all recorded equivocation
+/// evidence. Each evidence entry contains both conflicting signed
+/// attestations verbatim (hex signatures included), so the response is a
+/// third-party-verifiable proof of misbehaviour bundle.
+pub async fn get_equivocations(State(state): State<Arc<AppState>>) -> Json<EquivocationReport> {
+    let evidence = state.equivocation.evidence();
+    Json(EquivocationReport {
+        accused_authorities: state
+            .equivocation
+            .accused()
+            .into_iter()
+            .map(|n| n.0)
+            .collect(),
+        evidence_count: evidence.len(),
+        evidence_overflow_total: state.equivocation.evidence_overflow_total(),
+        evidence,
+    })
 }
 
 /// `GET /api/internal/frontiers`
@@ -1625,44 +1779,6 @@ pub async fn healthz() -> Json<serde_json::Value> {
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
-
-/// Write `data` to `path` atomically: write to a uniquely-named sibling temp
-/// file, fsync, then rename. The unique suffix (pid + counter) avoids temp
-/// file contention when multiple handlers persist concurrently.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        ".tmp.{}.{}.{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        seq,
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
-    file.write_all(data).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        // Clean up stranded temp file on rename failure.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    // Fsync the parent directory so the rename is durable.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
 
 /// Validate that `addr` is a bare host:port address.
 ///

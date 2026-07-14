@@ -202,6 +202,7 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/metrics` | メトリクス取得 |
 | `GET` | `/api/slo` | SLO ステータス取得 |
 | `GET` | `/api/topology` | クラスタトポロジービュー取得 |
+| `GET` | `/api/authority/equivocations` | Authority equivocation 証拠取得（第三者検証可能な署名付きペア） |
 
 ### 3.1 Eventual Read/Write
 

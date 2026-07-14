@@ -304,6 +304,7 @@ mod tests {
                 digest_hash: "hash-1".into(),
             }],
             signatures: vec![],
+            observed: vec![],
         };
 
         let (bytes, _) = serialize_internal(&req, Some(CONTENT_TYPE_BINCODE)).unwrap();

@@ -9,6 +9,7 @@ use asteroidb_poc::authority::bls::{BlsProofOfPossession, BlsPublicKey};
 #[cfg(not(feature = "native-crypto"))]
 use asteroidb_poc::authority::bls_stub::{BlsProofOfPossession, BlsPublicKey};
 use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
+use asteroidb_poc::authority::equivocation::EquivocationDetector;
 use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
@@ -535,6 +536,30 @@ async fn main() {
 
     let current_epoch = Arc::new(std::sync::atomic::AtomicU64::new(current_epoch_val));
 
+    // Equivocation detector: one shared instance for the HTTP receive path
+    // (AppState) and the runner's gossip/self-report path — sharing the Arc
+    // is what makes evidence detected via HTTP ride the outgoing gossip.
+    // Evidence is persisted next to the other node state so it survives
+    // restarts (the attestation pool itself is volatile).
+    let equivocation = Arc::new(EquivocationDetector::new(Some(
+        data_dir.join("equivocation_evidence.json"),
+    )));
+    // Initialize the accused-authorities gauge from the restored evidence
+    // store: without this, a restart resets the gauge to 0 until the next
+    // *new* detection, while GET /api/authority/equivocations still reports
+    // the persisted accusations — silently blinding gauge-based alerting
+    // during an ongoing incident.
+    metrics.set_accused_authorities(equivocation.accused_count());
+
+    // Opt-in: exclude attestations from accused authorities from certificate
+    // assembly. Off by default — detection never enforces on its own.
+    let exclude_accused_authorities = std::env::var("ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
     // Build shared HTTP state.
     let state = Arc::new(AppState {
         eventual: Arc::clone(&eventual_api),
@@ -555,6 +580,8 @@ async fn main() {
         epoch_config,
         current_epoch: Arc::clone(&current_epoch),
         require_signed_frontiers,
+        equivocation: Arc::clone(&equivocation),
+        exclude_accused_authorities,
     });
 
     let app = router(state);
@@ -565,6 +592,7 @@ async fn main() {
         keyset_registry,
         internal_token: internal_token.clone(),
         current_epoch: Some(Arc::clone(&current_epoch)),
+        equivocation: Some(Arc::clone(&equivocation)),
         ..NodeRunnerConfig::default()
     };
 

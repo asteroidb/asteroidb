@@ -177,9 +177,25 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と（`native-crypto` ビルドでは）BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する。`native-crypto` 無効ビルドでは Ed25519 のみで署名する |
 | `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
+| `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
-> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止されるが、同一 Authority が矛盾する digest を別ピアに報告する equivocation の検出は将来課題。
+> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
+
+### Equivocation / split-view 検知
+
+同一 Authority が矛盾する frontier 報告を（同一ピアまたは別ピアへ）署名付きで送った場合、受信ノードはこれをローカルで検知し、否認不能な証拠を保存する。
+
+- **判定条件**: 同一 `(authority_id, key_range, policy_version, frontier_hlc)` に対して `digest_hash` が異なる、**署名検証済み** attestation のペア。report 署名は frontier の全フィールド（digest 含む）を束縛するため、このペアは 2 つの相異なる署名済みメッセージそのものであり、第三者がレジストリ鍵で再検証できる **proof of misbehaviour（POM）** になる。同一チェックポイント内での frontier_hlc の前進や、鍵ローテーション中の同一 digest 再署名は定義上検知対象外（誤検知ゼロ）。無署名報告・検証に失敗した報告は証拠にならない。
+- **split-view 検知（CT-gossip Protocol 2 型）**: 各ノードは自身が観測した署名付き attestation の要約を既存の frontier push（`observed` レーン、旧ノードは無視して decode 可能）に相乗りさせて交換する。悪意 Authority がピアごとに異なる digest を報告しても、ピア間の gossip 交換後に受信側が矛盾を検知する。検知済み証拠のペアは gossip で全ピアへ能動的に伝播する。
+- **検知時の動作**: `EQUIVOCATION DETECTED` の警告ログ（構造化フィールド付き）、メトリクス計上（`equivocation_detected_total` ほか）、証拠のデータディレクトリへの永続化（`equivocation_evidence.json`、再起動後も保持）。**自動隔離は行わない**——Authority の排除には合意が必要であり、検知レイヤに強制を混ぜない設計（除外の opt-in は `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` を参照）。証拠は `GET /api/authority/equivocations` で取得できる。対応手順は `docs/runbook/troubleshooting.md` の「Authority Equivocation Detected」を参照。
+- **限界（重要・脅威モデル上の正直な注記）**:
+  1. 検知は**事後的・確率的**であり防止ではない（reactive security）。矛盾する報告が一時的に受理・配布される時間窓を許す。
+  2. **結託した過半数**が全ノードに一貫して同じ嘘をつく非分岐型の不正は、本機構（および fork*/ハッシュチェーン系一般）では検知できない。対抗手段は Authority 群の独立配置のみ。
+  3. 悪意 Authority がピアごとに frontier_hlc を僅かにずらして報告すると、完全一致ベースの検知確率は下がる（その場合も certificate は checkpoint 単位で束縛される）。
+  4. 検知遅延 ≈ frontier 報告周期 + push 伝搬遅延 + クロックスキュー。honest なピアが定期的に push し合うことが前提で、長期分断では検知が遅れる。
+  5. 観測索引は scope あたり 128 件（報告周期 1 秒でおよそ 2 分）に prune されるため、それより古い時点との矛盾はローカルでは検知できない（記録済みの証拠自体は消えない）。
+  6. `observed` レーンは 1 件あたり Ed25519 検証コストがかかる（リクエストあたり 64 件で打ち切り）。内部 API には `ASTEROIDB_INTERNAL_TOKEN` の設定を推奨する。
 
 ### BLS 鍵配布のローリングアップグレード手順（PoP 導入）
 
@@ -237,6 +253,10 @@ curl -s http://localhost:3000/api/slo | jq .
 | `key_rotation_total` | u64 | 鍵ローテーション累計 |
 | `key_rotation_last_version` | u64 | 最新 keyset バージョン |
 | `key_rotation_last_time_ms` | u64 | 最新ローテーション時刻 (ms) |
+| `equivocation_detected_total` | u64 | equivocation 証拠ペア検知累計 |
+| `equivocation_last_detected_ms` | u64 | 最終 equivocation 検知時刻 (ms、0=なし) |
+| `equivocation_accused_authorities` | u64 | 証拠が存在する Authority 数（ゲージ） |
+| `split_view_observations_total` | u64 | gossip 経由で検証・照合した観測数累計 |
 | `peer_sync` | map | ピアごとの同期統計（60 秒スライディングウィンドウ） |
 | `certification_latency_window` | object | 証明レイテンシウィンドウ統計（60 秒） |
 
@@ -304,6 +324,9 @@ for node in $NODES; do
   echo "asteroidb_write_ops_total{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.write_ops_total')"
   echo "asteroidb_full_sync_fallback_ratio{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.full_sync_fallback_ratio')"
   echo "asteroidb_certification_latency_p99_us{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.certification_latency_window.p99_us')"
+  echo "asteroidb_equivocation_detected_total{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.equivocation_detected_total')"
+  echo "asteroidb_equivocation_accused_authorities{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.equivocation_accused_authorities')"
+  echo "asteroidb_split_view_observations_total{node=\"${NODE_ID}\"} $(echo $METRICS | jq '.split_view_observations_total')"
 done > "$OUTPUT"
 ```
 
@@ -318,6 +341,7 @@ done > "$OUTPUT"
 | Full Sync Fallback Ratio | `full_sync_fallback_ratio` | Warning: 30%, Critical: 50% |
 | Write Throughput | `write_ops_total` (rate) | 情報表示のみ |
 | Rebalance Progress | `rebalance_keys_migrated` vs `rebalance_keys_failed` | Failed > 0 で Warning |
+| Authority Equivocation | `equivocation_detected_total` | **> 0 で即時対応（P1）**——runbook「Authority Equivocation Detected」参照 |
 
 ### 3.5 アラートルール例
 

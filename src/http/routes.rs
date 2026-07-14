@@ -5,11 +5,11 @@ use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy, get_slo,
-    get_topology, get_version_history, healthz, internal_announce, internal_delta_sync,
-    internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
-    list_policies, post_internal_frontiers, remove_policy, set_authority_definition,
-    set_placement_policy, verify_proof,
+    get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
+    get_policy, get_slo, get_topology, get_version_history, healthz, internal_announce,
+    internal_delta_sync, internal_join, internal_keys, internal_leave, internal_ping,
+    internal_sync, list_authorities, list_policies, post_internal_frontiers, remove_policy,
+    set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -86,6 +86,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
         .route("/api/slo", get(get_slo))
+        // Equivocation evidence is public read-only by design: the raw
+        // signed pairs already circulate via gossip, so there is nothing
+        // secret to protect, and operators need unauthenticated access
+        // during incident response (same posture as /api/metrics).
+        .route("/api/authority/equivocations", get(get_equivocations))
         // Health check endpoint — outside auth middleware for load balancer probes.
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -172,6 +177,10 @@ mod tests {
             epoch_config: crate::authority::certificate::EpochConfig::default(),
             current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             require_signed_frontiers: false,
+            equivocation: Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+                None,
+            )),
+            exclude_accused_authorities: false,
         })
     }
 
@@ -239,6 +248,10 @@ mod tests {
             epoch_config: crate::authority::certificate::EpochConfig::default(),
             current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             require_signed_frontiers,
+            equivocation: Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+                None,
+            )),
+            exclude_accused_authorities: false,
         })
     }
 
@@ -2269,6 +2282,7 @@ mod tests {
         FrontierPushRequest {
             frontiers,
             signatures,
+            observed: vec![],
         }
     }
 
@@ -2428,6 +2442,7 @@ mod tests {
             FrontierPushRequest {
                 frontiers: vec![frontier],
                 signatures: vec![Some(sig)],
+                observed: vec![],
             }
         };
 
