@@ -5,9 +5,9 @@ use tokio::sync::Mutex;
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
-use asteroidb_poc::authority::bls::BlsPublicKey;
+use asteroidb_poc::authority::bls::{BlsProofOfPossession, BlsPublicKey};
 #[cfg(not(feature = "native-crypto"))]
-use asteroidb_poc::authority::bls_stub::BlsPublicKey;
+use asteroidb_poc::authority::bls_stub::{BlsProofOfPossession, BlsPublicKey};
 use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
 use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
@@ -22,25 +22,46 @@ use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
 
+/// A parsed `ASTEROIDB_AUTHORITY_KEYS` entry: node ID, Ed25519 verifying key,
+/// and (optionally) a BLS public key with its verified proof of possession.
+type AuthorityKeyEntry = (
+    NodeId,
+    ed25519_dalek::VerifyingKey,
+    Option<(BlsPublicKey, BlsProofOfPossession)>,
+);
+
 /// Parse peer authority public keys from `ASTEROIDB_AUTHORITY_KEYS`.
 ///
-/// Format: comma-separated `<node-id>=<ed25519 hex (64 chars)>[/<bls hex (96 chars)>]`
-/// entries, e.g. `auth-2=ab..cd,auth-3=ef..01/89..76`. Entries that fail to
-/// parse are logged and skipped so a single bad key cannot prevent startup.
+/// Format: comma-separated
+/// `<node-id>=<ed25519 hex (64 chars)>[/<bls hex (96 chars)>/<pop hex (192 chars)>]`
+/// entries, e.g. `auth-2=ab..cd,auth-3=ef..01/89..76/aa..bb`. The third
+/// segment is a BLS proof of possession (PoP): a signature over the public
+/// key itself proving the distributor holds the secret key, which blocks
+/// rogue-key attacks against BLS aggregate verification. Each node prints
+/// its own ready-to-distribute entry (including the PoP) at startup.
+///
+/// With `strict = false` (default), entries that fail to parse are logged
+/// and skipped so a single bad key cannot prevent startup, and a legacy
+/// two-segment entry (BLS key without PoP) degrades to Ed25519-only. With
+/// `strict = true` (`ASTEROIDB_REQUIRE_SIGNED_FRONTIERS`), any malformed
+/// entry — missing '=', invalid Ed25519 key, or a missing/invalid PoP —
+/// is a hard error, so a typo cannot silently drop a peer's keys.
 ///
 /// This is the static key distribution channel required for verifying peer
 /// frontier signatures (FR-008); without it only self-signed frontiers verify.
-fn parse_authority_keys_env() -> Vec<(NodeId, ed25519_dalek::VerifyingKey, Option<BlsPublicKey>)> {
+fn parse_authority_keys_env(strict: bool) -> Result<Vec<AuthorityKeyEntry>, String> {
     let Ok(raw) = std::env::var("ASTEROIDB_AUTHORITY_KEYS") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    parse_authority_keys(&raw)
+    parse_authority_keys(&raw, strict)
 }
 
 /// Parse the `ASTEROIDB_AUTHORITY_KEYS` value (separated for unit testing).
-fn parse_authority_keys(
-    raw: &str,
-) -> Vec<(NodeId, ed25519_dalek::VerifyingKey, Option<BlsPublicKey>)> {
+///
+/// With `strict = false` this always returns `Ok`; in strict mode any
+/// malformed entry (missing '=', invalid Ed25519 key, or a BLS key
+/// distributed without a valid proof of possession) produces `Err`.
+fn parse_authority_keys(raw: &str, strict: bool) -> Result<Vec<AuthorityKeyEntry>, String> {
     let mut keys = Vec::new();
     for entry in raw.split(',') {
         let entry = entry.trim();
@@ -48,41 +69,104 @@ fn parse_authority_keys(
             continue;
         }
         let Some((id, key_part)) = entry.split_once('=') else {
+            if strict {
+                return Err(format!("entry '{entry}' is missing '='"));
+            }
             eprintln!("warning: ASTEROIDB_AUTHORITY_KEYS entry '{entry}' missing '='; skipping");
             continue;
         };
-        let (ed_hex, bls_hex) = match key_part.split_once('/') {
-            Some((ed, bls)) => (ed, Some(bls)),
-            None => (key_part, None),
-        };
+        let segments: Vec<&str> = key_part.splitn(3, '/').map(str::trim).collect();
 
-        let ed_vk = hex::decode(ed_hex.trim())
+        let ed_vk = hex::decode(segments[0])
             .ok()
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .and_then(|arr| ed25519_dalek::VerifyingKey::from_bytes(&arr).ok());
         let Some(ed_vk) = ed_vk else {
+            if strict {
+                return Err(format!("entry for '{id}' has an invalid Ed25519 key"));
+            }
             eprintln!(
                 "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' has an invalid Ed25519 key; skipping"
             );
             continue;
         };
 
-        let bls_pk = match bls_hex {
-            Some(hex_str) => match BlsPublicKey::from_hex(hex_str.trim()) {
-                Some(pk) => Some(pk),
-                None => {
+        let bls = match segments.len() {
+            1 => None,
+            2 => {
+                // Legacy format: BLS key without proof of possession.
+                if strict {
+                    return Err(format!(
+                        "entry for '{id}' has a BLS key without a proof-of-possession"
+                    ));
+                }
+                eprintln!(
+                    "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' has a BLS key without a \
+                     proof-of-possession; ignoring the BLS part (Ed25519-only)"
+                );
+                None
+            }
+            _ => match parse_bls_with_pop(segments[1], segments[2]) {
+                Ok(pair) => Some(pair),
+                Err(reason) => {
+                    if strict {
+                        return Err(format!("entry for '{id}' {reason}"));
+                    }
                     eprintln!(
-                        "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' has an invalid BLS key; skipping entry"
+                        "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' {reason}; skipping entry"
                     );
                     continue;
                 }
             },
-            None => None,
         };
 
-        keys.push((NodeId(id.trim().to_string()), ed_vk, bls_pk));
+        keys.push((NodeId(id.trim().to_string()), ed_vk, bls));
     }
-    keys
+    Ok(keys)
+}
+
+/// Parse and validate a `<bls hex>/<pop hex>` pair (native build).
+///
+/// Both values must decode to valid group elements and the proof of
+/// possession must verify against the public key (rogue-key defense).
+#[cfg(feature = "native-crypto")]
+fn parse_bls_with_pop(
+    bls_hex: &str,
+    pop_hex: &str,
+) -> Result<(BlsPublicKey, BlsProofOfPossession), String> {
+    let pk = BlsPublicKey::from_hex(bls_hex).ok_or_else(|| "has an invalid BLS key".to_string())?;
+    let pop = BlsProofOfPossession::from_hex(pop_hex)
+        .ok_or_else(|| "has an invalid BLS proof-of-possession".to_string())?;
+    if !asteroidb_poc::authority::bls::verify_pop(&pk, &pop) {
+        return Err("has a BLS proof-of-possession that fails verification".to_string());
+    }
+    Ok((pk, pop))
+}
+
+/// Syntactic-only validation of a `<bls hex>/<pop hex>` pair (stub build).
+///
+/// Stub builds cannot verify a PoP cryptographically, and non-native
+/// verification ignores the BLS lane entirely, so only the hex shape is
+/// checked (96 / 192 hex chars) to keep the env format consistent across
+/// build flavours.
+#[cfg(not(feature = "native-crypto"))]
+fn parse_bls_with_pop(
+    bls_hex: &str,
+    pop_hex: &str,
+) -> Result<(BlsPublicKey, BlsProofOfPossession), String> {
+    fn is_hex(s: &str, len: usize) -> bool {
+        s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    if !is_hex(bls_hex, 96) {
+        return Err("has an invalid BLS key".to_string());
+    }
+    if !is_hex(pop_hex, 192) {
+        return Err("has an invalid BLS proof-of-possession".to_string());
+    }
+    Ok((
+        BlsPublicKey(bls_hex.to_string()),
+        BlsProofOfPossession(pop_hex.to_string()),
+    ))
 }
 
 /// Parse authority node IDs from `ASTEROIDB_AUTHORITY_NODES` env var (comma-separated),
@@ -338,8 +422,47 @@ async fn main() {
         .as_ref()
         .map(|seed| Arc::new(NodeSigner::from_seed(node_id.clone(), seed)));
 
-    // Peer authority keys: "auth-2=<ed25519 hex64>[/<bls hex96>],auth-3=...".
-    let peer_authority_keys = parse_authority_keys_env();
+    // Print this node's ready-to-distribute ASTEROIDB_AUTHORITY_KEYS entry
+    // (including the BLS proof of possession on native-crypto builds) so
+    // operators can copy it into their peers' configuration.
+    if let Some(signer) = &node_signer {
+        let ed_hex = hex::encode(signer.verifying_key().as_bytes());
+        #[cfg(feature = "native-crypto")]
+        let entry = match (signer.bls_public_key(), signer.bls_proof_of_possession()) {
+            (Some(pk), Some(pop)) => {
+                format!("{}={ed_hex}/{}/{}", node_id.0, pk.to_hex(), pop.to_hex())
+            }
+            _ => format!("{}={ed_hex}", node_id.0),
+        };
+        #[cfg(not(feature = "native-crypto"))]
+        let entry = format!("{}={ed_hex}", node_id.0);
+        println!("Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: {entry}");
+    }
+
+    // Opt-in strict mode: reject unsigned frontier pushes and require a valid
+    // proof of possession for every BLS key distributed via
+    // ASTEROIDB_AUTHORITY_KEYS. Read before parsing the peer keys so the
+    // parser can fail loudly instead of degrading silently.
+    let require_signed_frontiers = std::env::var("ASTEROIDB_REQUIRE_SIGNED_FRONTIERS")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
+    // Peer authority keys: "auth-2=<ed25519 hex64>[/<bls hex96>/<pop hex192>],auth-3=...".
+    let peer_authority_keys = match parse_authority_keys_env(require_signed_frontiers) {
+        Ok(keys) => keys,
+        Err(msg) => {
+            eprintln!(
+                "error: ASTEROIDB_REQUIRE_SIGNED_FRONTIERS is set but ASTEROIDB_AUTHORITY_KEYS \
+                 {msg}. Fix the entry (format <node-id>=<ed25519 hex>[/<bls hex>/<pop hex>]; \
+                 each node prints its own ready-to-distribute entry at startup) or unset \
+                 strict mode."
+            );
+            std::process::exit(1);
+        }
+    };
 
     // Build the keyset registry from the signer's public keys (when signing
     // is enabled) plus any peer authority public keys distributed via
@@ -355,26 +478,29 @@ async fn main() {
 
         let mut ed_keys: Vec<(NodeId, ed25519_dalek::VerifyingKey)> = Vec::new();
         #[cfg(feature = "native-crypto")]
-        let mut bls_keys: Vec<(String, BlsPublicKey)> = Vec::new();
+        let mut bls_keys: Vec<(String, BlsPublicKey, BlsProofOfPossession)> = Vec::new();
 
         if let Some(signer) = &node_signer {
             ed_keys.push((node_id.clone(), signer.verifying_key()));
             #[cfg(feature = "native-crypto")]
-            if let Some(pk) = signer.bls_public_key() {
-                bls_keys.push((node_id.0.clone(), pk));
+            if let Some((pk, pop)) = signer
+                .bls_public_key()
+                .zip(signer.bls_proof_of_possession())
+            {
+                bls_keys.push((node_id.0.clone(), pk, pop));
             }
         }
 
-        for (peer_id, ed_vk, bls_pk) in peer_authority_keys {
+        for (peer_id, ed_vk, bls_pair) in peer_authority_keys {
             if peer_id == node_id {
                 continue; // own keys already derived from the seed
             }
             #[cfg(feature = "native-crypto")]
-            if let Some(pk) = bls_pk {
-                bls_keys.push((peer_id.0.clone(), pk));
+            if let Some((pk, pop)) = bls_pair {
+                bls_keys.push((peer_id.0.clone(), pk, pop));
             }
             #[cfg(not(feature = "native-crypto"))]
-            let _ = bls_pk;
+            let _ = bls_pair;
             ed_keys.push((peer_id, ed_vk));
         }
 
@@ -383,20 +509,16 @@ async fn main() {
             .expect("initial keyset registration should succeed");
         #[cfg(feature = "native-crypto")]
         if !bls_keys.is_empty() {
+            // register_bls_keys re-verifies every proof of possession
+            // (defense-in-depth: peer PoPs were already checked at parse
+            // time and our own PoP is derived from our own key), so this
+            // expect cannot fire for well-formed inputs.
             registry
                 .register_bls_keys(&KeysetVersion(1), bls_keys)
                 .expect("BLS key registration should succeed");
         }
         Some(Arc::new(std::sync::RwLock::new(registry)))
     };
-
-    // Opt-in strict mode: reject unsigned frontier pushes.
-    let require_signed_frontiers = std::env::var("ASTEROIDB_REQUIRE_SIGNED_FRONTIERS")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true"
-        })
-        .unwrap_or(false);
 
     // Strict mode is meaningless without a keyset registry: the frontier
     // handler would have no keys to verify against and would either
@@ -608,10 +730,27 @@ mod tests {
         format!("{byte:02x}").repeat(48)
     }
 
+    /// A matching BLS public key + proof-of-possession hex pair (96 + 192
+    /// chars). Real key material with native-crypto; shape-only for the stub.
+    #[cfg(feature = "native-crypto")]
+    fn bls_entry_hex(byte: u8) -> (String, String) {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        let kp = asteroidb_poc::authority::bls::BlsKeypair::generate(&seed);
+        (kp.public_key.to_hex(), kp.proof_of_possession().to_hex())
+    }
+    #[cfg(not(feature = "native-crypto"))]
+    fn bls_entry_hex(byte: u8) -> (String, String) {
+        (
+            format!("{byte:02x}").repeat(48),
+            format!("{byte:02x}").repeat(96),
+        )
+    }
+
     #[test]
     fn parse_authority_keys_ed25519_only_entry() {
         let (vk, ed_hex) = ed_key_hex(1);
-        let parsed = parse_authority_keys(&format!("auth-2={ed_hex}"));
+        let parsed = parse_authority_keys(&format!("auth-2={ed_hex}"), false).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, NodeId("auth-2".into()));
         assert_eq!(parsed[0].1, vk);
@@ -619,22 +758,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_authority_keys_ed25519_plus_bls_entry() {
+    fn parse_authority_keys_full_triple_accepted() {
         let (vk, ed_hex) = ed_key_hex(2);
-        let bls_hex = bls_key_hex(2);
-        let parsed = parse_authority_keys(&format!("auth-3={ed_hex}/{bls_hex}"));
+        let (bls_hex, pop_hex) = bls_entry_hex(2);
+        let parsed =
+            parse_authority_keys(&format!("auth-3={ed_hex}/{bls_hex}/{pop_hex}"), false).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].0, NodeId("auth-3".into()));
         assert_eq!(parsed[0].1, vk);
-        let bls = parsed[0].2.as_ref().expect("BLS key must be parsed");
-        assert_eq!(bls.to_hex(), bls_hex);
+        let (pk, pop) = parsed[0].2.as_ref().expect("BLS key + PoP must be parsed");
+        assert_eq!(pk.to_hex(), bls_hex);
+        assert_eq!(pop.to_hex(), pop_hex);
+    }
+
+    #[test]
+    fn parse_authority_keys_bls_without_pop_degrades_to_ed25519() {
+        // Legacy two-segment entries carry no proof of possession: the BLS
+        // part is dropped but the Ed25519 key is kept (lenient mode).
+        let (vk, ed_hex) = ed_key_hex(3);
+        let bls_hex = bls_key_hex(3);
+        let parsed = parse_authority_keys(&format!("auth-3={ed_hex}/{bls_hex}"), false).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].1, vk);
+        assert!(
+            parsed[0].2.is_none(),
+            "a BLS key without a PoP must be dropped"
+        );
     }
 
     #[test]
     fn parse_authority_keys_multiple_entries_with_whitespace() {
-        let (vk1, ed1) = ed_key_hex(3);
-        let (vk2, ed2) = ed_key_hex(4);
-        let parsed = parse_authority_keys(&format!(" auth-2 = {ed1} , auth-3={ed2},, "));
+        let (vk1, ed1) = ed_key_hex(4);
+        let (vk2, ed2) = ed_key_hex(5);
+        let parsed =
+            parse_authority_keys(&format!(" auth-2 = {ed1} , auth-3={ed2},, "), false).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, NodeId("auth-2".into()));
         assert_eq!(parsed[0].1, vk1);
@@ -644,16 +801,18 @@ mod tests {
 
     #[test]
     fn parse_authority_keys_skips_entry_without_equals() {
-        let (_, ed_hex) = ed_key_hex(5);
-        let parsed = parse_authority_keys(&format!("garbage,auth-2={ed_hex}"));
+        let (_, ed_hex) = ed_key_hex(6);
+        let parsed = parse_authority_keys(&format!("garbage,auth-2={ed_hex}"), false).unwrap();
         assert_eq!(parsed.len(), 1, "malformed entry must be skipped");
         assert_eq!(parsed[0].0, NodeId("auth-2".into()));
     }
 
     #[test]
     fn parse_authority_keys_skips_invalid_ed25519_hex() {
-        let (_, ed_hex) = ed_key_hex(6);
-        let parsed = parse_authority_keys(&format!("auth-2=nothex,auth-3=abcd,auth-4={ed_hex}"));
+        let (_, ed_hex) = ed_key_hex(7);
+        let parsed =
+            parse_authority_keys(&format!("auth-2=nothex,auth-3=abcd,auth-4={ed_hex}"), false)
+                .unwrap();
         assert_eq!(
             parsed.len(),
             1,
@@ -662,22 +821,99 @@ mod tests {
         assert_eq!(parsed[0].0, NodeId("auth-4".into()));
     }
 
-    // The BLS stub's from_hex is a passthrough that never fails, so the
-    // invalid-BLS rejection path only exists with native-crypto.
+    // The BLS stub's from_hex is a passthrough, so full group-element
+    // rejection only exists with native-crypto (the stub still enforces the
+    // hex shape; see the stub-specific test below).
     #[cfg(feature = "native-crypto")]
     #[test]
     fn parse_authority_keys_skips_invalid_bls_key() {
-        let (_, ed_hex) = ed_key_hex(7);
-        let parsed = parse_authority_keys(&format!("auth-2={ed_hex}/nothex"));
+        let (_, ed_hex) = ed_key_hex(8);
+        let (_, pop_hex) = bls_entry_hex(8);
+        let parsed =
+            parse_authority_keys(&format!("auth-2={ed_hex}/nothex/{pop_hex}"), false).unwrap();
         assert!(
             parsed.is_empty(),
             "an entry with an invalid BLS part must be skipped entirely"
         );
     }
 
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn parse_authority_keys_invalid_pop_skips_entry() {
+        // A PoP generated by a different keypair fails verification.
+        let (_, ed_hex) = ed_key_hex(9);
+        let (bls_hex, _) = bls_entry_hex(9);
+        let (_, wrong_pop_hex) = bls_entry_hex(10);
+        let parsed =
+            parse_authority_keys(&format!("auth-2={ed_hex}/{bls_hex}/{wrong_pop_hex}"), false)
+                .unwrap();
+        assert!(
+            parsed.is_empty(),
+            "an entry whose PoP fails verification must be skipped entirely"
+        );
+    }
+
+    #[test]
+    fn parse_authority_keys_strict_rejects_missing_pop() {
+        let (_, ed_hex) = ed_key_hex(11);
+        let bls_hex = bls_key_hex(11);
+        let result = parse_authority_keys(&format!("auth-2={ed_hex}/{bls_hex}"), true);
+        let err = result.expect_err("strict mode must reject a BLS key without a PoP");
+        assert!(err.contains("auth-2"), "error must name the entry: {err}");
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn parse_authority_keys_strict_rejects_invalid_pop() {
+        let (_, ed_hex) = ed_key_hex(12);
+        let (bls_hex, _) = bls_entry_hex(12);
+        let (_, wrong_pop_hex) = bls_entry_hex(13);
+        let result =
+            parse_authority_keys(&format!("auth-2={ed_hex}/{bls_hex}/{wrong_pop_hex}"), true);
+        assert!(
+            result.is_err(),
+            "strict mode must reject a PoP that fails verification"
+        );
+    }
+
+    #[test]
+    fn parse_authority_keys_strict_rejects_entry_without_equals() {
+        let (_, ed_hex) = ed_key_hex(15);
+        let result = parse_authority_keys(&format!("garbage,auth-2={ed_hex}"), true);
+        let err = result.expect_err("strict mode must reject an entry without '='");
+        assert!(err.contains("garbage"), "error must name the entry: {err}");
+    }
+
+    #[test]
+    fn parse_authority_keys_strict_rejects_invalid_ed25519_hex() {
+        let (_, ed_hex) = ed_key_hex(16);
+        let result = parse_authority_keys(&format!("auth-2=abcg,auth-3={ed_hex}"), true);
+        let err = result.expect_err("strict mode must reject an invalid Ed25519 key");
+        assert!(err.contains("auth-2"), "error must name the entry: {err}");
+    }
+
+    // Stub builds cannot verify a PoP cryptographically but still enforce
+    // the hex shape (96-char key, 192-char PoP) so the env format stays
+    // consistent across build flavours.
+    #[cfg(not(feature = "native-crypto"))]
+    #[test]
+    fn parse_authority_keys_stub_rejects_malformed_hex_lengths() {
+        let (_, ed_hex) = ed_key_hex(14);
+        let (bls_hex, pop_hex) = bls_entry_hex(14);
+
+        let parsed =
+            parse_authority_keys(&format!("auth-2={ed_hex}/abcd/{pop_hex}"), false).unwrap();
+        assert!(parsed.is_empty(), "short BLS hex must skip the entry");
+
+        let parsed =
+            parse_authority_keys(&format!("auth-2={ed_hex}/{bls_hex}/abcd"), false).unwrap();
+        assert!(parsed.is_empty(), "short PoP hex must skip the entry");
+    }
+
     #[test]
     fn parse_authority_keys_empty_input() {
-        assert!(parse_authority_keys("").is_empty());
-        assert!(parse_authority_keys(" , ,").is_empty());
+        assert!(parse_authority_keys("", false).unwrap().is_empty());
+        assert!(parse_authority_keys(" , ,", false).unwrap().is_empty());
+        assert!(parse_authority_keys("", true).unwrap().is_empty());
     }
 }

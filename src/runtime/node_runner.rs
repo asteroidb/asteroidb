@@ -4029,9 +4029,15 @@ mod tests {
             )
             .unwrap();
         #[cfg(feature = "native-crypto")]
-        if let Some(pk) = signer.bls_public_key() {
+        if let Some((pk, pop)) = signer
+            .bls_public_key()
+            .zip(signer.bls_proof_of_possession())
+        {
             registry
-                .register_bls_keys(&KeysetVersion(1), vec![(signer.node_id().0.clone(), pk)])
+                .register_bls_keys(
+                    &KeysetVersion(1),
+                    vec![(signer.node_id().0.clone(), pk, pop)],
+                )
                 .unwrap();
         }
         Arc::new(RwLock::new(registry))

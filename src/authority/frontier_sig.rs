@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::authority::ack_frontier::AckFrontier;
 #[cfg(feature = "native-crypto")]
-use crate::authority::bls::{self, BlsKeypair, BlsPublicKey, BlsSignature};
+use crate::authority::bls::{self, BlsKeypair, BlsProofOfPossession, BlsPublicKey, BlsSignature};
 #[cfg(not(feature = "native-crypto"))]
 use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{
@@ -188,6 +188,17 @@ impl NodeSigner {
     #[cfg(feature = "native-crypto")]
     pub fn bls_public_key(&self) -> Option<BlsPublicKey> {
         self.bls.as_ref().map(|kp| kp.public_key.clone())
+    }
+
+    /// Return a proof of possession over the BLS public key, if BLS signing
+    /// is enabled.
+    ///
+    /// Required alongside the public key when registering into a
+    /// `KeysetRegistry` and when distributing this node's keys via
+    /// `ASTEROIDB_AUTHORITY_KEYS`. Deterministic for a given seed.
+    #[cfg(feature = "native-crypto")]
+    pub fn bls_proof_of_possession(&self) -> Option<BlsProofOfPossession> {
+        self.bls.as_ref().map(|kp| kp.proof_of_possession())
     }
 
     /// Sign a frontier report.
@@ -450,9 +461,13 @@ mod tests {
         registry.register_keyset(KeysetVersion(1), 0, keys).unwrap();
         #[cfg(feature = "native-crypto")]
         {
-            let bls_keys: Vec<(String, BlsPublicKey)> = signers
+            let bls_keys: Vec<(String, BlsPublicKey, BlsProofOfPossession)> = signers
                 .iter()
-                .filter_map(|s| s.bls_public_key().map(|pk| (s.node_id().0.clone(), pk)))
+                .filter_map(|s| {
+                    s.bls_public_key()
+                        .zip(s.bls_proof_of_possession())
+                        .map(|(pk, pop)| (s.node_id().0.clone(), pk, pop))
+                })
                 .collect();
             if !bls_keys.is_empty() {
                 registry

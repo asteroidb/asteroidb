@@ -2568,8 +2568,16 @@ mod tests {
             .register_bls_keys(
                 &KeysetVersion(1),
                 vec![
-                    ("auth-1".into(), s1.bls_public_key().unwrap()),
-                    ("auth-2".into(), s2.bls_public_key().unwrap()),
+                    (
+                        "auth-1".into(),
+                        s1.bls_public_key().unwrap(),
+                        s1.bls_proof_of_possession().unwrap(),
+                    ),
+                    (
+                        "auth-2".into(),
+                        s2.bls_public_key().unwrap(),
+                        s2.bls_proof_of_possession().unwrap(),
+                    ),
                 ],
             )
             .unwrap();

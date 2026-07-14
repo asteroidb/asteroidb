@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[cfg(feature = "native-crypto")]
-use crate::authority::bls::{self, BlsPublicKey, BlsSignature};
+use crate::authority::bls::{self, BlsProofOfPossession, BlsPublicKey, BlsSignature};
 #[cfg(not(feature = "native-crypto"))]
-use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
+use crate::authority::bls_stub::{BlsProofOfPossession, BlsPublicKey, BlsSignature};
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
@@ -120,6 +120,9 @@ pub enum CertError {
 
     #[error("expired certificate format version {version} (grace period elapsed)")]
     ExpiredFormatVersion { version: u32 },
+
+    #[error("invalid BLS proof-of-possession for authority {0}")]
+    InvalidProofOfPossession(String),
 }
 
 /// Certificate signature mode: Ed25519 (individual signatures) or BLS (aggregated).
@@ -357,19 +360,45 @@ impl KeysetRegistry {
 
     /// Register BLS public keys for a keyset version.
     ///
-    /// `bls_keys` maps authority ID strings to their BLS public keys.
-    /// The keyset version must already exist (i.e., `register_keyset` must have
-    /// been called first).
+    /// `bls_keys` maps authority ID strings to their BLS public keys, each
+    /// accompanied by a proof of possession (PoP,
+    /// draft-irtf-cfrg-bls-signature §3.3). The keyset version must already
+    /// exist (i.e., `register_keyset` must have been called first).
+    ///
+    /// **Invariant**: this is the *only* write path into a keyset's BLS key
+    /// map (`KeysetEntry.bls_keys` is private and `KeysetRegistry` is not
+    /// serializable), so every key resolvable via [`Self::get_bls_key`] has
+    /// passed PoP verification — including the subgroup / infinity-point
+    /// check performed by `bls::verify_pop` — which is what makes
+    /// `fast_aggregate_verify` sound against rogue-key attacks.
+    ///
+    /// The batch is atomic: with `native-crypto`, every PoP is verified
+    /// *before* any key is inserted, and a single failure rejects the whole
+    /// batch with [`CertError::InvalidProofOfPossession`]. Without
+    /// `native-crypto` the stub types cannot be verified; the keys are
+    /// inserted unchecked, which is harmless because non-native verification
+    /// ignores the BLS lane entirely.
     pub fn register_bls_keys(
         &mut self,
         version: &KeysetVersion,
-        bls_keys: Vec<(String, BlsPublicKey)>,
+        bls_keys: Vec<(String, BlsPublicKey, BlsProofOfPossession)>,
     ) -> Result<(), CertError> {
         let entry = self
             .keysets
             .get_mut(&version.0)
             .ok_or(CertError::UnknownKeyset(version.0))?;
-        for (id, pk) in bls_keys {
+
+        // Pass 1 (native only): verify every proof of possession before
+        // touching the map, so a failing entry cannot leave a partial batch.
+        #[cfg(feature = "native-crypto")]
+        for (id, pk, pop) in &bls_keys {
+            if !bls::verify_pop(pk, pop) {
+                return Err(CertError::InvalidProofOfPossession(id.clone()));
+            }
+        }
+
+        // Pass 2: all proofs verified — insert.
+        for (id, pk, _pop) in bls_keys {
             entry.bls_keys.insert(id, pk);
         }
         Ok(())
@@ -481,6 +510,10 @@ impl EpochManager {
     /// Registers the new keys under the next version and records the
     /// current epoch. Old keys remain valid for `grace_epochs` after
     /// the epoch in which they were registered.
+    ///
+    /// The new version is created with an *empty* BLS key map: BLS keys must
+    /// be re-registered per version via `KeysetRegistry::register_bls_keys`,
+    /// which re-verifies each key's proof of possession on every rotation.
     pub fn rotate_keyset(
         &mut self,
         now_secs: u64,
@@ -938,6 +971,14 @@ impl DualModeCertificate {
     /// Dispatches to Ed25519 or BLS verification based on the `signature_algorithm`
     /// field.  For backward compatibility, certificates with `signature_algorithm`
     /// defaulting to `Ed25519` (format v1) still verify via the Ed25519 path.
+    ///
+    /// **Security note**: the BLS path trusts the certificate's embedded
+    /// public keys and is therefore not safe against rogue-key attacks on
+    /// its own — the registration-time proof-of-possession check in
+    /// [`KeysetRegistry::register_bls_keys`] only protects verification that
+    /// resolves keys through the registry. Use [`Self::verify_with_registry`]
+    /// for any certificate received from an untrusted source (the production
+    /// proof-verification path does).
     pub fn verify(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
         match self.signature_algorithm {
             SignatureAlgorithm::Ed25519 => self.verify_ed25519(message),
@@ -978,6 +1019,13 @@ impl DualModeCertificate {
     }
 
     /// BLS verification path.
+    ///
+    /// **Security note**: this registry-free path trusts the certificate's
+    /// embedded `bls_public_keys` as-is, so a rogue key crafted from another
+    /// authority's public key would pass. Callers with untrusted input must
+    /// use `verify_bls_with_registry` (via [`Self::verify_with_registry`]),
+    /// where every key has passed the registration-time proof-of-possession
+    /// check.
     #[cfg(feature = "native-crypto")]
     fn verify_bls(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
         // P1-1: Validate signer ID / public key count match.
@@ -1269,6 +1317,12 @@ impl BlsVerifyCache {
     /// Returns cached results for previously-verified (message, signature)
     /// pairs, avoiding the expensive BLS pairing computation.
     /// Falls back to full verification for Ed25519 mode or cache misses.
+    ///
+    /// **Security note**: delegates to [`DualModeCertificate::verify`], which
+    /// trusts the certificate's embedded BLS public keys (no registry
+    /// cross-check). Do not use for certificates from untrusted sources —
+    /// see the security note on `verify` and use
+    /// [`DualModeCertificate::verify_with_registry`] instead.
     pub fn verify_cached(
         &mut self,
         cert: &DualModeCertificate,
@@ -2502,7 +2556,11 @@ mod tests {
         registry
             .register_bls_keys(
                 &KeysetVersion(1),
-                vec![("known".into(), kp_known.public_key.clone())],
+                vec![(
+                    "known".into(),
+                    kp_known.public_key.clone(),
+                    kp_known.proof_of_possession(),
+                )],
             )
             .unwrap();
 
@@ -2560,8 +2618,16 @@ mod tests {
             .register_bls_keys(
                 &KeysetVersion(1),
                 vec![
-                    ("auth-a".into(), kp_a.public_key.clone()),
-                    ("auth-b".into(), kp_b.public_key.clone()),
+                    (
+                        "auth-a".into(),
+                        kp_a.public_key.clone(),
+                        kp_a.proof_of_possession(),
+                    ),
+                    (
+                        "auth-b".into(),
+                        kp_b.public_key.clone(),
+                        kp_b.proof_of_possession(),
+                    ),
                 ],
             )
             .unwrap();
@@ -2586,6 +2652,193 @@ mod tests {
         assert_eq!(signers.len(), 2);
         assert_eq!(signers[0], NodeId("auth-a".into()));
         assert_eq!(signers[1], NodeId("auth-b".into()));
+    }
+
+    // ---------------------------------------------------------------
+    // Proof-of-possession enforcement at key registration
+    // ---------------------------------------------------------------
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_accepts_valid_pop() {
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), ed_vk)])
+            .unwrap();
+
+        let kp = make_bls_keypair(90);
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-1".into(),
+                    kp.public_key.clone(),
+                    kp.proof_of_possession(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            registry.get_bls_key(&KeysetVersion(1), "auth-1"),
+            Some(&kp.public_key)
+        );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_rejects_invalid_pop() {
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), ed_vk)])
+            .unwrap();
+
+        // A PoP produced by a *different* keypair must be rejected.
+        let kp = make_bls_keypair(91);
+        let other = make_bls_keypair(92);
+        let result = registry.register_bls_keys(
+            &KeysetVersion(1),
+            vec![(
+                "auth-1".into(),
+                kp.public_key.clone(),
+                other.proof_of_possession(),
+            )],
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CertError::InvalidProofOfPossession(ref id)) if id == "auth-1"
+            ),
+            "expected InvalidProofOfPossession, got: {result:?}"
+        );
+        assert!(
+            registry.get_bls_key(&KeysetVersion(1), "auth-1").is_none(),
+            "rejected key must not be registered"
+        );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_is_atomic_on_pop_failure() {
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), ed_vk)])
+            .unwrap();
+
+        let valid = make_bls_keypair(93);
+        let invalid = make_bls_keypair(94);
+        let wrong = make_bls_keypair(95);
+        let result = registry.register_bls_keys(
+            &KeysetVersion(1),
+            vec![
+                (
+                    "auth-1".into(),
+                    valid.public_key.clone(),
+                    valid.proof_of_possession(),
+                ),
+                (
+                    "auth-2".into(),
+                    invalid.public_key.clone(),
+                    wrong.proof_of_possession(),
+                ),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(CertError::InvalidProofOfPossession(ref id)) if id == "auth-2"
+        ));
+        assert!(
+            registry.get_bls_key(&KeysetVersion(1), "auth-1").is_none(),
+            "a failing batch must not insert the valid entries either"
+        );
+        assert!(registry.get_bls_key(&KeysetVersion(1), "auth-2").is_none());
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn rotated_keyset_requires_pop_again() {
+        let mut manager = EpochManager::new(EpochConfig::default(), 0);
+        let (_, ed_vk) = make_key_pair();
+        manager
+            .rotate_keyset(0, vec![(NodeId("auth-1".into()), ed_vk)])
+            .unwrap();
+
+        let kp = make_bls_keypair(96);
+        manager
+            .registry_mut()
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-1".into(),
+                    kp.public_key.clone(),
+                    kp.proof_of_possession(),
+                )],
+            )
+            .unwrap();
+
+        // Rotate: the new version starts with an empty BLS key map, and a
+        // bad PoP must be rejected again on re-registration.
+        let (_, ed_vk2) = make_key_pair();
+        let v2 = manager
+            .rotate_keyset(86_400 * 2, vec![(NodeId("auth-1".into()), ed_vk2)])
+            .unwrap();
+        assert!(manager.registry().get_bls_key(&v2, "auth-1").is_none());
+
+        let other = make_bls_keypair(97);
+        let result = manager.registry_mut().register_bls_keys(
+            &v2,
+            vec![(
+                "auth-1".into(),
+                kp.public_key.clone(),
+                other.proof_of_possession(),
+            )],
+        );
+        assert!(matches!(
+            result,
+            Err(CertError::InvalidProofOfPossession(_))
+        ));
+
+        // The correct PoP passes for the new version as well.
+        manager
+            .registry_mut()
+            .register_bls_keys(
+                &v2,
+                vec![(
+                    "auth-1".into(),
+                    kp.public_key.clone(),
+                    kp.proof_of_possession(),
+                )],
+            )
+            .unwrap();
+        assert_eq!(
+            manager.registry().get_bls_key(&v2, "auth-1"),
+            Some(&kp.public_key)
+        );
+    }
+
+    /// Stub builds cannot verify a PoP; registration accepts the opaque
+    /// value so certificates remain (de)serializable, and the BLS lane is
+    /// ignored during verification anyway.
+    #[cfg(not(feature = "native-crypto"))]
+    #[test]
+    fn register_bls_keys_accepts_stub_pop_without_verification() {
+        let mut registry = KeysetRegistry::new();
+        let (_, ed_vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), ed_vk)])
+            .unwrap();
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-1".into(),
+                    BlsPublicKey("aa".repeat(48)),
+                    BlsProofOfPossession("bb".repeat(96)),
+                )],
+            )
+            .unwrap();
+        assert!(registry.get_bls_key(&KeysetVersion(1), "auth-1").is_some());
     }
 
     // ---------------------------------------------------------------

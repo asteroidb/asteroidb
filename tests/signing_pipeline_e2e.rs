@@ -67,9 +67,17 @@ fn full_registry(signers: &[&NodeSigner]) -> KeysetRegistry {
         .unwrap();
     #[cfg(feature = "native-crypto")]
     {
-        let bls_keys: Vec<(String, asteroidb_poc::authority::bls::BlsPublicKey)> = signers
+        let bls_keys: Vec<(
+            String,
+            asteroidb_poc::authority::bls::BlsPublicKey,
+            asteroidb_poc::authority::bls::BlsProofOfPossession,
+        )> = signers
             .iter()
-            .filter_map(|s| s.bls_public_key().map(|pk| (s.node_id().0.clone(), pk)))
+            .filter_map(|s| {
+                s.bls_public_key()
+                    .zip(s.bls_proof_of_possession())
+                    .map(|(pk, pop)| (s.node_id().0.clone(), pk, pop))
+            })
             .collect();
         if !bls_keys.is_empty() {
             registry

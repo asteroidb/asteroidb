@@ -755,11 +755,15 @@ mod tests {
 
             let mut registry = KeysetRegistry::new();
             let mut ed_keys = Vec::new();
-            let mut bls_keys: Vec<(String, BlsPublicKey)> = Vec::new();
+            let mut bls_keys: Vec<(String, BlsPublicKey, bls::BlsProofOfPossession)> = Vec::new();
             for (i, kp) in keypairs.iter().enumerate().take(registered) {
                 let (_, vk) = make_key_pair();
                 ed_keys.push((NodeId(format!("auth-{i}")), vk));
-                bls_keys.push((format!("auth-{i}"), kp.public_key.clone()));
+                bls_keys.push((
+                    format!("auth-{i}"),
+                    kp.public_key.clone(),
+                    kp.proof_of_possession(),
+                ));
             }
             registry
                 .register_keyset(KeysetVersion(1), 0, ed_keys)

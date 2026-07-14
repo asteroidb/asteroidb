@@ -175,11 +175,22 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_DATA_DIR` | いいえ | `./data` | データ永続化ディレクトリ |
 | `ASTEROIDB_INTERNAL_TOKEN` | いいえ | なし | 内部 API 認証用 Bearer トークン |
 | `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と（`native-crypto` ビルドでは）BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する。`native-crypto` 無効ビルドでは Ed25519 のみで署名する |
-| `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。BLS 部を省略したピアの署名は Ed25519 のみで検証される（BLS レーンは無視）。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
-| `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合、ノードは起動時にエラー終了する |
+| `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
+| `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
 > **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止されるが、同一 Authority が矛盾する digest を別ピアに報告する equivocation の検出は将来課題。
+
+### BLS 鍵配布のローリングアップグレード手順（PoP 導入）
+
+`ASTEROIDB_AUTHORITY_KEYS` の BLS 部は 2 セグメント形式（`<ed>/<bls>`）から PoP 付き 3 セグメント形式（`<ed>/<bls>/<pop>`）へ拡張された。**旧バイナリは 3 セグメント形式を解釈できない**——旧パーサは `<bls>/<pop>` 全体を不正な BLS hex とみなし、**Ed25519 鍵を含むエントリ全体をスキップ**する。env を先に切り替えると、未更新ノードがピアの Ed25519 鍵まで失い、strict モード（`ASTEROIDB_REQUIRE_SIGNED_FRONTIERS=1`）ではピアの署名付き frontier が unknown authority として拒否され certification が停滞する。したがって以下の順序を厳守すること:
+
+1. **全ノードのバイナリを新版へ更新**する（env は旧 2 セグメント形式のままでよい。新版は lenient で BLS 部を破棄し Ed25519-only に degrade して動作する）。
+2. 各ノードの起動ログから **PoP 付き配布用エントリ**（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: ...`）を収集する。
+3. 全ノードの `ASTEROIDB_AUTHORITY_KEYS` を **3 セグメント形式へ一斉に更新して再起動**する。
+4. 必要なら `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS=1` を有効化する。
+
+strict モードで運用中のクラスタは、手順 (1) の前に一時的に strict を外すか、手順 (3) 完了まで strict 化を遅らせること（strict のまま旧 2 セグメント形式でアップグレードすると、新版が PoP 欠落を検出して起動エラーになる）。
 
 ---
 
@@ -1192,6 +1203,33 @@ curl -s http://localhost:3000/api/metrics | jq '{
 - BLS シードが正しく設定されているか確認（`ASTEROIDB_BLS_SEED`）
 - epoch 設定の確認（デフォルト: 24 時間 epoch、7 epoch グレース期間）
 - 詳細は `docs/runbook/key-rotation.md` を参照
+
+### 症状: 起動時に BLS Proof-of-Possession エラーで終了する
+
+`ASTEROIDB_REQUIRE_SIGNED_FRONTIERS=1`（strict モード）で以下のようなエラーが出て起動に失敗する:
+
+```
+error: ASTEROIDB_REQUIRE_SIGNED_FRONTIERS is set but ASTEROIDB_AUTHORITY_KEYS entry for '<id>' ...
+```
+
+**原因と対処:**
+- `ASTEROIDB_AUTHORITY_KEYS` の当該エントリが PoP を欠く旧 2 セグメント形式（`<ed>/<bls>`）、または PoP の検証に失敗している。各ノードの起動ログにある配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: ...`）から正しい 3 セグメント形式（`<ed>/<bls>/<pop>`）をコピーする。
+- BLS 検証をそのピアで不要とする場合は、当該エントリの BLS 部（`/<bls>/<pop>`）を削除して Ed25519 のみにする。
+- 過渡的に strict を外す場合は `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` を未設定にする。
+
+### 症状: アップグレード後にピアの frontier 報告が拒否され certification が進まない
+
+lenient モードの警告ログに以下が出る:
+
+```
+warning: ASTEROIDB_AUTHORITY_KEYS entry for '<id>' has a BLS key without a proof-of-possession; ignoring the BLS part (Ed25519-only)
+```
+
+または未更新ノード側でピアのエントリ全体がスキップされている。
+
+**原因と対処:**
+- `ASTEROIDB_AUTHORITY_KEYS` を 3 セグメント形式へ切り替えるタイミングが早すぎ、未更新（旧バイナリ）のノードがピアエントリ全体（Ed25519 鍵を含む）をスキップしている。「BLS 鍵配布のローリングアップグレード手順」（本ガイドの環境変数リファレンス直後の節）に従い、**全ノードのバイナリを新版へ更新してから** env を一斉に切り替える。
+- 警告のみで degrade している場合は、該当ピアの配布用エントリ（PoP 付き）を収集して env を更新し、再起動する。
 
 ---
 
