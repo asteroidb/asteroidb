@@ -7,9 +7,9 @@ use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
     get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
     get_policy, get_slo, get_topology, get_version_history, healthz, internal_announce,
-    internal_delta_sync, internal_join, internal_keys, internal_leave, internal_ping,
-    internal_sync, list_authorities, list_policies, post_internal_frontiers, remove_policy,
-    set_authority_definition, set_placement_policy, verify_proof,
+    internal_delta_sync, internal_digest_sync, internal_join, internal_keys, internal_leave,
+    internal_ping, internal_sync, list_authorities, list_policies, post_internal_frontiers,
+    remove_policy, set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -27,6 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/internal/sync", post(internal_sync))
         .route("/api/internal/sync/delta", post(internal_delta_sync))
+        .route("/api/internal/sync/digest", post(internal_digest_sync))
         .route("/api/internal/keys", get(internal_keys))
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))

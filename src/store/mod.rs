@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod digest;
 pub mod kv;
 pub mod migration;
 #[cfg(not(target_arch = "wasm32"))]

@@ -620,6 +620,16 @@ async fn main() {
 
     let app = router(state);
 
+    // Ops kill switch for digest-based anti-entropy: when set, the sync
+    // loop skips the digest probe and uses the legacy full-sync fallbacks
+    // only (see docs/ops-guide.md).
+    let digest_sync_enabled = !std::env::var("ASTEROIDB_DIGEST_SYNC_DISABLED")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
     let runner_config = NodeRunnerConfig {
         bls_config,
         node_signer,
@@ -627,6 +637,7 @@ async fn main() {
         internal_token: internal_token.clone(),
         current_epoch: Some(Arc::clone(&current_epoch)),
         equivocation: Some(Arc::clone(&equivocation)),
+        digest_sync_enabled,
         ..NodeRunnerConfig::default()
     };
 

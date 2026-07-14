@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::hlc::HlcTimestamp;
 use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 use crate::network::peer::PeerRegistry;
+use crate::store::digest::{DIGEST_LEN, DIGEST_SCHEME_VERSION, StoreDigest};
 use crate::store::kv::CrdtValue;
 
 /// Bulk sync request payload sent to `POST /api/internal/sync`.
@@ -131,6 +132,143 @@ pub struct DeltaSyncResponse {
     /// (false negatives); it never fabricates an applied claim.
     #[serde(default)]
     pub visible_origins: HashMap<String, HlcTimestamp>,
+}
+
+// ---------------------------------------------------------------
+// Digest sync types (stepwise diff, see crate::store::digest)
+// ---------------------------------------------------------------
+
+/// A single non-empty bucket digest in a [`DigestSyncRequest`].
+///
+/// The bucket list is sparse: absent indexes mean "empty bucket".
+/// NOTE for maintainers: bincode is positional — new fields may only be
+/// appended at the end with `#[serde(default)]` and never
+/// `skip_serializing_if` (same rule as `KeyDumpResponse`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketDigestEntry {
+    /// Bucket index (`0..DIGEST_BUCKET_COUNT`).
+    pub index: u16,
+    /// 32-byte SHA-256 bucket digest.
+    pub digest: Vec<u8>,
+}
+
+/// Request payload for `POST /api/internal/sync/digest`.
+///
+/// The requester sends its full two-level digest; the responder compares
+/// against its own state and answers in ONE round trip — either
+/// `root_matched` (zero transfer) or the entries of every mismatched
+/// bucket. Keeping the whole exchange in one round trip matters on
+/// high-latency links (the target deployment), which is why this is a
+/// fixed-depth digest rather than a Merkle-tree descent (O(log n) RTTs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestSyncRequest {
+    /// Node ID of the requesting node.
+    pub sender: String,
+    /// Digest scheme version ([`DIGEST_SCHEME_VERSION`]). A responder
+    /// with a different version replies `scheme_ok = false` and the
+    /// requester falls back to legacy full sync.
+    pub scheme_version: u32,
+    /// 32-byte root digest of the requester's state.
+    pub root: Vec<u8>,
+    /// Sparse list of the requester's non-empty bucket digests.
+    pub buckets: Vec<BucketDigestEntry>,
+    /// `true` (pull): the responder returns mismatched-bucket entries.
+    /// `false` (push probe): the responder returns only the mismatched
+    /// bucket indexes, and the requester pushes its own keys for them.
+    pub include_entries: bool,
+}
+
+impl DigestSyncRequest {
+    /// Build a request from a locally computed [`StoreDigest`].
+    pub fn from_digest(sender: &str, digest: &StoreDigest, include_entries: bool) -> Self {
+        Self {
+            sender: sender.to_string(),
+            scheme_version: DIGEST_SCHEME_VERSION,
+            root: digest.root.to_vec(),
+            buckets: digest
+                .non_empty_buckets()
+                .map(|(index, d)| BucketDigestEntry {
+                    index,
+                    digest: d.to_vec(),
+                })
+                .collect(),
+            include_entries,
+        }
+    }
+}
+
+/// Response payload for `POST /api/internal/sync/digest`.
+///
+/// Everything in this response — digest comparison, entries, frontier and
+/// session-guarantee metadata — is taken from ONE snapshot of the
+/// responder's store (single lock scope). That is what makes adopting the
+/// session claims after applying the mismatched entries exactly as sound
+/// as after a full dump: matched buckets are byte-identical to the
+/// snapshot, mismatched buckets are fully contained in `entries`, so the
+/// receiver's post-merge state dominates the responder's snapshot state.
+///
+/// All fields carry `#[serde(default)]` so future trailing additions stay
+/// JSON-compatible; bincode remains positional (append-only, no
+/// `skip_serializing_if`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DigestSyncResponse {
+    /// `false` when the responder does not speak the requested digest
+    /// scheme version (or the request digests were malformed). The
+    /// requester must fall back to legacy full sync.
+    #[serde(default)]
+    pub scheme_ok: bool,
+    /// `true` when the root digests matched: states are identical and no
+    /// entries are transferred.
+    #[serde(default)]
+    pub root_matched: bool,
+    /// Bucket indexes whose digests differ (bidirectional difference).
+    #[serde(default)]
+    pub mismatched_buckets: Vec<u16>,
+    /// Entries of every mismatched bucket (only when the request had
+    /// `include_entries = true` and the root did not match).
+    #[serde(default)]
+    pub entries: HashMap<String, CrdtValue>,
+    /// Per-key HLC timestamps for `entries` (where tracked).
+    #[serde(default)]
+    pub timestamps: HashMap<String, HlcTimestamp>,
+    /// The responder's current frontier at snapshot time.
+    #[serde(default)]
+    pub frontier: Option<HlcTimestamp>,
+    /// The responder's per-origin applied frontier (session guarantees),
+    /// snapshotted together with the digest — adoptable by the receiver
+    /// after applying `entries` (full-dump-equivalent completeness).
+    #[serde(default)]
+    pub applied_origins: HashMap<String, HlcTimestamp>,
+    /// The responder's per-origin visible frontier (superset of
+    /// `applied_origins`; merged unconditionally).
+    #[serde(default)]
+    pub visible_origins: HashMap<String, HlcTimestamp>,
+    /// Keys poisoned on the responder by failed merges (unioned when
+    /// adopting `applied_origins`).
+    #[serde(default)]
+    pub merge_failed_keys: Vec<String>,
+    /// Total number of keys in the responder's snapshot. The requester
+    /// derives the transfer saving as `total_keys - entries.len()`.
+    #[serde(default)]
+    pub total_keys: u64,
+}
+
+/// Result of a digest sync attempt.
+#[derive(Debug)]
+pub enum DigestSyncResult {
+    /// Response received and decoded (check `scheme_ok` before use).
+    /// Boxed: the response struct is large relative to the other variants.
+    Ok(Box<DigestSyncResponse>),
+    /// The peer answered with a status proving the digest route is
+    /// absent (404 from an older node, 405 from a router that knows the
+    /// path but not the method). The caller should fall back to legacy
+    /// full sync and cache the peer as digest-unsupported for a while.
+    Unsupported,
+    /// Network failure, undecodable response, or any other non-2xx
+    /// status (500/503/429/401, ... — plausibly transient conditions on
+    /// a digest-capable peer); fall back to legacy full sync for this
+    /// cycle without caching the peer as unsupported.
+    Failed,
 }
 
 /// Error returned when a batched push partially or fully fails.
@@ -665,9 +803,16 @@ impl SyncClient {
     /// after `frontier` (using the `timestamps` map), then sends them
     /// in batches of [`DEFAULT_BATCH_SIZE`] via `POST /api/internal/sync`.
     ///
-    /// Returns the total number of entries successfully pushed. If any
-    /// batch fails, remaining batches are skipped and the partial count
-    /// is returned so the caller can decide whether to retry.
+    /// Returns the total number of entries successfully pushed. If a
+    /// batch fails at the transport/HTTP level, remaining batches are
+    /// skipped and the partial count is returned so the caller can
+    /// decide whether to retry. Per-key merge errors reported by the
+    /// peer (e.g. permanent type mismatches) do NOT abort later batches:
+    /// the failing keys are skipped, every remaining batch is still
+    /// attempted, and the accumulated failures are reported through the
+    /// returned error at the end — one poisoned key must not starve the
+    /// keys in subsequent batches (which a full-state push would have
+    /// delivered).
     pub async fn push_changed_keys(
         &self,
         peer_addr: &str,
@@ -686,6 +831,7 @@ impl SyncClient {
         };
 
         let mut total_pushed = 0usize;
+        let mut merge_error_total = 0usize;
 
         for chunk in changed_entries.chunks(effective_batch_size) {
             let entries: HashMap<String, CrdtValue> = chunk.iter().cloned().collect();
@@ -715,12 +861,13 @@ impl SyncClient {
                                 error_keys = ?error_keys,
                                 "delta push batch had merge errors on remote"
                             );
-                            // Partial success: return error so the caller can
-                            // advance the frontier only up to what succeeded.
-                            return Err(SyncPushError {
-                                pushed: total_pushed + actually_pushed,
-                                reason: format!("{error_count} keys failed to merge on remote"),
-                            });
+                            // Per-key merge errors are typically permanent
+                            // (type mismatches poisoned on the remote):
+                            // aborting here would starve every key in the
+                            // remaining batches without helping the failed
+                            // ones. Keep pushing and report the accumulated
+                            // failures once all batches were attempted.
+                            merge_error_total += error_count;
                         }
                         total_pushed += actually_pushed;
                         tracing::debug!(
@@ -752,6 +899,15 @@ impl SyncClient {
                     });
                 }
             }
+        }
+
+        if merge_error_total > 0 {
+            // Partial success: return an error so the caller does not
+            // advance its frontier past the failed keys.
+            return Err(SyncPushError {
+                pushed: total_pushed,
+                reason: format!("{merge_error_total} keys failed to merge on remote"),
+            });
         }
 
         Ok(total_pushed)
@@ -927,6 +1083,102 @@ impl SyncClient {
             Err(e) => {
                 tracing::warn!(error = %e, "delta sync request failed");
                 PullDeltaResult::NetworkError
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Digest sync methods
+    // ---------------------------------------------------------------
+
+    /// Exchange key-range digests with a peer via
+    /// `POST /api/internal/sync/digest`.
+    ///
+    /// Returns [`DigestSyncResult::Unsupported`] only for 404/405
+    /// responses (older nodes answer 404 for the unknown route —
+    /// rolling-upgrade safe) and [`DigestSyncResult::Failed`] for
+    /// transport errors, undecodable payloads, and every other non-2xx
+    /// status: a 500/503/429/401 may come from a digest-capable peer
+    /// that is merely overloaded or mid-token-rotation, and must not
+    /// park the peer in the caller's digest-unsupported cache. Like
+    /// [`pull_delta`](Self::pull_delta), an undecodable bincode body is
+    /// retried once forcing a JSON response (mixed-version peers).
+    pub async fn digest_sync(&self, peer_addr: &str, req: &DigestSyncRequest) -> DigestSyncResult {
+        debug_assert_eq!(req.root.len(), DIGEST_LEN);
+        let url = format!("http://{peer_addr}/api/internal/sync/digest");
+
+        match self.send_with_json_fallback(&url, req).await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match Self::decode_response::<DigestSyncResponse>(resp).await {
+                        Ok(digest_resp) => DigestSyncResult::Ok(Box::new(digest_resp)),
+                        Err(e) => {
+                            // Mixed-version compatibility: retry once
+                            // forcing JSON (see pull_delta for rationale).
+                            tracing::warn!(
+                                error = %e,
+                                peer = %peer_addr,
+                                "failed to deserialize digest sync response; \
+                                 retrying with JSON (mixed-version peer?)"
+                            );
+                            let json_retry = self
+                                .json_post(&url, req)
+                                .header("accept", "application/json")
+                                .send()
+                                .await;
+                            match json_retry {
+                                Ok(resp) if resp.status().is_success() => {
+                                    match Self::decode_response::<DigestSyncResponse>(resp).await {
+                                        Ok(digest_resp) => {
+                                            DigestSyncResult::Ok(Box::new(digest_resp))
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                peer = %peer_addr,
+                                                "digest sync JSON retry undecodable"
+                                            );
+                                            DigestSyncResult::Failed
+                                        }
+                                    }
+                                }
+                                _ => DigestSyncResult::Failed,
+                            }
+                        }
+                    }
+                } else {
+                    // send_with_json_fallback already retried with JSON on
+                    // a non-success status. Only a status that proves the
+                    // route itself is absent (404 on old nodes, 405 from a
+                    // router that knows the path but not the method) means
+                    // the peer is digest-unsupported; anything else —
+                    // 503/500 under load, 429, 401 during token rotation —
+                    // is plausibly transient on a digest-capable peer and
+                    // must map to Failed so the caller does not cache the
+                    // peer as unsupported for 10 minutes.
+                    let status = resp.status();
+                    if status == reqwest::StatusCode::NOT_FOUND
+                        || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    {
+                        tracing::debug!(
+                            peer = %peer_addr,
+                            status = %status,
+                            "digest sync rejected by peer (digest-unsupported node?)"
+                        );
+                        DigestSyncResult::Unsupported
+                    } else {
+                        tracing::warn!(
+                            peer = %peer_addr,
+                            status = %status,
+                            "digest sync received non-success status (transient?)"
+                        );
+                        DigestSyncResult::Failed
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, peer = %peer_addr, "digest sync request failed");
+                DigestSyncResult::Failed
             }
         }
     }
@@ -1544,5 +1796,127 @@ mod tests {
     #[test]
     fn max_delta_payload_bytes_is_512_kib() {
         assert_eq!(super::MAX_DELTA_PAYLOAD_BYTES, 512 * 1024);
+    }
+
+    // ---------------------------------------------------------------
+    // Digest sync types serde
+    // ---------------------------------------------------------------
+
+    fn sample_digest_response() -> DigestSyncResponse {
+        let mut counter = PnCounter::new();
+        counter.increment(&nid("node-1"));
+        let mut entries = HashMap::new();
+        entries.insert("hits".to_string(), CrdtValue::Counter(counter));
+        let mut timestamps = HashMap::new();
+        timestamps.insert("hits".to_string(), hlc(500, 0, "node-1"));
+        let mut applied_origins = HashMap::new();
+        applied_origins.insert("node-1".to_string(), hlc(500, 0, "node-1"));
+
+        DigestSyncResponse {
+            scheme_ok: true,
+            root_matched: false,
+            mismatched_buckets: vec![3, 200],
+            entries,
+            timestamps,
+            frontier: Some(hlc(500, 0, "node-1")),
+            applied_origins,
+            visible_origins: HashMap::new(),
+            merge_failed_keys: vec!["bad-key".into()],
+            total_keys: 42,
+        }
+    }
+
+    #[test]
+    fn digest_sync_request_bincode_roundtrip() {
+        let req = DigestSyncRequest {
+            sender: "node-1".to_string(),
+            scheme_version: crate::store::digest::DIGEST_SCHEME_VERSION,
+            root: vec![7u8; 32],
+            buckets: vec![BucketDigestEntry {
+                index: 12,
+                digest: vec![9u8; 32],
+            }],
+            include_entries: true,
+        };
+        let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (back, _): (DigestSyncRequest, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back.sender, "node-1");
+        assert_eq!(back.scheme_version, 1);
+        assert_eq!(back.root, vec![7u8; 32]);
+        assert_eq!(back.buckets.len(), 1);
+        assert_eq!(back.buckets[0].index, 12);
+        assert!(back.include_entries);
+    }
+
+    #[test]
+    fn digest_sync_response_bincode_roundtrip() {
+        let resp = sample_digest_response();
+        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (back, _): (DigestSyncResponse, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert!(back.scheme_ok);
+        assert!(!back.root_matched);
+        assert_eq!(back.mismatched_buckets, vec![3, 200]);
+        assert!(back.entries.contains_key("hits"));
+        assert_eq!(back.timestamps["hits"].physical, 500);
+        assert_eq!(back.applied_origins["node-1"].physical, 500);
+        assert_eq!(back.merge_failed_keys, vec!["bad-key".to_string()]);
+        assert_eq!(back.total_keys, 42);
+    }
+
+    /// Fields missing from an older peer's JSON must default (serde
+    /// forward compatibility for future trailing additions).
+    #[test]
+    fn digest_sync_response_legacy_json_deserialises_with_defaults() {
+        let json = r#"{"scheme_ok":true,"root_matched":true}"#;
+        let back: DigestSyncResponse = serde_json::from_str(json).unwrap();
+        assert!(back.scheme_ok);
+        assert!(back.root_matched);
+        assert!(back.mismatched_buckets.is_empty());
+        assert!(back.entries.is_empty());
+        assert!(back.frontier.is_none());
+        assert!(back.applied_origins.is_empty());
+        assert_eq!(back.total_keys, 0);
+    }
+
+    #[test]
+    fn digest_sync_request_from_digest_sends_only_non_empty_buckets() {
+        use crate::store::digest::compute_store_digest;
+        use std::collections::BTreeMap;
+
+        let mut counter = PnCounter::new();
+        counter.increment(&nid("node-1"));
+        let mut data = BTreeMap::new();
+        data.insert("hits".to_string(), CrdtValue::Counter(counter));
+        let digest = compute_store_digest(&data);
+
+        let req = DigestSyncRequest::from_digest("node-1", &digest, true);
+        assert_eq!(
+            req.scheme_version,
+            crate::store::digest::DIGEST_SCHEME_VERSION
+        );
+        assert_eq!(req.root.len(), 32);
+        assert_eq!(req.buckets.len(), 1, "single key → single non-empty bucket");
+        assert_eq!(
+            req.buckets[0].index as usize,
+            crate::store::digest::bucket_of("hits")
+        );
+        assert_eq!(req.buckets[0].digest.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn digest_sync_to_unreachable_peer_returns_failed() {
+        let registry = shared_registry(vec![]);
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let client = SyncClient::with_client(registry, http_client);
+
+        let digest = crate::store::digest::compute_store_digest(&std::collections::BTreeMap::new());
+        let req = DigestSyncRequest::from_digest("node-1", &digest, true);
+        let result = client.digest_sync("127.0.0.1:1", &req).await;
+        assert!(matches!(result, DigestSyncResult::Failed));
     }
 }

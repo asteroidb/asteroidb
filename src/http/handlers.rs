@@ -38,8 +38,12 @@ use crate::types::{KeyRange, NodeId, PolicyVersion};
 use crate::network::PeerRegistry;
 use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
 use crate::network::sync::{
-    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
-    SyncResponse,
+    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, DigestSyncRequest, DigestSyncResponse,
+    KeyDumpResponse, SyncError, SyncRequest, SyncResponse,
+};
+use crate::store::digest::{
+    DIGEST_BUCKET_COUNT, DIGEST_LEN, DIGEST_SCHEME_VERSION, bucket_of, compute_store_digest,
+    mismatched_buckets,
 };
 
 use crate::session::SessionToken;
@@ -1422,6 +1426,132 @@ pub async fn internal_delta_sync(
         pruned_floor,
         visible_origins,
     };
+    internal_response(&resp, accept)
+}
+
+/// `POST /api/internal/sync/digest`
+///
+/// Digest-based stepwise diff (anti-entropy). The requester sends its
+/// two-level key-range digest; this handler compares it against the local
+/// state and answers in one round trip:
+/// - root match → `root_matched = true`, zero entries;
+/// - mismatch → the full entries of every mismatched bucket (when
+///   `include_entries` is set), plus timestamps.
+///
+/// The digest input, entries, frontier and session-guarantee metadata are
+/// all snapshotted in a SINGLE lock scope (same invariant as
+/// `internal_keys`): the receiver may adopt `applied_origins` after
+/// applying the mismatched entries precisely because matched buckets are
+/// byte-identical to this snapshot and mismatched buckets are transferred
+/// in full — completeness equivalent to a full dump. The O(state size)
+/// hashing runs OFF the lock in `spawn_blocking`.
+///
+/// Read-only: no `wait_wal_durable` is needed (nothing is acknowledged).
+pub async fn internal_digest_sync(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Scheme validation: a version or shape mismatch is NOT an error —
+    // answer 200 with `scheme_ok = false` so the requester falls back to
+    // the legacy full sync (rolling-upgrade safe in both directions).
+    let scheme_valid = req.scheme_version == DIGEST_SCHEME_VERSION
+        && req.root.len() == DIGEST_LEN
+        && req
+            .buckets
+            .iter()
+            .all(|b| (b.index as usize) < DIGEST_BUCKET_COUNT && b.digest.len() == DIGEST_LEN);
+    if !scheme_valid {
+        tracing::debug!(
+            sender = %req.sender,
+            scheme_version = req.scheme_version,
+            "digest sync request with unsupported scheme; answering scheme_ok=false"
+        );
+        return internal_response(&DigestSyncResponse::default(), accept);
+    }
+
+    // Single-lock-scope snapshot: digest material, entries, frontier and
+    // session claims must all describe exactly the same state T0.
+    let api = state.eventual.lock().await;
+    let store = api.store();
+    let data: std::collections::BTreeMap<String, CrdtValue> = store
+        .all_entries()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut timestamps = std::collections::HashMap::new();
+    for (k, _, hlc) in store.all_entries_with_hlc() {
+        timestamps.insert(k.clone(), hlc.clone());
+    }
+    let frontier = store.current_frontier();
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let visible_origins = store.visible_origins().clone();
+    drop(api);
+
+    let resp = tokio::task::spawn_blocking(move || {
+        let local = compute_store_digest(&data);
+        let total_keys = local.total_keys;
+
+        if req.root.as_slice() == local.root {
+            return DigestSyncResponse {
+                scheme_ok: true,
+                root_matched: true,
+                frontier,
+                applied_origins,
+                visible_origins,
+                merge_failed_keys,
+                total_keys,
+                ..DigestSyncResponse::default()
+            };
+        }
+
+        let remote: Vec<(u16, [u8; DIGEST_LEN])> = req
+            .buckets
+            .iter()
+            .map(|b| {
+                let mut digest = [0u8; DIGEST_LEN];
+                digest.copy_from_slice(&b.digest);
+                (b.index, digest)
+            })
+            .collect();
+        let mismatched = mismatched_buckets(&local, &remote);
+
+        let mut entries = std::collections::HashMap::new();
+        let mut entry_timestamps = std::collections::HashMap::new();
+        if req.include_entries {
+            let mismatched_set: std::collections::HashSet<u16> =
+                mismatched.iter().copied().collect();
+            for (key, value) in data {
+                if mismatched_set.contains(&(bucket_of(&key) as u16)) {
+                    if let Some(ts) = timestamps.get(&key) {
+                        entry_timestamps.insert(key.clone(), ts.clone());
+                    }
+                    entries.insert(key, value);
+                }
+            }
+        }
+
+        DigestSyncResponse {
+            scheme_ok: true,
+            root_matched: false,
+            mismatched_buckets: mismatched,
+            entries,
+            timestamps: entry_timestamps,
+            frontier,
+            applied_origins,
+            visible_origins,
+            merge_failed_keys,
+            total_keys,
+        }
+    })
+    .await
+    .expect("spawn_blocking panicked");
+
     internal_response(&resp, accept)
 }
 

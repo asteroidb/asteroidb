@@ -287,7 +287,48 @@ pub struct RuntimeMetrics {
     ///
     /// When the ratio of changed keys to total keys exceeds the configured
     /// threshold, delta sync is skipped and full state is pushed instead.
+    /// Only counts full pushes that actually ran (a successful digest
+    /// probe on the same branch counts under `digest_push_*` instead).
     pub full_sync_fallback_count: AtomicU64,
+
+    /// Cumulative number of digest sync pull attempts (fallback path).
+    pub digest_sync_attempt_total: AtomicU64,
+
+    /// Cumulative number of digest pulls that completed with a root digest
+    /// match — full-sync-equivalent coverage at zero data transfer.
+    pub digest_sync_root_match_total: AtomicU64,
+
+    /// Cumulative number of digest pulls that transferred only the
+    /// mismatched buckets (partial dump instead of a full dump).
+    pub digest_sync_partial_total: AtomicU64,
+
+    /// Cumulative number of digest sync attempts rejected by a peer that
+    /// does not support the endpoint/scheme (old node; legacy full sync
+    /// was used instead).
+    pub digest_sync_unsupported_total: AtomicU64,
+
+    /// Cumulative number of digest sync attempts that failed at the
+    /// network/decode level (legacy full sync was used instead).
+    pub digest_sync_failed_total: AtomicU64,
+
+    /// Cumulative number of keys actually transferred by digest pulls.
+    pub digest_sync_keys_transferred_total: AtomicU64,
+
+    /// Cumulative number of keys whose transfer was avoided by digest
+    /// sync (`Σ sender total_keys − transferred`); the bandwidth saving
+    /// relative to the legacy full dump.
+    pub digest_sync_keys_skipped_total: AtomicU64,
+
+    /// Cumulative number of digest push probes (before a full-state push).
+    pub digest_push_probe_total: AtomicU64,
+
+    /// Cumulative number of digest push probes that matched — the full
+    /// push was skipped entirely.
+    pub digest_push_match_total: AtomicU64,
+
+    /// Cumulative number of keys pushed via digest subset pushes (instead
+    /// of the full store).
+    pub digest_push_keys_pushed_total: AtomicU64,
 
     /// Cumulative number of rebalance operations started.
     pub rebalance_start_total: AtomicU64,
@@ -362,6 +403,16 @@ impl Default for RuntimeMetrics {
             sync_fallback_total: AtomicU64::default(),
             delta_sync_count: AtomicU64::default(),
             full_sync_fallback_count: AtomicU64::default(),
+            digest_sync_attempt_total: AtomicU64::default(),
+            digest_sync_root_match_total: AtomicU64::default(),
+            digest_sync_partial_total: AtomicU64::default(),
+            digest_sync_unsupported_total: AtomicU64::default(),
+            digest_sync_failed_total: AtomicU64::default(),
+            digest_sync_keys_transferred_total: AtomicU64::default(),
+            digest_sync_keys_skipped_total: AtomicU64::default(),
+            digest_push_probe_total: AtomicU64::default(),
+            digest_push_match_total: AtomicU64::default(),
+            digest_push_keys_pushed_total: AtomicU64::default(),
             rebalance_start_total: AtomicU64::default(),
             rebalance_keys_migrated: AtomicU64::default(),
             rebalance_keys_failed: AtomicU64::default(),
@@ -633,6 +684,24 @@ impl RuntimeMetrics {
             delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
             full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
             full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
+            digest_sync_attempt_total: self.digest_sync_attempt_total.load(Ordering::Relaxed),
+            digest_sync_root_match_total: self.digest_sync_root_match_total.load(Ordering::Relaxed),
+            digest_sync_partial_total: self.digest_sync_partial_total.load(Ordering::Relaxed),
+            digest_sync_unsupported_total: self
+                .digest_sync_unsupported_total
+                .load(Ordering::Relaxed),
+            digest_sync_failed_total: self.digest_sync_failed_total.load(Ordering::Relaxed),
+            digest_sync_keys_transferred_total: self
+                .digest_sync_keys_transferred_total
+                .load(Ordering::Relaxed),
+            digest_sync_keys_skipped_total: self
+                .digest_sync_keys_skipped_total
+                .load(Ordering::Relaxed),
+            digest_push_probe_total: self.digest_push_probe_total.load(Ordering::Relaxed),
+            digest_push_match_total: self.digest_push_match_total.load(Ordering::Relaxed),
+            digest_push_keys_pushed_total: self
+                .digest_push_keys_pushed_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -714,6 +783,27 @@ pub struct MetricsSnapshot {
     pub full_sync_fallback_count: u64,
     /// Ratio of full sync fallbacks to total syncs (0.0 to 1.0).
     pub full_sync_fallback_ratio: f64,
+    /// Cumulative number of digest sync pull attempts (fallback path).
+    pub digest_sync_attempt_total: u64,
+    /// Digest pulls completed with a root match (zero data transfer).
+    pub digest_sync_root_match_total: u64,
+    /// Digest pulls that transferred only the mismatched buckets.
+    pub digest_sync_partial_total: u64,
+    /// Digest sync attempts rejected by digest-unsupported peers.
+    pub digest_sync_unsupported_total: u64,
+    /// Digest sync attempts that failed at network/decode level.
+    pub digest_sync_failed_total: u64,
+    /// Keys actually transferred by digest pulls.
+    pub digest_sync_keys_transferred_total: u64,
+    /// Keys whose transfer was avoided by digest sync (bandwidth saving
+    /// relative to a full dump).
+    pub digest_sync_keys_skipped_total: u64,
+    /// Digest push probes attempted before full-state pushes.
+    pub digest_push_probe_total: u64,
+    /// Digest push probes that matched (full push skipped).
+    pub digest_push_match_total: u64,
+    /// Keys pushed via digest subset pushes (instead of the full store).
+    pub digest_push_keys_pushed_total: u64,
 }
 
 #[cfg(test)]

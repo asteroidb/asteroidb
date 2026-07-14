@@ -21,8 +21,8 @@ use crate::hlc::{Hlc, HlcTimestamp};
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
-    should_fallback_to_full_sync,
+    DEFAULT_BATCH_SIZE, DigestSyncRequest, DigestSyncResult, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff,
+    PullDeltaResult, SyncClient, should_fallback_to_full_sync,
 };
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
@@ -33,7 +33,14 @@ use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
 };
 use crate::placement::topology::TopologyView;
+use crate::store::digest::{StoreDigest, bucket_of, compute_store_digest};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
+
+/// How long a peer stays cached as digest-unsupported (e.g. an old node
+/// answering 404 for `/api/internal/sync/digest`) before being re-probed.
+/// Bounds the per-cycle probe overhead against not-yet-upgraded peers
+/// while letting upgraded peers be picked up within minutes.
+const DIGEST_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
 
 /// Configuration for BLS key generation in [`NodeRunner`].
 ///
@@ -107,6 +114,14 @@ pub struct NodeRunnerConfig {
     /// pushed to the peer instead, because the delta payload is nearly as
     /// large as a full dump. Default: 0.5 (50%).
     pub full_sync_threshold: f64,
+    /// Enable digest-based stepwise diff before full-sync fallbacks.
+    ///
+    /// When `true` (default), the sync loop exchanges two-level key-range
+    /// digests with the peer before pushing/pulling a full state dump and
+    /// transfers only mismatched buckets (zero transfer on a root match).
+    /// Ops kill switch: set `false` to restore the legacy full-sync-only
+    /// behaviour (`ASTEROIDB_DIGEST_SYNC_DISABLED=1` in the binary).
+    pub digest_sync_enabled: bool,
     /// This node's signing key holder. When `Some` and this node is an
     /// authority, frontier reports are signed (FR-008 signing pipeline).
     pub node_signer: Option<Arc<NodeSigner>>,
@@ -143,6 +158,7 @@ impl Default for NodeRunnerConfig {
             frontier_gc_max_retained_versions: 2,
             frontier_gc_grace_period_secs: 300,
             full_sync_threshold: 0.5,
+            digest_sync_enabled: true,
             node_signer: None,
             keyset_registry: None,
             internal_token: None,
@@ -207,6 +223,13 @@ pub struct NodeRunner {
     /// Per-peer exponential backoff state for sync retries.
     /// Tracks consecutive failures and gates retry attempts.
     peer_backoffs: HashMap<String, PeerBackoff>,
+    /// Peers that rejected digest sync (old nodes without the endpoint or
+    /// with a different scheme version), keyed by peer address with the
+    /// instant of the rejection. Digest probes are skipped for these
+    /// peers until [`DIGEST_UNSUPPORTED_RETRY`] elapses (re-probe picks
+    /// up rolling upgrades). Cleaned together with `peer_frontiers` when
+    /// peers leave the registry.
+    digest_unsupported: HashMap<String, Instant>,
     /// Known cluster nodes for authority auto-reconfiguration.
     ///
     /// When this list changes (node join/leave), the runner triggers
@@ -331,6 +354,32 @@ struct DeltaApplyOutcome {
     claims_ok: bool,
 }
 
+/// Outcome of a digest-based pull attempt (see [`NodeRunner::try_digest_pull`]).
+enum DigestPullOutcome {
+    /// Digest sync completed with full-dump-equivalent coverage (either a
+    /// root match with zero transfer, or a mismatched-bucket dump). The
+    /// caller records success and skips the legacy full sync.
+    Synced,
+    /// Digest sync was not possible (unsupported peer, scheme mismatch,
+    /// or a network/decode failure). The caller falls through to the
+    /// legacy full sync — behaviour identical to before digest sync.
+    Fallback,
+}
+
+/// Outcome of a digest-based push probe (see [`NodeRunner::try_digest_push`]).
+enum DigestPushOutcome {
+    /// The probe ran: either the peer already matched (nothing pushed) or
+    /// the mismatched-bucket subset was pushed. The caller skips the
+    /// legacy full-state push. Partial subset-push failures are also
+    /// `Handled` — the frontier was not advanced, so the next cycle
+    /// retries; an immediate full push would only resend more.
+    Handled,
+    /// The probe could not run (unsupported peer, scheme mismatch, or a
+    /// network/decode failure). The caller falls through to the legacy
+    /// full-state push.
+    Fallback,
+}
+
 impl NodeRunner {
     /// Initialize epoch manager and optional BLS keypair from config.
     ///
@@ -453,6 +502,7 @@ impl NodeRunner {
             peer_frontiers: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
+            digest_unsupported: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
@@ -555,6 +605,7 @@ impl NodeRunner {
             peer_frontiers: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
+            digest_unsupported: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick,
             // consistent with `with_cluster_nodes()`.
@@ -1728,12 +1779,10 @@ impl NodeRunner {
                     total_keys,
                     self.config.full_sync_threshold,
                 ) {
-                    // High change rate: fall back to full state push.
-                    let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
-                        .store()
-                        .all_entries()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    // High change rate: full-sync territory. Probe the
+                    // peer with a key-range digest first — if the states
+                    // already match (or only a few buckets differ) the
+                    // full-state push is avoided entirely.
                     drop(api);
 
                     tracing::info!(
@@ -1745,31 +1794,65 @@ impl NodeRunner {
                         "change rate exceeds threshold, falling back to full sync push"
                     );
 
-                    self.metrics
-                        .full_sync_fallback_count
-                        .fetch_add(1, Ordering::Relaxed);
+                    let digest_handled = if Self::digest_sync_allowed(
+                        &self.digest_unsupported,
+                        self.config.digest_sync_enabled,
+                        &peer_key,
+                    ) {
+                        matches!(
+                            Self::try_digest_push(
+                                sync_client,
+                                eventual_api,
+                                &self.metrics,
+                                &self.node_id.0,
+                                peer_id,
+                                &peer_key,
+                                &peer.addr,
+                                &mut self.peer_frontiers,
+                                &mut self.digest_unsupported,
+                            )
+                            .await,
+                            DigestPushOutcome::Handled
+                        )
+                    } else {
+                        false
+                    };
 
-                    let push_resp = sync_client
-                        .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
-                        .await;
+                    if !digest_handled {
+                        self.metrics
+                            .full_sync_fallback_count
+                            .fetch_add(1, Ordering::Relaxed);
 
-                    if let Some(resp) = push_resp {
-                        if !resp.errors.is_empty() {
-                            tracing::warn!(
-                                peer = %peer.node_id.0,
-                                error_count = resp.errors.len(),
-                                merged = resp.merged,
-                                "full sync push had per-key errors, not advancing frontier"
-                            );
-                        } else {
-                            // After a successful full push, advance the frontier to
-                            // the local store's current frontier so the next delta
-                            // sync starts from the right point.
-                            let api = eventual_api.lock().await;
-                            if let Some(current) = api.store().current_frontier() {
-                                self.peer_frontiers.insert(peer_key.clone(), current);
+                        let api = eventual_api.lock().await;
+                        let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                            .store()
+                            .all_entries()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        drop(api);
+
+                        let push_resp = sync_client
+                            .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
+                            .await;
+
+                        if let Some(resp) = push_resp {
+                            if !resp.errors.is_empty() {
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    error_count = resp.errors.len(),
+                                    merged = resp.merged,
+                                    "full sync push had per-key errors, not advancing frontier"
+                                );
+                            } else {
+                                // After a successful full push, advance the frontier to
+                                // the local store's current frontier so the next delta
+                                // sync starts from the right point.
+                                let api = eventual_api.lock().await;
+                                if let Some(current) = api.store().current_frontier() {
+                                    self.peer_frontiers.insert(peer_key.clone(), current);
+                                }
+                                drop(api);
                             }
-                            drop(api);
                         }
                     }
                 } else {
@@ -1811,44 +1894,77 @@ impl NodeRunner {
                                 "delta payload exceeds size limit, falling back to full sync"
                             );
 
-                            self.metrics
-                                .full_sync_fallback_count
-                                .fetch_add(1, Ordering::Relaxed);
+                            // Digest probe first: skip the full push when
+                            // the peer already matches (or push only the
+                            // mismatched buckets).
+                            let digest_handled = if Self::digest_sync_allowed(
+                                &self.digest_unsupported,
+                                self.config.digest_sync_enabled,
+                                &peer_key,
+                            ) {
+                                matches!(
+                                    Self::try_digest_push(
+                                        sync_client,
+                                        eventual_api,
+                                        &self.metrics,
+                                        &self.node_id.0,
+                                        peer_id,
+                                        &peer_key,
+                                        &peer.addr,
+                                        &mut self.peer_frontiers,
+                                        &mut self.digest_unsupported,
+                                    )
+                                    .await,
+                                    DigestPushOutcome::Handled
+                                )
+                            } else {
+                                false
+                            };
 
-                            let api = eventual_api.lock().await;
-                            let snapshot: Vec<(String, crate::store::kv::CrdtValue)> = api
-                                .store()
-                                .all_entries()
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect();
-                            drop(api);
+                            if !digest_handled {
+                                self.metrics
+                                    .full_sync_fallback_count
+                                    .fetch_add(1, Ordering::Relaxed);
 
-                            let all_entries = tokio::task::spawn_blocking(move || {
-                                snapshot
-                                    .into_iter()
-                                    .collect::<HashMap<String, crate::store::kv::CrdtValue>>()
-                            })
-                            .await
-                            .expect("spawn_blocking panicked");
+                                let api = eventual_api.lock().await;
+                                let snapshot: Vec<(String, crate::store::kv::CrdtValue)> = api
+                                    .store()
+                                    .all_entries()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                drop(api);
 
-                            let push_resp = sync_client
-                                .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
-                                .await;
+                                let all_entries = tokio::task::spawn_blocking(move || {
+                                    snapshot
+                                        .into_iter()
+                                        .collect::<HashMap<String, crate::store::kv::CrdtValue>>()
+                                })
+                                .await
+                                .expect("spawn_blocking panicked");
 
-                            if let Some(resp) = push_resp {
-                                if !resp.errors.is_empty() {
-                                    tracing::warn!(
-                                        peer = %peer.node_id.0,
-                                        error_count = resp.errors.len(),
-                                        merged = resp.merged,
-                                        "payload overflow full push had per-key errors"
-                                    );
-                                } else {
-                                    let api = eventual_api.lock().await;
-                                    if let Some(current) = api.store().current_frontier() {
-                                        self.peer_frontiers.insert(peer_key.clone(), current);
+                                let push_resp = sync_client
+                                    .push_full_state_to_peer(
+                                        &peer.addr,
+                                        all_entries,
+                                        &self.node_id.0,
+                                    )
+                                    .await;
+
+                                if let Some(resp) = push_resp {
+                                    if !resp.errors.is_empty() {
+                                        tracing::warn!(
+                                            peer = %peer.node_id.0,
+                                            error_count = resp.errors.len(),
+                                            merged = resp.merged,
+                                            "payload overflow full push had per-key errors"
+                                        );
+                                    } else {
+                                        let api = eventual_api.lock().await;
+                                        if let Some(current) = api.store().current_frontier() {
+                                            self.peer_frontiers.insert(peer_key.clone(), current);
+                                        }
+                                        drop(api);
                                     }
-                                    drop(api);
                                 }
                             }
                         } else {
@@ -2151,99 +2267,73 @@ impl NodeRunner {
                 }
             }
 
-            // Full sync fallback: pull all keys from peer.
-            if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
-                let mut api = eventual_api.lock().await;
-                let mut full_sync_errors = 0u64;
-                for (key, value) in &dump.entries {
-                    // Preserve original HLC timestamps when available to avoid
-                    // retimestamping imported entries with a local clock tick.
-                    let result = if let Some(hlc) = dump.timestamps.get(key) {
-                        api.merge_remote_with_hlc(key.clone(), value, hlc.clone())
-                    } else {
-                        api.merge_remote(key.clone(), value)
-                    };
-                    if let Err(e) = result {
-                        full_sync_errors += 1;
-                        tracing::warn!(
-                            peer = %peer.node_id.0,
-                            key = %key,
-                            error = %e,
-                            "full sync merge failed for key"
-                        );
-                    }
+            // Digest-based stepwise diff: before falling back to a full
+            // key dump, compare key-range digests with the peer and pull
+            // only the mismatched buckets — zero transfer when the states
+            // already match. Every failure mode (unsupported peer, scheme
+            // mismatch, network/decode error) falls through to the legacy
+            // full sync below, unchanged (rolling-upgrade safe).
+            if Self::digest_sync_allowed(
+                &self.digest_unsupported,
+                self.config.digest_sync_enabled,
+                &peer_key,
+            ) {
+                let outcome = Self::try_digest_pull(
+                    sync_client,
+                    eventual_api,
+                    &self.metrics,
+                    &self.node_id.0,
+                    peer_id,
+                    &peer_key,
+                    &peer.addr,
+                    &mut self.peer_frontiers,
+                    &mut self.pull_verified_frontiers,
+                    &mut self.digest_unsupported,
+                )
+                .await;
+                if matches!(outcome, DigestPullOutcome::Synced) {
+                    any_success = true;
+                    let elapsed = peer_start.elapsed();
+                    self.record_peer_rtt(&peer.node_id, elapsed);
+                    self.metrics.record_peer_sync_success(peer_id, elapsed);
+                    self.peer_backoffs
+                        .entry(peer_key)
+                        .or_default()
+                        .record_success();
+                    tracing::debug!(
+                        peer = %peer.node_id.0,
+                        rtt_ms = elapsed.as_secs_f64() * 1000.0,
+                        "digest sync fallback succeeded"
+                    );
+                    continue;
                 }
-                // Frontier adoption (session guarantees): a full dump is
-                // the sender's complete state (pruned keys are still
-                // present in `entries`), so adopting its applied_origins
-                // is unconditionally sound after merging all entries.
-                // The sender's poisoned keys are unioned so its dropped
-                // contributions are not claimed as present here, and the
-                // visible frontier is merged so response tokens cover the
-                // now-visible contributions. adopt_session_claims persists
-                // all three as ONE WAL record; a WAL append failure only
-                // degrades durability of the adoption (retried by the
-                // next sync round), so it is logged rather than fatal.
-                if let Err(e) = api.adopt_session_claims(
+            }
+
+            // Full sync fallback: pull all keys from peer.
+            //
+            // Frontier adoption (session guarantees): a full dump is the
+            // sender's complete state (pruned keys are still present in
+            // `entries`), so adopting its applied_origins is
+            // unconditionally sound after merging all entries — see
+            // `apply_complete_state`, which is shared with the digest
+            // sync path precisely so the claims/frontier/poison semantics
+            // cannot diverge between the two.
+            if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
+                Self::apply_complete_state(
+                    &mut self.peer_frontiers,
+                    &mut self.pull_verified_frontiers,
+                    eventual_api,
+                    peer_id,
+                    &peer_key,
+                    &dump.entries,
+                    &dump.timestamps,
+                    dump.frontier.clone(),
                     &dump.applied_origins,
                     &dump.visible_origins,
                     dump.merge_failed_keys.clone(),
-                ) {
-                    tracing::warn!(
-                        peer = %peer.node_id.0,
-                        error = %e,
-                        "failed to persist adopted session claims (full sync)"
-                    );
-                }
-                drop(api);
-
-                if full_sync_errors > 0 {
-                    tracing::warn!(
-                        peer = %peer.node_id.0,
-                        error_count = full_sync_errors,
-                        total_entries = dump.entries.len(),
-                        "full sync completed with merge errors"
-                    );
-                    // Still advance the frontier below even with per-key
-                    // errors. Type-mismatch errors are typically permanent
-                    // for those keys, so refusing to advance would cause
-                    // full-sync to be retried endlessly without progress.
-                }
-                if let Some(remote_frontier) = dump.frontier {
-                    // A full dump is the peer's complete state: the verified
-                    // received prefix (session guarantees) advances to the
-                    // remote frontier along with the delta-sync frontier.
-                    if self
-                        .pull_verified_frontiers
-                        .get(&peer_key)
-                        .is_none_or(|existing| remote_frontier > *existing)
-                    {
-                        self.pull_verified_frontiers
-                            .insert(peer_key.clone(), remote_frontier.clone());
-                    }
-                    // Update the peer frontier from the *remote* peer's frontier.
-                    // We must NOT use our local store frontier here because the local
-                    // store may be ahead of the remote; using it would cause subsequent
-                    // delta pulls to miss remote updates between the remote's true
-                    // frontier and our local frontier.
-                    self.peer_frontiers
-                        .insert(peer_key.clone(), remote_frontier);
-                } else {
-                    // Remote reported no frontier (empty store or older peer).
-                    // Set a zero-epoch frontier so that subsequent sync cycles
-                    // enter the delta push/pull paths instead of repeatedly
-                    // falling back to full sync. A zero frontier causes
-                    // `entries_since()` to return all entries, which is correct
-                    // because the peer has seen nothing so far.
-                    self.peer_frontiers.insert(
-                        peer_key.clone(),
-                        crate::hlc::HlcTimestamp {
-                            physical: 0,
-                            logical: 0,
-                            node_id: String::new(),
-                        },
-                    );
-                }
+                    "full sync",
+                )
+                .await;
 
                 any_success = true;
                 let elapsed = peer_start.elapsed();
@@ -2277,6 +2367,8 @@ impl NodeRunner {
         self.pull_verified_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
         self.peer_backoffs
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.digest_unsupported
             .retain(|addr, _| active_addrs.contains(addr));
 
         // NOTE: sync_failure_total is incremented per-peer on failure above,
@@ -2718,6 +2810,443 @@ impl NodeRunner {
         }
     }
 
+    /// Whether a digest sync should be attempted against this peer.
+    ///
+    /// Skips peers that recently rejected the digest endpoint/scheme
+    /// (old nodes) until [`DIGEST_UNSUPPORTED_RETRY`] elapses, and
+    /// everything when the ops kill switch is off.
+    fn digest_sync_allowed(
+        digest_unsupported: &HashMap<String, Instant>,
+        enabled: bool,
+        peer_key: &str,
+    ) -> bool {
+        if !enabled {
+            return false;
+        }
+        match digest_unsupported.get(peer_key) {
+            Some(rejected_at) => rejected_at.elapsed() >= DIGEST_UNSUPPORTED_RETRY,
+            None => true,
+        }
+    }
+
+    /// Snapshot the eventual store's data and frontier in ONE lock scope,
+    /// then compute the two-level key-range digest OFF the lock.
+    ///
+    /// The digest describes exactly the returned `data`/frontier (that
+    /// coupling is what makes the push-side frontier advancement and the
+    /// pull-side claims adoption sound). Hashing is O(total CRDT state
+    /// size), so it runs in `spawn_blocking`; the lock is held only for
+    /// the clone, matching the existing full-push snapshot pattern.
+    async fn snapshot_store_digest(
+        eventual_api: &Arc<Mutex<EventualApi>>,
+    ) -> (
+        StoreDigest,
+        std::collections::BTreeMap<String, crate::store::kv::CrdtValue>,
+        Option<HlcTimestamp>,
+    ) {
+        let api = eventual_api.lock().await;
+        let data: std::collections::BTreeMap<String, crate::store::kv::CrdtValue> = api
+            .store()
+            .all_entries()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let frontier = api.store().current_frontier();
+        drop(api);
+
+        let (digest, data) = tokio::task::spawn_blocking(move || {
+            let digest = compute_store_digest(&data);
+            (digest, data)
+        })
+        .await
+        .expect("spawn_blocking panicked");
+
+        (digest, data, frontier)
+    }
+
+    /// Apply a COMPLETE state transfer received from a peer.
+    ///
+    /// "Complete" means that after merging `entries` this node holds
+    /// everything the sender's snapshot held: a full key dump satisfies
+    /// this trivially, and a digest sync response does too (matched
+    /// buckets are byte-identical to the sender's snapshot, mismatched
+    /// buckets are transferred in full). That completeness is the
+    /// soundness precondition for the unconditional adoption of the
+    /// sender's `applied_origins` below; the sender's poisoned keys are
+    /// unioned so its dropped contributions are not claimed as present
+    /// here, and the visible frontier is merged so response tokens cover
+    /// the now-visible contributions. `adopt_session_claims` persists all
+    /// three as ONE WAL record; an append failure only degrades the
+    /// adoption's durability (retried next round) and is logged.
+    ///
+    /// Frontier handling matches the historical full-sync behaviour:
+    /// - per-key merge errors are logged but do NOT block advancement
+    ///   (type mismatches are typically permanent; refusing to advance
+    ///   would retry the same failing dump forever — the keys are
+    ///   poisoned inside `merge_remote(_with_hlc)` so session checks stay
+    ///   fail-closed);
+    /// - both `pull_verified_frontiers` (max-monotone) and
+    ///   `peer_frontiers` advance to the sender's frontier — never the
+    ///   local frontier, which may be ahead of the remote;
+    /// - a sender without a frontier (empty store / old peer) yields a
+    ///   zero `peer_frontiers` entry so later cycles use the delta paths.
+    ///
+    /// Returns the number of per-key merge errors.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_complete_state(
+        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        pull_verified_frontiers: &mut HashMap<String, HlcTimestamp>,
+        eventual_api: &Arc<Mutex<EventualApi>>,
+        peer_id: &str,
+        peer_key: &str,
+        entries: &HashMap<String, crate::store::kv::CrdtValue>,
+        timestamps: &HashMap<String, HlcTimestamp>,
+        frontier: Option<HlcTimestamp>,
+        applied_origins: &HashMap<String, HlcTimestamp>,
+        visible_origins: &HashMap<String, HlcTimestamp>,
+        merge_failed_keys: Vec<String>,
+        label: &str,
+    ) -> u64 {
+        let mut api = eventual_api.lock().await;
+        let mut merge_errors = 0u64;
+        for (key, value) in entries {
+            // Preserve original HLC timestamps when available to avoid
+            // retimestamping imported entries with a local clock tick.
+            let result = if let Some(hlc) = timestamps.get(key) {
+                api.merge_remote_with_hlc(key.clone(), value, hlc.clone())
+            } else {
+                api.merge_remote(key.clone(), value)
+            };
+            if let Err(e) = result {
+                merge_errors += 1;
+                tracing::warn!(
+                    peer = %peer_id,
+                    key = %key,
+                    error = %e,
+                    "{} merge failed for key", label
+                );
+            }
+        }
+        if let Err(e) =
+            api.adopt_session_claims(applied_origins, visible_origins, merge_failed_keys)
+        {
+            tracing::warn!(
+                peer = %peer_id,
+                error = %e,
+                "failed to persist adopted session claims ({})", label
+            );
+        }
+        drop(api);
+
+        if merge_errors > 0 {
+            tracing::warn!(
+                peer = %peer_id,
+                error_count = merge_errors,
+                total_entries = entries.len(),
+                "{} completed with merge errors", label
+            );
+        }
+
+        if let Some(remote_frontier) = frontier {
+            // A complete transfer covers the sender's whole state: the
+            // verified received prefix (session guarantees) advances to
+            // the remote frontier along with the delta-sync frontier.
+            if pull_verified_frontiers
+                .get(peer_key)
+                .is_none_or(|existing| remote_frontier > *existing)
+            {
+                pull_verified_frontiers.insert(peer_key.to_string(), remote_frontier.clone());
+            }
+            peer_frontiers.insert(peer_key.to_string(), remote_frontier);
+        } else {
+            // Remote reported no frontier (empty store or older peer).
+            // Set a zero-epoch frontier so that subsequent sync cycles
+            // enter the delta push/pull paths instead of repeatedly
+            // falling back; a zero frontier makes `entries_since()`
+            // return everything, which is correct for a peer that has
+            // seen nothing.
+            peer_frontiers.insert(
+                peer_key.to_string(),
+                HlcTimestamp {
+                    physical: 0,
+                    logical: 0,
+                    node_id: String::new(),
+                },
+            );
+        }
+
+        merge_errors
+    }
+
+    /// Attempt a digest-based stepwise pull instead of a full key dump.
+    ///
+    /// Runs on the full-sync fallback path only (unclaimed delta, decode
+    /// failure, or exhausted delta retries). Sends the local digest and
+    /// applies the peer's answer: a root match completes with ZERO data
+    /// transfer, a mismatch transfers only the differing buckets — both
+    /// with full-dump-equivalent session-claim adoption (the response is
+    /// a single-snapshot answer, see `internal_digest_sync`).
+    ///
+    /// Returns [`DigestPullOutcome::Fallback`] on any failure WITHOUT
+    /// adopting anything (fail-closed: never a false claim) so the caller
+    /// proceeds with the legacy full sync.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_digest_pull(
+        sync_client: &SyncClient,
+        eventual_api: &Arc<Mutex<EventualApi>>,
+        metrics: &Arc<RuntimeMetrics>,
+        node_id: &str,
+        peer_id: &str,
+        peer_key: &str,
+        peer_addr: &str,
+        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        pull_verified_frontiers: &mut HashMap<String, HlcTimestamp>,
+        digest_unsupported: &mut HashMap<String, Instant>,
+    ) -> DigestPullOutcome {
+        metrics
+            .digest_sync_attempt_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let (digest, _data, _frontier) = Self::snapshot_store_digest(eventual_api).await;
+        let request = DigestSyncRequest::from_digest(node_id, &digest, true);
+
+        match sync_client.digest_sync(peer_addr, &request).await {
+            DigestSyncResult::Ok(resp) if resp.scheme_ok => {
+                digest_unsupported.remove(peer_key);
+                if resp.root_matched {
+                    metrics
+                        .digest_sync_root_match_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .digest_sync_keys_skipped_total
+                        .fetch_add(resp.total_keys, Ordering::Relaxed);
+                    tracing::info!(
+                        peer = %peer_id,
+                        total_keys = resp.total_keys,
+                        "digest sync: root digest matched, zero-transfer coverage"
+                    );
+                } else {
+                    let transferred = resp.entries.len() as u64;
+                    metrics
+                        .digest_sync_partial_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .digest_sync_keys_transferred_total
+                        .fetch_add(transferred, Ordering::Relaxed);
+                    metrics.digest_sync_keys_skipped_total.fetch_add(
+                        resp.total_keys.saturating_sub(transferred),
+                        Ordering::Relaxed,
+                    );
+                    tracing::info!(
+                        peer = %peer_id,
+                        mismatched_buckets = resp.mismatched_buckets.len(),
+                        transferred_keys = transferred,
+                        peer_total_keys = resp.total_keys,
+                        "digest sync: transferring mismatched buckets only"
+                    );
+                }
+                Self::apply_complete_state(
+                    peer_frontiers,
+                    pull_verified_frontiers,
+                    eventual_api,
+                    peer_id,
+                    peer_key,
+                    &resp.entries,
+                    &resp.timestamps,
+                    resp.frontier.clone(),
+                    &resp.applied_origins,
+                    &resp.visible_origins,
+                    resp.merge_failed_keys.clone(),
+                    "digest sync",
+                )
+                .await;
+                DigestPullOutcome::Synced
+            }
+            DigestSyncResult::Ok(_) => {
+                // scheme_ok = false: version mismatch during a rolling
+                // upgrade. Cache and use the legacy full sync meanwhile.
+                metrics
+                    .digest_sync_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                digest_unsupported.insert(peer_key.to_string(), Instant::now());
+                tracing::info!(
+                    peer = %peer_id,
+                    "peer rejected digest scheme version; falling back to full sync"
+                );
+                DigestPullOutcome::Fallback
+            }
+            DigestSyncResult::Unsupported => {
+                metrics
+                    .digest_sync_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                digest_unsupported.insert(peer_key.to_string(), Instant::now());
+                tracing::info!(
+                    peer = %peer_id,
+                    "peer does not support digest sync; falling back to full sync"
+                );
+                DigestPullOutcome::Fallback
+            }
+            DigestSyncResult::Failed => {
+                // Fail-closed: nothing was merged or claimed. The legacy
+                // full sync below (or the next cycle) re-establishes
+                // coverage. Not cached as unsupported: transient network
+                // failures should not suppress digest sync for 10 minutes.
+                metrics
+                    .digest_sync_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                DigestPullOutcome::Fallback
+            }
+        }
+    }
+
+    /// Attempt a digest probe + subset push instead of a full-state push.
+    ///
+    /// Runs on the push-side full-sync branches (high change rate or
+    /// oversized delta). Sends the local digest with
+    /// `include_entries = false`; on a root match nothing is pushed at
+    /// all, otherwise only the local keys living in mismatched buckets
+    /// are pushed (batched through the existing `/api/internal/sync`
+    /// endpoint, whose WAL-durability ack semantics are unchanged).
+    ///
+    /// On success the push frontier advances to the SNAPSHOT-time
+    /// frontier — deliberately not `current_frontier()`, which may have
+    /// advanced past writes that were not part of the compared state
+    /// (they are delta-pushed next cycle). Partial subset-push failures
+    /// leave the frontier untouched (idempotent re-push next cycle),
+    /// matching the delta push policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_digest_push(
+        sync_client: &SyncClient,
+        eventual_api: &Arc<Mutex<EventualApi>>,
+        metrics: &Arc<RuntimeMetrics>,
+        node_id: &str,
+        peer_id: &str,
+        peer_key: &str,
+        peer_addr: &str,
+        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        digest_unsupported: &mut HashMap<String, Instant>,
+    ) -> DigestPushOutcome {
+        metrics
+            .digest_push_probe_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        let (digest, data, snapshot_frontier) = Self::snapshot_store_digest(eventual_api).await;
+        let request = DigestSyncRequest::from_digest(node_id, &digest, false);
+
+        match sync_client.digest_sync(peer_addr, &request).await {
+            DigestSyncResult::Ok(resp) if resp.scheme_ok => {
+                digest_unsupported.remove(peer_key);
+                if resp.root_matched {
+                    metrics
+                        .digest_push_match_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        peer = %peer_id,
+                        "digest push probe: peer already matches, skipping full push"
+                    );
+                    if let Some(frontier) = snapshot_frontier {
+                        peer_frontiers.insert(peer_key.to_string(), frontier);
+                    }
+                    return DigestPushOutcome::Handled;
+                }
+
+                let mismatched: std::collections::HashSet<u16> =
+                    resp.mismatched_buckets.iter().copied().collect();
+                let changed: Vec<(String, crate::store::kv::CrdtValue)> = data
+                    .into_iter()
+                    .filter(|(key, _)| mismatched.contains(&(bucket_of(key) as u16)))
+                    .collect();
+
+                if changed.is_empty() {
+                    // Every mismatched bucket is empty on OUR side: the
+                    // peer holds data we lack, but everything we hold it
+                    // already has — the snapshot state is fully conveyed,
+                    // so the snapshot frontier may advance. The pull
+                    // phase fetches the peer-only data.
+                    tracing::debug!(
+                        peer = %peer_id,
+                        "digest push probe: mismatches are peer-only data, nothing to push"
+                    );
+                    if let Some(frontier) = snapshot_frontier {
+                        peer_frontiers.insert(peer_key.to_string(), frontier);
+                    }
+                    return DigestPushOutcome::Handled;
+                }
+
+                let changed_count = changed.len();
+                match sync_client
+                    .push_changed_keys(peer_addr, changed, node_id, DEFAULT_BATCH_SIZE)
+                    .await
+                {
+                    Ok(pushed) => {
+                        metrics
+                            .digest_push_keys_pushed_total
+                            .fetch_add(pushed as u64, Ordering::Relaxed);
+                        tracing::info!(
+                            peer = %peer_id,
+                            pushed_keys = pushed,
+                            mismatched_buckets = resp.mismatched_buckets.len(),
+                            "digest push: pushed mismatched buckets instead of full state"
+                        );
+                        if let Some(frontier) = snapshot_frontier {
+                            peer_frontiers.insert(peer_key.to_string(), frontier);
+                        }
+                        DigestPushOutcome::Handled
+                    }
+                    Err(e) => {
+                        metrics
+                            .digest_push_keys_pushed_total
+                            .fetch_add(e.pushed as u64, Ordering::Relaxed);
+                        metrics.sync_failure_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            peer = %peer_id,
+                            error = %e,
+                            pushed = e.pushed,
+                            total_changed = changed_count,
+                            "digest subset push failed; not advancing frontier"
+                        );
+                        // Handled (not Fallback): a full push now would
+                        // resend strictly more over the same failing
+                        // link; the next cycle retries idempotently.
+                        // Per-key merge errors do not starve later keys:
+                        // push_changed_keys still attempts every batch
+                        // and only aborts on transport/HTTP failures,
+                        // so all mergeable keys were already delivered
+                        // (matching the legacy full push).
+                        DigestPushOutcome::Handled
+                    }
+                }
+            }
+            DigestSyncResult::Ok(_) => {
+                metrics
+                    .digest_sync_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                digest_unsupported.insert(peer_key.to_string(), Instant::now());
+                tracing::info!(
+                    peer = %peer_id,
+                    "peer rejected digest scheme version; falling back to full push"
+                );
+                DigestPushOutcome::Fallback
+            }
+            DigestSyncResult::Unsupported => {
+                metrics
+                    .digest_sync_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                digest_unsupported.insert(peer_key.to_string(), Instant::now());
+                tracing::info!(
+                    peer = %peer_id,
+                    "peer does not support digest sync; falling back to full push"
+                );
+                DigestPushOutcome::Fallback
+            }
+            DigestSyncResult::Failed => {
+                metrics
+                    .digest_sync_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                DigestPushOutcome::Fallback
+            }
+        }
+    }
+
     /// Run garbage collection on stale ack-frontier entries.
     ///
     /// Determines the current policy version **per key range** across all
@@ -2845,6 +3374,64 @@ mod tests {
 
     fn wrap_api(api: CertifiedApi) -> Arc<Mutex<CertifiedApi>> {
         Arc::new(Mutex::new(api))
+    }
+
+    // -----------------------------------------------------------------
+    // digest_sync_allowed (pure TTL gate for the digest-unsupported cache)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn digest_sync_allowed_respects_kill_switch() {
+        let cache = HashMap::new();
+        assert!(
+            !NodeRunner::digest_sync_allowed(&cache, false, "peer:1"),
+            "kill switch off must suppress digest sync even for unknown peers"
+        );
+        assert!(
+            NodeRunner::digest_sync_allowed(&cache, true, "peer:1"),
+            "unknown peer with the switch on must be probed"
+        );
+    }
+
+    #[test]
+    fn digest_sync_allowed_skips_recently_rejected_peer() {
+        let mut cache = HashMap::new();
+        cache.insert("peer:1".to_string(), Instant::now());
+        assert!(
+            !NodeRunner::digest_sync_allowed(&cache, true, "peer:1"),
+            "a peer that just rejected the digest route must not be re-probed"
+        );
+        assert!(
+            NodeRunner::digest_sync_allowed(&cache, true, "peer:2"),
+            "other peers are unaffected by peer:1's rejection"
+        );
+    }
+
+    #[test]
+    fn digest_sync_allowed_reprobes_after_ttl() {
+        // An entry exactly DIGEST_UNSUPPORTED_RETRY old (or older) must be
+        // re-probed so upgraded peers are picked up automatically.
+        let Some(expired) = Instant::now().checked_sub(DIGEST_UNSUPPORTED_RETRY) else {
+            // Platforms where Instant cannot represent t-10min (e.g. just
+            // after boot) cannot run this case.
+            return;
+        };
+        let mut cache = HashMap::new();
+        cache.insert("peer:1".to_string(), expired);
+        assert!(
+            NodeRunner::digest_sync_allowed(&cache, true, "peer:1"),
+            "peer must be re-probed once DIGEST_UNSUPPORTED_RETRY has elapsed"
+        );
+
+        // Just under the TTL: still suppressed.
+        let Some(recent) = Instant::now().checked_sub(DIGEST_UNSUPPORTED_RETRY / 2) else {
+            return;
+        };
+        cache.insert("peer:1".to_string(), recent);
+        assert!(
+            !NodeRunner::digest_sync_allowed(&cache, true, "peer:1"),
+            "peer must stay suppressed while the TTL has not elapsed"
+        );
     }
 
     #[tokio::test]

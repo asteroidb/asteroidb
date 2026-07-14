@@ -178,6 +178,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in |
+| `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
 ### 永続化（WAL・スナップショット）
@@ -295,8 +296,18 @@ curl -s http://localhost:3000/api/slo | jq .
 | `sync_attempt_total` | u64 | 同期試行累計 |
 | `sync_failure_total` | u64 | 同期失敗累計 |
 | `delta_sync_count` | u64 | デルタ同期累計 |
-| `full_sync_fallback_count` | u64 | フルシンクフォールバック累計 |
+| `full_sync_fallback_count` | u64 | フルシンクフォールバック累計（実際に全キー push が走った回数） |
 | `full_sync_fallback_ratio` | f64 | フルシンク比率 (0.0-1.0) |
+| `digest_sync_attempt_total` | u64 | digest 同期 pull 試行累計 |
+| `digest_sync_root_match_total` | u64 | ルート digest 一致（転送ゼロ完了）累計 |
+| `digest_sync_partial_total` | u64 | 不一致バケットのみの部分転送累計 |
+| `digest_sync_unsupported_total` | u64 | digest 非対応ピア（404 / スキーム不一致）による従来フルシンク移行累計 |
+| `digest_sync_failed_total` | u64 | digest 交換のネットワーク/デコード失敗累計 |
+| `digest_sync_keys_transferred_total` | u64 | digest pull で実際に転送したキー数累計 |
+| `digest_sync_keys_skipped_total` | u64 | digest 同期で転送を回避したキー数累計（フルダンプ比の帯域削減量の推定） |
+| `digest_push_probe_total` | u64 | push 側 digest probe 試行累計 |
+| `digest_push_match_total` | u64 | probe 一致によるフル push スキップ累計 |
+| `digest_push_keys_pushed_total` | u64 | digest subset push で送ったキー数累計 |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
 | `rebalance_keys_migrated` | u64 | リバランス移行キー累計 |
@@ -451,6 +462,48 @@ groups:
         annotations:
           summary: "Over 50% of syncs are full-sync fallbacks"
 ```
+
+### 3.6 digest 段階 diff 同期の運用
+
+フルシンク相当の状況（高変更率・prune 済み change log・デコード失敗・連続
+ネットワーク障害・長期分断後の再接続）では、全キーダンプの前にキー範囲
+digest を比較し、不一致バケットのみを転送します（設計は
+`docs/architecture.md` の「Anti-Entropy: 3 段構えの同期と digest 段階 diff」
+を参照）。
+
+**メトリクスの読み方**:
+
+- `digest_sync_root_match_total` の増加 = 分断後再接続やアイドル時の
+  フォールバックが**転送ゼロ**で完了している（帯域節約が効いている）。
+- `digest_sync_keys_skipped_total` / (`digest_sync_keys_skipped_total` +
+  `digest_sync_keys_transferred_total`) がフルダンプ比の削減率の推定値。
+- `digest_sync_unsupported_total` が増え続ける = 旧バージョン（digest
+  エンドポイント未実装）またはスキームバージョン不一致のノードが残存。
+  ローリングアップグレードの完了を確認する。非対応ピアは 10 分 TTL で
+  キャッシュされ、TTL 経過後に自動で再 probe される。
+- `digest_sync_partial_total` が恒常的に増える（root match がほぼない）のに
+  データが収束している場合、tombstone GC の非対称による偽不一致が疑わしい。
+  正しさへの影響はなく帯域のみのコスト。GC 周期（`gc_interval`）を揃えると
+  減少する。
+- `digest_sync_failed_total` の増加はネットワーク/デコード失敗。従来フル
+  シンクで救済されるため正しさは不変だが、リンク品質を確認する。
+
+**切り戻し手順**（digest 同期に起因する問題を疑う場合）:
+
+1. 対象ノードに `ASTEROIDB_DIGEST_SYNC_DISABLED=1` を設定して再起動。
+   同期は従来のフルシンクのみのフォールバック動作（digest 導入前と同一）に
+   戻る。ノードごとに独立して切り戻せる（受信側エンドポイントは残るが、
+   digest を無効化したノードは probe を送らなくなるだけで無害）。
+2. `digest_sync_attempt_total` と `digest_push_probe_total` が増加しなく
+   なったことを確認。
+3. 問題が解消しない場合、digest 同期は原因ではない。
+
+**ローリングアップグレード時の挙動**: 旧ノードは
+`POST /api/internal/sync/digest` に 404 を返し、新ノードはそれを検知して
+従来フルシンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
+混在期間中は帯域削減効果がないだけで、収束の正しさ・セッション保証は不変。
+全ノードのアップグレード完了後、10 分以内（再 probe TTL）に digest 同期が
+自動的に有効化される。
 
 ---
 

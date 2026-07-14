@@ -98,6 +98,27 @@ impl CrdtValue {
             }),
         }
     }
+
+    /// Feed this value's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy, see [`crate::store::digest`]).
+    ///
+    /// Dispatches to the per-CRDT `digest_into` methods, each of which
+    /// prefixes its own type tag (0x01 Register, 0x02 Counter, 0x03 Set,
+    /// 0x04 Map) and emits a deterministic, sorted canonical stream.
+    /// NEVER hash raw bincode/JSON output of a `CrdtValue` instead: the
+    /// inner `HashMap`/`HashSet` iteration order is non-deterministic.
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a `CrdtValue` variant REQUIRES a new type tag here plus a
+    /// `DIGEST_SCHEME_VERSION` bump (see `crate::store::digest`).
+    pub fn canonical_digest_into(&self, hasher: &mut sha2::Sha256) {
+        match self {
+            CrdtValue::Counter(c) => c.digest_into(hasher),
+            CrdtValue::Set(s) => s.digest_into(hasher),
+            CrdtValue::Map(m) => m.digest_into(hasher),
+            CrdtValue::Register(r) => r.digest_into(hasher),
+        }
+    }
 }
 
 /// Key-value store backed by CRDT values (FR-001).

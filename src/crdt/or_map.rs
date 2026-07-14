@@ -388,6 +388,56 @@ where
     }
 }
 
+impl OrMap<String, String> {
+    /// Feed this map's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x04` ‖ live entries (key byte order), each as
+    /// `str(key)` ‖ dots (dot order) ‖ LWW-register canonical stream ‖
+    /// counters (node-id order) ‖ deferred dots (dot order). Entries whose
+    /// dot set is empty are skipped (normalisation: semantically equal to
+    /// absent entries). The `deferred` set is included — see
+    /// [`OrSet::digest_into`](crate::crdt::or_set::OrSet::digest_into)
+    /// for the equality-vs-GC trade-off.
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `OrMap`/`Dot` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound. Instantiating `OrMap`
+    /// for new key/value types in `CrdtValue` requires defining their
+    /// canonical byte encoding here, plus a scheme version bump.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
+        use sha2::Digest as _;
+
+        hasher.update([0x04]);
+        type MapEntryRef<'a> = (&'a String, &'a (HashSet<Dot>, LwwRegister<String>));
+        let mut items: Vec<MapEntryRef<'_>> = self
+            .entries
+            .iter()
+            .filter(|(_, (dots, _))| !dots.is_empty())
+            .collect();
+        items.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        write_u32(hasher, items.len() as u32);
+        for (key, (dots, reg)) in items {
+            write_str(hasher, key);
+            write_dots(
+                hasher,
+                dots.iter().map(|d| (d.node_id.0.as_str(), d.counter)),
+            );
+            reg.digest_into(hasher);
+        }
+        write_counters(hasher, &self.counters);
+        write_dots(
+            hasher,
+            self.deferred
+                .iter()
+                .map(|d| (d.node_id.0.as_str(), d.counter)),
+        );
+    }
+}
+
 impl<K, V> Default for OrMap<K, V>
 where
     K: Eq + Hash + Clone + Serialize + DeserializeOwned,

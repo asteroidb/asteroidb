@@ -230,6 +230,105 @@ sequenceDiagram
     Note over N1,N2: Both nodes hold identical state
 ```
 
+### Anti-Entropy: 3 段構えの同期と digest 段階 diff
+
+Anti-entropy 同期は 3 段構えで動作します:
+
+1. **Delta sync**（通常経路）: peer ごとのフロンティア以降の変更キーのみを
+   バッチ push / pull する。
+2. **Digest 段階 diff**（フォールバック第 1 段）: delta が使えない状況で、
+   まずキー範囲 digest を比較し、不一致バケットのみを転送する。
+   完全一致ならば転送ゼロで完了する。
+3. **Full sync**（フォールバック第 2 段 / 最終手段）: digest 同期が使えない
+   場合（旧ノード・スキーム不一致・ネットワーク/デコード失敗・ops による
+   無効化）のみ、従来どおり全キーダンプを転送する。
+
+digest 段階 diff は以下のすべてのフルシンク誘因を吸収します:
+push 側の高変更率（`full_sync_threshold` 超過）とペイロードサイズ超過、
+pull 側の claims 不成立（送信側の change-log prune を含む）・デコード失敗・
+連続ネットワーク障害。長期分断後の再接続や高変更率環境で毎回フルダンプに
+近づいていた帯域消費を、実際に発散している部分だけの転送に置き換えます
+（衛星リンク等の高遅延・低帯域リンクが想定ユースケース）。
+
+#### 2 層キー範囲 digest（DIGEST_SCHEME_VERSION = 1）
+
+`src/store/digest.rs` が定義する固定深さ 2 層の digest:
+
+- **per-key digest**: `D(k) = SHA256( str(k) ‖ CRDT 正準ストリーム )`。
+  CRDT 正準ストリームは各 CRDT 型（`src/crdt/*.rs` の `digest_into`）が
+  型タグ（0x01 Register / 0x02 Counter / 0x03 Set / 0x04 Map）付きで生成する。
+- **バケット割当**: `bucket(k) = SHA256(k)[0]`（256 バケット固定）。
+  レプリカ・挿入順に依存しない決定的な割当。
+- **バケット digest**: `B_i = SHA256( D(k_1) ‖ D(k_2) ‖ … )`
+  （バケット i 所属キーの辞書順）。空バケットは全ゼロ 32 バイトで、
+  wire 上には載せない（不在 = 空）。
+- **ルート digest**: `root = SHA256( B_0 ‖ … ‖ B_255 )`。
+
+**決定性要件**（プロトコルの根幹）: 同一の CRDT 状態は挿入順・マージ順・
+プロセス・serde ラウンドトリップに依らず同一の digest を生成しなければ
+ならない。`HashMap`/`HashSet` の反復順は非決定的なので、**生の bincode/JSON
+出力をハッシュすることは禁止** — 全ての非順序コレクションを全順序ソート
+した正準バイト列をハッシュする。dot 空集合のエントリは不在エントリと
+同一に正規化する。この決定性は property テスト（挿入順・マージ順・serde
+ラウンドトリップ不変）と golden digest テスト（wire 契約の凍結）で守られる。
+
+digest の材料に関する設計判断:
+
+- **`Store::timestamps`（per-key HLC）は含めない**: push 経路の merge は
+  ローカル clock で再スタンプし、prune は片側だけでエントリを消すため、
+  per-key HLC はレプリカ間で収束せず、恒常的な偽不一致を生む。
+- **deferred tombstone / counters は含める**: これにより
+  「digest 一致 ⟺ CRDT 状態の完全一致（SHA-256 衝突を除く）」が成立し、
+  一致時のセッション claims 採用がフルダンプと同等の健全性を持つ。
+  また pending の remove（tombstone 差のみの発散）も digest 経路で伝播する。
+  代償は tombstone GC がレプリカ間で非対称に走った直後の偽不一致で、
+  影響は帯域のみ（false-negative 方向で安全）。両側の GC 完了後は一致に戻る。
+
+**保守契約**: CRDT 型へのフィールド追加・正準エンコーディングの変更は
+`DIGEST_SCHEME_VERSION` の bump と golden テストの更新を必須とする
+（怠ると「一致」が嘘になり claims が不健全化する）。バージョン不一致の
+ピアは `scheme_ok = false` を返し、要求側は従来フルシンクへフォールバック
+する。
+
+#### プロトコル（往復数を固定）
+
+高遅延リンクでは往復数が支配的コストになるため、Merkle Search Tree の
+逐次降下（O(log n) RTT）は採用せず、全バケット digest を 1 メッセージに
+詰める幅優先・固定深さ設計で往復数を固定しています:
+
+- **Pull digest 同期（1 RTT）**: 要求側が自分のルート + 非空バケット digest を
+  `POST /api/internal/sync/digest`（`include_entries = true`）で送る。応答側は
+  **単一ロックスコープ**のスナップショットから比較し、ルート一致なら
+  `root_matched`（転送ゼロ）、不一致なら不一致バケット所属キーの実データ +
+  per-key HLC + フロンティア + セッションメタデータを 1 応答で返す。
+- **Push digest probe（2 RTT）**: 高変更率 / サイズ超過の full push 直前に
+  `include_entries = false` で probe し、一致なら push を丸ごとスキップ、
+  不一致なら不一致バケット所属の自キーのみを既存の
+  `POST /api/internal/sync`（WAL 耐久化 ack 込み）でバッチ push する。
+
+**claims 健全性の論証**: 応答の digest 比較・エントリ・フロンティア・
+`applied_origins`/`visible_origins`/`merge_failed_keys` はすべて応答側の
+同一スナップショット T0 に由来する。一致バケットは T0 の応答側状態と
+バイト同一、不一致バケットは全キーが転送されるため、適用後の受信側状態は
+応答側の T0 状態を支配する — これはフルダンプ適用と同じ前提であり、
+`applied_origins` の無条件採用と `pull_verified_frontiers` の前進が同じ
+根拠で正当化される（実装はフルダンプ経路と同一のヘルパー
+`apply_complete_state` を共用し、意味論の分岐を構造的に防ぐ）。
+digest 交換が失敗した場合は何も採用しない（fail-closed、false success なし）。
+
+#### ローリングアップグレード安全性
+
+旧ノードは `/api/internal/sync/digest` に 404 を返す。要求側はこれを
+「digest 非対応」として per-peer キャッシュ（TTL 10 分、`DIGEST_UNSUPPORTED_RETRY`）
+に記録し、従来のフルシンクへフォールバックする。TTL 経過後の再 probe で
+アップグレード済みピアを自動検出する。混在期間中は削減効果がないだけで
+正しさは不変。`digest_sync_enabled = false`（`ASTEROIDB_DIGEST_SYNC_DISABLED=1`）
+で機能全体を無効化できる（ops キルスイッチ）。
+
+digest 段は信頼済みクラスタ内の帯域削減が目的であり、Merkle「証明」や
+Byzantine 耐性はスコープ外（敵対的キー注入によるバケット偏りは BFT 拡張時に
+要再検討）。
+
 ## ノードモード
 
 各ノードは 3 つのモードのいずれかで動作します:

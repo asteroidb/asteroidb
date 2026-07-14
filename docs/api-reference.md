@@ -1198,6 +1198,65 @@ curl -X POST http://localhost:3000/api/internal/sync/delta \
 
 ---
 
+### Digest Sync
+
+#### POST /api/internal/sync/digest
+
+digest 段階 diff 同期（フルシンクの前段）。要求側の 2 層キー範囲 digest
+（ルート + 非空バケット、SHA-256）を受け取り、応答側の単一スナップショットと
+比較して 1 往復で応答する: ルート一致なら `root_matched = true`（転送ゼロ）、
+不一致なら不一致バケット所属キーの実データを返す。詳細は
+`docs/architecture.md` の anti-entropy 節を参照。
+
+- **認証**: Bearer Token (設定時)
+- **Content-Type**: `application/json` または `application/octet-stream`
+- **Accept**: `application/json` または `application/octet-stream`
+
+**リクエストボディ (JSON):**
+
+```json
+{
+  "sender": "node-2",
+  "scheme_version": 1,
+  "root": [18, 52, "..."],
+  "buckets": [{ "index": 7, "digest": [171, 205, "..."] }],
+  "include_entries": true
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `sender` | string | 送信元ノード ID |
+| `scheme_version` | u32 | digest スキームバージョン（現行 1）。不一致は `scheme_ok=false` |
+| `root` | bytes (32) | 要求側のルート digest |
+| `buckets` | array | 要求側の非空バケット digest のスパース列（不在 = 空バケット） |
+| `include_entries` | bool | `true`（pull）: 不一致バケットの実データを返す。`false`（push probe）: 不一致バケット番号のみ |
+
+**レスポンスボディ:**
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `scheme_ok` | bool | `false` = バージョン/形式非対応（要求側は従来フルシンクへ） |
+| `root_matched` | bool | `true` = 状態完全一致、転送ゼロで完了 |
+| `mismatched_buckets` | array<u16> | digest が不一致だったバケット番号（双方向差） |
+| `entries` | map<string, CrdtValue> | 不一致バケット所属キーの全データ（`include_entries=true` 時のみ） |
+| `timestamps` | map<string, HlcTimestamp> | `entries` の per-key HLC |
+| `frontier` | HlcTimestamp \| null | 応答側スナップショット時点の frontier |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の適用済みフロンティア（digest 応答はスナップショットに対し完全なので受信側は適用後に無条件採用できる） |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の可視フロンティア（無条件 max マージ） |
+| `merge_failed_keys` | array<string> | 応答側の poison 済みキー（採用時に union） |
+| `total_keys` | u64 | 応答側スナップショットの総キー数（転送削減量の推定に使用） |
+
+**curl 例（空ストアの digest で全量取得）:**
+
+```bash
+curl -X POST http://localhost:3000/api/internal/sync/digest \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"node-2","scheme_version":1,"root":['"$(python3 -c 'import hashlib;print(",".join(str(b) for b in hashlib.sha256(bytes(8192)).digest()))')"'],"buckets":[],"include_entries":true}'
+```
+
+---
+
 ### Key Dump
 
 #### GET /api/internal/keys

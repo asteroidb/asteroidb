@@ -1,3 +1,4 @@
+pub(crate) mod digest;
 pub mod gc;
 pub mod lww_register;
 pub mod or_map;

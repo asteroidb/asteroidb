@@ -354,6 +354,59 @@ where
     }
 }
 
+impl OrSet<String> {
+    /// Feed this set's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x03` ‖ live elements (byte order) with their dots (dot
+    /// order) ‖ counters (node-id order) ‖ deferred dots (dot order).
+    /// Elements whose dot set is empty are skipped: they are semantically
+    /// equivalent to absent entries (`merge` normally retains them away,
+    /// but the normalisation is specified defensively so representation
+    /// differences never cause false digest mismatches).
+    ///
+    /// The `deferred` (tombstone) set IS part of the digest: this makes
+    /// "digest matched" mean full CRDT-state equality, which is what lets
+    /// the sync layer adopt session claims on a match. The cost is a
+    /// false mismatch after asymmetric tombstone GC — bandwidth only,
+    /// never a correctness issue (false-negative direction).
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `OrSet`/`Dot` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound. Instantiating `OrSet`
+    /// for a new element type in `CrdtValue` requires defining that type's
+    /// canonical byte encoding here, plus a scheme version bump.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
+        use sha2::Digest as _;
+
+        hasher.update([0x03]);
+        let mut elems: Vec<(&String, &HashSet<Dot>)> = self
+            .elements
+            .iter()
+            .filter(|(_, dots)| !dots.is_empty())
+            .collect();
+        elems.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        write_u32(hasher, elems.len() as u32);
+        for (elem, dots) in elems {
+            write_str(hasher, elem);
+            write_dots(
+                hasher,
+                dots.iter().map(|d| (d.node_id.0.as_str(), d.counter)),
+            );
+        }
+        write_counters(hasher, &self.counters);
+        write_dots(
+            hasher,
+            self.deferred
+                .iter()
+                .map(|d| (d.node_id.0.as_str(), d.counter)),
+        );
+    }
+}
+
 impl<T: Eq + Hash + Clone + Serialize + DeserializeOwned> Default for OrSet<T> {
     fn default() -> Self {
         Self::new()

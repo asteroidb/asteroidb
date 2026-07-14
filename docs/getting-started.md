@@ -176,6 +176,7 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/internal/frontiers` | フロンティア取得 |
 | `POST` | `/api/internal/sync` | フルステート同期 |
 | `POST` | `/api/internal/sync/delta` | デルタ同期 |
+| `POST` | `/api/internal/sync/digest` | digest 段階 diff 同期（キー範囲 digest 比較） |
 | `GET` | `/api/internal/keys` | キー一覧取得 |
 | `POST` | `/api/internal/join` | ノード参加 |
 | `POST` | `/api/internal/leave` | ノード離脱 |
