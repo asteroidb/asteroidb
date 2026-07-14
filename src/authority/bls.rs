@@ -85,6 +85,40 @@ impl BlsSignature {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.0.to_bytes().to_vec()
     }
+
+    /// Return the hex encoding of this signature (192 hex characters).
+    pub fn to_hex(&self) -> String {
+        self.0
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Parse a signature from its hex encoding. Returns `None` on invalid input.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let bytes = hex_to_bytes(hex).ok()?;
+        let sig = blst::min_pk::Signature::from_bytes(&bytes).ok()?;
+        Some(BlsSignature(sig))
+    }
+}
+
+impl BlsPublicKey {
+    /// Return the hex encoding of this public key (96 hex characters).
+    pub fn to_hex(&self) -> String {
+        self.0
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Parse a public key from its hex encoding. Returns `None` on invalid input.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let bytes = hex_to_bytes(hex).ok()?;
+        let pk = blst::min_pk::PublicKey::from_bytes(&bytes).ok()?;
+        Some(BlsPublicKey(pk))
+    }
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {

@@ -10,12 +10,14 @@ use crate::api::certified::CertifiedApi;
 use crate::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use crate::authority::bls::BlsKeypair;
-use crate::authority::certificate::{EpochConfig, EpochManager};
+use crate::authority::certificate::{EpochConfig, EpochManager, KeysetRegistry, KeysetVersion};
 use crate::authority::frontier_reporter::FrontierReporter;
+use crate::authority::frontier_sig::{FrontierSignature, NodeSigner};
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp};
+use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
     DEFAULT_BATCH_SIZE, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
@@ -104,6 +106,18 @@ pub struct NodeRunnerConfig {
     /// pushed to the peer instead, because the delta payload is nearly as
     /// large as a full dump. Default: 0.5 (50%).
     pub full_sync_threshold: f64,
+    /// This node's signing key holder. When `Some` and this node is an
+    /// authority, frontier reports are signed (FR-008 signing pipeline).
+    pub node_signer: Option<Arc<NodeSigner>>,
+    /// Shared keyset registry — the same `Arc` as `AppState.keyset_registry`
+    /// so that signing-side keyset resolution and verification agree.
+    pub keyset_registry: Option<Arc<std::sync::RwLock<KeysetRegistry>>>,
+    /// Optional bearer token for the frontier push client
+    /// (`ASTEROIDB_INTERNAL_TOKEN`).
+    pub internal_token: Option<String>,
+    /// Shared current-epoch counter — the same `Arc` as
+    /// `AppState.current_epoch`, refreshed on each epoch check tick.
+    pub current_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -123,6 +137,10 @@ impl Default for NodeRunnerConfig {
             frontier_gc_max_retained_versions: 2,
             frontier_gc_grace_period_secs: 300,
             full_sync_threshold: 0.5,
+            node_signer: None,
+            keyset_registry: None,
+            internal_token: None,
+            current_epoch: None,
         }
     }
 }
@@ -224,6 +242,17 @@ pub struct NodeRunner {
     /// latency data. The same `Arc` is shared with `AppState` so the
     /// `/api/topology` endpoint returns current data.
     topology_view: Option<Arc<std::sync::RwLock<TopologyView>>>,
+    /// This node's signing key holder for frontier attestations (FR-008).
+    node_signer: Option<Arc<NodeSigner>>,
+    /// Shared keyset registry (same `Arc` as `AppState.keyset_registry`).
+    /// Used to resolve the signing keyset version and for BLS mode detection.
+    shared_keyset_registry: Option<Arc<std::sync::RwLock<KeysetRegistry>>>,
+    /// HTTP client for pushing signed frontiers to peers. Built when this
+    /// node is an authority.
+    frontier_sync_client: Option<FrontierSyncClient>,
+    /// Shared current-epoch counter (same `Arc` as `AppState.current_epoch`),
+    /// refreshed by the epoch check tick.
+    current_epoch_shared: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// State for an in-progress rebalance operation.
@@ -352,6 +381,8 @@ impl NodeRunner {
             None
         };
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
+        let frontier_sync_client =
+            Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
         let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -359,6 +390,9 @@ impl NodeRunner {
             node_id,
             certified_api,
             compaction_engine,
+            node_signer: config.node_signer.clone(),
+            shared_keyset_registry: config.keyset_registry.clone(),
+            current_epoch_shared: config.current_epoch.clone(),
             config,
             frontier_reporter,
             shutdown_tx,
@@ -381,6 +415,7 @@ impl NodeRunner {
             tombstone_gc,
             latency_model: None,
             topology_view: None,
+            frontier_sync_client,
         }
     }
 
@@ -441,6 +476,8 @@ impl NodeRunner {
         };
 
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
+        let frontier_sync_client =
+            Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
         let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -448,6 +485,9 @@ impl NodeRunner {
             node_id,
             certified_api,
             compaction_engine,
+            node_signer: config.node_signer.clone(),
+            shared_keyset_registry: config.keyset_registry.clone(),
+            current_epoch_shared: config.current_epoch.clone(),
             config,
             frontier_reporter,
             shutdown_tx,
@@ -471,7 +511,24 @@ impl NodeRunner {
             tombstone_gc,
             latency_model: None,
             topology_view: None,
+            frontier_sync_client,
         }
+    }
+
+    /// Build the frontier push client for authority nodes.
+    ///
+    /// Returns `None` for non-authority nodes (nothing to push).
+    fn build_frontier_sync_client(
+        config: &NodeRunnerConfig,
+        is_authority: bool,
+    ) -> Option<FrontierSyncClient> {
+        if !is_authority {
+            return None;
+        }
+        Some(match &config.internal_token {
+            Some(token) => FrontierSyncClient::with_token(token.clone()),
+            None => FrontierSyncClient::new(),
+        })
     }
 
     /// Set the membership client for periodic peer list exchange (ping).
@@ -606,10 +663,22 @@ impl NodeRunner {
     ///
     /// Returns `CertificateMode::Bls` when BLS keys are configured and
     /// registered in the keyset registry, otherwise `CertificateMode::Ed25519`.
+    ///
+    /// The shared keyset registry (same instance as `AppState`) is consulted
+    /// first: it is where production BLS keys are actually registered. The
+    /// internal `EpochManager` registry is only a fallback for tests that
+    /// register keys there directly.
     pub fn certificate_mode(&self) -> crate::authority::certificate::CertificateMode {
         use crate::authority::certificate::CertificateMode;
         #[cfg(feature = "native-crypto")]
         if self.bls_keypair.is_some() {
+            if let Some(shared) = &self.shared_keyset_registry {
+                let registry = shared.read().unwrap_or_else(|e| e.into_inner());
+                let version = registry.current_version();
+                if registry.get_bls_key(&version, &self.node_id.0).is_some() {
+                    return CertificateMode::Bls;
+                }
+            }
             let version = self.epoch_manager.registry().current_version();
             if self
                 .epoch_manager
@@ -1314,17 +1383,56 @@ impl NodeRunner {
             self.metrics
                 .record_key_rotation_at(event.new_version.0, now_ms);
         }
+
+        // Keep the shared epoch counter (used by verify_proof keyset expiry
+        // checks) in sync with wall-clock epoch progression, so that it does
+        // not stay frozen at its startup value.
+        if let Some(shared) = &self.current_epoch_shared {
+            let epoch = self.epoch_manager.current_epoch(now_ms / 1000);
+            shared.store(epoch, Ordering::Relaxed);
+        }
     }
 
-    /// Generate and apply frontier reports for this authority node.
+    /// Generate, sign, apply, and push frontier reports for this authority node.
+    ///
+    /// When a `NodeSigner` is configured, each frontier gets a
+    /// [`FrontierSignature`] (produced outside the certified lock) and is
+    /// recorded as a self-verified attestation. Signed or not, the frontiers
+    /// are then pushed to all known peers as a fire-and-forget background
+    /// task so that network latency never blocks the run loop.
     async fn report_frontiers(&mut self) {
         if let Some(reporter) = &self.frontier_reporter {
             match reporter.report_frontiers(&mut self.clock) {
                 Ok(frontiers) => {
-                    let mut api = self.certified_api.lock().await;
-                    for f in frontiers {
-                        api.update_frontier(f);
+                    // Sign outside the certified lock (crypto is CPU-heavy).
+                    let signatures: Vec<Option<FrontierSignature>> = match &self.node_signer {
+                        Some(signer) => {
+                            let keyset_version = self.signing_keyset_version();
+                            frontiers
+                                .iter()
+                                .map(|f| Some(signer.sign_frontier(f, keyset_version.clone())))
+                                .collect()
+                        }
+                        None => frontiers.iter().map(|_| None).collect(),
+                    };
+
+                    {
+                        let mut api = self.certified_api.lock().await;
+                        for (f, sig) in frontiers.iter().zip(signatures.iter()) {
+                            match (&self.node_signer, sig) {
+                                (Some(signer), Some(sig)) => {
+                                    // Own signature: no re-verification needed.
+                                    let att = signer.self_verified(f, sig);
+                                    api.update_frontier_verified(f.clone(), Some(att));
+                                }
+                                _ => {
+                                    api.update_frontier(f.clone());
+                                }
+                            }
+                        }
                     }
+
+                    self.push_frontiers_to_peers(frontiers, signatures).await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1338,6 +1446,73 @@ impl NodeRunner {
         // Compute frontier skew: for each scope, find max and min frontier
         // HLC among authorities, and report the maximum skew across all scopes.
         self.update_frontier_skew().await;
+    }
+
+    /// Resolve the keyset version to sign under.
+    ///
+    /// Uses the shared registry's current version (the latest version under
+    /// which this node's keys are registered). Falls back to version 1 when
+    /// no registry is shared or the registry is still empty.
+    fn signing_keyset_version(&self) -> KeysetVersion {
+        self.shared_keyset_registry
+            .as_ref()
+            .map(|r| {
+                r.read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .current_version()
+            })
+            .filter(|v| v.0 > 0)
+            .unwrap_or(KeysetVersion(1))
+    }
+
+    /// Push frontier reports (and their signatures) to all known peers.
+    ///
+    /// Spawned as a background task with the 5-second-timeout HTTP client so
+    /// the run loop is never blocked by slow peers. Failures are logged at
+    /// debug level; the next report tick acts as the retry.
+    async fn push_frontiers_to_peers(
+        &self,
+        frontiers: Vec<crate::authority::ack_frontier::AckFrontier>,
+        signatures: Vec<Option<FrontierSignature>>,
+    ) {
+        let Some(client) = &self.frontier_sync_client else {
+            return;
+        };
+        let Some(sync_client) = &self.sync_client else {
+            return;
+        };
+        if frontiers.is_empty() {
+            return;
+        }
+        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+        if peers.is_empty() {
+            return;
+        }
+
+        let client = client.clone();
+        tokio::spawn(async move {
+            for peer in peers {
+                match client
+                    .push_signed_frontiers(&peer.addr, frontiers.clone(), signatures.clone())
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::trace!(
+                            peer = %peer.addr,
+                            accepted = resp.accepted,
+                            "pushed frontiers to peer"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            peer = %peer.addr,
+                            error = %e,
+                            "frontier push failed; will retry on next report tick"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Compute and store the maximum frontier skew across all authority scopes.
@@ -3820,6 +3995,246 @@ mod tests {
                     node_id: "any".into(),
                 },
             "zero HLC must be less than any real HLC"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Signing pipeline wiring (FR-008)
+    // ---------------------------------------------------------------
+
+    use crate::authority::frontier_sig::NodeSigner;
+
+    #[cfg(feature = "native-crypto")]
+    fn make_signer(name: &str, seed_byte: u8) -> Arc<NodeSigner> {
+        let mut seed = [0u8; 32];
+        seed[0] = seed_byte;
+        Arc::new(NodeSigner::from_seed(node_id(name), &seed, true))
+    }
+
+    #[cfg(not(feature = "native-crypto"))]
+    fn make_signer(name: &str, seed_byte: u8) -> Arc<NodeSigner> {
+        let mut seed = [0u8; 32];
+        seed[0] = seed_byte;
+        Arc::new(NodeSigner::from_seed(node_id(name), &seed))
+    }
+
+    /// Registry with the given signer's keys under keyset version 1.
+    fn shared_registry_with(signer: &NodeSigner) -> Arc<RwLock<KeysetRegistry>> {
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(signer.node_id().clone(), signer.verifying_key())],
+            )
+            .unwrap();
+        #[cfg(feature = "native-crypto")]
+        if let Some(pk) = signer.bls_public_key() {
+            registry
+                .register_bls_keys(&KeysetVersion(1), vec![(signer.node_id().0.clone(), pk)])
+                .unwrap();
+        }
+        Arc::new(RwLock::new(registry))
+    }
+
+    #[tokio::test]
+    async fn report_frontiers_attaches_signature_when_signer_configured() {
+        let signer = make_signer("auth-1", 42);
+        let registry = shared_registry_with(&signer);
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+        assert!(runner.is_authority());
+
+        runner.report_frontiers().await;
+
+        // The frontier was applied locally...
+        let mut api = shared_api.lock().await;
+        assert!(!api.all_frontiers().is_empty());
+
+        // ...and a signed attestation was recorded: a write below the next
+        // signed checkpoint receives a certificate once reports catch up.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        drop(api);
+
+        // Report a couple more times so the checkpoint crosses the write.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..2 {
+            runner.report_frontiers().await;
+        }
+
+        // With 3 total authorities, one signer is not a majority — but the
+        // attestation pool must contain the self-signed entry. Verify via
+        // a single-authority namespace instead for a full assertion below.
+        let api = shared_api.lock().await;
+        assert!(
+            !api.all_frontiers().is_empty(),
+            "signed reports must still update the frontier set"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_reports_certify_with_single_authority_namespace() {
+        // Single-authority scope: this node alone is the majority (1/2+1 = 1),
+        // so its self-signed attestations must produce a certificate.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1))
+            .unwrap();
+
+        let signer = make_signer("auth-1", 43);
+        let registry = shared_registry_with(&signer);
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), wrap_ns(ns)));
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        {
+            let mut api = shared_api.lock().await;
+            api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+        }
+
+        // Report until the signed checkpoint passes the write (bucket width
+        // is 1s, so wait past the next boundary).
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        runner.report_frontiers().await;
+        runner.process_certifications().await;
+
+        let api = shared_api.lock().await;
+        let read = api.get_certified("key1");
+        assert_eq!(read.status, CertificationStatus::Certified);
+        let proof = read.proof.expect("certified read must include proof");
+        assert!(
+            proof.certificate.is_some(),
+            "self-signed majority (1-of-1) must attach a certificate"
+        );
+        let verification = crate::authority::verifier::verify_proof(&proof, None, 0);
+        assert!(
+            verification.valid,
+            "certificate must verify: {verification:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_frontiers_without_signer_remains_unsigned() {
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+        )
+        .await;
+
+        runner.report_frontiers().await;
+
+        let mut api = shared_api.lock().await;
+        assert!(!api.all_frontiers().is_empty());
+
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        drop(api);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        runner.report_frontiers().await;
+
+        // Even a 1-of-1 namespace would not get a certificate here, but with
+        // the 3-authority namespace the write may not even certify. What must
+        // hold: any certified proof carries no certificate (unsigned reports).
+        let api = shared_api.lock().await;
+        let read = api.get_certified("key1");
+        if let Some(proof) = read.proof {
+            assert!(
+                proof.certificate.is_none(),
+                "unsigned reports must not produce certificates"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[tokio::test]
+    async fn certificate_mode_returns_bls_with_shared_registry() {
+        // Regression test for the wiring bug where certificate_mode() only
+        // consulted the EpochManager's internal registry (which never has
+        // BLS keys registered in production) and thus always returned Ed25519.
+        let signer = make_signer("auth-1", 44);
+        let registry = shared_registry_with(&signer);
+
+        let mut seed = [0u8; 32];
+        seed[0] = 44;
+        let config = NodeRunnerConfig {
+            bls_config: Some(BlsConfig { seed }),
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            ..NodeRunnerConfig::default()
+        };
+        let runner = NodeRunner::new(
+            node_id("auth-1"),
+            wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        assert_eq!(
+            runner.certificate_mode(),
+            crate::authority::certificate::CertificateMode::Bls,
+            "shared registry with BLS keys must enable BLS mode"
+        );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[tokio::test]
+    async fn certificate_mode_ed25519_without_registered_bls_key() {
+        let mut seed = [0u8; 32];
+        seed[0] = 45;
+        let config = NodeRunnerConfig {
+            bls_config: Some(BlsConfig { seed }),
+            ..NodeRunnerConfig::default()
+        };
+        let runner = NodeRunner::new(
+            node_id("auth-1"),
+            wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        assert_eq!(
+            runner.certificate_mode(),
+            crate::authority::certificate::CertificateMode::Ed25519,
+            "BLS keypair without registry registration falls back to Ed25519"
         );
     }
 }

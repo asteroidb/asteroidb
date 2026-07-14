@@ -182,6 +182,23 @@ pub struct ProofBundleJson {
     /// Must be present for the proof to be considered valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<CertificateJson>,
+    /// Signature algorithm of the attached certificate material
+    /// (`"Ed25519"` or `"Bls12_381"`). Mirrors `VerifyProofRequest` so a
+    /// certified read response can round-trip into a verify request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_algorithm: Option<String>,
+    /// Keyset version of the attached certificate material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyset_version: Option<u64>,
+    /// BLS signer node IDs (same order as `bls_public_keys`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_signer_ids: Option<Vec<String>>,
+    /// Hex-encoded BLS public keys (same order as `bls_signer_ids`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_public_keys: Option<Vec<String>>,
+    /// Hex-encoded aggregated BLS signature over the certificate message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_aggregate_signature: Option<String>,
 }
 
 /// Response for `POST /api/certified/write`.
@@ -216,8 +233,14 @@ pub struct VerifyProofRequest {
     /// so the verifier selects the correct verification path.
     #[serde(default)]
     pub signature_algorithm: Option<String>,
-    /// Optional hex-encoded BLS aggregated signature. Reserved for future
-    /// BLS verification through the public endpoint.
+    /// Optional keyset version for BLS verification without a certificate
+    /// JSON body. Falls back to `certificate.keyset_version`, then 1.
+    #[serde(default)]
+    pub keyset_version: Option<u64>,
+    /// Optional hex-encoded BLS aggregated signature. When present together
+    /// with `bls_signer_ids` and `bls_public_keys` and
+    /// `signature_algorithm == "Bls12_381"`, the handler performs BLS
+    /// aggregate verification against the keyset registry.
     #[serde(default)]
     pub bls_aggregate_signature: Option<String>,
     /// Optional BLS signer node IDs (same order as `bls_public_keys`).

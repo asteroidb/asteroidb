@@ -174,8 +174,12 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_AUTHORITY_NODES` | いいえ | `auth-1,auth-2,auth-3` | Authority ノード ID（カンマ区切り） |
 | `ASTEROIDB_DATA_DIR` | いいえ | `./data` | データ永続化ディレクトリ |
 | `ASTEROIDB_INTERNAL_TOKEN` | いいえ | なし | 内部 API 認証用 Bearer トークン |
-| `ASTEROIDB_BLS_SEED` | いいえ | なし | BLS 鍵生成用 hex シード（32 バイト） |
+| `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する |
+| `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。未設定の場合は自ノードの署名のみ検証可能 |
+| `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
+
+> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止されるが、同一 Authority が矛盾する digest を別ピアに報告する equivocation の検出は将来課題。
 
 ---
 

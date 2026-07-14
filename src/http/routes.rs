@@ -171,12 +171,75 @@ mod tests {
             ))),
             epoch_config: crate::authority::certificate::EpochConfig::default(),
             current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers: false,
         })
     }
 
     async fn body_string(body: Body) -> String {
         let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Test state with a populated keyset registry and configurable
+    /// signed-frontier requirement (signing pipeline tests).
+    fn test_state_signing(
+        registry: Option<crate::authority::certificate::KeysetRegistry>,
+        require_signed_frontiers: bool,
+    ) -> Arc<AppState> {
+        let node_id = NodeId("test-node".into());
+
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            authority_nodes: vec![
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            KeyRange {
+                prefix: String::new(),
+            },
+            3,
+        ))
+        .unwrap();
+
+        let namespace = Arc::new(RwLock::new(ns));
+
+        Arc::new(AppState {
+            eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(
+                node_id,
+                Arc::clone(&namespace),
+            ))),
+            namespace,
+            metrics: Arc::new(RuntimeMetrics::default()),
+            peers: None,
+            peer_persist_path: None,
+            namespace_persist_path: None,
+            consensus: Arc::new(Mutex::new(
+                crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ]),
+            )),
+            internal_token: None,
+            self_node_id: None,
+            self_addr: None,
+            latency_model: None,
+            cluster_nodes: None,
+            slo_tracker: Arc::new(crate::ops::slo::SloTracker::new()),
+            keyset_registry: registry.map(|r| Arc::new(RwLock::new(r))),
+            epoch_config: crate::authority::certificate::EpochConfig::default(),
+            current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers,
+        })
     }
 
     // ---------------------------------------------------------------
@@ -1926,5 +1989,296 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------
+    // Signing pipeline: signed frontier push + end-to-end verify (FR-008)
+    // ---------------------------------------------------------------
+
+    use crate::authority::certificate::{KeysetRegistry, KeysetVersion};
+    use crate::authority::frontier_sig::NodeSigner;
+    use crate::hlc::HlcTimestamp;
+    use crate::network::frontier_sync::{FrontierPushRequest, FrontierPushResponse};
+
+    #[cfg(feature = "native-crypto")]
+    fn signing_test_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(NodeId(name.into()), &seed, true)
+    }
+
+    #[cfg(not(feature = "native-crypto"))]
+    fn signing_test_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(NodeId(name.into()), &seed)
+    }
+
+    fn signing_registry(signers: &[&NodeSigner]) -> KeysetRegistry {
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                signers
+                    .iter()
+                    .map(|s| (s.node_id().clone(), s.verifying_key()))
+                    .collect(),
+            )
+            .unwrap();
+        #[cfg(feature = "native-crypto")]
+        {
+            let bls_keys: Vec<(String, crate::authority::bls::BlsPublicKey)> = signers
+                .iter()
+                .filter_map(|s| s.bls_public_key().map(|pk| (s.node_id().0.clone(), pk)))
+                .collect();
+            if !bls_keys.is_empty() {
+                registry
+                    .register_bls_keys(&KeysetVersion(1), bls_keys)
+                    .unwrap();
+            }
+        }
+        registry
+    }
+
+    fn signed_push_body(signers: &[&NodeSigner], physical: u64) -> FrontierPushRequest {
+        let mut frontiers = Vec::new();
+        let mut signatures = Vec::new();
+        for signer in signers {
+            let frontier = crate::authority::ack_frontier::AckFrontier {
+                authority_id: signer.node_id().clone(),
+                frontier_hlc: HlcTimestamp {
+                    physical,
+                    logical: 0,
+                    node_id: signer.node_id().0.clone(),
+                },
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                policy_version: PolicyVersion(1),
+                digest_hash: format!("{}-{physical}", signer.node_id().0),
+            };
+            let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+            frontiers.push(frontier);
+            signatures.push(Some(sig));
+        }
+        FrontierPushRequest {
+            frontiers,
+            signatures,
+        }
+    }
+
+    async fn push_frontiers(app: &Router, body: &FrontierPushRequest) -> FrontierPushResponse {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/frontiers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn signed_frontier_push_verified_and_accepted() {
+        let s1 = signing_test_signer("auth-1", 61);
+        let s2 = signing_test_signer("auth-2", 62);
+        let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let app = router(state);
+
+        let body = signed_push_body(&[&s1, &s2], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 2,
+            "valid signed frontiers must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_signed_frontier_rejected() {
+        let s1 = signing_test_signer("auth-1", 63);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+
+        let mut body = signed_push_body(&[&s1], 10_500);
+        // Inflate the frontier after signing (attestation replay attack).
+        body.frontiers[0].frontier_hlc.physical += 60_000;
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 0, "tampered frontier must be rejected");
+    }
+
+    #[tokio::test]
+    async fn frontier_from_unregistered_authority_rejected() {
+        let s1 = signing_test_signer("auth-1", 64);
+        let rogue = signing_test_signer("auth-9", 65);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+
+        let body = signed_push_body(&[&rogue], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "signature from an unregistered authority must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_frontier_policy_depends_on_require_flag() {
+        let s1 = signing_test_signer("auth-1", 66);
+
+        // Lenient (default): unsigned frontiers are accepted.
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+        let mut body = signed_push_body(&[&s1], 10_500);
+        body.signatures = vec![None];
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 1,
+            "lenient mode accepts unsigned frontiers"
+        );
+
+        // Strict: unsigned frontiers are rejected.
+        let state = test_state_signing(Some(signing_registry(&[&s1])), true);
+        let app = router(state);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 0, "strict mode rejects unsigned frontiers");
+    }
+
+    #[tokio::test]
+    async fn no_registry_accepts_unverified_frontiers() {
+        // Without a registry, the legacy unverified path applies even for
+        // payloads carrying (unverifiable) signatures.
+        let s1 = signing_test_signer("auth-1", 67);
+        let state = test_state_signing(None, false);
+        let app = router(state);
+        let body = signed_push_body(&[&s1], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 1);
+    }
+
+    /// Full HTTP round-trip: certified write → signed frontier pushes →
+    /// certification → GET proof → POST the proof to /api/certified/verify.
+    #[tokio::test]
+    async fn certified_proof_round_trips_through_verify_endpoint() {
+        let s1 = signing_test_signer("auth-1", 68);
+        let s2 = signing_test_signer("auth-2", 69);
+        let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let app = router(Arc::clone(&state));
+
+        // 1. Certified write.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/write")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key":"user1","value":{"type":"register","value":"v1"},"on_timeout":"pending"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. Majority of authorities push signed frontiers past the write's
+        //    next checkpoint boundary.
+        let write_ts = {
+            let api = state.certified.lock().await;
+            api.pending_writes()[0].timestamp.physical
+        };
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        let body = signed_push_body(&[&s1, &s2], report_ts);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 2);
+
+        // 3. Drive certification (normally done by the NodeRunner tick).
+        state.certified.lock().await.process_certifications();
+
+        // 4. Read the proof.
+        let req = Request::builder()
+            .uri("/api/certified/user1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let read: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(read["status"], "Certified");
+        let proof = read["proof"].clone();
+        assert!(
+            proof["certificate"].is_object(),
+            "proof must carry a certificate: {proof}"
+        );
+
+        // 5. The proof JSON round-trips directly into the verify endpoint.
+        let verify = |payload: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/api/certified/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = body_string(resp.into_body()).await;
+                (status, body)
+            }
+        };
+
+        // Ed25519 path.
+        let mut ed_payload = proof.clone();
+        ed_payload["signature_algorithm"] = serde_json::json!("Ed25519");
+        let (status, body) = verify(ed_payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result["valid"], true,
+            "Ed25519 proof must verify end-to-end: {result}"
+        );
+
+        // Tampered signature must be rejected.
+        let mut tampered = proof.clone();
+        tampered["signature_algorithm"] = serde_json::json!("Ed25519");
+        let sig = tampered["certificate"]["signatures"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        tampered["certificate"]["signatures"][0]["signature"] =
+            serde_json::json!(format!("{flipped}{}", &sig[1..]));
+        let (status, body) = verify(tampered).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result["valid"], false,
+            "tampered proof must not verify: {result}"
+        );
+
+        // BLS path (native-crypto only): the proof carries the aggregate.
+        #[cfg(feature = "native-crypto")]
+        {
+            assert_eq!(proof["signature_algorithm"], "Bls12_381");
+            assert!(proof["bls_aggregate_signature"].is_string());
+            let (status, body) = verify(proof.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                result["valid"], true,
+                "BLS proof must verify end-to-end: {result}"
+            );
+
+            // A missing signer breaks the aggregate.
+            let mut partial = proof.clone();
+            partial["bls_signer_ids"] = serde_json::json!(["auth-1"]);
+            partial["bls_public_keys"] =
+                serde_json::json!([proof["bls_public_keys"][0].as_str().unwrap()]);
+            let (status, body) = verify(partial).await;
+            assert_eq!(status, StatusCode::OK);
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                result["valid"], false,
+                "aggregate with a missing signer must not verify: {result}"
+            );
+        }
     }
 }

@@ -499,9 +499,16 @@ curl http://localhost:3000/api/certified/sensor-1
 | `certificate` | CertificateJson | いいえ | 暗号署名付き証明書 |
 | `format_version` | u32 | いいえ | 証明書フォーマットバージョン（指定時にバージョン互換チェック実施） |
 | `signature_algorithm` | string | いいえ | 署名アルゴリズム: `"Ed25519"` (デフォルト) または `"Bls12_381"` |
-| `bls_aggregate_signature` | string | いいえ | hex エンコード BLS 集約署名（将来用） |
-| `bls_signer_ids` | string[] | いいえ | BLS 署名者ノード ID |
-| `bls_public_keys` | string[] | いいえ | hex エンコード BLS 公開鍵 |
+| `keyset_version` | u64 | いいえ | BLS 検証で使用する keyset バージョン（省略時は `certificate.keyset_version`、それも無ければ 1） |
+| `bls_aggregate_signature` | string | いいえ | hex エンコード BLS 集約署名。`bls_signer_ids` / `bls_public_keys` と共に指定し `signature_algorithm` が `"Bls12_381"` の場合、keyset registry に対する BLS 集約検証を実施 |
+| `bls_signer_ids` | string[] | いいえ | BLS 署名者ノード ID（`bls_public_keys` と同順） |
+| `bls_public_keys` | string[] | いいえ | hex エンコード BLS 公開鍵（registry 鍵との一致を要求） |
+
+> `GET /api/certified/{key}` の `proof` オブジェクトはこのリクエストボディとして
+> そのまま送信できる（round-trip 可能）。署名パイプラインが有効な場合、`proof` には
+> `signature_algorithm` / `keyset_version` / BLS フィールドが自動的に含まれる。
+> 証明書の `frontier` は Authority が署名したチェックポイント HLC
+> （1 秒単位に床丸めされた値、`logical=0`, `node_id=""`）である点に注意。
 
 **レスポンスボディ:**
 

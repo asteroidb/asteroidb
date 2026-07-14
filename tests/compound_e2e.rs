@@ -159,6 +159,7 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     })
 }
 
@@ -364,6 +365,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
             contributing_authorities: vec![node_id("n1"), node_id("n2")],
             total_authorities: 3,
             certificate: Some(cert),
+            bls_certificate: None,
         };
 
         let verify_result = verify_proof_with_registry(
@@ -563,6 +565,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         contributing_authorities: vec![node_id("n1"), node_id("n2")],
         total_authorities: 2,
         certificate: Some(mixed_cert),
+        bls_certificate: None,
     };
 
     // During grace period (epoch 5), mixed v1+v2 signatures are valid.
@@ -1028,6 +1031,7 @@ fn expired_keyset_proof_rejected_after_reconfig() {
         contributing_authorities: vec![id_old],
         total_authorities: 1,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     // At epoch 3 (boundary): v1 registered at epoch 0, grace=3 -> 3 <= 0+3 -> valid.
@@ -1193,6 +1197,7 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     // Write data to the legacy peer.

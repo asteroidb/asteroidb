@@ -76,6 +76,7 @@ async fn two_node_anti_entropy_convergence() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     // Build state for node 2.
@@ -101,6 +102,7 @@ async fn two_node_anti_entropy_convergence() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     // Write some data to node 1.
@@ -292,6 +294,7 @@ async fn pull_based_sync() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     {
@@ -360,6 +363,7 @@ async fn sync_endpoint_partial_failure() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     // Pre-populate with a counter at "k".
@@ -463,6 +467,7 @@ async fn three_node_convergence_via_sync() {
             keyset_registry: None,
             epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
             current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers: false,
         });
         states.push(state);
     }
@@ -585,6 +590,7 @@ async fn internal_keys_endpoint() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     {
@@ -662,6 +668,7 @@ async fn full_sync_records_remote_frontier_not_local() {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
     });
 
     // Write data to the remote node.

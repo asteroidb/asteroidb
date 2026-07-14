@@ -274,6 +274,7 @@ fn broken_quorum_proof_is_invalid() {
         contributing_authorities: vec![node_id("auth-0")],
         total_authorities: 5,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     let result = verify_proof(&proof, None, 0);
@@ -540,6 +541,7 @@ fn empty_authority_set_rejects_certification() {
         contributing_authorities: vec![],
         total_authorities: 0,
         certificate: None,
+        bls_certificate: None,
     };
 
     let result = verify_proof(&proof, None, 0);

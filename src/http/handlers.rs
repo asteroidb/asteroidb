@@ -13,6 +13,10 @@ use super::codec::{deserialize_internal, internal_response};
 
 use crate::api::certified::{CertifiedApi, OnTimeout};
 use crate::api::eventual::EventualApi;
+#[cfg(feature = "native-crypto")]
+use crate::authority::bls::{BlsPublicKey, BlsSignature};
+#[cfg(not(feature = "native-crypto"))]
+use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{EpochConfig, KeysetRegistry};
 use crate::control_plane::consensus::ControlPlaneConsensus;
 use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -83,6 +87,10 @@ pub struct AppState {
     pub epoch_config: EpochConfig,
     /// Current epoch, used for keyset expiry checks during verification.
     pub current_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// When `true` and a keyset registry is configured, unsigned frontier
+    /// pushes to `/api/internal/frontiers` are rejected. Signed frontiers
+    /// that fail verification are always rejected regardless of this flag.
+    pub require_signed_frontiers: bool,
 }
 
 // ---------------------------------------------------------------
@@ -206,7 +214,7 @@ pub async fn get_certified(
     });
 
     let proof = read.proof.map(|p| {
-        let certificate = p.certificate.map(|cert| {
+        let certificate = p.certificate.as_ref().map(|cert| {
             use super::types::{AuthoritySignatureJson, CertificateJson};
             CertificateJson {
                 keyset_version: cert.keyset_version.0,
@@ -236,6 +244,45 @@ pub async fn get_certified(
                     .collect(),
             }
         });
+
+        // BLS aggregate certificate fields (round-trippable into
+        // POST /api/certified/verify with signature_algorithm=Bls12_381).
+        let (signature_algorithm, keyset_version, bls_signer_ids, bls_public_keys, bls_agg) =
+            if let Some(bls_cert) = p.bls_certificate.as_ref() {
+                (
+                    Some("Bls12_381".to_string()),
+                    Some(bls_cert.keyset_version.0),
+                    Some(
+                        bls_cert
+                            .bls_signer_ids
+                            .iter()
+                            .map(|n| n.0.clone())
+                            .collect::<Vec<String>>(),
+                    ),
+                    Some(
+                        bls_cert
+                            .bls_public_keys
+                            .iter()
+                            .map(|pk| pk.to_hex())
+                            .collect::<Vec<String>>(),
+                    ),
+                    bls_cert
+                        .bls_aggregated_signature
+                        .as_ref()
+                        .map(|sig| sig.to_hex()),
+                )
+            } else if let Some(cert) = p.certificate.as_ref() {
+                (
+                    Some("Ed25519".to_string()),
+                    Some(cert.keyset_version.0),
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
         ProofBundleJson {
             key_range_prefix: p.key_range.prefix,
             frontier: FrontierJson {
@@ -251,6 +298,11 @@ pub async fn get_certified(
                 .collect(),
             total_authorities: p.total_authorities,
             certificate,
+            signature_algorithm,
+            keyset_version,
+            bls_signer_ids,
+            bls_public_keys,
+            bls_aggregate_signature: bls_agg,
         }
     });
 
@@ -290,21 +342,86 @@ pub async fn get_certification_status(
 ///
 /// Receives frontier updates from a peer and applies them to the local
 /// `AckFrontierSet`. Monotonicity is enforced by `AckFrontierSet::update()`.
+///
+/// When a keyset registry is configured, signed frontiers are verified
+/// (registry keys only) before the certified lock is taken; frontiers whose
+/// signatures fail verification are dropped. Unsigned frontiers are accepted
+/// unless `require_signed_frontiers` is enabled. Without a registry, all
+/// frontiers are accepted unverified (backwards-compatible).
 pub async fn post_internal_frontiers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, super::codec::SerializationError> {
+    use crate::authority::frontier_sig::{VerifiedAttestation, verify_frontier_signature};
+
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
     let req: crate::network::frontier_sync::FrontierPushRequest =
         deserialize_internal(&body, content_type)?;
 
+    // Verify signatures BEFORE taking the certified lock — signature
+    // verification is CPU-heavy and must not serialize with other handlers.
+    let mut signatures = req.signatures.into_iter();
+    let mut to_apply: Vec<(
+        crate::authority::ack_frontier::AckFrontier,
+        Option<VerifiedAttestation>,
+    )> = Vec::with_capacity(req.frontiers.len());
+
+    match &state.keyset_registry {
+        None => {
+            // No registry configured: legacy unverified acceptance.
+            for frontier in req.frontiers {
+                to_apply.push((frontier, None));
+            }
+        }
+        Some(registry_lock) => {
+            let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+            let current_epoch = state
+                .current_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+            for frontier in req.frontiers {
+                match signatures.next().flatten() {
+                    Some(sig) => match verify_frontier_signature(
+                        &frontier,
+                        &sig,
+                        &registry,
+                        current_epoch,
+                        &state.epoch_config,
+                    ) {
+                        Ok(att) => to_apply.push((frontier, Some(att))),
+                        Err(e) => {
+                            tracing::warn!(
+                                authority = %frontier.authority_id.0,
+                                error = %e,
+                                "rejecting frontier with invalid signature"
+                            );
+                        }
+                    },
+                    None => {
+                        if state.require_signed_frontiers {
+                            tracing::warn!(
+                                authority = %frontier.authority_id.0,
+                                "rejecting unsigned frontier (require_signed_frontiers)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                authority = %frontier.authority_id.0,
+                                "accepting unsigned frontier (lenient mode)"
+                            );
+                            to_apply.push((frontier, None));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
-    for frontier in req.frontiers {
-        if api.update_frontier(frontier) {
+    for (frontier, attestation) in to_apply {
+        if api.update_frontier_verified(frontier, attestation) {
             accepted += 1;
         }
     }
@@ -633,6 +750,79 @@ pub async fn verify_proof(
         _ => crate::authority::certificate::SignatureAlgorithm::Ed25519,
     };
 
+    // BLS aggregate verification path: reconstruct a DualModeCertificate
+    // from the dedicated BLS fields and verify against the registry.
+    if sig_algorithm == crate::authority::certificate::SignatureAlgorithm::Bls12_381
+        && let (Some(agg_hex), Some(signer_ids), Some(pk_hexes)) = (
+            &req.bls_aggregate_signature,
+            &req.bls_signer_ids,
+            &req.bls_public_keys,
+        )
+    {
+        use crate::authority::certificate::DualModeCertificate;
+
+        if signer_ids.len() != pk_hexes.len() {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "bls_signer_ids and bls_public_keys must have the same length".to_string(),
+            ));
+        }
+
+        let keyset_version = KeysetVersion(
+            req.keyset_version
+                .or(req.certificate.as_ref().map(|c| c.keyset_version))
+                .unwrap_or(1),
+        );
+
+        let mut cert = DualModeCertificate::new_bls(
+            key_range.clone(),
+            frontier_hlc.clone(),
+            policy_version,
+            keyset_version,
+        );
+        if let Some(fv) = req.format_version {
+            cert.format_version = fv;
+        }
+
+        let aggregated = BlsSignature::from_hex(agg_hex).ok_or((
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid hex in bls_aggregate_signature".to_string(),
+        ))?;
+        let mut signers = Vec::with_capacity(signer_ids.len());
+        for (id, pk_hex) in signer_ids.iter().zip(pk_hexes.iter()) {
+            let pk = BlsPublicKey::from_hex(pk_hex).ok_or((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid hex in bls_public_keys for signer {id}"),
+            ))?;
+            signers.push((NodeId(id.clone()), pk));
+        }
+        cert.set_bls_aggregate(signers, aggregated);
+
+        let format_config = req
+            .format_version
+            .map(|_| crate::authority::certificate::FormatVersionConfig::default());
+        let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+        let current_epoch = state
+            .current_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = verifier::verify_dual_proof_with_registry(
+            &cert,
+            req.total_authorities,
+            &registry,
+            current_epoch,
+            &state.epoch_config,
+            format_config.as_ref(),
+            0,
+        );
+
+        return Ok(Json(VerifyProofResponse {
+            valid: result.valid,
+            has_majority: result.has_majority,
+            contributing_count: result.contributing_count,
+            required_count: result.required_count,
+        }));
+    }
+
     // Reconstruct the certificate from the HTTP payload, if provided.
     // Apply caller-specified format_version and signature_algorithm so that
     // BLS certificates and non-default format versions can be verified.
@@ -680,6 +870,7 @@ pub async fn verify_proof(
             .collect(),
         total_authorities: req.total_authorities,
         certificate,
+        bls_certificate: None,
     };
 
     let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());

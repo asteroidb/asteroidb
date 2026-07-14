@@ -1,6 +1,4 @@
-#[cfg(feature = "native-crypto")]
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -2131,6 +2129,7 @@ mod tests {
         assert_eq!(valid.len(), 3);
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn dual_mode_bls_sign_and_verify() {
         let kr = sample_key_range();
@@ -2163,6 +2162,7 @@ mod tests {
         assert_eq!(valid.len(), 5);
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn dual_mode_bls_wrong_message_fails() {
         let kr = sample_key_range();
@@ -2235,6 +2235,7 @@ mod tests {
         assert!(restored.verify(&message).is_ok());
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn dual_mode_serde_roundtrip_bls() {
         let kr = sample_key_range();
@@ -2388,6 +2389,7 @@ mod tests {
     // CertificateMode serde tests
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn certificate_mode_serde_roundtrip() {
         let ed = CertificateMode::Ed25519;
@@ -2407,6 +2409,7 @@ mod tests {
     // P1 security fix tests: BLS signer integrity & registry validation
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "native-crypto")]
     fn make_bls_keypair(seed: u8) -> crate::authority::bls::BlsKeypair {
         let mut ikm = [0u8; 32];
         ikm[0] = seed;
@@ -2414,6 +2417,7 @@ mod tests {
         crate::authority::bls::BlsKeypair::generate(&ikm)
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_verify_rejects_signer_key_count_mismatch() {
         let kr = sample_key_range();
@@ -2445,6 +2449,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_verify_rejects_duplicate_signer_ids() {
         let kr = sample_key_range();
@@ -2478,6 +2483,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_verify_with_registry_rejects_unknown_signer() {
         let kr = sample_key_range();
@@ -2526,6 +2532,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_verify_with_registry_accepts_valid_signers() {
         let kr = sample_key_range();
@@ -2678,6 +2685,7 @@ mod tests {
         assert!(restored.verify(&message).is_ok());
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_certificate_roundtrips_algorithm_bls12_381() {
         let kr = sample_key_range();
@@ -2700,6 +2708,7 @@ mod tests {
         assert!(restored.verify(&message).is_ok());
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn verify_dispatches_based_on_signature_algorithm() {
         let kr = sample_key_range();
@@ -2839,6 +2848,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn verify_with_format_check_old_bls_cert_within_grace() {
         let kr = sample_key_range();
@@ -2873,6 +2883,7 @@ mod tests {
     // BLS verify cache tests (#306)
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_cache_hit_avoids_reverification() {
         use crate::authority::bls;
@@ -2919,6 +2930,7 @@ mod tests {
         assert_eq!(cache.len(), 1); // No new entry.
     }
 
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn bls_cache_evicts_oldest() {
         use crate::authority::bls;

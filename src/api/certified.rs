@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 
 use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
-use crate::authority::certificate::MajorityCertificate;
+use crate::authority::attestation_pool::AttestationPool;
+use crate::authority::certificate::{DualModeCertificate, MajorityCertificate};
+use crate::authority::frontier_sig::VerifiedAttestation;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
@@ -30,13 +32,20 @@ pub enum OnTimeout {
 ///
 /// Contains the metadata needed for an external client to independently
 /// verify that a majority of authorities have acknowledged a given frontier.
-/// The `certificate` field will carry cryptographic signatures once the
-/// full signing pipeline is implemented.
+/// When the signing pipeline is active (signed frontier reports), the
+/// `certificate` field carries an Ed25519 `MajorityCertificate` whose
+/// `frontier_hlc` matches this bundle's `frontier_hlc` (the checkpoint the
+/// authorities signed), and `bls_certificate` optionally carries a compact
+/// BLS aggregate over the same checkpoint message.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProofBundle {
     /// The key range this proof covers.
     pub key_range: KeyRange,
     /// The majority frontier HLC at the time of certification.
+    ///
+    /// When a certificate is attached, this is the certificate checkpoint
+    /// (a floor-normalised HLC) so that verifiers recompute the exact
+    /// message the authorities signed.
     pub frontier_hlc: HlcTimestamp,
     /// The policy version in effect when the proof was generated.
     pub policy_version: PolicyVersion,
@@ -44,8 +53,13 @@ pub struct ProofBundle {
     pub contributing_authorities: Vec<NodeId>,
     /// The total number of authorities in the authority set for this key range.
     pub total_authorities: usize,
-    /// The majority certificate, if available (future: full signing pipeline).
+    /// The Ed25519 majority certificate, when signed attestations reached
+    /// a majority. `None` when frontiers were reported unsigned.
     pub certificate: Option<MajorityCertificate>,
+    /// Optional BLS aggregate certificate over the same checkpoint
+    /// (`CertificateMode::Bls`), attached in addition to the Ed25519
+    /// certificate when a BLS majority under a uniform keyset is available.
+    pub bls_certificate: Option<DualModeCertificate>,
 }
 
 /// Result of a certified read (FR-002).
@@ -125,6 +139,8 @@ pub struct CertifiedCacheEntry {
     pub total_authorities: usize,
     /// The majority certificate, if available.
     pub certificate: Option<MajorityCertificate>,
+    /// The BLS aggregate certificate, if available.
+    pub bls_certificate: Option<DualModeCertificate>,
     /// The HLC timestamp of the write that was certified.
     pub write_timestamp: HlcTimestamp,
 }
@@ -154,6 +170,12 @@ pub struct CertifiedApi {
     /// the pending write entry has been removed by cleanup or retention eviction.
     /// For a given key, only the latest certified entry is kept.
     certified_cache: HashMap<String, CertifiedCacheEntry>,
+    /// Pool of signature-verified frontier attestations, used to assemble
+    /// majority certificates for certified proofs (FR-008).
+    attestations: AttestationPool,
+    /// Keys promoted to `Certified` before a certificate could be assembled.
+    /// Later certification ticks retry certificate assembly for these keys.
+    cert_pending_keys: HashSet<String>,
 }
 
 impl CertifiedApi {
@@ -171,6 +193,8 @@ impl CertifiedApi {
             retention: RetentionPolicy::default(),
             evicted_count: 0,
             certified_cache: HashMap::new(),
+            attestations: AttestationPool::new(),
+            cert_pending_keys: HashSet::new(),
         }
     }
 
@@ -189,6 +213,8 @@ impl CertifiedApi {
             retention,
             evicted_count: 0,
             certified_cache: HashMap::new(),
+            attestations: AttestationPool::new(),
+            cert_pending_keys: HashSet::new(),
         }
     }
 
@@ -225,18 +251,44 @@ impl CertifiedApi {
     /// can still return `Certified` with a valid proof bundle even after the
     /// pending write has been cleaned up.
     fn cache_certified_proof(&mut self, pw: &PendingWrite) {
-        let scoped_frontiers = self
-            .frontiers
-            .all_for_scope(&pw.key_range, &pw.policy_version);
-        let contributing_authorities: Vec<NodeId> = scoped_frontiers
-            .iter()
-            .map(|f| f.authority_id.clone())
-            .collect();
+        // Prefer a cryptographic certificate assembled from signed
+        // attestations. When available, the proof's frontier_hlc becomes the
+        // certificate checkpoint so that verifiers recompute the exact signed
+        // message. When not yet available (e.g. the signed checkpoint has not
+        // caught up with the write), fall back to the unsigned proof and let
+        // later certification ticks attach the certificate lazily.
+        let built = self.attestations.build_certificates(
+            &pw.key_range,
+            pw.policy_version,
+            pw.total_authorities,
+            &pw.timestamp,
+        );
 
-        let frontier_hlc = self
-            .frontiers
-            .majority_frontier_for_scope(&pw.key_range, &pw.policy_version, pw.total_authorities)
-            .unwrap_or_else(|| pw.timestamp.clone());
+        let (frontier_hlc, contributing_authorities, certificate, bls_certificate) = match built {
+            Some((checkpoint, cert, bls_cert)) => {
+                let contributing: Vec<NodeId> = cert.signers().into_iter().cloned().collect();
+                (checkpoint, contributing, Some(cert), bls_cert)
+            }
+            None => {
+                self.cert_pending_keys.insert(pw.key.clone());
+                let scoped_frontiers = self
+                    .frontiers
+                    .all_for_scope(&pw.key_range, &pw.policy_version);
+                let contributing: Vec<NodeId> = scoped_frontiers
+                    .iter()
+                    .map(|f| f.authority_id.clone())
+                    .collect();
+                let frontier_hlc = self
+                    .frontiers
+                    .majority_frontier_for_scope(
+                        &pw.key_range,
+                        &pw.policy_version,
+                        pw.total_authorities,
+                    )
+                    .unwrap_or_else(|| pw.timestamp.clone());
+                (frontier_hlc, contributing, None, None)
+            }
+        };
 
         self.certified_cache.insert(
             pw.key.clone(),
@@ -246,7 +298,8 @@ impl CertifiedApi {
                 policy_version: pw.policy_version,
                 contributing_authorities,
                 total_authorities: pw.total_authorities,
-                certificate: None,
+                certificate,
+                bls_certificate,
                 write_timestamp: pw.timestamp.clone(),
             },
         );
@@ -295,39 +348,42 @@ impl CertifiedApi {
 
         let (status, proof) = match pending_status {
             Some(CertificationStatus::Certified) => {
-                // Build proof from live frontier data.
-                let proof = scope_info.as_ref().and_then(|(kr, pv, total)| {
-                    let frontier_hlc = frontier.clone()?;
-                    let scoped_frontiers = self.frontiers.all_for_scope(kr, pv);
-                    let contributing_authorities: Vec<NodeId> = scoped_frontiers
-                        .iter()
-                        .map(|f| f.authority_id.clone())
-                        .collect();
+                // Prefer the cached proof: it carries the certificate (and the
+                // checkpoint frontier the authorities actually signed) when
+                // the signing pipeline produced one at promotion time.
+                let proof = if let Some(cached) = self.certified_cache.get(key) {
+                    Some(Self::proof_from_cache(cached))
+                } else {
+                    // Fall back to live frontier data (no certificate).
+                    scope_info.as_ref().and_then(|(kr, pv, total)| {
+                        let frontier_hlc = frontier.clone()?;
+                        let scoped_frontiers = self.frontiers.all_for_scope(kr, pv);
+                        let contributing_authorities: Vec<NodeId> = scoped_frontiers
+                            .iter()
+                            .map(|f| f.authority_id.clone())
+                            .collect();
 
-                    Some(ProofBundle {
-                        key_range: kr.clone(),
-                        frontier_hlc,
-                        policy_version: *pv,
-                        contributing_authorities,
-                        total_authorities: *total,
-                        certificate: None,
+                        Some(ProofBundle {
+                            key_range: kr.clone(),
+                            frontier_hlc,
+                            policy_version: *pv,
+                            contributing_authorities,
+                            total_authorities: *total,
+                            certificate: None,
+                            bls_certificate: None,
+                        })
                     })
-                });
+                };
                 (CertificationStatus::Certified, proof)
             }
             Some(other_status) => (other_status, None),
             None => {
                 // No pending write — check the certified cache.
                 if let Some(cached) = self.certified_cache.get(key) {
-                    let proof = ProofBundle {
-                        key_range: cached.key_range.clone(),
-                        frontier_hlc: cached.frontier_hlc.clone(),
-                        policy_version: cached.policy_version,
-                        contributing_authorities: cached.contributing_authorities.clone(),
-                        total_authorities: cached.total_authorities,
-                        certificate: cached.certificate.clone(),
-                    };
-                    (CertificationStatus::Certified, Some(proof))
+                    (
+                        CertificationStatus::Certified,
+                        Some(Self::proof_from_cache(cached)),
+                    )
                 } else {
                     (CertificationStatus::Pending, None)
                 }
@@ -480,13 +536,53 @@ impl CertifiedApi {
             })
     }
 
+    /// Build a `ProofBundle` from a cached certified entry.
+    fn proof_from_cache(cached: &CertifiedCacheEntry) -> ProofBundle {
+        ProofBundle {
+            key_range: cached.key_range.clone(),
+            frontier_hlc: cached.frontier_hlc.clone(),
+            policy_version: cached.policy_version,
+            contributing_authorities: cached.contributing_authorities.clone(),
+            total_authorities: cached.total_authorities,
+            certificate: cached.certificate.clone(),
+            bls_certificate: cached.bls_certificate.clone(),
+        }
+    }
+
     /// Update an Authority's ack frontier.
     ///
     /// Simulates receiving an ack from an Authority node. Returns `true` if
     /// the frontier was actually advanced, `false` if the update was
     /// stale or duplicate.
     pub fn update_frontier(&mut self, frontier: AckFrontier) -> bool {
-        self.frontiers.update(frontier)
+        self.update_frontier_verified(frontier, None)
+    }
+
+    /// Update an Authority's ack frontier, recording a verified attestation.
+    ///
+    /// The frontier itself goes through `AckFrontierSet::update()` unchanged
+    /// (monotonicity, deduplication, fencing). When `verified` is present and
+    /// the scope is not fenced, the attestation is recorded in the pool
+    /// **even if the frontier update itself was stale** — a late-arriving
+    /// signature for an already-known checkpoint still contributes to
+    /// certificate assembly. Returns whether the frontier advanced.
+    pub fn update_frontier_verified(
+        &mut self,
+        frontier: AckFrontier,
+        verified: Option<VerifiedAttestation>,
+    ) -> bool {
+        let fenced = self
+            .frontiers
+            .is_version_fenced(&frontier.key_range, &frontier.policy_version);
+        let key_range = frontier.key_range.clone();
+        let policy_version = frontier.policy_version;
+        let advanced = self.frontiers.update(frontier);
+        if let Some(att) = verified
+            && !fenced
+        {
+            self.attestations.insert(&key_range, policy_version, att);
+        }
+        advanced
     }
 
     /// Re-evaluate all pending writes against the current frontiers.
@@ -513,6 +609,7 @@ impl CertifiedApi {
         for pw in &newly_certified {
             self.cache_certified_proof(pw);
         }
+        self.refresh_missing_certificates();
     }
 
     /// Re-evaluate pending writes and detect timeouts in a single pass.
@@ -549,7 +646,45 @@ impl CertifiedApi {
         for pw in &newly_certified {
             self.cache_certified_proof(pw);
         }
+        self.refresh_missing_certificates();
         transitions
+    }
+
+    /// Retry certificate assembly for keys certified without a certificate.
+    ///
+    /// Checkpoint normalisation means the signed checkpoint can lag a write
+    /// by up to the bucket width plus one report interval, so a write is
+    /// often promoted to `Certified` before a qualifying certificate exists.
+    /// This pass back-fills those cache entries once attestations catch up.
+    fn refresh_missing_certificates(&mut self) {
+        if self.cert_pending_keys.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self.cert_pending_keys.iter().cloned().collect();
+        for key in keys {
+            let Some(entry) = self.certified_cache.get(&key) else {
+                // Entry evicted or invalidated; nothing to back-fill.
+                self.cert_pending_keys.remove(&key);
+                continue;
+            };
+            let built = self.attestations.build_certificates(
+                &entry.key_range,
+                entry.policy_version,
+                entry.total_authorities,
+                &entry.write_timestamp,
+            );
+            if let Some((checkpoint, cert, bls_cert)) = built {
+                let entry = self
+                    .certified_cache
+                    .get_mut(&key)
+                    .expect("entry existence checked above");
+                entry.frontier_hlc = checkpoint;
+                entry.contributing_authorities = cert.signers().into_iter().cloned().collect();
+                entry.certificate = Some(cert);
+                entry.bls_certificate = bls_cert;
+                self.cert_pending_keys.remove(&key);
+            }
+        }
     }
 
     /// Reject a pending write by key.
@@ -655,6 +790,9 @@ impl CertifiedApi {
     /// boundaries during policy transitions (FR-009).
     pub fn fence_version(&mut self, range: &KeyRange, version: PolicyVersion) {
         self.frontiers.fence_version(range, version);
+        // Drop collected attestations for the fenced scope so that no new
+        // certificates can be assembled for it (FR-009 safe transition).
+        self.attestations.gc_scope(range, &version);
     }
 
     /// Check whether a (key_range, policy_version) pair has been fenced.
@@ -1752,7 +1890,7 @@ mod tests {
         assert_eq!(proof.total_authorities, 3);
         assert!(
             proof.certificate.is_none(),
-            "certificate not yet implemented"
+            "unsigned frontiers carry no certificate"
         );
     }
 
@@ -2145,5 +2283,269 @@ mod tests {
         let mut keys: Vec<&str> = delta.iter().map(|(k, _, _)| k.as_str()).collect();
         keys.sort();
         assert_eq!(keys, vec!["key-a", "key-b", "key-c"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Signing pipeline: signed frontiers → certificate in ProofBundle
+    // ---------------------------------------------------------------
+
+    use crate::authority::certificate::KeysetVersion;
+    use crate::authority::frontier_sig::NodeSigner;
+
+    #[cfg(feature = "native-crypto")]
+    fn make_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(node(name), &seed, true)
+    }
+
+    #[cfg(not(feature = "native-crypto"))]
+    fn make_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(node(name), &seed)
+    }
+
+    /// Build a signed frontier report and its self-verified attestation.
+    fn make_signed_frontier(
+        signer: &NodeSigner,
+        physical: u64,
+        prefix: &str,
+    ) -> (AckFrontier, VerifiedAttestation) {
+        let frontier = make_frontier(signer.node_id().0.as_str(), physical, 0, prefix);
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        let att = signer.self_verified(&frontier, &sig);
+        (frontier, att)
+    }
+
+    #[test]
+    fn update_frontier_verified_records_attestation_and_matches_update() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        let signer = make_signer("auth-1", 1);
+
+        let (f1, a1) = make_signed_frontier(&signer, 10_500, "");
+        assert!(api.update_frontier_verified(f1.clone(), Some(a1.clone())));
+
+        // Stale (same-or-older) frontier: update returns false, but the
+        // attestation for the same checkpoint is still collected.
+        let (f2, a2) = make_signed_frontier(&signer, 10_200, "");
+        assert!(!api.update_frontier_verified(f2, Some(a2)));
+
+        // Both attestations landed in the same checkpoint bucket (idempotent).
+        let signer2 = make_signer("auth-2", 2);
+        let (f3, a3) = make_signed_frontier(&signer2, 10_600, "");
+        api.update_frontier_verified(f3, Some(a3));
+
+        let write_ts = HlcTimestamp {
+            physical: 9_000,
+            logical: 0,
+            node_id: "writer".into(),
+        };
+        let built = api
+            .attestations
+            .build_certificates(&kr(""), PolicyVersion(1), 3, &write_ts);
+        assert!(built.is_some(), "2 of 3 attestations must reach majority");
+    }
+
+    #[test]
+    fn fenced_scope_does_not_collect_attestations() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.fence_version(&kr(""), PolicyVersion(1));
+
+        let signer = make_signer("auth-1", 3);
+        let signer2 = make_signer("auth-2", 4);
+        let (f1, a1) = make_signed_frontier(&signer, 10_500, "");
+        let (f2, a2) = make_signed_frontier(&signer2, 10_600, "");
+        assert!(!api.update_frontier_verified(f1, Some(a1)));
+        assert!(!api.update_frontier_verified(f2, Some(a2)));
+
+        let write_ts = HlcTimestamp {
+            physical: 9_000,
+            logical: 0,
+            node_id: "writer".into(),
+        };
+        assert!(
+            api.attestations
+                .build_certificates(&kr(""), PolicyVersion(1), 3, &write_ts)
+                .is_none(),
+            "fenced scopes must not accumulate attestations (FR-009)"
+        );
+    }
+
+    /// End-to-end: signed frontier reports from a majority of authorities
+    /// produce a ProofBundle whose certificate passes the verifier.
+    #[test]
+    fn signed_majority_produces_verifiable_certificate() {
+        use crate::authority::certificate::{EpochConfig, KeysetRegistry};
+        use crate::authority::verifier;
+
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(5), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        let s1 = make_signer("auth-1", 5);
+        let s2 = make_signer("auth-2", 6);
+
+        // Both authorities report past the write's checkpoint boundary.
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        for signer in [&s1, &s2] {
+            let (f, a) = make_signed_frontier(signer, report_ts, "");
+            api.update_frontier_verified(f, Some(a));
+        }
+
+        api.process_certifications();
+
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        let proof = result.proof.expect("certified read must include a proof");
+        let cert = proof
+            .certificate
+            .as_ref()
+            .expect("signed majority must attach a certificate");
+
+        // The proof's frontier is the certificate checkpoint.
+        assert_eq!(proof.frontier_hlc, cert.frontier_hlc);
+        assert_eq!(proof.frontier_hlc.logical, 0);
+        assert_eq!(proof.frontier_hlc.physical % 1000, 0);
+        assert_eq!(proof.contributing_authorities.len(), 2);
+
+        // Embedded-key verification passes end-to-end.
+        let verification = verifier::verify_proof(&proof, None, 0);
+        assert!(
+            verification.valid,
+            "assembled certificate must verify: {verification:?}"
+        );
+        assert_eq!(verification.signatures_valid, Some(true));
+
+        // Registry-based verification also passes.
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![
+                    (node("auth-1"), s1.verifying_key()),
+                    (node("auth-2"), s2.verifying_key()),
+                ],
+            )
+            .unwrap();
+        let verification = verifier::verify_proof_with_registry(
+            &proof,
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
+        assert!(verification.valid, "registry verification must pass");
+    }
+
+    /// A write promoted before the signed checkpoint catches up gets its
+    /// certificate attached by a later certification tick.
+    #[test]
+    fn certificate_attached_lazily_by_later_ticks() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        let s1 = make_signer("auth-1", 7);
+        let s2 = make_signer("auth-2", 8);
+
+        // Reports advance the frontier past the write but their checkpoint
+        // (floor to 1s) is still below the write timestamp: promotion happens
+        // without a certificate.
+        let early_ts = write_ts + 1; // same checkpoint bucket as the write
+        if !early_ts.is_multiple_of(1000) {
+            for signer in [&s1, &s2] {
+                let (f, a) = make_signed_frontier(signer, early_ts, "");
+                api.update_frontier_verified(f, Some(a));
+            }
+            api.process_certifications();
+            let result = api.get_certified("key1");
+            if result.status == CertificationStatus::Certified {
+                let proof = result.proof.unwrap();
+                assert!(
+                    proof.certificate.is_none(),
+                    "checkpoint has not caught up; certificate must be absent"
+                );
+            }
+        }
+
+        // Later reports cross the next checkpoint boundary.
+        let late_ts = (write_ts / 1000 + 1) * 1000 + 50;
+        for signer in [&s1, &s2] {
+            let (f, a) = make_signed_frontier(signer, late_ts, "");
+            api.update_frontier_verified(f, Some(a));
+        }
+        api.process_certifications();
+
+        let result = api.get_certified("key1");
+        assert_eq!(result.status, CertificationStatus::Certified);
+        let proof = result.proof.unwrap();
+        assert!(
+            proof.certificate.is_some(),
+            "certificate must be back-filled by a later tick"
+        );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn signed_majority_attaches_bls_certificate() {
+        use crate::authority::certificate::{EpochConfig, KeysetRegistry};
+        use crate::authority::verifier;
+
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        let s1 = make_signer("auth-1", 9);
+        let s2 = make_signer("auth-2", 10);
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        for signer in [&s1, &s2] {
+            let (f, a) = make_signed_frontier(signer, report_ts, "");
+            api.update_frontier_verified(f, Some(a));
+        }
+        api.process_certifications();
+
+        let proof = api.get_certified("key1").proof.unwrap();
+        let bls_cert = proof
+            .bls_certificate
+            .expect("BLS-capable majority must attach a BLS certificate");
+        assert!(bls_cert.has_majority(3));
+
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![
+                    (node("auth-1"), s1.verifying_key()),
+                    (node("auth-2"), s2.verifying_key()),
+                ],
+            )
+            .unwrap();
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![
+                    ("auth-1".into(), s1.bls_public_key().unwrap()),
+                    ("auth-2".into(), s2.bls_public_key().unwrap()),
+                ],
+            )
+            .unwrap();
+
+        let result = verifier::verify_dual_proof_with_registry(
+            &bls_cert,
+            3,
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
+        assert!(result.valid, "BLS certificate must verify: {result:?}");
     }
 }

@@ -44,9 +44,17 @@ Certified 整合性を提供します。
 | コンポーネント | 場所 | 役割 |
 |--------------|------|------|
 | Ack Frontier | `src/authority/ack_frontier.rs` | Authority ごとの確認済み更新を HLC ベースの frontier で追跡 |
+| Frontier Signing | `src/authority/frontier_sig.rs` | frontier 報告への二重署名（報告全体への Ed25519 署名 + チェックポイント HLC への証明書署名）と registry ベースの受信検証 |
+| Attestation Pool | `src/authority/attestation_pool.rs` | 検証済み attestation をスコープ × チェックポイント単位で収集し majority certificate を組み立て |
 | Certificate | `src/authority/certificate.rs` | デュアルモード（Ed25519 / BLS）majority certificate の構築 |
 | BLS Signatures | `src/authority/bls.rs` | `blst` クレート経由の BLS12-381 aggregate signatures |
 | Epoch Manager | `src/authority/certificate.rs` | 24 時間 epoch、7 epoch 猶予期間付き鍵ローテーション |
+
+frontier 報告の署名対象は 1 秒単位に床丸めした「チェックポイント HLC」であり、
+全 Authority が同一メッセージバイト列に署名する。これにより Ed25519 の
+`MajorityCertificate`（単一メッセージ検証）と BLS `fast_aggregate_verify`
+（同一メッセージ前提）の両方が成立する。certified read の
+`ProofBundle.frontier_hlc` は certificate 付きの場合このチェックポイント値になる。
 
 ### Control Plane
 

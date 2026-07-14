@@ -5,10 +5,11 @@ use tokio::sync::Mutex;
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
-use asteroidb_poc::authority::bls::BlsKeypair;
-#[cfg(feature = "native-crypto")]
-use asteroidb_poc::authority::certificate::KeysetVersion;
-use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry};
+use asteroidb_poc::authority::bls::BlsPublicKey;
+#[cfg(not(feature = "native-crypto"))]
+use asteroidb_poc::authority::bls_stub::BlsPublicKey;
+use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -20,6 +21,62 @@ use asteroidb_poc::network::{NodeConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
+
+/// Parse peer authority public keys from `ASTEROIDB_AUTHORITY_KEYS`.
+///
+/// Format: comma-separated `<node-id>=<ed25519 hex (64 chars)>[/<bls hex (96 chars)>]`
+/// entries, e.g. `auth-2=ab..cd,auth-3=ef..01/89..76`. Entries that fail to
+/// parse are logged and skipped so a single bad key cannot prevent startup.
+///
+/// This is the static key distribution channel required for verifying peer
+/// frontier signatures (FR-008); without it only self-signed frontiers verify.
+fn parse_authority_keys_env() -> Vec<(NodeId, ed25519_dalek::VerifyingKey, Option<BlsPublicKey>)> {
+    let Ok(raw) = std::env::var("ASTEROIDB_AUTHORITY_KEYS") else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((id, key_part)) = entry.split_once('=') else {
+            eprintln!("warning: ASTEROIDB_AUTHORITY_KEYS entry '{entry}' missing '='; skipping");
+            continue;
+        };
+        let (ed_hex, bls_hex) = match key_part.split_once('/') {
+            Some((ed, bls)) => (ed, Some(bls)),
+            None => (key_part, None),
+        };
+
+        let ed_vk = hex::decode(ed_hex.trim())
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            .and_then(|arr| ed25519_dalek::VerifyingKey::from_bytes(&arr).ok());
+        let Some(ed_vk) = ed_vk else {
+            eprintln!(
+                "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' has an invalid Ed25519 key; skipping"
+            );
+            continue;
+        };
+
+        let bls_pk = match bls_hex {
+            Some(hex_str) => match BlsPublicKey::from_hex(hex_str.trim()) {
+                Some(pk) => Some(pk),
+                None => {
+                    eprintln!(
+                        "warning: ASTEROIDB_AUTHORITY_KEYS entry for '{id}' has an invalid BLS key; skipping entry"
+                    );
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        keys.push((NodeId(id.trim().to_string()), ed_vk, bls_pk));
+    }
+    keys
+}
 
 /// Parse authority node IDs from `ASTEROIDB_AUTHORITY_NODES` env var (comma-separated),
 /// falling back to the default `["auth-1", "auth-2", "auth-3"]`.
@@ -258,32 +315,65 @@ async fn main() {
     let epoch_manager = EpochManager::new(epoch_config.clone(), now_secs);
     let current_epoch_val = epoch_manager.current_epoch(now_secs);
 
+    // Build the node signer from the seed. The signer owns the Ed25519
+    // signing key (and, with native-crypto, the BLS keypair) for the whole
+    // process lifetime — it is the single derivation point for key material.
     #[cfg(feature = "native-crypto")]
-    let keyset_registry = bls_config.as_ref().map(|bls_cfg| {
-        let keypair = BlsKeypair::generate(&bls_cfg.seed);
+    let node_signer = bls_config
+        .as_ref()
+        .map(|bls_cfg| Arc::new(NodeSigner::from_seed(node_id.clone(), &bls_cfg.seed, true)));
+    #[cfg(not(feature = "native-crypto"))]
+    let node_signer: Option<Arc<NodeSigner>> = None;
+
+    // Build the keyset registry from the signer's public keys plus any peer
+    // authority public keys distributed via ASTEROIDB_AUTHORITY_KEYS.
+    // The same registry instance is shared between AppState (verification)
+    // and NodeRunner (signing keyset resolution).
+    let keyset_registry = node_signer.as_ref().map(|signer| {
         let mut registry = KeysetRegistry::new();
-        // Register an initial keyset (version 1) with an Ed25519 key derived from
-        // the same seed. The BLS public key is what matters for production verification.
-        let ed_signing_key = ed25519_dalek::SigningKey::from_bytes(&bls_cfg.seed);
-        let ed_verifying_key = ed_signing_key.verifying_key();
+
+        let mut ed_keys = vec![(node_id.clone(), signer.verifying_key())];
+        #[cfg(feature = "native-crypto")]
+        let mut bls_keys: Vec<(String, BlsPublicKey)> = signer
+            .bls_public_key()
+            .map(|pk| vec![(node_id.0.clone(), pk)])
+            .unwrap_or_default();
+
+        // Peer authority keys: "auth-2=<ed25519 hex64>[/<bls hex96>],auth-3=...".
+        for (peer_id, ed_vk, bls_pk) in parse_authority_keys_env() {
+            if peer_id == node_id {
+                continue; // own keys already derived from the seed
+            }
+            #[cfg(feature = "native-crypto")]
+            if let Some(pk) = bls_pk {
+                bls_keys.push((peer_id.0.clone(), pk));
+            }
+            #[cfg(not(feature = "native-crypto"))]
+            let _ = bls_pk;
+            ed_keys.push((peer_id, ed_vk));
+        }
+
         registry
-            .register_keyset(
-                KeysetVersion(1),
-                current_epoch_val,
-                vec![(node_id.clone(), ed_verifying_key)],
-            )
+            .register_keyset(KeysetVersion(1), current_epoch_val, ed_keys)
             .expect("initial keyset registration should succeed");
-        // Register the BLS public key for this node.
-        registry
-            .register_bls_keys(
-                &KeysetVersion(1),
-                vec![(node_id.0.clone(), keypair.public_key)],
-            )
-            .expect("BLS key registration should succeed");
+        #[cfg(feature = "native-crypto")]
+        if !bls_keys.is_empty() {
+            registry
+                .register_bls_keys(&KeysetVersion(1), bls_keys)
+                .expect("BLS key registration should succeed");
+        }
         Arc::new(std::sync::RwLock::new(registry))
     });
-    #[cfg(not(feature = "native-crypto"))]
-    let keyset_registry: Option<Arc<std::sync::RwLock<KeysetRegistry>>> = None;
+
+    // Opt-in strict mode: reject unsigned frontier pushes.
+    let require_signed_frontiers = std::env::var("ASTEROIDB_REQUIRE_SIGNED_FRONTIERS")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
+    let current_epoch = Arc::new(std::sync::atomic::AtomicU64::new(current_epoch_val));
 
     // Build shared HTTP state.
     let state = Arc::new(AppState {
@@ -301,15 +391,20 @@ async fn main() {
         latency_model: Some(Arc::clone(&shared_latency_model)),
         cluster_nodes: Some(Arc::clone(&shared_cluster_nodes)),
         slo_tracker: Arc::clone(&slo_tracker),
-        keyset_registry,
+        keyset_registry: keyset_registry.clone(),
         epoch_config,
-        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(current_epoch_val)),
+        current_epoch: Arc::clone(&current_epoch),
+        require_signed_frontiers,
     });
 
     let app = router(state);
 
     let runner_config = NodeRunnerConfig {
         bls_config,
+        node_signer,
+        keyset_registry,
+        internal_token: internal_token.clone(),
+        current_epoch: Some(Arc::clone(&current_epoch)),
         ..NodeRunnerConfig::default()
     };
 
