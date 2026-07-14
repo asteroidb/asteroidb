@@ -580,6 +580,14 @@ impl IntoResponse for ApiError {
                      retry, increase wait_ms, or try another replica"
                 ),
             ),
+            // WAL append failure: the write was applied in memory but its
+            // durability could not be established (e.g. disk full). 503
+            // signals a retryable service condition; reads keep working.
+            CrdtError::Storage(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "STORAGE_UNAVAILABLE",
+                msg.clone(),
+            ),
         };
         let retry_after = matches!(&self.0, CrdtError::SessionNotSatisfied { .. });
 

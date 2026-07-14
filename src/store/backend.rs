@@ -27,6 +27,24 @@ pub trait StorageBackend: Send + Sync {
 // FileBackend (not available on wasm32)
 // ---------------------------------------------------------------------------
 
+/// Fsync the directory containing `path`-like entries so that file
+/// creations, renames, and deletions inside it are themselves durable.
+///
+/// Without this, a crash after `rename()` can lose the rename (the ALICE
+/// study's most common durability defect): the file data is on disk but
+/// the directory entry pointing at it is not.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    // A bare relative filename has an empty parent; that means "current dir".
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let handle = std::fs::File::open(dir)?;
+    handle.sync_all()
+}
+
 /// File-based persistence backend using atomic write + fsync.
 ///
 /// Writes go to a `.tmp` sibling file first, which is fsynced and then
@@ -63,18 +81,31 @@ impl StorageBackend for FileBackend {
         }
 
         // Atomic write: temp file -> fsync -> rename.
-        // Use `<filename>.<pid>.tmp` rather than `with_extension("tmp")` so
-        // that paths that already end in `.tmp` (where `with_extension` is a
-        // no-op) still get a distinct temporary path.
+        // Use `<filename>.<pid>.<seq>.tmp` rather than `with_extension("tmp")`
+        // so that paths that already end in `.tmp` (where `with_extension` is
+        // a no-op) still get a distinct temporary path. The per-process
+        // sequence number makes concurrent saves of the SAME target path
+        // (e.g. the periodic checkpoint ticker racing the shutdown-path
+        // final checkpoint) use distinct tmp files — sharing one tmp file
+        // would interleave their writes and could rename a garbled snapshot
+        // into place.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp_path = self.path.with_file_name(format!(
-            "{}.{}.tmp",
+            "{}.{}.{}.tmp",
             self.path.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let mut file = File::create(&tmp_path)?;
         file.write_all(data)?;
         file.sync_all()?;
         std::fs::rename(&tmp_path, &self.path)?;
+        // The rename only becomes durable once the parent directory itself
+        // is flushed; without it a crash can revert to the previous file
+        // (or to nothing, for a first save).
+        if let Some(parent) = self.path.parent() {
+            fsync_dir(parent)?;
+        }
         Ok(())
     }
 
@@ -407,6 +438,46 @@ mod tests {
         assert!(
             !leftover_tmp,
             "no .tmp file should remain after a successful save"
+        );
+    }
+
+    /// Concurrent saves to the same target must never install an
+    /// interleaving of two payloads: each save uses its own tmp file, so
+    /// the final content is exactly one writer's payload.
+    #[test]
+    fn concurrent_saves_to_same_path_stay_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snap.bin");
+        let backend = FileBackend::new(&path);
+        let payload_a = vec![0xAA_u8; 4096];
+        let payload_b = vec![0xBB_u8; 8192];
+
+        let t1 = std::thread::spawn({
+            let backend = backend.clone();
+            let payload = payload_a.clone();
+            move || {
+                for _ in 0..50 {
+                    backend.save(&payload).unwrap();
+                }
+            }
+        });
+        let t2 = std::thread::spawn({
+            let backend = backend.clone();
+            let payload = payload_b.clone();
+            move || {
+                for _ in 0..50 {
+                    backend.save(&payload).unwrap();
+                }
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let data = backend.load().unwrap();
+        assert!(
+            data == payload_a || data == payload_b,
+            "snapshot must be exactly one writer's payload, never a mix (len={})",
+            data.len()
         );
     }
 

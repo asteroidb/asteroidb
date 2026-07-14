@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::session::SessionToken;
 use crate::store::kv::{CrdtValue, Store};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::store::wal::{WalPos, WalRecord, WalWriter};
 use crate::types::NodeId;
 
 use crate::crdt::lww_register::LwwRegister;
@@ -14,21 +18,203 @@ use crate::crdt::pn_counter::PnCounter;
 /// Reads and writes are local-first: writes are accepted immediately
 /// and propagated asynchronously. Reads return the local CRDT state,
 /// which converges across replicas via merge.
+///
+/// ## Durability (WAL)
+///
+/// When constructed via [`recovered`](Self::recovered) with a
+/// [`WalWriter`], every mutation appends a state-based redo record (the
+/// post-mutation CRDT value + HLC) to the write-ahead log BEFORE the call
+/// returns. A failed append surfaces as [`CrdtError::Storage`]: the
+/// in-memory effect remains (un-acked; it converges via anti-entropy), but
+/// the caller must not acknowledge durability. `new` builds a WAL-less
+/// API with the historical purely-in-memory behaviour.
 pub struct EventualApi {
     store: Store,
     clock: Hlc,
     node_id: NodeId,
+    /// Write-ahead log appender; `None` = persistence disabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    wal: Option<WalWriter>,
+    /// Position of the most recent WAL append, for `wait_durable`.
+    #[cfg(not(target_arch = "wasm32"))]
+    last_wal_pos: Option<WalPos>,
+    /// Poison marks whose `MergeFailed` append failed. They are re-appended
+    /// in front of the NEXT record (see `wal_append`): a frontier-advancing
+    /// record must never reach the log while a poison mark is missing from
+    /// it, or a crash would replay the frontier without the poison — a
+    /// false session success (the invariant on `WalRecord::MergeFailed`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_poison: Vec<String>,
 }
 
 impl EventualApi {
-    /// Create a new EventualApi for the given node.
+    /// Create a new EventualApi for the given node (no WAL: in-memory only).
     pub fn new(node_id: NodeId) -> Self {
         let clock = Hlc::new(node_id.0.clone());
         Self {
             store: Store::new(),
             clock,
             node_id,
+            #[cfg(not(target_arch = "wasm32"))]
+            wal: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_wal_pos: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_poison: Vec::new(),
         }
+    }
+
+    /// Create an EventualApi from a recovered store (snapshot + WAL replay).
+    ///
+    /// Seeds the HLC clock from the highest recovered timestamp so writes
+    /// issued after the restart are strictly greater than anything already
+    /// persisted (clock rollback would break LWW and delta sync).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn recovered(node_id: NodeId, store: Store, wal: Option<WalWriter>) -> Self {
+        let mut clock = Hlc::new(node_id.0.clone());
+        if let Some(max) = store.max_known_hlc() {
+            clock.seed_recovered(&max);
+        }
+        Self {
+            store,
+            clock,
+            node_id,
+            wal,
+            last_wal_pos: None,
+            pending_poison: Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // WAL plumbing
+    // ---------------------------------------------------------------
+
+    /// Append a record to the WAL (no-op when persistence is disabled).
+    ///
+    /// Poison marks whose own `MergeFailed` append previously failed are
+    /// flushed FIRST: no later record — in particular no frontier-advancing
+    /// `UpsertApplied`/`SessionClaims` — may reach the log while a poison
+    /// mark is missing from it. If the flush fails, the new record is not
+    /// appended either (ordering is the invariant, not best-effort).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_append(&mut self, record: WalRecord) -> Result<(), CrdtError> {
+        let Some(wal) = self.wal.as_mut() else {
+            return Ok(());
+        };
+        if !self.pending_poison.is_empty() {
+            let poison = WalRecord::MergeFailed {
+                keys: self.pending_poison.clone(),
+            };
+            match wal.append(&poison) {
+                Ok(pos) => {
+                    self.last_wal_pos = Some(pos);
+                    self.pending_poison.clear();
+                }
+                Err(e) => {
+                    return Err(CrdtError::Storage(format!(
+                        "WAL append failed (pending poison marks must precede new records): {e}"
+                    )));
+                }
+            }
+        }
+        match wal.append(&record) {
+            Ok(pos) => self.last_wal_pos = Some(pos),
+            Err(e) => return Err(CrdtError::Storage(format!("WAL append failed: {e}"))),
+        }
+        Ok(())
+    }
+
+    /// Log the post-mutation state of `key` as an `UpsertApplied` record.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_log_applied(&mut self, key: &str, hlc: &HlcTimestamp) -> Result<(), CrdtError> {
+        if self.wal.is_none() {
+            return Ok(());
+        }
+        let value = self
+            .store
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CrdtError::Internal(format!("no post-state for WAL key {key}")))?;
+        self.wal_append(WalRecord::UpsertApplied {
+            key: key.to_string(),
+            value,
+            hlc: hlc.clone(),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wal_log_applied(&mut self, _key: &str, _hlc: &HlcTimestamp) -> Result<(), CrdtError> {
+        Ok(())
+    }
+
+    /// Log the post-mutation state of `key` as an `UpsertVisible` record.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_log_visible(&mut self, key: &str, hlc: &HlcTimestamp) -> Result<(), CrdtError> {
+        if self.wal.is_none() {
+            return Ok(());
+        }
+        let value = self
+            .store
+            .get(key)
+            .cloned()
+            .ok_or_else(|| CrdtError::Internal(format!("no post-state for WAL key {key}")))?;
+        self.wal_append(WalRecord::UpsertVisible {
+            key: key.to_string(),
+            value,
+            hlc: hlc.clone(),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wal_log_visible(&mut self, _key: &str, _hlc: &HlcTimestamp) -> Result<(), CrdtError> {
+        Ok(())
+    }
+
+    /// Persist a merge-failure poison mark. The caller is already
+    /// propagating the merge error, so an append failure here does not
+    /// surface — but it is NOT merely logged: the key is queued in
+    /// `pending_poison` and the `MergeFailed` record is re-appended in
+    /// front of the next successful append (`wal_append`), so a later
+    /// frontier-advancing record can never reach the log without it.
+    /// Losing the poison while keeping the frontier would produce false
+    /// session successes after a crash.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wal_log_merge_failed(&mut self, key: &str) {
+        if self.wal.is_none() {
+            return;
+        }
+        if let Err(e) = self.wal_append(WalRecord::MergeFailed {
+            keys: vec![key.to_string()],
+        }) {
+            tracing::warn!(
+                key = %key,
+                error = %e,
+                "failed to WAL-log merge poison; queued for re-append before the next record"
+            );
+            if !self.pending_poison.iter().any(|k| k == key) {
+                self.pending_poison.push(key.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wal_log_merge_failed(&mut self, _key: &str) {}
+
+    /// Position of the most recent WAL append (for durability waits).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn last_wal_pos(&self) -> Option<WalPos> {
+        self.last_wal_pos
+    }
+
+    /// Seal the active WAL segment and start a new one (checkpoint step 1).
+    ///
+    /// Returns the sealed segment sequence, or `None` when persistence is
+    /// disabled. Must be called in the same critical section as the store
+    /// clone that will be snapshotted, so the snapshot provably covers
+    /// every record in segments `<= sealed`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wal_rotate(&mut self) -> std::io::Result<Option<u64>> {
+        self.wal.as_mut().map(|w| w.rotate()).transpose()
     }
 
     /// Read the local CRDT value for a key (FR-002).
@@ -44,14 +230,26 @@ impl EventualApi {
     /// to other nodes asynchronously. Atomically records the HLC timestamp
     /// for delta sync tracking so the entry is immediately visible to
     /// `delta_sync` without a separate `record_change` call.
+    ///
+    /// The value is CRDT-**merged** into any existing entry (never a plain
+    /// replace), and a type-changing write is rejected with `TypeMismatch`.
+    /// This is required for crash safety, not just CRDT hygiene: WAL
+    /// recovery rebuilds state by merging the logged post-states, so the
+    /// live path must only produce post-states that dominate the previous
+    /// ones for the key. A replace can regress CRDT state (e.g. overwrite
+    /// counter `{a:2}` with a fresh `{b:1}`), and replay's merge would
+    /// then resurrect the replaced contributions — recovered state would
+    /// diverge from the acked pre-crash state.
     pub fn eventual_write(
         &mut self,
         key: String,
         value: CrdtValue,
     ) -> Result<HlcTimestamp, CrdtError> {
         let ts = self.clock.now()?;
-        self.store.put_with_timestamp(key, value, ts.clone());
+        self.store.merge_value(key.clone(), &value)?;
+        self.store.record_change(&key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(&key, &ts)?;
         Ok(ts)
     }
 
@@ -80,6 +278,7 @@ impl EventualApi {
         let ts = self.clock.now()?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -107,6 +306,7 @@ impl EventualApi {
         let ts = self.clock.now()?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -138,6 +338,7 @@ impl EventualApi {
         let ts = self.clock.now()?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -168,6 +369,7 @@ impl EventualApi {
         let ts = self.clock.now()?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -200,6 +402,7 @@ impl EventualApi {
         }
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -230,6 +433,7 @@ impl EventualApi {
         let ts = self.clock.now()?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -261,6 +465,7 @@ impl EventualApi {
         }
         self.store.record_change(key, ts.clone());
         self.store.note_applied(&ts);
+        self.wal_log_applied(key, &ts)?;
         Ok(ts)
     }
 
@@ -275,6 +480,9 @@ impl EventualApi {
             // dropped, so the applied_origins invariant no longer holds
             // for this key (the frontier may advance via other keys).
             self.store.note_merge_failed(&key);
+            // Persist the poison too: losing it while a later snapshot /
+            // claims record keeps the frontier would fake session success.
+            self.wal_log_merge_failed(&key);
             return Err(e);
         }
         let ts = self.clock.now()?;
@@ -284,6 +492,17 @@ impl EventualApi {
         // frontier may advance. Claiming the remote origin here would be
         // unsound (push batches are partial, not a complete prefix).
         self.store.note_applied(&ts);
+        if let Err(e) = self.wal_log_applied(&key, &ts) {
+            // The remote contribution IS merged and visible in memory, but
+            // its data record is NOT in the WAL — while later successful
+            // appends (e.g. an adopted SessionClaims) may still persist a
+            // frontier covering it. Poison the key so session checks stay
+            // fail-closed across a crash instead of claiming data whose
+            // record was never logged (frontier-without-data).
+            self.store.note_merge_failed(&key);
+            self.wal_log_merge_failed(&key);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -322,6 +541,7 @@ impl EventualApi {
         if let Err(e) = self.store.merge_value(key.clone(), remote_value) {
             // Poison the key for session checks (see merge_remote).
             self.store.note_merge_failed(&key);
+            self.wal_log_merge_failed(&key);
             return Err(e);
         }
         // The merged contribution is now visible; response tokens must
@@ -331,11 +551,47 @@ impl EventualApi {
         // and any existing timestamp for this key. This ensures that
         // merges are never silently dropped from the change log, which
         // would cause delta-sync peers to miss updates.
-        let record_hlc = match self.store.timestamp_for(&key) {
-            Some(existing) if *existing > hlc => existing.clone(),
-            _ => hlc,
-        };
-        self.store.record_change(&key, record_hlc);
+        self.store.record_change_max(&key, hlc.clone());
+        if let Err(e) = self.wal_log_visible(&key, &hlc) {
+            // Same as merge_remote: the entry is merged in memory but its
+            // data record never reached the WAL, and the caller
+            // (apply_delta_response) may still adopt the sender's applied
+            // frontier covering it. Poison the key so a crash cannot
+            // replay a frontier that claims data whose record was lost.
+            self.store.note_merge_failed(&key);
+            self.wal_log_merge_failed(&key);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Adopt a sync sender's session metadata (frontier adoption).
+    ///
+    /// Applies the three maps to the store and persists them as ONE
+    /// `SessionClaims` WAL record, so the applied frontier and the poison
+    /// set can never be separated by a crash (a frontier without its
+    /// poison set produces false session successes after restart).
+    ///
+    /// Callers pass an empty `applied`/`failed` when the transfer's
+    /// completeness could not be verified (visible-only adoption).
+    pub fn adopt_session_claims(
+        &mut self,
+        applied: &HashMap<String, HlcTimestamp>,
+        visible: &HashMap<String, HlcTimestamp>,
+        failed: Vec<String>,
+    ) -> Result<(), CrdtError> {
+        if applied.is_empty() && visible.is_empty() && failed.is_empty() {
+            return Ok(());
+        }
+        self.store.merge_applied_origins(applied);
+        self.store.merge_visible_origins(visible);
+        self.store.merge_failed_extend(failed.iter().cloned());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wal_append(WalRecord::SessionClaims {
+            applied: applied.clone(),
+            visible: visible.clone(),
+            failed,
+        })?;
         Ok(())
     }
 
@@ -370,6 +626,14 @@ impl EventualApi {
     ///
     /// Needed by tombstone GC and compaction to modify CRDT deferred sets
     /// and prune change-tracking timestamps in-place.
+    ///
+    /// # MAINTAINER WARNING
+    /// Mutations through this reference BYPASS the write-ahead log. That
+    /// is intentional (and safe) for compaction / tombstone GC only: their
+    /// effects are captured by the next snapshot, and losing them to a
+    /// crash merely re-runs the GC. Any NEW data mutation added through
+    /// this path would be silently lost on crash — route it through the
+    /// `EventualApi` mutation methods (or `adopt_session_claims`) instead.
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
     }

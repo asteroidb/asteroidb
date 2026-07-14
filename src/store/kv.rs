@@ -271,6 +271,13 @@ impl Store {
     ///
     /// Also removes the corresponding change-tracking timestamp so that
     /// orphaned entries never accumulate in `self.timestamps`.
+    ///
+    /// # MAINTAINER WARNING
+    /// Physical deletion is NOT recorded in the write-ahead log. Wiring
+    /// this into an eventual write path would make deletes resurrect on
+    /// WAL over-replay (an earlier `UpsertApplied` record re-inserts the
+    /// key). Logical deletion must go through the CRDT tombstone
+    /// operations (`OrSet::remove` / `OrMap::delete`) instead.
     pub fn delete(&mut self, key: &str) -> Option<CrdtValue> {
         self.timestamps.remove(key);
         self.data.remove(key)
@@ -386,6 +393,21 @@ impl Store {
     pub fn load_snapshot_bincode(path: &Path) -> io::Result<Self> {
         let backend = FileBackend::new(path);
         Self::load_from_backend_bincode(&backend)
+    }
+
+    /// Load a store from a bincode-encoded snapshot, falling back to an
+    /// empty store only when the file is missing.
+    ///
+    /// Any other error (corruption, incompatible version, I/O failure) is
+    /// propagated so a damaged snapshot can never be silently replaced by
+    /// an empty store (data-loss direction).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_snapshot_bincode_or_default(path: &Path) -> io::Result<Self> {
+        match Self::load_snapshot_bincode(path) {
+            Ok(store) => Ok(store),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Load a store from an arbitrary [`StorageBackend`] using bincode.
@@ -589,6 +611,41 @@ impl Store {
     /// Called after any mutation to enable delta sync tracking.
     pub fn record_change(&mut self, key: &str, hlc: HlcTimestamp) {
         self.timestamps.insert(key.to_string(), hlc);
+    }
+
+    /// Record a change timestamp for the given key, keeping the maximum of
+    /// the incoming HLC and any existing per-key timestamp.
+    ///
+    /// Unlike [`record_change`](Self::record_change) (overwrite semantics)
+    /// this never moves a per-key timestamp backwards, so merges replayed
+    /// out of order (remote deltas, WAL recovery) cannot silently drop an
+    /// entry from the delta-sync change log.
+    pub fn record_change_max(&mut self, key: &str, hlc: HlcTimestamp) {
+        match self.timestamps.get_mut(key) {
+            Some(existing) => {
+                if hlc > *existing {
+                    *existing = hlc;
+                }
+            }
+            None => {
+                self.timestamps.insert(key.to_string(), hlc);
+            }
+        }
+    }
+
+    /// Return the highest HLC timestamp known to this store across the
+    /// per-key change log, the applied frontier, and the visible frontier.
+    ///
+    /// Used after crash recovery to re-seed the node's HLC clock: new
+    /// timestamps issued after a restart must be strictly greater than
+    /// anything already persisted, or LWW resolution and delta sync break.
+    pub fn max_known_hlc(&self) -> Option<HlcTimestamp> {
+        self.timestamps
+            .values()
+            .chain(self.applied_origins.values())
+            .chain(self.visible_origins.values())
+            .max()
+            .cloned()
     }
 
     /// Return entries modified strictly after the given frontier timestamp.

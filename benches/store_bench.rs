@@ -168,6 +168,71 @@ fn bench_load_snapshot_bincode(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// WAL benchmarks
+// ---------------------------------------------------------------------------
+
+/// Counter-increment throughput through the EventualApi, with and without a
+/// WAL attached (Off = pure append cost; the regression baseline is `none`).
+fn bench_wal_append_overhead(c: &mut Criterion) {
+    use asteroidb_poc::api::eventual::EventualApi;
+    use asteroidb_poc::store::wal::{SyncPolicy, WalConfig, WalWriter};
+
+    let mut group = c.benchmark_group("wal/counter_inc");
+
+    group.bench_function("none", |b| {
+        let mut api = EventualApi::new(node("bench-node"));
+        b.iter(|| {
+            api.eventual_counter_inc("cnt").unwrap();
+        });
+    });
+
+    for (label, sync) in [
+        ("sync_off", SyncPolicy::Off),
+        (
+            "sync_interval",
+            SyncPolicy::Interval(std::time::Duration::from_millis(100)),
+        ),
+    ] {
+        group.bench_function(label, |b| {
+            let tmp_dir = TempDir::new().expect("create temp dir");
+            let wal = WalWriter::open(WalConfig::new(tmp_dir.path(), sync)).unwrap();
+            let mut api = EventualApi::recovered(node("bench-node"), Store::new(), Some(wal));
+            b.iter(|| {
+                api.eventual_counter_inc("cnt").unwrap();
+            });
+        });
+    }
+    // Note: `always` is dominated by fdatasync latency and needs the tokio
+    // group-commit syncer; measure it end-to-end via the HTTP benchmarks.
+    group.finish();
+}
+
+fn bench_wal_replay(c: &mut Criterion) {
+    use asteroidb_poc::api::eventual::EventualApi;
+    use asteroidb_poc::store::wal::{self, SyncPolicy, WalConfig, WalWriter};
+
+    let tmp_dir = TempDir::new().expect("create temp dir");
+    {
+        let wal = WalWriter::open(WalConfig::new(tmp_dir.path(), SyncPolicy::Off)).unwrap();
+        let mut api = EventualApi::recovered(node("bench-node"), Store::new(), Some(wal));
+        for i in 0..1000 {
+            api.eventual_counter_inc(&format!("key-{i:06}")).unwrap();
+        }
+    }
+
+    c.bench_function("wal/replay_1000", |b| {
+        b.iter(|| {
+            let read = wal::read_all_segments(tmp_dir.path()).unwrap();
+            let mut store = Store::new();
+            for record in read.records {
+                wal::replay_record(&mut store, record);
+            }
+            std::hint::black_box(store.len());
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_store_put,
@@ -178,5 +243,7 @@ criterion_group!(
     bench_load_snapshot,
     bench_save_snapshot_bincode,
     bench_load_snapshot_bincode,
+    bench_wal_append_overhead,
+    bench_wal_replay,
 );
 criterion_main!(benches);

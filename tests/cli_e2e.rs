@@ -76,6 +76,8 @@ fn test_state() -> Arc<AppState> {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     })
 }
 

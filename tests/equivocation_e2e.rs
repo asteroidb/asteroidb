@@ -131,6 +131,8 @@ async fn spawn_node(name: &str, opts: NodeOpts) -> (Arc<AppState>, SocketAddr, J
         require_signed_frontiers: false,
         equivocation: Arc::new(EquivocationDetector::new(opts.persist_path)),
         exclude_accused_authorities: opts.exclude_accused,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     let app = router(state.clone());

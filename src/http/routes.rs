@@ -181,6 +181,8 @@ mod tests {
                 None,
             )),
             exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
         })
     }
 
@@ -252,6 +254,8 @@ mod tests {
                 None,
             )),
             exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
         })
     }
 

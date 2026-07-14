@@ -1,3 +1,15 @@
+//! Snapshot format migrations (JSON path).
+//!
+//! Scope note: the write-ahead log (`store::wal`) is an INDEPENDENT format
+//! with its own magic + `WAL_FORMAT_VERSION` header and is NOT managed by
+//! this registry. WAL records are idempotent redo records, so recovery
+//! needs no snapshot watermark and the `Store` layout (v3) is untouched by
+//! the WAL. If a future change embeds WAL metadata into the snapshot (or
+//! adds any `Store` field), it must bump `CURRENT_FORMAT_VERSION` to 4,
+//! add a bincode decode arm (see `StoreV2Layout`), AND register a `V3ToV4`
+//! migration here — bincode is positional, `#[serde(default)]` cannot
+//! rescue old snapshots.
+
 use crate::error::CrdtError;
 
 /// A migration that transforms persisted data from one format version to the next.

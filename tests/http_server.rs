@@ -73,6 +73,8 @@ fn test_state() -> Arc<AppState> {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     })
 }
 
@@ -349,6 +351,8 @@ fn test_state_with_slo() -> (Arc<AppState>, Arc<SloTracker>) {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     (state, slo_tracker)

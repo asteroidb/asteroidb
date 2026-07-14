@@ -89,6 +89,8 @@ async fn spawn_node_with_peers(
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     let app = router(state.clone());

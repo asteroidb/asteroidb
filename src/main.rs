@@ -2,8 +2,6 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
-use asteroidb_poc::api::certified::CertifiedApi;
-use asteroidb_poc::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use asteroidb_poc::authority::bls::{BlsProofOfPossession, BlsPublicKey};
 #[cfg(not(feature = "native-crypto"))]
@@ -296,17 +294,51 @@ async fn main() {
     // Build shared runtime metrics.
     let metrics = Arc::new(RuntimeMetrics::default());
 
+    // Crash recovery: load each store's snapshot and replay its WAL, then
+    // open fresh WAL writers. This must complete before the listener binds
+    // and before any peer sync starts, so clients and peers only ever see
+    // the recovered state. Recovery failures (damaged snapshot, mid-log
+    // WAL corruption) are fail-stop with a runbook pointer — silently
+    // starting empty would overwrite an intact replica's durable state.
+    let persistence_cfg = asteroidb_poc::runtime::PersistenceConfig::from_env(data_dir.clone());
+
     // Share a single CertifiedApi between HTTP handlers and NodeRunner
     // so that certification status updates are visible to both.
-    let certified_api = Arc::new(Mutex::new(CertifiedApi::new(
-        node_id.clone(),
-        Arc::clone(&namespace),
-    )));
+    let (certified_recovered, certified_wal_syncer) =
+        match asteroidb_poc::runtime::persistence::recover_certified(
+            node_id.clone(),
+            Arc::clone(&namespace),
+            &persistence_cfg,
+        ) {
+            Ok(recovered) => recovered,
+            Err(e) => {
+                eprintln!(
+                    "error: certified store recovery failed: {e}\n\
+                     See docs/ops-guide.md (Crash recovery runbook) before retrying."
+                );
+                std::process::exit(1);
+            }
+        };
+    let certified_api = Arc::new(Mutex::new(certified_recovered));
     let peer_persist_path = PeerRegistry::persist_path(&data_dir);
 
     // Share a single EventualApi between HTTP handlers and NodeRunner
     // so that HTTP writes are visible to the anti-entropy sync loop.
-    let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id.clone())));
+    let (eventual_recovered, eventual_wal_syncer) =
+        match asteroidb_poc::runtime::persistence::recover_eventual(
+            node_id.clone(),
+            &persistence_cfg,
+        ) {
+            Ok(recovered) => recovered,
+            Err(e) => {
+                eprintln!(
+                    "error: eventual store recovery failed: {e}\n\
+                     See docs/ops-guide.md (Crash recovery runbook) before retrying."
+                );
+                std::process::exit(1);
+            }
+        };
+    let eventual_api = Arc::new(Mutex::new(eventual_recovered));
 
     // Build peer registry: if a config file provided peers, use those;
     // otherwise try to load persisted state from disk; finally fall back
@@ -582,6 +614,8 @@ async fn main() {
         require_signed_frontiers,
         equivocation: Arc::clone(&equivocation),
         exclude_accused_authorities,
+        eventual_wal: eventual_wal_syncer.clone(),
+        certified_wal: certified_wal_syncer.clone(),
     });
 
     let app = router(state);
@@ -657,6 +691,16 @@ async fn main() {
 
     let shutdown_handle = runner.shutdown_handle();
 
+    // Background persistence: WAL group-commit flushers + periodic
+    // checkpoints (snapshot, then prune sealed WAL segments).
+    asteroidb_poc::runtime::persistence::spawn_persistence_tasks(
+        persistence_cfg.clone(),
+        Arc::clone(&eventual_api),
+        Arc::clone(&certified_api),
+        eventual_wal_syncer,
+        certified_wal_syncer,
+    );
+
     // Bind the TCP listener.
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -720,6 +764,37 @@ async fn main() {
                     eprintln!("warning: failed to save system namespace on shutdown: {e}");
                 } else {
                     println!("System namespace saved to {}", ns_persist_path.display());
+                }
+            }
+            // Final checkpoint: after a graceful shutdown WAL replay work
+            // is minimal, but the WAL directory is NOT empty — rotation
+            // always leaves a header-only active segment behind (pruning
+            // only removes sealed segments), and in-flight HTTP handlers
+            // can still append records after this point (no
+            // with_graceful_shutdown yet, see the TODO above). WAL format
+            // upgrades therefore require the new binary to read the old
+            // format (versioned decode arm — see the WAL_FORMAT_VERSION
+            // maintainer warning); a graceful shutdown alone is not a
+            // format-upgrade path. Failures are non-fatal — the WAL
+            // already holds everything a restart needs.
+            if persistence_cfg.enabled {
+                if let Err(e) = asteroidb_poc::runtime::persistence::checkpoint_eventual(
+                    &eventual_api,
+                    &persistence_cfg,
+                )
+                .await
+                {
+                    eprintln!("warning: eventual checkpoint on shutdown failed: {e}");
+                }
+                if let Err(e) = asteroidb_poc::runtime::persistence::checkpoint_certified(
+                    &certified_api,
+                    &persistence_cfg,
+                )
+                .await
+                {
+                    eprintln!("warning: certified checkpoint on shutdown failed: {e}");
+                } else {
+                    println!("Store checkpoints saved to {}", data_dir.display());
                 }
             }
             let _ = shutdown_handle.send(true);

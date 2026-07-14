@@ -54,6 +54,7 @@ subtle = "2"
 hex = "0.4"
 redb = { version = "2", optional = true }
 bincode = { version = "2", features = ["serde"] }
+crc32fast = "1"
 siphasher = "1"
 sha2 = "0.10"
 getrandom = "0.2"

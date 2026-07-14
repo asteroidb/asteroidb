@@ -32,6 +32,7 @@ use crate::placement::PlacementPolicy;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
 use crate::store::kv::CrdtValue;
+use crate::store::wal::{SyncPolicy, WalPos, WalSyncer};
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use crate::network::PeerRegistry;
@@ -111,6 +112,34 @@ pub struct AppState {
     /// posture is detect-and-warn only, because exclusion can drop a scope
     /// below majority and stall certificate production.
     pub exclude_accused_authorities: bool,
+    /// Group-commit WAL syncer for the eventual store. `None` when
+    /// persistence is disabled. Under `SyncPolicy::Always`, write handlers
+    /// wait (OUTSIDE the API lock) for the mutation's WAL record to be
+    /// fdatasynced before acknowledging.
+    pub eventual_wal: Option<Arc<WalSyncer>>,
+    /// Group-commit WAL syncer for the certified store (see `eventual_wal`).
+    pub certified_wal: Option<Arc<WalSyncer>>,
+}
+
+/// Wait for a mutation's WAL record to become durable before ack
+/// (`SyncPolicy::Always` only; other policies acknowledge immediately).
+///
+/// Called AFTER the API lock is released so a slow fdatasync never blocks
+/// other handlers or the sync loop; the group-commit syncer coalesces
+/// concurrent waiters into one flush.
+async fn wait_wal_durable(
+    syncer: &Option<Arc<WalSyncer>>,
+    pos: Option<WalPos>,
+) -> Result<(), ApiError> {
+    if let (Some(syncer), Some(pos)) = (syncer, pos)
+        && syncer.policy() == SyncPolicy::Always
+    {
+        syncer
+            .wait_durable(pos)
+            .await
+            .map_err(|e| ApiError(CrdtError::Storage(format!("WAL sync wait failed: {e}"))))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------
@@ -147,6 +176,13 @@ pub async fn eventual_write(
             api.eventual_register_set(&key, value)?
         }
     };
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // The session token doubles as a durability receipt: under
+    // SyncPolicy::Always it must not be handed out until the WAL record
+    // is on disk. Waiting happens after the lock is released.
+    wait_wal_durable(&state.eventual_wal, wal_pos).await?;
 
     state.metrics.record_write_op(&written_key);
 
@@ -270,6 +306,11 @@ pub async fn certified_write(
 
     let mut api = state.certified.lock().await;
     let status = api.certified_write(req.key, crdt_value, on_timeout)?;
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // Durability before ack (SyncPolicy::Always), outside the lock.
+    wait_wal_durable(&state.certified_wal, wal_pos).await?;
 
     state.metrics.record_write_op(&written_key);
 
@@ -1276,6 +1317,17 @@ pub async fn internal_sync(
                 });
             }
         }
+    }
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // One durability wait for the whole batch (SyncPolicy::Always): the
+    // pushing peer advances its push frontier on our ack, so acking
+    // un-synced merges could strand them on a crash. A wait error is only
+    // possible when the flusher is gone (which fail-stops the process on
+    // fsync errors), so it is logged rather than surfaced.
+    if let Err(e) = wait_wal_durable(&state.eventual_wal, wal_pos).await {
+        tracing::warn!(error = ?e.0, "internal sync WAL durability wait failed");
     }
 
     let resp = SyncResponse { merged, errors };

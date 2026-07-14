@@ -81,6 +81,8 @@ async fn two_node_anti_entropy_convergence() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     // Build state for node 2.
@@ -111,6 +113,8 @@ async fn two_node_anti_entropy_convergence() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     // Write some data to node 1.
@@ -307,6 +311,8 @@ async fn pull_based_sync() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     {
@@ -380,6 +386,8 @@ async fn sync_endpoint_partial_failure() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     // Pre-populate with a counter at "k".
@@ -488,6 +496,8 @@ async fn three_node_convergence_via_sync() {
                 asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
             ),
             exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
         });
         states.push(state);
     }
@@ -615,6 +625,8 @@ async fn internal_keys_endpoint() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     {
@@ -697,6 +709,8 @@ async fn full_sync_records_remote_frontier_not_local() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     // Write data to the remote node.

@@ -11,6 +11,8 @@ use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::store::kv::{CrdtValue, Store};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::store::wal::{WalPos, WalRecord, WalWriter};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// What to do when `certified_write` cannot achieve consensus.
@@ -176,6 +178,20 @@ pub struct CertifiedApi {
     /// Keys promoted to `Certified` before a certificate could be assembled.
     /// Later certification ticks retry certificate assembly for these keys.
     cert_pending_keys: HashSet<String>,
+    /// Write-ahead log appender; `None` = persistence disabled.
+    ///
+    /// The certified store is NOT covered by anti-entropy sync, so a crash
+    /// without a WAL cannot be repaired from peers — this store's WAL is
+    /// the only copy of un-snapshotted certified writes. The certification
+    /// state itself (`pending_writes` / `frontiers` / `attestations` /
+    /// `certified_cache`) is deliberately volatile: after a restart values
+    /// regress from `Certified` to `Pending` (fail-closed — never a false
+    /// certification) and re-certify as attestations are re-collected.
+    #[cfg(not(target_arch = "wasm32"))]
+    wal: Option<WalWriter>,
+    /// Position of the most recent WAL append, for `wait_durable`.
+    #[cfg(not(target_arch = "wasm32"))]
+    last_wal_pos: Option<WalPos>,
 }
 
 impl CertifiedApi {
@@ -195,7 +211,63 @@ impl CertifiedApi {
             certified_cache: HashMap::new(),
             attestations: AttestationPool::new(),
             cert_pending_keys: HashSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            wal: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_wal_pos: None,
         }
+    }
+
+    /// Create a `CertifiedApi` from a recovered store (snapshot + WAL
+    /// replay).
+    ///
+    /// Seeds the HLC clock from the highest recovered timestamp so writes
+    /// issued after the restart are strictly greater than anything already
+    /// persisted. The certification state starts empty: recovered values
+    /// read as `Pending` until re-certified (fail-closed).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn recovered(
+        node_id: NodeId,
+        namespace: Arc<RwLock<SystemNamespace>>,
+        store: Store,
+        wal: Option<WalWriter>,
+    ) -> Self {
+        let mut clock = Hlc::new(node_id.0);
+        if let Some(max) = store.max_known_hlc() {
+            clock.seed_recovered(&max);
+        }
+        Self {
+            store,
+            clock,
+            frontiers: AckFrontierSet::new(),
+            namespace,
+            pending_writes: Vec::new(),
+            retention: RetentionPolicy::default(),
+            evicted_count: 0,
+            certified_cache: HashMap::new(),
+            attestations: AttestationPool::new(),
+            cert_pending_keys: HashSet::new(),
+            wal,
+            last_wal_pos: None,
+        }
+    }
+
+    /// Position of the most recent WAL append (for durability waits).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn last_wal_pos(&self) -> Option<WalPos> {
+        self.last_wal_pos
+    }
+
+    /// Seal the active WAL segment and start a new one (checkpoint step 1).
+    /// See `EventualApi::wal_rotate`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wal_rotate(&mut self) -> std::io::Result<Option<u64>> {
+        self.wal.as_mut().map(|w| w.rotate()).transpose()
+    }
+
+    /// Return a reference to the underlying store (snapshot input).
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// Create a new `CertifiedApi` with a custom retention policy.
@@ -215,6 +287,10 @@ impl CertifiedApi {
             certified_cache: HashMap::new(),
             attestations: AttestationPool::new(),
             cert_pending_keys: HashSet::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            wal: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_wal_pos: None,
         }
     }
 
@@ -476,11 +552,41 @@ impl CertifiedApi {
 
         let timestamp = self.clock.now()?;
 
-        // Write to the local store (eventual consistency path).
-        // Use put_with_timestamp so the entry is immediately visible to
-        // delta_sync without requiring a separate record_change call.
-        self.store
-            .put_with_timestamp(key.clone(), value.clone(), timestamp.clone());
+        // Write to the local store (eventual consistency path), recording
+        // the HLC so the entry is immediately visible to delta_sync.
+        //
+        // The value is CRDT-MERGED into any existing entry, never a plain
+        // replace: WAL recovery rebuilds state by merging the logged
+        // post-states, so the live path must only produce post-states that
+        // dominate previous ones for the key. A replace can regress CRDT
+        // state (e.g. overwrite counter {a:2} with a fresh {b:1}) and
+        // replay's merge would resurrect the replaced contributions —
+        // and the certified store has no anti-entropy rebuild path, so the
+        // divergence would be permanent. A type-changing write is rejected
+        // here (TypeMismatch) instead of installing state that replay
+        // could not reconstruct.
+        self.store.merge_value(key.clone(), &value)?;
+        self.store.record_change(&key, timestamp.clone());
+
+        // WAL-log the post-write state before any acknowledgement. The
+        // certified store has no anti-entropy fallback, so a failed append
+        // is surfaced immediately (the in-memory value stays, un-acked).
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(wal) = self.wal.as_mut() {
+            let post_state =
+                self.store.get(&key).cloned().ok_or_else(|| {
+                    CrdtError::Internal(format!("no post-state for WAL key {key}"))
+                })?;
+            let record = WalRecord::UpsertApplied {
+                key: key.clone(),
+                value: post_state,
+                hlc: timestamp.clone(),
+            };
+            match wal.append(&record) {
+                Ok(pos) => self.last_wal_pos = Some(pos),
+                Err(e) => return Err(CrdtError::Storage(format!("WAL append failed: {e}"))),
+            }
+        }
 
         // Check if already certified at the current scoped frontier.
         let already_certified = self.frontiers.is_certified_at_for_scope(

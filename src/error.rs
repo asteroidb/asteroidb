@@ -74,6 +74,16 @@ pub enum CrdtError {
     #[error("migration failed from v{from} to v{to}: {reason}")]
     MigrationFailed { from: u32, to: u32, reason: String },
 
+    /// A durability-layer (WAL append) failure: the mutation was applied
+    /// in memory but could NOT be recorded in the write-ahead log, so it
+    /// must not be acknowledged as durable.
+    ///
+    /// This is a degrade signal (e.g. disk full): reads keep working and
+    /// the un-acked in-memory effect will converge via anti-entropy. Maps
+    /// to HTTP 503 SERVICE_UNAVAILABLE.
+    #[error("storage error: {0}")]
+    Storage(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

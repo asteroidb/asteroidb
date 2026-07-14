@@ -2178,16 +2178,23 @@ impl NodeRunner {
                 // present in `entries`), so adopting its applied_origins
                 // is unconditionally sound after merging all entries.
                 // The sender's poisoned keys are unioned so its dropped
-                // contributions are not claimed as present here.
-                if !dump.applied_origins.is_empty() || !dump.merge_failed_keys.is_empty() {
-                    let store = api.store_mut();
-                    store.merge_applied_origins(&dump.applied_origins);
-                    store.merge_failed_extend(dump.merge_failed_keys.iter().cloned());
+                // contributions are not claimed as present here, and the
+                // visible frontier is merged so response tokens cover the
+                // now-visible contributions. adopt_session_claims persists
+                // all three as ONE WAL record; a WAL append failure only
+                // degrades durability of the adoption (retried by the
+                // next sync round), so it is logged rather than fatal.
+                if let Err(e) = api.adopt_session_claims(
+                    &dump.applied_origins,
+                    &dump.visible_origins,
+                    dump.merge_failed_keys.clone(),
+                ) {
+                    tracing::warn!(
+                        peer = %peer.node_id.0,
+                        error = %e,
+                        "failed to persist adopted session claims (full sync)"
+                    );
                 }
-                // The sender's visible frontier is merged unconditionally:
-                // merged values may embed contributions the per-key HLCs
-                // do not name, and response tokens must cover them.
-                api.store_mut().merge_visible_origins(&dump.visible_origins);
                 drop(api);
 
                 if full_sync_errors > 0 {
@@ -2609,6 +2616,14 @@ impl NodeRunner {
             // merge_remote_with_hlc never claims the entry origin; it
             // records the position in the store's visible frontier so
             // response tokens cover it.
+            //
+            // Per-entry failures keep the adoption below sound in both
+            // shapes: a type mismatch poisons the key BEFORE the merge,
+            // and a WAL append failure AFTER a successful in-memory merge
+            // (CrdtError::Storage) also poisons the key inside
+            // merge_remote_with_hlc — so an adopted applied frontier can
+            // never claim a contribution whose data record is not in the
+            // log (session checks on that key stay fail-closed).
             let result =
                 api.merge_remote_with_hlc(entry.key.clone(), &entry.value, entry.hlc.clone());
             match result {
@@ -2633,18 +2648,33 @@ impl NodeRunner {
         // are made on this path. The sender's poisoned keys are unioned
         // whenever claims are made, so contributions dropped on the
         // sender are not claimed as present here.
-        if claims_ok {
-            let store = api.store_mut();
-            store.merge_failed_extend(delta_resp.merge_failed_keys.iter().cloned());
-            store.merge_applied_origins(&delta_resp.applied_origins);
-        }
         // The sender's VISIBLE frontier is merged UNCONDITIONALLY (claims
         // or not): merged entry values may embed contributions from
         // origins their HLCs do not name, and the response session tokens
         // issued here must cover everything a reader can now observe.
         // Over-covering is safe (false-negative direction only).
-        api.store_mut()
-            .merge_visible_origins(&delta_resp.visible_origins);
+        // adopt_session_claims persists the adoption as ONE WAL record
+        // (poison + frontier can never be separated by a crash); an append
+        // failure only degrades durability of the adoption and is retried
+        // by the next sync round.
+        let no_claims = HashMap::new();
+        let (adopt_applied, adopt_failed) = if claims_ok {
+            (
+                &delta_resp.applied_origins,
+                delta_resp.merge_failed_keys.clone(),
+            )
+        } else {
+            (&no_claims, Vec::new())
+        };
+        if let Err(e) =
+            api.adopt_session_claims(adopt_applied, &delta_resp.visible_origins, adopt_failed)
+        {
+            tracing::warn!(
+                peer = %peer_id,
+                error = %e,
+                "failed to persist adopted session claims ({})", label
+            );
+        }
         drop(api);
 
         if error_count > 0 {

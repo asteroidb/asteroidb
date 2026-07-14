@@ -277,6 +277,127 @@ sequenceDiagram
 - **ダイジェスト検証**: 定期的なキー範囲チェックサムで状態の乖離を検出し、
   不一致時に再検証をトリガ。
 
+## 永続化とクラッシュリカバリ（WAL）
+
+eventual / certified の各ストアは、**周期スナップショット + Write-Ahead Log
+（WAL）** で永続化される。書き込みは適用と同時に WAL へ追記され、起動時は
+「スナップショットをロード → 残存 WAL セグメントを全件リプレイ」で復元する。
+wasm32 ビルドはファイルシステムを持たないため対象外（純メモリ動作）。
+
+### ディスクレイアウト
+
+```
+<ASTEROIDB_DATA_DIR>/                      (default ./data)
+├── system_namespace.json                  (既存)
+├── peer_registry.json                     (既存)
+├── equivocation_evidence.json             (既存)
+├── eventual.snapshot.bin                  (bincode v3 スナップショット)
+├── certified.snapshot.bin
+└── wal/
+    ├── eventual/wal-<seq:016x>.log        (セグメント、seq は単調増加)
+    └── certified/wal-<seq:016x>.log
+```
+
+セグメントは 16 バイトヘッダ（magic `ADBWAL\x00\x01` + フォーマット
+バージョン）の後に `[len: u32 LE][crc32: u32 LE][payload]` のレコード
+フレームが連続する。起動時・ローテーション時は**常に新セグメントから書き
+始め、封印済みセグメントには二度と追記しない**——不完全フレーム（torn
+tail）が存在し得るのは最終セグメントの末尾だけになる。
+
+### state-based Redo-only 設計
+
+WAL レコードは「操作」ではなく **ミューテーション適用後のキーの CRDT 全状態
++ HLC** を記録する（`UpsertApplied` / `UpsertVisible`）。リプレイは
+`Store::merge_value`（冪等・可換な CRDT マージ）と max-monotone なメタ
+データ更新だけで構成されるため:
+
+- **Undo フェーズが不要**（ARIES の repeating history に相当するのは Redo
+  のみ。CRDT の可換・冪等性が loser の概念そのものを消す）
+- **二重リプレイが無害**: `replay(L) == replay(L ++ L)`。counter の
+  `inc` を操作として 2 回再生する二重カウント問題は post-state 記録で
+  構造的に排除される
+- **over-replay 安全**: スナップショットが既に含むレコードを再適用しても
+  no-op。そのためスナップショットに LSN 透かしを埋め込む必要がなく、
+  `Store` 構造体・スナップショット形式（v3）は WAL 導入後も不変
+
+HLC は per-key の max としてのみ利用する（`record_change_max`）。なお
+ARIES の耐久性根拠（ローカル WAL flush = durable）と AsteroidDB の
+quorum ack は別モデルであり、WAL が保証するのは**ローカルノードの
+ack 済み書き込みの再起動生存**である。
+
+セッション保証のメタデータも WAL に載る: merge 失敗の poison は
+`MergeFailed`、delta/full sync でのフロンティア養子縁組は
+`SessionClaims`（applied / visible / failed を **1 レコードで原子化**。
+poison を失ってフロンティアだけが残る「偽のセッション成功」をクラッシュ
+タイミングに依存せず排除する）。
+
+### 書き込み経路と fsync
+
+```
+(API Mutex 内)  型検査 → in-memory 適用 → post-state を WAL append (write)
+(Mutex 解放後)  sync=always のときのみ group-commit fdatasync の完了を待機
+→ HTTP ack（session token を含むレスポンス）
+```
+
+fdatasync は専用の WalSyncer タスク（`spawn_blocking`）が実行し、待機中に
+溜まった append を 1 回の flush でまとめる（group commit）。API の Mutex を
+保持したまま fsync することはないため、`always` でも他のハンドラや sync
+ループが flush に直列化されない。**fdatasync の失敗は fail-stop（プロセス
+abort）**——失敗後のページキャッシュ状態は不定であり（いわゆる fsyncgate）、
+リトライは偽の耐久性になる。一方 **append（write）の失敗は degrade**:
+HTTP 503 を返して読み取りは継続する（ディスクフル等）。
+
+### チェックポイント
+
+`ASTEROIDB_SNAPSHOT_INTERVAL_SECS`（既定 300 秒）ごと、および graceful
+shutdown 時に実行する。順序規律は **rotate → clone → save → delete**:
+
+1. API ロック内で WAL をローテーション（旧セグメント fsync + 封印）し、
+   同一クリティカルセクションで Store を clone
+2. ロック外（blocking pool）で bincode スナップショットを tmp → fsync →
+   rename → **親ディレクトリ fsync** のアトミック手順で保存
+3. 保存が成功したときのみ、封印済み（`seq <= sealed`）セグメントを削除
+
+どの時点でクラッシュしても「スナップショット + 残存セグメントの全リプレイ」
+が ack 済み状態を再構成する（削除前クラッシュは無害な over-replay になる
+だけ）。スナップショット失敗時はセグメントを一切削除しない——WAL は次回
+成功まで伸び続けるため、ディスク使用量の監視対象になる。compaction /
+tombstone GC の効果は WAL に載せず、次回スナップショットで捕捉する
+（クラッシュで GC 前状態に戻っても再 GC されるだけ）。
+
+### リカバリと破損判定
+
+起動時（listener bind とピア同期の開始前）に実行する:
+
+1. スナップショットをロード。**破損スナップショットは fail-stop**
+   （空ストアでの暗黙上書きはしない。runbook: ops-guide 13.6）
+2. WAL セグメントを seq 昇順に検証・リプレイ。破損は二分則で扱う:
+   - **torn tail**（最終セグメント末尾の不完全・ゼロ埋めフレーム）=
+     クラッシュ時の正常な形。警告してそこで打ち切り（失われるのは
+     fsync 未完了 = un-acked の書き込みのみ）
+   - **mid-log corruption**（無効フレームの後方に有効データが続く、
+     または封印済みセグメント内の無効フレーム)= ack 済みデータの損傷。
+     既定は fail-stop。`ASTEROIDB_WAL_RECOVER_TRUNCATE=1` で最初の無効
+     レコード以降を明示的に切り捨てて起動できる
+3. リプレイ後の最大 HLC でクロックを再シード（`Hlc::seed_recovered`）。
+   再起動後の新規書き込みが過去 HLC を発行して LWW / delta sync を壊す
+   「クロック巻き戻り」を防ぐ
+
+certified ストアの証明状態（pending_writes / frontiers / attestations /
+certified_cache）は**意図的に揮発**とする: 再起動後、値は復元されるが
+ステータスは `Certified` → `Pending` に退行する（fail-closed——偽の
+Certified は決して返さない。attestation の再収集で回復する）。
+
+### 既知の割り切り
+
+- **WAL 増幅**: post-state 全量記録のため、大型 OR-Set / OR-Map への高頻度
+  書き込みでは O(値サイズ) の追記増幅が生じる。セグメント上限 + 周期
+  スナップショットで有界化している（delta ベースのレコード化は将来課題）
+- **スナップショット時の Store clone は API Mutex 保持中 O(store)**:
+  巨大ストアでは書き込みストールが生じ得る（fuzzy checkpoint は将来課題）
+- `store_mut()` 経由の直接変異は WAL を素通りする（compaction / GC 専用。
+  コード上の MAINTAINER WARNING とレビュー規律で担保）
+
 ## 主要な設計判断
 
 | 判断 | 根拠 |

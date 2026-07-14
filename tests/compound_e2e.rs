@@ -164,6 +164,8 @@ fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppS
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     })
 }
 
@@ -1206,6 +1208,8 @@ async fn node_runner_delta_fail_falls_back_to_full_sync() {
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
         exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     // Write data to the legacy peer.
