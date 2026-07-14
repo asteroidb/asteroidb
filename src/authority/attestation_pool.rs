@@ -16,10 +16,28 @@ use crate::types::{KeyRange, NodeId, PolicyVersion};
 #[cfg(feature = "native-crypto")]
 use crate::authority::bls;
 
-/// Maximum number of checkpoints retained per scope (~32 seconds of history
+/// Maximum number of checkpoints retained per scope (~128 seconds of history
 /// at the default 1s checkpoint interval). Oldest checkpoints are pruned
 /// first when the limit is exceeded.
-const MAX_CHECKPOINTS_PER_SCOPE: usize = 32;
+///
+/// This window is deliberately wider than [`MAX_CHECKPOINT_FUTURE_SKEW_MS`]:
+/// even if an authority fills every future bucket the skew guard allows, a
+/// majority of remaining buckets is still available for honest checkpoints,
+/// so current-time attestations can never be evicted by a future-bucket flood.
+const MAX_CHECKPOINTS_PER_SCOPE: usize = 128;
+
+/// Maximum tolerated clock skew for attestation checkpoints, in milliseconds.
+///
+/// Attestations whose checkpoint lies further than this ahead of the local
+/// wall clock are rejected on insert. Without this cap, a single authority
+/// (malicious or with a badly skewed clock) could fill the per-scope
+/// checkpoint window with far-future buckets; every honest current-time
+/// attestation would then be the oldest bucket and be pruned immediately
+/// after insertion, permanently preventing certificate assembly.
+///
+/// Matches the HLC's `MAX_CLOCK_SKEW_MS` (60 s) so the signing pipeline and
+/// the clock share a single skew policy.
+pub const MAX_CHECKPOINT_FUTURE_SKEW_MS: u64 = 60_000;
 
 /// Scope key for attestation grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,12 +68,30 @@ impl AttestationPool {
     /// same authority for the same checkpoint overwrites the earlier one, so
     /// duplicate signers can never inflate the majority count. Old
     /// checkpoints beyond [`MAX_CHECKPOINTS_PER_SCOPE`] are pruned.
+    ///
+    /// `now_ms` is the local wall clock: attestations whose checkpoint is
+    /// more than [`MAX_CHECKPOINT_FUTURE_SKEW_MS`] in the future are rejected
+    /// so a skewed or malicious authority cannot flood the checkpoint window
+    /// with future buckets and evict honest attestations. Returns whether the
+    /// attestation was recorded.
     pub fn insert(
         &mut self,
         key_range: &KeyRange,
         policy_version: PolicyVersion,
         attestation: VerifiedAttestation,
-    ) {
+        now_ms: u64,
+    ) -> bool {
+        if attestation.checkpoint_hlc.physical
+            > now_ms.saturating_add(MAX_CHECKPOINT_FUTURE_SKEW_MS)
+        {
+            tracing::warn!(
+                authority = %attestation.authority_id.0,
+                checkpoint_ms = attestation.checkpoint_hlc.physical,
+                now_ms,
+                "rejecting attestation with far-future checkpoint (clock skew)"
+            );
+            return false;
+        }
         let scope = PoolScope {
             key_range: key_range.clone(),
             policy_version,
@@ -69,6 +105,21 @@ impl AttestationPool {
         while checkpoints.len() > MAX_CHECKPOINTS_PER_SCOPE {
             checkpoints.pop_first();
         }
+        true
+    }
+
+    /// Whether any attestations are recorded for a scope.
+    ///
+    /// Used to decide if certificate back-fill retries are worthwhile: in
+    /// unsigned deployments no attestation ever arrives, so keys must not be
+    /// queued for perpetual (and futile) certificate assembly retries.
+    pub fn has_attestations(&self, key_range: &KeyRange, policy_version: &PolicyVersion) -> bool {
+        self.entries
+            .get(&PoolScope {
+                key_range: key_range.clone(),
+                policy_version: *policy_version,
+            })
+            .is_some_and(|checkpoints| !checkpoints.is_empty())
     }
 
     /// Assemble certificates for the newest checkpoint `C` satisfying
@@ -234,6 +285,11 @@ mod tests {
     use crate::authority::frontier_sig::{CHECKPOINT_INTERVAL_MS, NodeSigner};
     use crate::types::NodeId;
 
+    /// Fixed "wall clock" for tests: comfortably after every synthetic
+    /// timestamp used below, so the future-skew guard never interferes
+    /// unless a test exercises it deliberately.
+    const TEST_NOW: u64 = 200_000;
+
     fn node(name: &str) -> NodeId {
         NodeId(name.into())
     }
@@ -295,14 +351,24 @@ mod tests {
         let s2 = make_signer("auth-2", 2, false);
         let mut pool = AttestationPool::new();
 
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_500));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_500),
+            TEST_NOW,
+        );
         // Only 1 of 3: no majority.
         assert!(
             pool.build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
                 .is_none()
         );
 
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s2, 10_700));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s2, 10_700),
+            TEST_NOW,
+        );
         let (checkpoint, cert, _bls) = pool
             .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
             .expect("2 of 3 must reach majority");
@@ -320,8 +386,18 @@ mod tests {
     fn duplicate_authority_counted_once() {
         let s1 = make_signer("auth-1", 3, false);
         let mut pool = AttestationPool::new();
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_100));
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_200));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_100),
+            TEST_NOW,
+        );
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_200),
+            TEST_NOW,
+        );
 
         // Two inserts from the same authority in the same bucket: still 1 signer.
         assert!(
@@ -338,8 +414,8 @@ mod tests {
 
         // Both signed checkpoints 10_000 and 12_000.
         for phys in [10_500, 12_500] {
-            pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, phys));
-            pool.insert(&kr("user/"), PolicyVersion(1), attest(&s2, phys));
+            pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, phys), TEST_NOW);
+            pool.insert(&kr("user/"), PolicyVersion(1), attest(&s2, phys), TEST_NOW);
         }
 
         let (checkpoint, _, _) = pool
@@ -369,11 +445,26 @@ mod tests {
         let s2 = make_signer("auth-2", 7, false);
         let mut pool = AttestationPool::new();
 
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 50_000));
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s2, 50_000));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 50_000),
+            TEST_NOW,
+        );
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s2, 50_000),
+            TEST_NOW,
+        );
 
         // Replaying the same (old) attestations later cannot certify newer writes.
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 50_000));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 50_000),
+            TEST_NOW,
+        );
         assert!(
             pool.build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(51_000))
                 .is_none(),
@@ -390,6 +481,7 @@ mod tests {
                 &kr("user/"),
                 PolicyVersion(1),
                 attest(&s1, (i + 1) * CHECKPOINT_INTERVAL_MS),
+                TEST_NOW,
             );
         }
         let scope = PoolScope {
@@ -406,7 +498,12 @@ mod tests {
     fn gc_scope_drops_attestations() {
         let s1 = make_signer("auth-1", 9, false);
         let mut pool = AttestationPool::new();
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_000));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_000),
+            TEST_NOW,
+        );
         assert_eq!(pool.scope_count(), 1);
         pool.gc_scope(&kr("user/"), &PolicyVersion(1));
         assert_eq!(pool.scope_count(), 0);
@@ -417,14 +514,115 @@ mod tests {
         let s1 = make_signer("auth-1", 10, false);
         let s2 = make_signer("auth-2", 11, false);
         let mut pool = AttestationPool::new();
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_500));
-        pool.insert(&kr("order/"), PolicyVersion(1), attest(&s2, 10_500));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_500),
+            TEST_NOW,
+        );
+        pool.insert(
+            &kr("order/"),
+            PolicyVersion(1),
+            attest(&s2, 10_500),
+            TEST_NOW,
+        );
 
         // Attestations from different scopes must not combine.
         assert!(
             pool.build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn far_future_attestation_is_rejected() {
+        let s1 = make_signer("auth-1", 30, false);
+        let mut pool = AttestationPool::new();
+
+        // Just inside the skew allowance: accepted.
+        let inside = TEST_NOW + MAX_CHECKPOINT_FUTURE_SKEW_MS;
+        assert!(pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, inside),
+            TEST_NOW
+        ));
+
+        // Beyond the allowance: rejected, and no bucket is created.
+        let outside = TEST_NOW + MAX_CHECKPOINT_FUTURE_SKEW_MS + CHECKPOINT_INTERVAL_MS;
+        assert!(!pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, outside),
+            TEST_NOW
+        ));
+        let scope = PoolScope {
+            key_range: kr("user/"),
+            policy_version: PolicyVersion(1),
+        };
+        assert_eq!(pool.entries.get(&scope).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn future_bucket_flood_cannot_evict_current_majority() {
+        // A single skewed/malicious authority pushes attestations for every
+        // future bucket the skew guard allows. Honest current-time
+        // attestations must still accumulate a majority and certify.
+        let attacker = make_signer("auth-1", 31, false);
+        let s2 = make_signer("auth-2", 32, false);
+        let s3 = make_signer("auth-3", 33, false);
+        let mut pool = AttestationPool::new();
+
+        // Attempt to fill far beyond the window; only buckets within the
+        // skew allowance are admitted.
+        for i in 1..=(2 * MAX_CHECKPOINTS_PER_SCOPE as u64) {
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&attacker, TEST_NOW + i * CHECKPOINT_INTERVAL_MS),
+                TEST_NOW,
+            );
+        }
+
+        // Two honest authorities attest the current checkpoint.
+        assert!(pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s2, TEST_NOW),
+            TEST_NOW
+        ));
+        assert!(pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s3, TEST_NOW),
+            TEST_NOW
+        ));
+
+        let (checkpoint, cert, _) = pool
+            .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(TEST_NOW - 500))
+            .expect("honest majority must certify despite the future-bucket flood");
+        assert_eq!(
+            checkpoint.physical,
+            TEST_NOW - TEST_NOW % CHECKPOINT_INTERVAL_MS
+        );
+        assert!(cert.has_majority(3));
+    }
+
+    #[test]
+    fn has_attestations_reflects_pool_contents() {
+        let s1 = make_signer("auth-1", 34, false);
+        let mut pool = AttestationPool::new();
+        assert!(!pool.has_attestations(&kr("user/"), &PolicyVersion(1)));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_500),
+            TEST_NOW,
+        );
+        assert!(pool.has_attestations(&kr("user/"), &PolicyVersion(1)));
+        assert!(!pool.has_attestations(&kr("order/"), &PolicyVersion(1)));
+        pool.gc_scope(&kr("user/"), &PolicyVersion(1));
+        assert!(!pool.has_attestations(&kr("user/"), &PolicyVersion(1)));
     }
 
     #[cfg(feature = "native-crypto")]
@@ -465,7 +663,7 @@ mod tests {
             let att =
                 verify_frontier_signature(&frontier, &sig, &registry, 0, &EpochConfig::default())
                     .unwrap();
-            pool.insert(&kr("user/"), PolicyVersion(1), att);
+            pool.insert(&kr("user/"), PolicyVersion(1), att, TEST_NOW);
         }
 
         let (checkpoint, cert, bls_cert) = pool
@@ -496,8 +694,8 @@ mod tests {
         let mut att2 = attest(&s2, 10_500);
         att2.keyset_version = KeysetVersion(2);
 
-        pool.insert(&kr("user/"), PolicyVersion(1), att1);
-        pool.insert(&kr("user/"), PolicyVersion(1), att2);
+        pool.insert(&kr("user/"), PolicyVersion(1), att1, TEST_NOW);
+        pool.insert(&kr("user/"), PolicyVersion(1), att2, TEST_NOW);
 
         let (_, cert, bls_cert) = pool
             .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
@@ -517,8 +715,18 @@ mod tests {
         let s1 = make_signer("auth-1", 17, true);
         let s2 = make_signer("auth-2", 18, false);
         let mut pool = AttestationPool::new();
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, 10_500));
-        pool.insert(&kr("user/"), PolicyVersion(1), attest(&s2, 10_500));
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_500),
+            TEST_NOW,
+        );
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s2, 10_500),
+            TEST_NOW,
+        );
 
         let (_, cert, bls_cert) = pool
             .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))

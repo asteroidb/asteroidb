@@ -219,6 +219,11 @@ pub struct VerifyProofRequest {
     /// Authority node IDs that contributed to this proof.
     pub contributing_authorities: Vec<String>,
     /// Total number of authorities in the set.
+    ///
+    /// Accepted for wire compatibility but **ignored by the server**: the
+    /// majority denominator is derived from this node's authority definition
+    /// for `key_range_prefix`, so callers cannot understate the quorum.
+    #[serde(default)]
     pub total_authorities: usize,
     /// The majority certificate with cryptographic signatures.
     /// Must be present for the proof to be considered valid.

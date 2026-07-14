@@ -1478,7 +1478,201 @@ mod tests {
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
-        assert_eq!(result.required_count, 3); // 5/2+1 = 3
+        // The denominator comes from the server's authority definition
+        // (3 authorities), not the request's total_authorities=5: 3/2+1 = 2.
+        assert_eq!(result.required_count, 2);
+    }
+
+    /// The caller-supplied `total_authorities` must be ignored: shrinking the
+    /// denominator must not turn a sub-quorum signature set into a majority.
+    #[tokio::test]
+    async fn verify_proof_ignores_caller_supplied_total_authorities() {
+        use crate::authority::certificate::{
+            KeysetVersion, create_certificate_message, sign_message,
+        };
+        use crate::http::types::VerifyProofResponse;
+        use crate::types::PolicyVersion;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let kr = KeyRange {
+            prefix: "user/".into(),
+        };
+        let hlc = crate::hlc::HlcTimestamp {
+            physical: 1000,
+            logical: 0,
+            node_id: "auth-1".into(),
+        };
+        let pv = PolicyVersion(1);
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        // Only 2 of 5 authorities sign — a genuine sub-quorum.
+        let mut sigs_json = Vec::new();
+        let mut registry_keys = Vec::new();
+        for auth_id in ["auth-1", "auth-2"] {
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = sk.verifying_key();
+            let sig = sign_message(&sk, &message);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            registry_keys.push((NodeId(auth_id.to_string()), vk));
+            sigs_json.push(serde_json::json!({
+                "authority_id": auth_id,
+                "public_key": pk_hex,
+                "signature": sig_hex,
+                "keyset_version": 1
+            }));
+        }
+
+        let state = test_state();
+        {
+            // The server-side authority set for the range has 5 members.
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                authority_nodes: (1..=5).map(|i| NodeId(format!("auth-{i}"))).collect(),
+                auto_generated: false,
+            });
+        }
+        {
+            let registry_lock = state.keyset_registry.as_ref().unwrap();
+            let mut registry = registry_lock.write().unwrap();
+            registry
+                .register_keyset(KeysetVersion(1), 0, registry_keys)
+                .unwrap();
+        }
+        let app = router(state);
+
+        // The attacker claims total_authorities=3 so that 2 signatures
+        // would count as a majority (3/2+1 = 2).
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": ["auth-1", "auth-2"],
+            "total_authorities": 3,
+            "certificate": {
+                "keyset_version": 1,
+                "signatures": sigs_json
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result.required_count, 3,
+            "denominator must come from the 5-member authority definition"
+        );
+        assert!(!result.has_majority, "2 of 5 must not be a majority");
+        assert!(!result.valid, "sub-quorum proof must be invalid");
+    }
+
+    /// Valid signatures from authorities outside the range's authority set
+    /// must not count toward the majority.
+    #[tokio::test]
+    async fn verify_proof_rejects_non_member_signers() {
+        use crate::authority::certificate::{
+            KeysetVersion, create_certificate_message, sign_message,
+        };
+        use crate::http::types::VerifyProofResponse;
+        use crate::types::PolicyVersion;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let kr = KeyRange {
+            prefix: "order/".into(),
+        };
+        let hlc = crate::hlc::HlcTimestamp {
+            physical: 1000,
+            logical: 0,
+            node_id: "auth-1".into(),
+        };
+        let pv = PolicyVersion(1);
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        // auth-1/auth-2 are registered keys but NOT authorities of order/.
+        let mut sigs_json = Vec::new();
+        let mut registry_keys = Vec::new();
+        for auth_id in ["auth-1", "auth-2"] {
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = sk.verifying_key();
+            let sig = sign_message(&sk, &message);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            registry_keys.push((NodeId(auth_id.to_string()), vk));
+            sigs_json.push(serde_json::json!({
+                "authority_id": auth_id,
+                "public_key": pk_hex,
+                "signature": sig_hex,
+                "keyset_version": 1
+            }));
+        }
+
+        let state = test_state();
+        {
+            // order/ is owned by a disjoint authority set.
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "order/".into(),
+                },
+                authority_nodes: vec![
+                    NodeId("auth-b1".into()),
+                    NodeId("auth-b2".into()),
+                    NodeId("auth-b3".into()),
+                ],
+                auto_generated: false,
+            });
+        }
+        {
+            let registry_lock = state.keyset_registry.as_ref().unwrap();
+            let mut registry = registry_lock.write().unwrap();
+            registry
+                .register_keyset(KeysetVersion(1), 0, registry_keys)
+                .unwrap();
+        }
+        let app = router(state);
+
+        let body_json = serde_json::json!({
+            "key_range_prefix": "order/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": ["auth-1", "auth-2"],
+            "total_authorities": 3,
+            "certificate": {
+                "keyset_version": 1,
+                "signatures": sigs_json
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            !result.has_majority,
+            "signatures from non-members of the range must not count: {result:?}"
+        );
+        assert!(!result.valid);
+        assert_eq!(result.contributing_count, 0);
     }
 
     #[tokio::test]
@@ -1513,7 +1707,8 @@ mod tests {
         assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
-        assert_eq!(result.required_count, 3);
+        // Derived from the server's 3-member authority definition.
+        assert_eq!(result.required_count, 2);
     }
 
     #[tokio::test]
@@ -1546,7 +1741,8 @@ mod tests {
         assert!(!result.valid);
         assert!(!result.has_majority);
         assert_eq!(result.contributing_count, 1);
-        assert_eq!(result.required_count, 3);
+        // Derived from the server's 3-member authority definition.
+        assert_eq!(result.required_count, 2);
     }
 
     // ---------------------------------------------------------------
@@ -2154,6 +2350,89 @@ mod tests {
         let app = router(state);
         let body = signed_push_body(&[&s1], 10_500);
         let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_without_registry_rejects_all_frontiers() {
+        // require_signed_frontiers must fail closed when no registry is
+        // configured: nothing can be verified, so nothing may be accepted.
+        let s1 = signing_test_signer("auth-1", 70);
+        let state = test_state_signing(None, true);
+        let app = router(state);
+
+        // Signed payload: rejected (no keys to verify against).
+        let body = signed_push_body(&[&s1], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "strict mode without a registry must reject signed frontiers"
+        );
+
+        // Unsigned payload: rejected as well.
+        let mut body = signed_push_body(&[&s1], 10_600);
+        body.signatures = vec![None];
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "strict mode without a registry must reject unsigned frontiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontier_from_non_member_of_range_authority_set_rejected() {
+        // auth-1 is registered in the keyset registry (its signature is
+        // cryptographically valid) but is NOT an authority for order/, so
+        // its frontier must not count toward order/'s majority.
+        let s1 = signing_test_signer("auth-1", 71);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        {
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "order/".into(),
+                },
+                authority_nodes: vec![
+                    NodeId("auth-b1".into()),
+                    NodeId("auth-b2".into()),
+                    NodeId("auth-b3".into()),
+                ],
+                auto_generated: false,
+            });
+        }
+        let app = router(Arc::clone(&state));
+
+        let make_body = |prefix: &str| {
+            let frontier = crate::authority::ack_frontier::AckFrontier {
+                authority_id: s1.node_id().clone(),
+                frontier_hlc: HlcTimestamp {
+                    physical: 10_500,
+                    logical: 0,
+                    node_id: s1.node_id().0.clone(),
+                },
+                key_range: KeyRange {
+                    prefix: prefix.into(),
+                },
+                policy_version: PolicyVersion(1),
+                digest_hash: format!("{}-10500", s1.node_id().0),
+            };
+            let sig = s1.sign_frontier(&frontier, KeysetVersion(1));
+            FrontierPushRequest {
+                frontiers: vec![frontier],
+                signatures: vec![Some(sig)],
+            }
+        };
+
+        // Frontier for order/ (owned by auth-b1..b3): rejected despite the
+        // valid signature.
+        let result = push_frontiers(&app, &make_body("order/")).await;
+        assert_eq!(
+            result.accepted, 0,
+            "registered authority outside the range's authority set must be rejected"
+        );
+
+        // Frontier for the catch-all range (auth-1 IS a member): accepted.
+        let result = push_frontiers(&app, &make_body("")).await;
         assert_eq!(result.accepted, 1);
     }
 

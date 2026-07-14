@@ -87,9 +87,11 @@ pub struct AppState {
     pub epoch_config: EpochConfig,
     /// Current epoch, used for keyset expiry checks during verification.
     pub current_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// When `true` and a keyset registry is configured, unsigned frontier
-    /// pushes to `/api/internal/frontiers` are rejected. Signed frontiers
-    /// that fail verification are always rejected regardless of this flag.
+    /// When `true`, unsigned frontier pushes to `/api/internal/frontiers`
+    /// are rejected. Without a keyset registry this rejects *all* frontier
+    /// pushes (fail-closed), since no signature can be verified. Signed
+    /// frontiers that fail verification are always rejected regardless of
+    /// this flag.
     pub require_signed_frontiers: bool,
 }
 
@@ -346,8 +348,15 @@ pub async fn get_certification_status(
 /// When a keyset registry is configured, signed frontiers are verified
 /// (registry keys only) before the certified lock is taken; frontiers whose
 /// signatures fail verification are dropped. Unsigned frontiers are accepted
-/// unless `require_signed_frontiers` is enabled. Without a registry, all
-/// frontiers are accepted unverified (backwards-compatible).
+/// unless `require_signed_frontiers` is enabled. Without a registry,
+/// frontiers are accepted unverified (backwards-compatible) — unless
+/// `require_signed_frontiers` is enabled, in which case everything is
+/// rejected (fail-closed) since no signature can be verified.
+///
+/// Independent of signature status, a frontier is only accepted if its
+/// authority is a member of the authority set defined for its key range
+/// (when such a definition exists): otherwise any registered authority
+/// could inflate the majority count of a range it does not own.
 pub async fn post_internal_frontiers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -369,48 +378,91 @@ pub async fn post_internal_frontiers(
         Option<VerifiedAttestation>,
     )> = Vec::with_capacity(req.frontiers.len());
 
-    match &state.keyset_registry {
-        None => {
-            // No registry configured: legacy unverified acceptance.
-            for frontier in req.frontiers {
-                to_apply.push((frontier, None));
+    {
+        // Authority-set membership gate (FR-008): the sender must be one of
+        // the authorities defined for the frontier's key range. Signature
+        // verification only proves *who* signed, not that the signer owns
+        // the range. Ranges without an authority definition cannot certify
+        // writes anyway, so they are accepted for backwards compatibility.
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
+            match ns.get_authorities_for_key(&frontier.key_range.prefix) {
+                Some(def) => def.authority_nodes.contains(&frontier.authority_id),
+                None => true,
             }
-        }
-        Some(registry_lock) => {
-            let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
-            let current_epoch = state
-                .current_epoch
-                .load(std::sync::atomic::Ordering::Relaxed);
-            for frontier in req.frontiers {
-                match signatures.next().flatten() {
-                    Some(sig) => match verify_frontier_signature(
-                        &frontier,
-                        &sig,
-                        &registry,
-                        current_epoch,
-                        &state.epoch_config,
-                    ) {
-                        Ok(att) => to_apply.push((frontier, Some(att))),
-                        Err(e) => {
-                            tracing::warn!(
-                                authority = %frontier.authority_id.0,
-                                error = %e,
-                                "rejecting frontier with invalid signature"
-                            );
-                        }
-                    },
-                    None => {
-                        if state.require_signed_frontiers {
-                            tracing::warn!(
-                                authority = %frontier.authority_id.0,
-                                "rejecting unsigned frontier (require_signed_frontiers)"
-                            );
-                        } else {
-                            tracing::debug!(
-                                authority = %frontier.authority_id.0,
-                                "accepting unsigned frontier (lenient mode)"
-                            );
-                            to_apply.push((frontier, None));
+        };
+
+        match &state.keyset_registry {
+            None => {
+                for frontier in req.frontiers {
+                    if state.require_signed_frontiers {
+                        // Strict mode without a registry must fail closed:
+                        // there is no key material to verify any signature,
+                        // so accepting frontiers here would silently disable
+                        // the security control the operator asked for.
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            "rejecting frontier: require_signed_frontiers is set but no keyset registry is configured"
+                        );
+                        continue;
+                    }
+                    if !is_range_authority(&frontier) {
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            key_range = %frontier.key_range.prefix,
+                            "rejecting frontier from non-member of the range's authority set"
+                        );
+                        continue;
+                    }
+                    // No registry configured: legacy unverified acceptance.
+                    to_apply.push((frontier, None));
+                }
+            }
+            Some(registry_lock) => {
+                let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+                let current_epoch = state
+                    .current_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                for frontier in req.frontiers {
+                    let signature = signatures.next().flatten();
+                    if !is_range_authority(&frontier) {
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            key_range = %frontier.key_range.prefix,
+                            "rejecting frontier from non-member of the range's authority set"
+                        );
+                        continue;
+                    }
+                    match signature {
+                        Some(sig) => match verify_frontier_signature(
+                            &frontier,
+                            &sig,
+                            &registry,
+                            current_epoch,
+                            &state.epoch_config,
+                        ) {
+                            Ok(att) => to_apply.push((frontier, Some(att))),
+                            Err(e) => {
+                                tracing::warn!(
+                                    authority = %frontier.authority_id.0,
+                                    error = %e,
+                                    "rejecting frontier with invalid signature"
+                                );
+                            }
+                        },
+                        None => {
+                            if state.require_signed_frontiers {
+                                tracing::warn!(
+                                    authority = %frontier.authority_id.0,
+                                    "rejecting unsigned frontier (require_signed_frontiers)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    authority = %frontier.authority_id.0,
+                                    "accepting unsigned frontier (lenient mode)"
+                                );
+                                to_apply.push((frontier, None));
+                            }
                         }
                     }
                 }
@@ -718,6 +770,11 @@ pub async fn get_version_history(
 /// Accepts a proof bundle and returns the verification result.
 /// External clients can use this to independently verify that a
 /// proof bundle represents genuine Authority consensus.
+///
+/// The majority denominator (`total_authorities`) and the eligible signer
+/// set are always derived from this node's authority definition for the
+/// proof's key range; the caller-supplied `total_authorities` field is
+/// ignored so the quorum cannot be understated by the requester.
 pub async fn verify_proof(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyProofRequest>,
@@ -743,6 +800,31 @@ pub async fn verify_proof(
         node_id: req.frontier.node_id,
     };
     let policy_version = PolicyVersion(req.policy_version);
+
+    // The majority denominator and the eligible signer set come from this
+    // node's own authority definition for the key range. Trusting the
+    // caller-supplied `total_authorities` would let an attacker shrink the
+    // denominator and pass a sub-quorum proof (e.g. 2-of-5 presented as
+    // 2-of-3) off as a certified majority.
+    let (total_authorities, authority_members) = {
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let Some(def) = ns.get_authorities_for_key(&key_range.prefix) else {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "no authority definition covers key range '{}'; cannot determine the authority set",
+                    key_range.prefix
+                ),
+            ));
+        };
+        (
+            def.authority_nodes.len(),
+            def.authority_nodes
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<NodeId>>(),
+        )
+    };
 
     // Determine the signature algorithm from the request.
     let sig_algorithm = match req.signature_algorithm.as_deref() {
@@ -796,6 +878,23 @@ pub async fn verify_proof(
             ))?;
             signers.push((NodeId(id.clone()), pk));
         }
+        // Every aggregate signer must belong to the range's authority set;
+        // an aggregate cannot be partially discounted, so any outside signer
+        // invalidates the proof as a whole.
+        if signers
+            .iter()
+            .any(|(id, _)| !authority_members.contains(id))
+        {
+            return Ok(Json(VerifyProofResponse {
+                valid: false,
+                has_majority: false,
+                contributing_count: signers
+                    .iter()
+                    .filter(|(id, _)| authority_members.contains(id))
+                    .count(),
+                required_count: total_authorities / 2 + 1,
+            }));
+        }
         cert.set_bls_aggregate(signers, aggregated);
 
         let format_config = req
@@ -807,7 +906,7 @@ pub async fn verify_proof(
             .load(std::sync::atomic::Ordering::Relaxed);
         let result = verifier::verify_dual_proof_with_registry(
             &cert,
-            req.total_authorities,
+            total_authorities,
             &registry,
             current_epoch,
             &state.epoch_config,
@@ -839,6 +938,11 @@ pub async fn verify_proof(
         cert.signature_algorithm = sig_algorithm;
 
         for sig_json in &cert_json.signatures {
+            // Signatures from authorities outside the range's authority set
+            // do not count toward the majority, however valid they are.
+            if !authority_members.contains(&NodeId(sig_json.authority_id.clone())) {
+                continue;
+            }
             let pk_bytes = hex_to_bytes_32(&sig_json.public_key)?;
             let sig_bytes = hex_to_bytes_64(&sig_json.signature)?;
             let public_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).ok()?;
@@ -867,8 +971,9 @@ pub async fn verify_proof(
             .contributing_authorities
             .into_iter()
             .map(NodeId)
+            .filter(|id| authority_members.contains(id))
             .collect(),
-        total_authorities: req.total_authorities,
+        total_authorities,
         certificate,
         bls_certificate: None,
     };

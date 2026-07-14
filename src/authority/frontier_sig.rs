@@ -271,8 +271,13 @@ fn decode_signature(hex_str: &str) -> Option<Signature> {
 /// 4. The report signature verifies over [`create_frontier_report_message`].
 /// 5. `checkpoint_hlc` equals `checkpoint_hlc(frontier.frontier_hlc)` exactly.
 /// 6. The certificate signature verifies over the checkpoint message.
-/// 7. When BLS fields are present (native-crypto builds), the embedded BLS
-///    key must match the registry BLS key and the BLS signature must verify.
+/// 7. When BLS fields are present (native-crypto builds) and the registry
+///    holds a BLS key for the authority, the embedded BLS key must match the
+///    registry BLS key and the BLS signature must verify. When the registry
+///    has no BLS key for the authority (e.g. `ASTEROIDB_AUTHORITY_KEYS`
+///    distributed Ed25519 keys only), the BLS lane is ignored and the
+///    attestation degrades to Ed25519-only — rejecting it outright would
+///    let a documented-valid key distribution halt all frontier exchange.
 ///    A half-populated BLS pair is rejected. Non-native builds ignore the
 ///    BLS fields entirely.
 pub fn verify_frontier_signature(
@@ -343,11 +348,22 @@ pub fn verify_frontier_signature(
     #[cfg(feature = "native-crypto")]
     let bls = match (&sig.bls_public_key, &sig.bls_cert_signature) {
         (Some(embedded_pk), Some(bls_sig)) => {
-            let registry_bls = registry
-                .get_bls_key(&sig.keyset_version, &frontier.authority_id.0)
-                .ok_or_else(|| {
-                    CertError::AuthorityNotInRegistry(frontier.authority_id.0.clone())
-                })?;
+            let Some(registry_bls) =
+                registry.get_bls_key(&sig.keyset_version, &frontier.authority_id.0)
+            else {
+                // The registry holds no BLS key for this authority (BLS keys
+                // are optional in ASTEROIDB_AUTHORITY_KEYS). The Ed25519
+                // report and certificate signatures already verified above,
+                // so accept the attestation without its BLS lane instead of
+                // rejecting the whole frontier.
+                return Ok(VerifiedAttestation {
+                    authority_id: frontier.authority_id.clone(),
+                    keyset_version: sig.keyset_version.clone(),
+                    checkpoint_hlc: expected_checkpoint,
+                    ed25519: (*registry_key, cert_sig),
+                    bls: None,
+                });
+            };
             if embedded_pk != registry_bls {
                 return Err(CertError::InvalidSignature(format!(
                     "embedded BLS key mismatch for {}",
@@ -722,6 +738,34 @@ mod tests {
         assert!(
             att.bls.is_some(),
             "BLS attestation must survive verification"
+        );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn bls_fields_without_registry_bls_key_degrade_to_ed25519() {
+        // A BLS-seeded signer always attaches BLS fields, but the receiver's
+        // registry only has the Ed25519 key (ASTEROIDB_AUTHORITY_KEYS with
+        // the optional BLS part omitted). The frontier must still verify.
+        let signer = make_signer("auth-1", 26, true);
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(node("auth-1"), signer.verifying_key())],
+            )
+            .unwrap();
+
+        let frontier = make_frontier("auth-1", 5_000, 0);
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        assert!(sig.bls_public_key.is_some());
+
+        let att = verify_frontier_signature(&frontier, &sig, &registry, 0, &EpochConfig::default())
+            .expect("Ed25519-only registry must accept BLS-signed frontiers");
+        assert!(
+            att.bls.is_none(),
+            "attestation must degrade to Ed25519-only when the registry has no BLS key"
         );
     }
 

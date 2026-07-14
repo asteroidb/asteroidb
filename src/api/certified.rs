@@ -270,7 +270,18 @@ impl CertifiedApi {
                 (checkpoint, contributing, Some(cert), bls_cert)
             }
             None => {
-                self.cert_pending_keys.insert(pw.key.clone());
+                // Only queue the key for certificate back-fill when signed
+                // attestations exist for this scope. In unsigned deployments
+                // (no signer / non-native builds) no certificate can ever be
+                // assembled, and queueing every certified key would make
+                // refresh_missing_certificates rescan the full certified
+                // cache on every certification tick, forever.
+                if self
+                    .attestations
+                    .has_attestations(&pw.key_range, &pw.policy_version)
+                {
+                    self.cert_pending_keys.insert(pw.key.clone());
+                }
                 let scoped_frontiers = self
                     .frontiers
                     .all_for_scope(&pw.key_range, &pw.policy_version);
@@ -580,7 +591,8 @@ impl CertifiedApi {
         if let Some(att) = verified
             && !fenced
         {
-            self.attestations.insert(&key_range, policy_version, att);
+            self.attestations
+                .insert(&key_range, policy_version, att, crate::hlc::wall_clock_ms());
         }
         advanced
     }
@@ -2487,6 +2499,31 @@ mod tests {
         assert!(
             proof.certificate.is_some(),
             "certificate must be back-filled by a later tick"
+        );
+    }
+
+    /// Unsigned deployments must not queue keys for certificate back-fill:
+    /// no attestation ever arrives, so the retry would spin forever over the
+    /// whole certified cache on every certification tick.
+    #[test]
+    fn unsigned_certification_does_not_queue_certificate_backfill() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Unsigned frontier reports certify the write.
+        api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+        api.update_frontier(make_frontier("auth-2", write_ts + 100, 0, ""));
+        api.process_certifications();
+
+        assert_eq!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+        assert!(
+            api.cert_pending_keys.is_empty(),
+            "unsigned certification must not queue certificate back-fill retries"
         );
     }
 

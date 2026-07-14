@@ -169,6 +169,14 @@ impl Hlc {
 }
 
 /// Returns current wall-clock time in milliseconds since UNIX epoch.
+///
+/// Public so that other subsystems (e.g. the attestation pool's future-skew
+/// guard) share the same wall-clock source as the HLC.
+pub fn wall_clock_ms() -> u64 {
+    physical_ms()
+}
+
+/// Returns current wall-clock time in milliseconds since UNIX epoch.
 fn physical_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

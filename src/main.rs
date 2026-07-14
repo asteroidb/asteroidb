@@ -34,6 +34,13 @@ fn parse_authority_keys_env() -> Vec<(NodeId, ed25519_dalek::VerifyingKey, Optio
     let Ok(raw) = std::env::var("ASTEROIDB_AUTHORITY_KEYS") else {
         return Vec::new();
     };
+    parse_authority_keys(&raw)
+}
+
+/// Parse the `ASTEROIDB_AUTHORITY_KEYS` value (separated for unit testing).
+fn parse_authority_keys(
+    raw: &str,
+) -> Vec<(NodeId, ed25519_dalek::VerifyingKey, Option<BlsPublicKey>)> {
     let mut keys = Vec::new();
     for entry in raw.split(',') {
         let entry = entry.trim();
@@ -289,11 +296,11 @@ async fn main() {
         ),
     ));
 
-    // Parse optional BLS key seed from environment variable.
-    // When set, the node generates a BLS keypair and enables BLS certificate mode.
-    // Requires the `native-crypto` feature.
-    #[cfg(feature = "native-crypto")]
-    let bls_config = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
+    // Parse the optional signing key seed from the environment.
+    // The seed derives the node's Ed25519 frontier-signing key on every
+    // build; with `native-crypto` it additionally derives the BLS keypair
+    // and enables BLS certificate mode.
+    let signing_seed: Option<[u8; 32]> = std::env::var("ASTEROIDB_BLS_SEED").ok().map(|hex_seed| {
         let bytes = hex::decode(&hex_seed).unwrap_or_else(|e| {
             eprintln!("error: ASTEROIDB_BLS_SEED contains invalid hex: {e}");
             std::process::exit(1);
@@ -301,8 +308,10 @@ async fn main() {
         let mut seed = [0u8; 32];
         let len = bytes.len().min(32);
         seed[..len].copy_from_slice(&bytes[..len]);
-        BlsConfig { seed }
+        seed
     });
+    #[cfg(feature = "native-crypto")]
+    let bls_config = signing_seed.map(|seed| BlsConfig { seed });
     #[cfg(not(feature = "native-crypto"))]
     let bls_config: Option<BlsConfig> = None;
 
@@ -318,29 +327,45 @@ async fn main() {
     // Build the node signer from the seed. The signer owns the Ed25519
     // signing key (and, with native-crypto, the BLS keypair) for the whole
     // process lifetime — it is the single derivation point for key material.
+    // Without native-crypto the signer is Ed25519-only, so non-native builds
+    // still participate in the signing pipeline.
     #[cfg(feature = "native-crypto")]
-    let node_signer = bls_config
+    let node_signer = signing_seed
         .as_ref()
-        .map(|bls_cfg| Arc::new(NodeSigner::from_seed(node_id.clone(), &bls_cfg.seed, true)));
+        .map(|seed| Arc::new(NodeSigner::from_seed(node_id.clone(), seed, true)));
     #[cfg(not(feature = "native-crypto"))]
-    let node_signer: Option<Arc<NodeSigner>> = None;
+    let node_signer = signing_seed
+        .as_ref()
+        .map(|seed| Arc::new(NodeSigner::from_seed(node_id.clone(), seed)));
 
-    // Build the keyset registry from the signer's public keys plus any peer
-    // authority public keys distributed via ASTEROIDB_AUTHORITY_KEYS.
-    // The same registry instance is shared between AppState (verification)
-    // and NodeRunner (signing keyset resolution).
-    let keyset_registry = node_signer.as_ref().map(|signer| {
+    // Peer authority keys: "auth-2=<ed25519 hex64>[/<bls hex96>],auth-3=...".
+    let peer_authority_keys = parse_authority_keys_env();
+
+    // Build the keyset registry from the signer's public keys (when signing
+    // is enabled) plus any peer authority public keys distributed via
+    // ASTEROIDB_AUTHORITY_KEYS. A registry is built whenever either source
+    // provides keys, so a verify-only node (peer keys but no local seed) can
+    // still verify peer frontier signatures. The same registry instance is
+    // shared between AppState (verification) and NodeRunner (signing keyset
+    // resolution).
+    let keyset_registry = if node_signer.is_none() && peer_authority_keys.is_empty() {
+        None
+    } else {
         let mut registry = KeysetRegistry::new();
 
-        let mut ed_keys = vec![(node_id.clone(), signer.verifying_key())];
+        let mut ed_keys: Vec<(NodeId, ed25519_dalek::VerifyingKey)> = Vec::new();
         #[cfg(feature = "native-crypto")]
-        let mut bls_keys: Vec<(String, BlsPublicKey)> = signer
-            .bls_public_key()
-            .map(|pk| vec![(node_id.0.clone(), pk)])
-            .unwrap_or_default();
+        let mut bls_keys: Vec<(String, BlsPublicKey)> = Vec::new();
 
-        // Peer authority keys: "auth-2=<ed25519 hex64>[/<bls hex96>],auth-3=...".
-        for (peer_id, ed_vk, bls_pk) in parse_authority_keys_env() {
+        if let Some(signer) = &node_signer {
+            ed_keys.push((node_id.clone(), signer.verifying_key()));
+            #[cfg(feature = "native-crypto")]
+            if let Some(pk) = signer.bls_public_key() {
+                bls_keys.push((node_id.0.clone(), pk));
+            }
+        }
+
+        for (peer_id, ed_vk, bls_pk) in peer_authority_keys {
             if peer_id == node_id {
                 continue; // own keys already derived from the seed
             }
@@ -362,8 +387,8 @@ async fn main() {
                 .register_bls_keys(&KeysetVersion(1), bls_keys)
                 .expect("BLS key registration should succeed");
         }
-        Arc::new(std::sync::RwLock::new(registry))
-    });
+        Some(Arc::new(std::sync::RwLock::new(registry)))
+    };
 
     // Opt-in strict mode: reject unsigned frontier pushes.
     let require_signed_frontiers = std::env::var("ASTEROIDB_REQUIRE_SIGNED_FRONTIERS")
@@ -372,6 +397,19 @@ async fn main() {
             v == "1" || v == "true"
         })
         .unwrap_or(false);
+
+    // Strict mode is meaningless without a keyset registry: the frontier
+    // handler would have no keys to verify against and would either
+    // silently accept everything (the historical fail-open) or reject
+    // everything. Fail loudly at startup instead of degrading silently.
+    if require_signed_frontiers && keyset_registry.is_none() {
+        eprintln!(
+            "error: ASTEROIDB_REQUIRE_SIGNED_FRONTIERS is set but no keyset registry could be \
+             built. Set ASTEROIDB_BLS_SEED (signing key seed) and/or ASTEROIDB_AUTHORITY_KEYS \
+             (peer public keys) so that signed frontiers can actually be verified."
+        );
+        std::process::exit(1);
+    }
 
     let current_epoch = Arc::new(std::sync::atomic::AtomicU64::new(current_epoch_val));
 
@@ -539,4 +577,107 @@ async fn main() {
     }
 
     println!("AsteroidDB stopped.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic Ed25519 verifying key and its hex encoding.
+    fn ed_key_hex(byte: u8) -> (ed25519_dalek::VerifyingKey, String) {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        let vk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        (vk, hex::encode(vk.as_bytes()))
+    }
+
+    /// A structurally valid BLS public key hex string (96 chars).
+    ///
+    /// With native-crypto this must be a real group element, so it is derived
+    /// from an actual keypair; the stub build accepts any string.
+    #[cfg(feature = "native-crypto")]
+    fn bls_key_hex(byte: u8) -> String {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        asteroidb_poc::authority::bls::BlsKeypair::generate(&seed)
+            .public_key
+            .to_hex()
+    }
+    #[cfg(not(feature = "native-crypto"))]
+    fn bls_key_hex(byte: u8) -> String {
+        format!("{byte:02x}").repeat(48)
+    }
+
+    #[test]
+    fn parse_authority_keys_ed25519_only_entry() {
+        let (vk, ed_hex) = ed_key_hex(1);
+        let parsed = parse_authority_keys(&format!("auth-2={ed_hex}"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, NodeId("auth-2".into()));
+        assert_eq!(parsed[0].1, vk);
+        assert!(parsed[0].2.is_none(), "BLS part is optional");
+    }
+
+    #[test]
+    fn parse_authority_keys_ed25519_plus_bls_entry() {
+        let (vk, ed_hex) = ed_key_hex(2);
+        let bls_hex = bls_key_hex(2);
+        let parsed = parse_authority_keys(&format!("auth-3={ed_hex}/{bls_hex}"));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, NodeId("auth-3".into()));
+        assert_eq!(parsed[0].1, vk);
+        let bls = parsed[0].2.as_ref().expect("BLS key must be parsed");
+        assert_eq!(bls.to_hex(), bls_hex);
+    }
+
+    #[test]
+    fn parse_authority_keys_multiple_entries_with_whitespace() {
+        let (vk1, ed1) = ed_key_hex(3);
+        let (vk2, ed2) = ed_key_hex(4);
+        let parsed = parse_authority_keys(&format!(" auth-2 = {ed1} , auth-3={ed2},, "));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, NodeId("auth-2".into()));
+        assert_eq!(parsed[0].1, vk1);
+        assert_eq!(parsed[1].0, NodeId("auth-3".into()));
+        assert_eq!(parsed[1].1, vk2);
+    }
+
+    #[test]
+    fn parse_authority_keys_skips_entry_without_equals() {
+        let (_, ed_hex) = ed_key_hex(5);
+        let parsed = parse_authority_keys(&format!("garbage,auth-2={ed_hex}"));
+        assert_eq!(parsed.len(), 1, "malformed entry must be skipped");
+        assert_eq!(parsed[0].0, NodeId("auth-2".into()));
+    }
+
+    #[test]
+    fn parse_authority_keys_skips_invalid_ed25519_hex() {
+        let (_, ed_hex) = ed_key_hex(6);
+        let parsed = parse_authority_keys(&format!("auth-2=nothex,auth-3=abcd,auth-4={ed_hex}"));
+        assert_eq!(
+            parsed.len(),
+            1,
+            "invalid/short Ed25519 keys must be skipped"
+        );
+        assert_eq!(parsed[0].0, NodeId("auth-4".into()));
+    }
+
+    // The BLS stub's from_hex is a passthrough that never fails, so the
+    // invalid-BLS rejection path only exists with native-crypto.
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn parse_authority_keys_skips_invalid_bls_key() {
+        let (_, ed_hex) = ed_key_hex(7);
+        let parsed = parse_authority_keys(&format!("auth-2={ed_hex}/nothex"));
+        assert!(
+            parsed.is_empty(),
+            "an entry with an invalid BLS part must be skipped entirely"
+        );
+    }
+
+    #[test]
+    fn parse_authority_keys_empty_input() {
+        assert!(parse_authority_keys("").is_empty());
+        assert!(parse_authority_keys(" , ,").is_empty());
+    }
 }
