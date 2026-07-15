@@ -1,332 +1,365 @@
-use std::collections::HashSet;
+//! Control-plane consensus facade (FR-009).
+//!
+//! Historically this was a stateless majority check over caller-supplied
+//! approval lists. It is now a thin, `Clone`-able facade over the real Raft
+//! consensus in [`crate::control_plane::raft`]: proposals are appended to
+//! the replicated log by the leader, committed on a majority of the static
+//! voter set, and applied — in commit order — to the system namespace on
+//! every voter.
+//!
+//! Two modes:
+//! - **Raft**: production and single-node test wiring; proposals go through
+//!   `RaftNode::propose_and_wait`.
+//! - **Detached**: no consensus configured. Every proposal is rejected with
+//!   `PolicyDenied` (HTTP 403), matching the old "insufficient approvals"
+//!   behavior that test scaffolding constructed via
+//!   `ControlPlaneConsensus::new(vec![])`.
+//!
+//! NOTE: this type deliberately does NOT share anything with the data-plane
+//! majority machinery (`MajorityCertificate::has_majority` and friends) —
+//! those certify data-plane writes and are a different concept entirely.
 
+#[cfg(feature = "native-runtime")]
 use crate::error::CrdtError;
-use crate::placement::PlacementPolicy;
 use crate::types::NodeId;
 
-use super::system_namespace::AuthorityDefinition;
+#[cfg(feature = "native-runtime")]
+use std::sync::Arc;
 
-/// Simulates control-plane Authority consensus for system namespace updates.
-/// In MVP, this is a simple majority check (FR-009).
+#[cfg(feature = "native-runtime")]
+use crate::control_plane::system_namespace::AuthorityDefinition;
+#[cfg(feature = "native-runtime")]
+use crate::placement::PlacementPolicy;
+
+#[cfg(feature = "native-runtime")]
+use super::raft::node::{RaftConfig, RaftNode, RaftStatus};
+#[cfg(feature = "native-runtime")]
+use super::raft::types::{ApplyOutcome, AuthoritySpec, ControlPlaneCommand, PolicySpec};
+
+/// Clone-able handle to the control-plane consensus. Handlers clone this
+/// out of the `AppState` mutex and drop the lock BEFORE awaiting a
+/// proposal, so a slow commit never blocks other control-plane requests or
+/// the Raft internals.
+#[derive(Clone)]
 pub struct ControlPlaneConsensus {
-    authority_nodes: Vec<NodeId>,
+    mode: Mode,
+}
+
+#[derive(Clone)]
+enum Mode {
+    /// No consensus configured: all proposals are denied.
+    Detached,
+    #[cfg(feature = "native-runtime")]
+    Raft(Arc<RaftNode>),
 }
 
 impl ControlPlaneConsensus {
-    /// Creates a new consensus instance with the given authority nodes.
-    pub fn new(authority_nodes: Vec<NodeId>) -> Self {
-        Self { authority_nodes }
-    }
-
-    /// Validates that a policy update has majority approval.
-    pub fn propose_policy_update(
-        &self,
-        _policy: PlacementPolicy,
-        approvals: &[NodeId],
-    ) -> Result<(), CrdtError> {
-        if !self.has_majority(approvals) {
-            return Err(CrdtError::PolicyDenied(
-                "insufficient approvals for policy update".into(),
-            ));
+    /// Compatibility constructor (signature preserved from the MVP): the
+    /// argument is ignored and the instance is DETACHED — every proposal
+    /// fails with `PolicyDenied`, the same 403 the old implementation
+    /// returned for missing approvals. Production wiring uses
+    /// [`ControlPlaneConsensus::with_raft`].
+    pub fn new(_authority_nodes: Vec<NodeId>) -> Self {
+        Self {
+            mode: Mode::Detached,
         }
-        Ok(())
     }
 
-    /// Proposes an authority definition update. Applies only if a majority of
-    /// authority nodes have approved.
-    pub fn propose_authority_update(
-        &self,
-        _def: AuthorityDefinition,
-        approvals: &[NodeId],
-    ) -> Result<(), CrdtError> {
-        if !self.has_majority(approvals) {
-            return Err(CrdtError::PolicyDenied(
-                "insufficient approvals for authority update".into(),
-            ));
+    /// Wrap a running Raft node.
+    #[cfg(feature = "native-runtime")]
+    pub fn with_raft(node: Arc<RaftNode>) -> Self {
+        Self {
+            mode: Mode::Raft(node),
         }
-        Ok(())
     }
 
-    /// Proposes a placement policy removal. Removes only if a majority of
-    /// authority nodes have approved (FR-009).
-    pub fn propose_policy_removal(
-        &self,
-        _prefix: &str,
-        approvals: &[NodeId],
-    ) -> Result<(), CrdtError> {
-        if !self.has_majority(approvals) {
-            return Err(CrdtError::PolicyDenied(
-                "insufficient approvals for policy removal".into(),
-            ));
+    /// Test helper: a single-voter Raft node over in-memory storage that is
+    /// already leader (single-voter clusters elect themselves in
+    /// `RaftNode::new`), sharing `namespace` with the caller. Proposals
+    /// commit and apply within a single `propose_and_wait` call, so no
+    /// driver task is needed.
+    #[cfg(feature = "native-runtime")]
+    pub fn single_node_for_test(
+        self_id: NodeId,
+        namespace: Arc<std::sync::RwLock<crate::control_plane::system_namespace::SystemNamespace>>,
+    ) -> Self {
+        use super::raft::storage::MemRaftStorage;
+        use super::raft::transport::NoopTransport;
+        let voters = [self_id.clone()].into_iter().collect();
+        let node = RaftNode::new(
+            self_id,
+            voters,
+            RaftConfig::default(),
+            Arc::new(MemRaftStorage::new()),
+            Arc::new(NoopTransport),
+            namespace,
+            None,
+        )
+        .expect("in-memory raft storage cannot fail to load");
+        Self::with_raft(node)
+    }
+
+    /// The underlying Raft node, when attached.
+    #[cfg(feature = "native-runtime")]
+    pub fn raft_handle(&self) -> Option<Arc<RaftNode>> {
+        match &self.mode {
+            Mode::Detached => None,
+            Mode::Raft(node) => Some(Arc::clone(node)),
         }
-        Ok(())
     }
 
-    /// Returns `true` if the given approvals constitute a majority of the
-    /// authority nodes. Duplicate approvals from the same node are counted
-    /// only once, and approvals from non-authority nodes are ignored.
-    pub fn has_majority(&self, approvals: &[NodeId]) -> bool {
-        let authority_set: HashSet<&NodeId> = self.authority_nodes.iter().collect();
-        let unique_valid: HashSet<&NodeId> = approvals
-            .iter()
-            .filter(|a| authority_set.contains(a))
-            .collect();
-        let majority = self.authority_nodes.len() / 2 + 1;
-        unique_valid.len() >= majority
+    #[cfg(feature = "native-runtime")]
+    fn detached_error() -> CrdtError {
+        CrdtError::PolicyDenied("control-plane consensus is not configured (detached mode)".into())
+    }
+
+    /// Propose a placement policy upsert and wait for commit + apply.
+    /// Returns the applied policy carrying its commit-order version.
+    #[cfg(feature = "native-runtime")]
+    pub async fn propose_policy_update(
+        &self,
+        spec: PolicySpec,
+    ) -> Result<PlacementPolicy, CrdtError> {
+        match &self.mode {
+            Mode::Detached => Err(Self::detached_error()),
+            Mode::Raft(node) => {
+                match node
+                    .propose_and_wait(ControlPlaneCommand::PutPolicy(spec))
+                    .await?
+                {
+                    ApplyOutcome::PolicyApplied(policy) => Ok(policy),
+                    ApplyOutcome::Noop => Err(CrdtError::InvalidArgument(
+                        "replica_count must be at least 1".into(),
+                    )),
+                    other => Err(CrdtError::Internal(format!(
+                        "unexpected apply outcome for policy update: {other:?}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Propose a placement policy removal and wait for commit + apply.
+    /// `Ok(None)` means the prefix did not exist (callers map to 404).
+    #[cfg(feature = "native-runtime")]
+    pub async fn propose_policy_removal(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<PlacementPolicy>, CrdtError> {
+        match &self.mode {
+            Mode::Detached => Err(Self::detached_error()),
+            Mode::Raft(node) => {
+                match node
+                    .propose_and_wait(ControlPlaneCommand::RemovePolicy {
+                        prefix: prefix.to_string(),
+                    })
+                    .await?
+                {
+                    ApplyOutcome::PolicyRemoved(removed) => Ok(removed),
+                    other => Err(CrdtError::Internal(format!(
+                        "unexpected apply outcome for policy removal: {other:?}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Propose a manual authority definition upsert and wait for commit +
+    /// apply.
+    #[cfg(feature = "native-runtime")]
+    pub async fn propose_authority_update(
+        &self,
+        spec: AuthoritySpec,
+    ) -> Result<AuthorityDefinition, CrdtError> {
+        match &self.mode {
+            Mode::Detached => Err(Self::detached_error()),
+            Mode::Raft(node) => {
+                match node
+                    .propose_and_wait(ControlPlaneCommand::PutAuthority(spec))
+                    .await?
+                {
+                    ApplyOutcome::AuthorityApplied(def) => Ok(def),
+                    other => Err(CrdtError::Internal(format!(
+                        "unexpected apply outcome for authority update: {other:?}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Whether this node is currently the control-plane Raft leader.
+    pub fn is_leader(&self) -> bool {
+        match &self.mode {
+            Mode::Detached => false,
+            #[cfg(feature = "native-runtime")]
+            Mode::Raft(node) => node.is_leader(),
+        }
+    }
+
+    /// Best-known leader `(id, resolved address)`.
+    pub fn leader_hint(&self) -> Option<(NodeId, Option<String>)> {
+        match &self.mode {
+            Mode::Detached => None,
+            #[cfg(feature = "native-runtime")]
+            Mode::Raft(node) => node.leader_hint(),
+        }
+    }
+
+    /// Consensus status for the observability endpoint. `None` = detached.
+    #[cfg(feature = "native-runtime")]
+    pub fn status(&self) -> Option<RaftStatus> {
+        match &self.mode {
+            Mode::Detached => None,
+            Mode::Raft(node) => Some(node.status()),
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-runtime"))]
 mod tests {
     use super::*;
     use crate::control_plane::system_namespace::SystemNamespace;
-    use crate::types::{KeyRange, PolicyVersion};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, RwLock};
 
     fn node_id(s: &str) -> NodeId {
         NodeId(s.into())
     }
 
-    fn key_range(prefix: &str) -> KeyRange {
-        KeyRange {
+    fn policy_spec(prefix: &str, replica_count: usize) -> PolicySpec {
+        PolicySpec {
             prefix: prefix.into(),
+            replica_count,
+            required_tags: BTreeSet::new(),
+            forbidden_tags: BTreeSet::new(),
+            allow_local_write_on_partition: false,
+            certified: false,
+            max_read_latency_ms: None,
+            preferred_cost_tier: None,
         }
     }
 
-    fn make_policy(prefix: &str) -> PlacementPolicy {
-        PlacementPolicy::new(PolicyVersion(1), key_range(prefix), 3)
+    fn fresh_namespace() -> Arc<RwLock<SystemNamespace>> {
+        Arc::new(RwLock::new(SystemNamespace::new()))
     }
 
-    fn make_authority_def(prefix: &str, nodes: &[&str]) -> AuthorityDefinition {
-        AuthorityDefinition {
-            key_range: key_range(prefix),
-            authority_nodes: nodes.iter().map(|s| node_id(s)).collect(),
-            auto_generated: false,
+    // --- Detached mode (compat with the old `new(vec![])` scaffolding) ---
+
+    #[tokio::test]
+    async fn detached_rejects_all_proposals_with_policy_denied() {
+        let consensus = ControlPlaneConsensus::new(vec![node_id("n1")]);
+        assert!(!consensus.is_leader());
+        assert!(consensus.leader_hint().is_none());
+        assert!(consensus.raft_handle().is_none());
+
+        let err = consensus
+            .propose_policy_update(policy_spec("user/", 3))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CrdtError::PolicyDenied(_)), "{err:?}");
+        let err = consensus.propose_policy_removal("user/").await.unwrap_err();
+        assert!(matches!(err, CrdtError::PolicyDenied(_)));
+        let err = consensus
+            .propose_authority_update(AuthoritySpec {
+                prefix: "user/".into(),
+                authority_nodes: vec![node_id("a1")],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CrdtError::PolicyDenied(_)));
+    }
+
+    // --- Single-node mode ---
+
+    #[tokio::test]
+    async fn single_node_commits_immediately_and_updates_namespace() {
+        let namespace = fresh_namespace();
+        let consensus =
+            ControlPlaneConsensus::single_node_for_test(node_id("solo"), Arc::clone(&namespace));
+        assert!(consensus.is_leader());
+
+        let policy = consensus
+            .propose_policy_update(policy_spec("user/", 3))
+            .await
+            .unwrap();
+        assert_eq!(policy.key_range.prefix, "user/");
+        {
+            let ns = namespace.read().unwrap();
+            let stored = ns.get_placement_policy("user/").unwrap();
+            assert_eq!(stored.version, policy.version);
+            assert_eq!(stored.replica_count, 3);
         }
-    }
 
-    fn three_node_consensus() -> ControlPlaneConsensus {
-        ControlPlaneConsensus::new(vec![node_id("n1"), node_id("n2"), node_id("n3")])
-    }
+        // Versions increase with commit order.
+        let policy2 = consensus
+            .propose_policy_update(policy_spec("order/", 2))
+            .await
+            .unwrap();
+        assert!(policy2.version.0 > policy.version.0);
 
-    // --- has_majority ---
-
-    #[test]
-    fn has_majority_with_all_nodes() {
-        let c = three_node_consensus();
-        assert!(c.has_majority(&[node_id("n1"), node_id("n2"), node_id("n3")]));
-    }
-
-    #[test]
-    fn has_majority_with_exact_majority() {
-        let c = three_node_consensus();
-        assert!(c.has_majority(&[node_id("n1"), node_id("n2")]));
-    }
-
-    #[test]
-    fn no_majority_with_minority() {
-        let c = three_node_consensus();
-        assert!(!c.has_majority(&[node_id("n1")]));
-    }
-
-    #[test]
-    fn no_majority_with_empty_approvals() {
-        let c = three_node_consensus();
-        assert!(!c.has_majority(&[]));
-    }
-
-    #[test]
-    fn non_authority_nodes_ignored() {
-        let c = three_node_consensus();
-        // "n4" is not an authority node, so only "n1" counts
-        assert!(!c.has_majority(&[node_id("n1"), node_id("n4")]));
-    }
-
-    #[test]
-    fn duplicate_approvals_counted_once() {
-        let c = three_node_consensus();
-        // "n1" appears three times but should count as only one unique approval
-        assert!(!c.has_majority(&[node_id("n1"), node_id("n1"), node_id("n1")]));
-    }
-
-    #[test]
-    fn duplicate_approvals_do_not_inflate_quorum() {
-        let c = three_node_consensus();
-        // Two unique authority nodes (n1, n2) = majority, even with duplicates
-        assert!(c.has_majority(&[node_id("n1"), node_id("n2"), node_id("n1"), node_id("n2")]));
-        // One unique authority node (n1) repeated != majority
-        assert!(!c.has_majority(&[node_id("n1"), node_id("n1")]));
-    }
-
-    #[test]
-    fn duplicate_non_authority_approvals_ignored() {
-        let c = three_node_consensus();
-        // "n4" is not authority; even duplicated many times, only n1 counts
-        assert!(!c.has_majority(&[node_id("n1"), node_id("n4"), node_id("n4"), node_id("n4")]));
-    }
-
-    #[test]
-    fn duplicate_approvals_policy_update_rejected() {
-        let c = three_node_consensus();
-        // Same node duplicated should not reach majority
-        let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1"), node_id("n1")]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn duplicate_approvals_authority_update_rejected() {
-        let c = three_node_consensus();
-        let result = c.propose_authority_update(
-            make_authority_def("user/", &["a1"]),
-            &[node_id("n1"), node_id("n1")],
+        // Removal round-trip.
+        let removed = consensus.propose_policy_removal("user/").await.unwrap();
+        assert_eq!(removed.unwrap().key_range.prefix, "user/");
+        assert!(
+            namespace
+                .read()
+                .unwrap()
+                .get_placement_policy("user/")
+                .is_none()
         );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn has_majority_five_nodes() {
-        let c = ControlPlaneConsensus::new(vec![
-            node_id("n1"),
-            node_id("n2"),
-            node_id("n3"),
-            node_id("n4"),
-            node_id("n5"),
-        ]);
-        // majority of 5 is 3
-        assert!(c.has_majority(&[node_id("n1"), node_id("n2"), node_id("n3")]));
-        assert!(!c.has_majority(&[node_id("n1"), node_id("n2")]));
-    }
-
-    // --- propose_policy_update ---
-
-    #[test]
-    fn propose_policy_with_majority_succeeds() {
-        let c = three_node_consensus();
-        let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1"), node_id("n2")]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn propose_policy_without_majority_fails() {
-        let c = three_node_consensus();
-        let result = c.propose_policy_update(make_policy("user/"), &[node_id("n1")]);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            CrdtError::PolicyDenied(msg) => {
-                assert!(msg.contains("insufficient approvals"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn propose_policy_increments_version() {
-        let c = three_node_consensus();
-        let approvals = [node_id("n1"), node_id("n2")];
-        let mut ns = SystemNamespace::new();
-        assert_eq!(*ns.version(), PolicyVersion(1));
-
-        c.propose_policy_update(make_policy("user/"), &approvals)
-            .unwrap();
-        ns.set_placement_policy(make_policy("user/")).unwrap();
-        assert_eq!(*ns.version(), PolicyVersion(2));
-
-        c.propose_policy_update(make_policy("order/"), &approvals)
-            .unwrap();
-        ns.set_placement_policy(make_policy("order/")).unwrap();
-        assert_eq!(*ns.version(), PolicyVersion(3));
-    }
-
-    // --- propose_authority_update ---
-
-    #[test]
-    fn propose_authority_with_majority_succeeds() {
-        let c = three_node_consensus();
-        let result = c.propose_authority_update(
-            make_authority_def("user/", &["a1", "a2", "a3"]),
-            &[node_id("n1"), node_id("n2")],
+        // Missing prefix maps to Ok(None) (handler turns it into 404).
+        assert!(
+            consensus
+                .propose_policy_removal("user/")
+                .await
+                .unwrap()
+                .is_none()
         );
-        assert!(result.is_ok());
     }
 
-    #[test]
-    fn propose_authority_without_majority_fails() {
-        let c = three_node_consensus();
-        let result =
-            c.propose_authority_update(make_authority_def("user/", &["a1"]), &[node_id("n1")]);
-        assert!(result.is_err());
-    }
-
-    // --- namespace access ---
-
-    #[test]
-    fn namespace_reflects_approved_changes() {
-        let c = three_node_consensus();
-        let approvals = [node_id("n1"), node_id("n2")];
-
-        let mut ns = SystemNamespace::new();
-
-        c.propose_policy_update(make_policy("user/"), &approvals)
+    #[tokio::test]
+    async fn single_node_authority_update_applies() {
+        let namespace = fresh_namespace();
+        let consensus =
+            ControlPlaneConsensus::single_node_for_test(node_id("solo"), Arc::clone(&namespace));
+        let def = consensus
+            .propose_authority_update(AuthoritySpec {
+                prefix: "user/".into(),
+                authority_nodes: vec![node_id("a1"), node_id("a2")],
+            })
+            .await
             .unwrap();
-        ns.set_placement_policy(make_policy("user/")).unwrap();
-
-        c.propose_authority_update(make_authority_def("user/", &["a1", "a2"]), &approvals)
-            .unwrap();
-        ns.set_authority_definition(make_authority_def("user/", &["a1", "a2"]));
-
-        assert_eq!(ns.all_placement_policies().len(), 1);
-        assert_eq!(ns.all_authority_definitions().len(), 1);
-        assert_eq!(*ns.version(), PolicyVersion(3));
+        assert!(!def.auto_generated);
+        let ns = namespace.read().unwrap();
+        let stored = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(stored.authority_nodes.len(), 2);
     }
 
-    // --- propose_policy_removal ---
-
-    #[test]
-    fn propose_policy_removal_with_majority_succeeds() {
-        let c = three_node_consensus();
-        let approvals = [node_id("n1"), node_id("n2")];
-        c.propose_policy_update(make_policy("user/"), &approvals)
-            .unwrap();
-
-        let result = c.propose_policy_removal("user/", &approvals);
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn failed_proposal_does_not_change_namespace() {
+        let namespace = fresh_namespace();
+        let consensus =
+            ControlPlaneConsensus::single_node_for_test(node_id("solo"), Arc::clone(&namespace));
+        let version_before = namespace.read().unwrap().version().0;
+        let err = consensus
+            .propose_policy_update(policy_spec("bad/", 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CrdtError::InvalidArgument(_)), "{err:?}");
+        let ns = namespace.read().unwrap();
+        assert!(ns.get_placement_policy("bad/").is_none());
+        assert_eq!(ns.version().0, version_before);
     }
 
-    #[test]
-    fn propose_policy_removal_without_majority_fails() {
-        let c = three_node_consensus();
-        let approvals = [node_id("n1"), node_id("n2")];
-        c.propose_policy_update(make_policy("user/"), &approvals)
-            .unwrap();
-
-        let result = c.propose_policy_removal("user/", &[node_id("n1")]);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            CrdtError::PolicyDenied(msg) => {
-                assert!(msg.contains("insufficient approvals"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    #[test]
-    fn propose_policy_removal_nonexistent_returns_none() {
-        let c = three_node_consensus();
-        let approvals = [node_id("n1"), node_id("n2")];
-        let result = c.propose_policy_removal("missing/", &approvals);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn failed_proposals_do_not_change_namespace() {
-        let c = three_node_consensus();
-        let insufficient = [node_id("n1")];
-
-        let _ = c.propose_policy_update(make_policy("user/"), &insufficient);
-        let _ = c.propose_authority_update(make_authority_def("user/", &["a1"]), &insufficient);
-
-        let ns = SystemNamespace::new();
-        assert!(ns.all_placement_policies().is_empty());
-        assert!(ns.all_authority_definitions().is_empty());
-        assert_eq!(*ns.version(), PolicyVersion(1));
+    #[tokio::test]
+    async fn single_node_leader_hint_points_to_self() {
+        let namespace = fresh_namespace();
+        let consensus =
+            ControlPlaneConsensus::single_node_for_test(node_id("solo"), Arc::clone(&namespace));
+        let (leader, _addr) = consensus.leader_hint().unwrap();
+        assert_eq!(leader, node_id("solo"));
+        let status = consensus.status().unwrap();
+        assert_eq!(status.role, "leader");
+        assert_eq!(status.voters, vec!["solo".to_string()]);
     }
 }

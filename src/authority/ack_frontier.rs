@@ -236,6 +236,35 @@ impl AckFrontierSet {
             .any(|fv| fv.key_range == *range && fv.policy_version == *version)
     }
 
+    /// Lift the fence on a (key_range, policy_version) pair because that
+    /// version became the CURRENT policy version again.
+    ///
+    /// This happens when the replicated control-plane version counter
+    /// restarts below versions a node already used locally (a `Bootstrap`
+    /// whose `version_floor` trails a diverged pre-Raft namespace): a later
+    /// policy commit re-assigns a previously fenced version, and without
+    /// unfencing every frontier report for the now-current version would be
+    /// silently rejected — stalling certification for the range.
+    ///
+    /// Frontier entries recorded under the fenced scope are DROPPED, not
+    /// resurrected: they predate the fence (old-era judgments) and must not
+    /// seed certification for the new era. Tracking restarts from scratch.
+    ///
+    /// Returns `true` when a fence was actually lifted.
+    pub fn unfence_version(&mut self, range: &KeyRange, version: PolicyVersion) -> bool {
+        let fv = FencedVersion {
+            key_range: range.clone(),
+            policy_version: version,
+        };
+        if !self.fenced_versions.remove(&fv) {
+            return false;
+        }
+        self.fenced_at.remove(&fv);
+        self.frontiers
+            .retain(|scope, _| !(scope.key_range == *range && scope.policy_version == version));
+        true
+    }
+
     /// Get the frontier for a specific authority by `NodeId`.
     ///
     /// Searches all scopes and returns the first match. **Only correct when
@@ -1422,6 +1451,40 @@ mod tests {
         // v1 for order/ should still be accepted.
         let accepted = set.update(make_frontier_v("auth-1", 300, 0, "order/", 1));
         assert!(accepted, "different key range should not be fenced");
+    }
+
+    #[test]
+    fn unfence_version_lifts_fence_and_drops_stale_entries() {
+        let mut set = AckFrontierSet::new();
+
+        // Old-era judgment at v5, then the version is fenced (policy moved
+        // to a lower version after a Bootstrap floor regression).
+        set.update(make_frontier_v("auth-1", 9_000, 0, "user/", 5));
+        set.fence_version(&kr("user/"), PolicyVersion(5));
+        assert!(!set.update(make_frontier_v("auth-1", 9_500, 0, "user/", 5)));
+
+        // The replicated counter later re-assigns v5 as the CURRENT version:
+        // the fence must lift, and the old-era entry must NOT seed the new
+        // era's certification (it would inflate the majority frontier).
+        assert!(set.unfence_version(&kr("user/"), PolicyVersion(5)));
+        assert!(!set.is_version_fenced(&kr("user/"), &PolicyVersion(5)));
+        let scope = FrontierScope::new(kr("user/"), pv(5), NodeId("auth-1".into()));
+        assert!(
+            set.get_scoped(&scope).is_none(),
+            "stale pre-fence entries must be dropped on unfence"
+        );
+
+        // Fresh reports for the now-current version are accepted again.
+        assert!(set.update(make_frontier_v("auth-1", 100, 0, "user/", 5)));
+        assert_eq!(set.get_scoped(&scope).unwrap().frontier_hlc.physical, 100);
+
+        // Unfencing something that was never fenced is a no-op.
+        assert!(!set.unfence_version(&kr("user/"), PolicyVersion(7)));
+
+        // Other scopes are untouched by the unfence.
+        set.fence_version(&kr("order/"), PolicyVersion(5));
+        set.unfence_version(&kr("user/"), PolicyVersion(5));
+        assert!(set.is_version_fenced(&kr("order/"), &PolicyVersion(5)));
     }
 
     #[test]

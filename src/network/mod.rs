@@ -1,6 +1,7 @@
 pub mod frontier_sync;
 pub mod membership;
 mod peer;
+pub mod raft_transport;
 pub mod sync;
 
 pub use frontier_sync::FrontierSyncClient;

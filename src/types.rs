@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a node in the cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Ordered so that node IDs can be kept in `BTreeSet`/`BTreeMap` collections
+/// where deterministic iteration order matters (e.g. Raft voter sets).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
 /// A tag used for placement policies.

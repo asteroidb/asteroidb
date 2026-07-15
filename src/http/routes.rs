@@ -6,10 +6,11 @@ use axum::routing::{delete, get, post, put};
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
     get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
-    get_policy, get_slo, get_topology, get_version_history, healthz, internal_announce,
-    internal_delta_sync, internal_digest_sync, internal_join, internal_keys, internal_leave,
-    internal_ping, internal_sync, list_authorities, list_policies, post_internal_frontiers,
-    remove_policy, set_authority_definition, set_placement_policy, verify_proof,
+    get_policy, get_raft_status, get_slo, get_topology, get_version_history, healthz,
+    internal_announce, internal_delta_sync, internal_digest_sync, internal_join, internal_keys,
+    internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
+    post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote, remove_policy,
+    set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -32,7 +33,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))
         .route("/api/internal/announce", post(internal_announce))
-        .route("/api/internal/ping", post(internal_ping));
+        .route("/api/internal/ping", post(internal_ping))
+        // Control-plane Raft RPCs. Protected by the same Bearer internal
+        // token middleware as the other internal routes; when no token is
+        // configured they are open (existing backwards-compat posture —
+        // see the ops guide security warning).
+        .route("/api/internal/raft/vote", post(raft_vote))
+        .route("/api/internal/raft/append", post(raft_append))
+        .route("/api/internal/raft/snapshot", post(raft_install_snapshot));
 
     // Control-plane mutation routes sub-router (PUT / DELETE).
     // These require internal token auth like the internal routes.
@@ -84,6 +92,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/control-plane/policies", get(list_policies))
         .route("/api/control-plane/policies/{prefix}", get(get_policy))
         .route("/api/control-plane/versions", get(get_version_history))
+        .route("/api/control-plane/raft/status", get(get_raft_status))
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
         .route("/api/slo", get(get_slo))
@@ -148,6 +157,14 @@ mod tests {
 
         let namespace = Arc::new(RwLock::new(ns));
 
+        // Single-voter Raft that is already leader: control-plane mutations
+        // commit and apply within the handler call (no driver task needed).
+        let consensus =
+            crate::control_plane::consensus::ControlPlaneConsensus::single_node_for_test(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            );
+
         Arc::new(AppState {
             eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
             certified: Arc::new(Mutex::new(CertifiedApi::new(
@@ -159,13 +176,7 @@ mod tests {
             peers: None,
             peer_persist_path: None,
             namespace_persist_path: None,
-            consensus: Arc::new(Mutex::new(
-                crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
-                    NodeId("auth-1".into()),
-                    NodeId("auth-2".into()),
-                    NodeId("auth-3".into()),
-                ]),
-            )),
+            consensus: Arc::new(Mutex::new(consensus)),
             internal_token: token,
             self_node_id: None,
             self_addr: None,
@@ -223,6 +234,12 @@ mod tests {
 
         let namespace = Arc::new(RwLock::new(ns));
 
+        let consensus =
+            crate::control_plane::consensus::ControlPlaneConsensus::single_node_for_test(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            );
+
         Arc::new(AppState {
             eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
             certified: Arc::new(Mutex::new(CertifiedApi::new(
@@ -234,13 +251,7 @@ mod tests {
             peers: None,
             peer_persist_path: None,
             namespace_persist_path: None,
-            consensus: Arc::new(Mutex::new(
-                crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
-                    NodeId("auth-1".into()),
-                    NodeId("auth-2".into()),
-                    NodeId("auth-3".into()),
-                ]),
-            )),
+            consensus: Arc::new(Mutex::new(consensus)),
             internal_token: None,
             self_node_id: None,
             self_addr: None,
@@ -927,7 +938,8 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Initial version history (namespace had 1 authority set + 1 placement policy -> version 3)
+        // Initial version history: authority set (2) + placement policy (3)
+        // + the raft leader's Bootstrap import (4).
         let req = Request::builder()
             .uri("/api/control-plane/versions")
             .body(Body::empty())
@@ -938,8 +950,8 @@ mod tests {
 
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 3);
-        assert_eq!(versions.history, vec![1, 2, 3]);
+        assert_eq!(versions.current_version, 4);
+        assert_eq!(versions.history, vec![1, 2, 3, 4]);
 
         // Set a policy -> version should increment
         let req = Request::builder()
@@ -961,8 +973,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 4);
-        assert_eq!(versions.history, vec![1, 2, 3, 4]);
+        assert_eq!(versions.current_version, 5);
+        assert_eq!(versions.history, vec![1, 2, 3, 4, 5]);
     }
 
     #[tokio::test]
@@ -992,61 +1004,91 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        // initial(1) + auth_def(2) + default_policy(3) + policy_set(4) + policy_set(5)
-        assert_eq!(versions.current_version, 5);
-        assert_eq!(versions.history.len(), 5);
+        // initial(1) + auth_def(2) + default_policy(3) + raft Bootstrap(4)
+        // + policy_set(5) + policy_set(6)
+        assert_eq!(versions.current_version, 6);
+        assert_eq!(versions.history.len(), 6);
     }
 
     // ---------------------------------------------------------------
-    // Control-plane: Consensus enforcement (FR-009)
+    // Control-plane: Consensus enforcement (FR-009, Raft semantics)
     // ---------------------------------------------------------------
 
+    /// Deprecated `approvals` are ignored: on the Raft leader a mutation
+    /// succeeds regardless of how many (or which) approvals are claimed —
+    /// agreement comes from log replication, not caller claims.
     #[tokio::test]
-    async fn control_plane_authority_without_majority_returns_403() {
+    async fn control_plane_approvals_field_is_ignored_on_leader() {
         let state = test_state();
         let app = router(state);
 
-        // Only 1 approval (need 2 of 3 for majority)
+        // Single self-claimed approval (previously rejected as sub-majority).
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/authorities")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"denied/","authority_nodes":["a1"],"approvals":["auth-1"]}"#,
+                r#"{"key_range_prefix":"ok/","authority_nodes":["a1"],"approvals":["auth-1"]}"#,
             ))
             .unwrap();
-
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = body_string(resp.into_body()).await;
-        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(err["error_code"], "POLICY_DENIED");
-
-        // Verify it was not applied
-        let req = Request::builder()
-            .uri("/api/control-plane/authorities/denied%2F")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn control_plane_policy_without_majority_returns_403() {
-        let state = test_state();
-        let app = router(state);
-
-        // Empty approvals (need 2 of 3 for majority)
+        // Empty approvals list.
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"denied/","replica_count":3,"approvals":[]}"#,
+                r#"{"key_range_prefix":"empty/","replica_count":3,"approvals":[]}"#,
             ))
             .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
+        // Approvals field omitted entirely (new-style client).
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"missingfield/","replica_count":3}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Approvals from unknown nodes are equally irrelevant.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"bad/","replica_count":3,"approvals":["unknown-1","unknown-2"]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Without a configured consensus (detached mode, the old `new(vec![])`
+    /// scaffolding), every control-plane mutation is denied with 403.
+    #[tokio::test]
+    async fn control_plane_detached_consensus_returns_403() {
+        let state = test_state();
+        // Swap in a detached consensus.
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::new(vec![]);
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"denied/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
@@ -1063,12 +1105,77 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A follower answers control-plane mutations with 503 NOT_LEADER and
+    /// leader hint headers so callers can retry against the leader.
     #[tokio::test]
-    async fn control_plane_authority_with_majority_succeeds() {
+    async fn control_plane_follower_returns_503_with_leader_hint() {
+        use crate::control_plane::raft::node::{RaftConfig, RaftNode};
+        use crate::control_plane::raft::storage::MemRaftStorage;
+        use crate::control_plane::raft::transport::NoopTransport;
+        use crate::control_plane::raft::types::AppendEntriesRequest;
+
+        let state = test_state();
+        // A two-voter node starts (and stays, without a driver) as follower.
+        let follower = RaftNode::new(
+            NodeId("test-node".into()),
+            [NodeId("test-node".into()), NodeId("cp-leader".into())]
+                .into_iter()
+                .collect(),
+            RaftConfig::default(),
+            std::sync::Arc::new(MemRaftStorage::new()),
+            std::sync::Arc::new(NoopTransport),
+            Arc::clone(&state.namespace),
+            None,
+        )
+        .unwrap();
+        // Learn the leader via a heartbeat.
+        follower
+            .handle_append_entries(AppendEntriesRequest {
+                term: 1,
+                leader_id: NodeId("cp-leader".into()),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            })
+            .unwrap();
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::with_raft(follower);
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":[]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get("x-asteroidb-leader-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("cp-leader"),
+            "leader hint header expected"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error_code"], "NOT_LEADER");
+    }
+
+    #[tokio::test]
+    async fn control_plane_authority_update_succeeds() {
         let state = test_state();
         let app = router(state);
 
-        // 2 of 3 approvals = majority
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/authorities")
@@ -1096,11 +1203,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_plane_policy_with_majority_succeeds() {
+    async fn control_plane_policy_update_succeeds_with_commit_ordered_version() {
         let state = test_state();
-        let app = router(state);
+        let app = router(Arc::clone(&state));
 
-        // All 3 approvals
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
@@ -1112,38 +1218,66 @@ mod tests {
 
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let first: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
 
         // Verify it was applied
         let req = Request::builder()
             .uri("/api/control-plane/policies/ok%2F")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = body_string(resp.into_body()).await;
         let policy: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(policy.key_range_prefix, "ok/");
         assert_eq!(policy.replica_count, 5);
-    }
+        assert_eq!(policy.version, first.version);
 
-    #[tokio::test]
-    async fn control_plane_non_authority_approvals_rejected() {
-        let state = test_state();
-        let app = router(state);
-
-        // 2 approvals but from non-authority nodes
+        // A second update gets a strictly larger commit-ordered version.
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"bad/","replica_count":3,"approvals":["unknown-1","unknown-2"]}"#,
+                r#"{"key_range_prefix":"ok/","replica_count":4,"approvals":[]}"#,
             ))
             .unwrap();
-
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let second: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            second.version > first.version,
+            "versions must increase with commit order: {} -> {}",
+            first.version,
+            second.version
+        );
+    }
+
+    /// The raft status endpoint reports leadership of the single-voter node.
+    #[tokio::test]
+    async fn control_plane_raft_status_endpoint() {
+        use crate::http::types::RaftStatusResponse;
+
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/control-plane/raft/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let status: RaftStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.role, "leader");
+        assert_eq!(status.node_id, "test-node");
+        assert_eq!(status.leader_id.as_deref(), Some("test-node"));
+        assert_eq!(status.voters, vec!["test-node".to_string()]);
+        assert!(status.commit_index >= 1, "noop + bootstrap committed");
+        assert_eq!(status.commit_index, status.last_applied);
     }
 
     // ---------------------------------------------------------------
@@ -1332,9 +1466,16 @@ mod tests {
     async fn certified_read_certified_has_proof() {
         use crate::authority::ack_frontier::AckFrontier;
         use crate::hlc::HlcTimestamp;
-        use crate::types::PolicyVersion;
 
         let state = test_state();
+
+        // The catch-all policy's version was re-assigned by the raft
+        // Bootstrap import; frontiers must report against the CURRENT
+        // version to count toward certification.
+        let current_pv = {
+            let ns = state.namespace.read().unwrap();
+            ns.get_placement_policy("").unwrap().version
+        };
 
         // Write a certified value and advance frontiers to certify it.
         {
@@ -1362,7 +1503,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: String::new(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: current_pv,
                 digest_hash: "h1".into(),
             });
             api.update_frontier(AckFrontier {
@@ -1375,7 +1516,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: String::new(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: current_pv,
                 digest_hash: "h2".into(),
             });
             api.process_certifications();
@@ -2166,15 +2307,17 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Control-plane: DELETE quorum enforcement
+    // Control-plane: DELETE consensus enforcement (Raft semantics)
     // ---------------------------------------------------------------
 
+    /// Removal on a detached consensus is denied and leaves the policy
+    /// intact; on the leader it succeeds regardless of claimed approvals.
     #[tokio::test]
-    async fn control_plane_remove_policy_without_majority_returns_403() {
+    async fn control_plane_remove_policy_consensus_enforcement() {
         let state = test_state();
-        let app = router(state);
+        let app = router(Arc::clone(&state));
 
-        // First set a policy
+        // First set a policy (on the single-voter leader).
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
@@ -2185,24 +2328,130 @@ mod tests {
             .unwrap();
         app.clone().oneshot(req).await.unwrap();
 
-        // Try to remove with insufficient approvals (only 1 of 3)
+        // With a DETACHED consensus, removal is denied (403) and the
+        // policy survives.
+        let raft_consensus = state.consensus.lock().await.clone();
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::new(vec![]);
         let req = Request::builder()
             .method("DELETE")
             .uri("/api/control-plane/policies/data%2F")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"approvals":["auth-1"]}"#))
             .unwrap();
-
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // Policy should still exist
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/data%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Back on the leader, a single claimed approval (previously
+        // sub-majority) removes the policy through the raft log.
+        *state.consensus.lock().await = raft_consensus;
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/data%2F")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1"]}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
         let req = Request::builder()
             .uri("/api/control-plane/policies/data%2F")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------
+    // Internal Raft endpoints: auth + codec
+    // ---------------------------------------------------------------
+
+    fn sample_vote_request_json() -> String {
+        r#"{"term":1,"candidate_id":"cp-2","last_log_index":0,"last_log_term":0}"#.to_string()
+    }
+
+    #[tokio::test]
+    async fn raft_internal_endpoints_require_token_when_configured() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        for path in [
+            "/api/internal/raft/vote",
+            "/api/internal/raft/append",
+            "/api/internal/raft/snapshot",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(sample_vote_request_json()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be protected by the internal token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_vote_endpoint_accepts_json_and_bincode() {
+        use crate::control_plane::raft::types::{RequestVoteRequest, RequestVoteResponse};
+        use crate::http::codec::{CONTENT_TYPE_BINCODE, serialize_internal};
+
+        let state = test_state();
+        let app = router(state);
+
+        // JSON request. The single-voter leader ignores foreign candidates
+        // (it is its own leader), but the endpoint must answer a valid
+        // RequestVoteResponse either way.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/raft/vote")
+            .header("content-type", "application/json")
+            .body(Body::from(sample_vote_request_json()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let vote: RequestVoteResponse = serde_json::from_str(&body).unwrap();
+        assert!(!vote.vote_granted, "leader's log/term wins");
+
+        // Bincode request + bincode response.
+        let raw = RequestVoteRequest {
+            term: 1,
+            candidate_id: NodeId("cp-2".into()),
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let (bytes, ct) = serialize_internal(&raw, Some(CONTENT_TYPE_BINCODE)).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/raft/vote")
+            .header("content-type", ct)
+            .header("accept", CONTENT_TYPE_BINCODE)
+            .body(Body::from(bytes))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some(CONTENT_TYPE_BINCODE)
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let vote: RequestVoteResponse =
+            crate::http::codec::deserialize_internal(&bytes, Some(CONTENT_TYPE_BINCODE)).unwrap();
+        assert!(!vote.vote_granted);
     }
 
     // ---------------------------------------------------------------
@@ -2264,6 +2513,14 @@ mod tests {
     }
 
     fn signed_push_body(signers: &[&NodeSigner], physical: u64) -> FrontierPushRequest {
+        signed_push_body_with_pv(signers, physical, PolicyVersion(1))
+    }
+
+    fn signed_push_body_with_pv(
+        signers: &[&NodeSigner],
+        physical: u64,
+        pv: PolicyVersion,
+    ) -> FrontierPushRequest {
         let mut frontiers = Vec::new();
         let mut signatures = Vec::new();
         for signer in signers {
@@ -2277,7 +2534,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: String::new(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: pv,
                 digest_hash: format!("{}-{physical}", signer.node_id().0),
             };
             let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
@@ -2492,7 +2749,13 @@ mod tests {
             api.pending_writes()[0].timestamp.physical
         };
         let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
-        let body = signed_push_body(&[&s1, &s2], report_ts);
+        // Frontiers must report against the CURRENT policy version (the
+        // catch-all policy was re-versioned by the raft Bootstrap import).
+        let current_pv = {
+            let ns = state.namespace.read().unwrap();
+            ns.get_placement_policy("").unwrap().version
+        };
+        let body = signed_push_body_with_pv(&[&s1, &s2], report_ts, current_pv);
         let result = push_frontiers(&app, &body).await;
         assert_eq!(result.accepted, 2);
 

@@ -84,6 +84,22 @@ pub enum CrdtError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The control-plane consensus rejected the operation because this node
+    /// is not the current Raft leader.
+    ///
+    /// Callers should retry the request against the hinted leader (when a
+    /// hint is present). Maps to HTTP 503 SERVICE_UNAVAILABLE with the
+    /// `NOT_LEADER` error code plus `x-asteroidb-leader-id` /
+    /// `x-asteroidb-leader-addr` hint headers and `Retry-After: 1`.
+    #[error(
+        "not the control-plane leader (leader hint: {})",
+        .leader_id.as_deref().unwrap_or("unknown")
+    )]
+    NotLeader {
+        leader_id: Option<String>,
+        leader_addr: Option<String>,
+    },
+
     #[error("internal error: {0}")]
     Internal(String),
 }

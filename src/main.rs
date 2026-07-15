@@ -184,6 +184,32 @@ fn authority_nodes() -> Vec<NodeId> {
     }
 }
 
+/// Parse the control-plane Raft voter set from `ASTEROIDB_CONTROL_PLANE_NODES`
+/// (comma-separated node IDs, static membership). Defaults to `[self]` so a
+/// standalone node elects itself immediately and stays writable.
+///
+/// NOTE: deliberately NOT derived from the gossip `PeerRegistry` — its
+/// membership shrinks on ping failures, which would silently change the
+/// majority definition and break election safety.
+fn control_plane_nodes(self_id: &NodeId) -> std::collections::BTreeSet<NodeId> {
+    match std::env::var("ASTEROIDB_CONTROL_PLANE_NODES") {
+        Ok(val) if !val.trim().is_empty() => val
+            .split(',')
+            .map(|s| NodeId(s.trim().to_string()))
+            .collect(),
+        _ => [self_id.clone()].into_iter().collect(),
+    }
+}
+
+/// Parse a millisecond duration env var with a default.
+fn env_duration_ms(name: &str, default_ms: u64) -> std::time::Duration {
+    let ms = std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_ms);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Wait for a shutdown signal.
 ///
 /// On Unix, this resolves on either SIGINT (Ctrl-C) or SIGTERM (the default
@@ -267,27 +293,34 @@ async fn main() {
     );
 
     let ns_persist_path = data_dir.join("system_namespace.json");
-    let mut ns = match SystemNamespace::load(&ns_persist_path) {
+    let (mut ns, ns_is_fresh) = match SystemNamespace::load(&ns_persist_path) {
         Ok(Some(loaded)) => {
             println!("Loaded system namespace from {}", ns_persist_path.display(),);
-            loaded
+            (loaded, false)
         }
-        Ok(None) => SystemNamespace::new(),
+        Ok(None) => (SystemNamespace::new(), true),
         Err(e) => {
             eprintln!(
                 "warning: failed to load system namespace from {}: {e}; starting fresh",
                 ns_persist_path.display(),
             );
-            SystemNamespace::new()
+            (SystemNamespace::new(), true)
         }
     };
-    ns.set_authority_definition(AuthorityDefinition {
-        key_range: KeyRange {
-            prefix: String::new(),
-        },
-        authority_nodes: auth_nodes.clone(),
-        auto_generated: false,
-    });
+    // Seed the catch-all authority definition only on FIRST boot. Doing it
+    // unconditionally would bump the namespace version on every restart,
+    // silently diverging this node's replicated control-plane state machine
+    // from its peers'. On a fresh cluster the seed is folded into the first
+    // Raft leader's `Bootstrap` entry and replicated from there.
+    if ns_is_fresh {
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            authority_nodes: auth_nodes.clone(),
+            auto_generated: false,
+        });
+    }
 
     let namespace = Arc::new(RwLock::new(ns));
 
@@ -383,9 +416,6 @@ async fn main() {
         Arc::new(Mutex::new(registry))
     };
 
-    // Build control-plane consensus with the same authority nodes (FR-009).
-    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::new(auth_nodes)));
-
     // Optional shared token for authenticating internal API requests.
     // Treat an empty string the same as unset — Docker Compose substitutes
     // `${ASTEROIDB_INTERNAL_TOKEN}` as "" when the host variable is not
@@ -394,6 +424,103 @@ async fn main() {
     let internal_token = std::env::var("ASTEROIDB_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
+
+    // -----------------------------------------------------------------
+    // Control-plane Raft consensus (FR-009).
+    //
+    // Replaces the MVP approval-count check with real log replication:
+    // policy/authority mutations are committed by a majority of the STATIC
+    // voter set (ASTEROIDB_CONTROL_PLANE_NODES) and applied in commit order
+    // on every voter. Membership changes require a full-cluster restart
+    // with the updated env (see docs/ops-guide.md).
+    // -----------------------------------------------------------------
+    let cp_voters = control_plane_nodes(&node_id);
+    let raft_config = asteroidb_poc::control_plane::raft::RaftConfig {
+        election_timeout_min: env_duration_ms("ASTEROIDB_RAFT_ELECTION_TIMEOUT_MIN_MS", 5_000),
+        election_timeout_max: env_duration_ms("ASTEROIDB_RAFT_ELECTION_TIMEOUT_MAX_MS", 10_000),
+        heartbeat_interval: env_duration_ms("ASTEROIDB_RAFT_HEARTBEAT_MS", 1_000),
+        propose_timeout: env_duration_ms("ASTEROIDB_RAFT_PROPOSE_TIMEOUT_MS", 30_000),
+        log_max: std::env::var("ASTEROIDB_RAFT_LOG_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096),
+    };
+    if raft_config.election_timeout_max < raft_config.election_timeout_min {
+        eprintln!(
+            "error: ASTEROIDB_RAFT_ELECTION_TIMEOUT_MAX_MS must be >= \
+             ASTEROIDB_RAFT_ELECTION_TIMEOUT_MIN_MS"
+        );
+        std::process::exit(1);
+    }
+    let raft_static_peers = std::env::var("ASTEROIDB_RAFT_PEERS")
+        .map(|v| asteroidb_poc::network::raft_transport::HttpRaftTransport::parse_static_peers(&v))
+        .unwrap_or_default();
+    let raft_transport = Arc::new(
+        asteroidb_poc::network::raft_transport::HttpRaftTransport::new(
+            raft_static_peers.clone(),
+            Some(Arc::clone(&shared_peers)),
+            internal_token.clone(),
+        ),
+    );
+    // Raft persistence lives under data_dir/raft/ and is ALWAYS enabled
+    // (even with ASTEROIDB_PERSISTENCE=off): currentTerm/votedFor/log
+    // durability is an election-safety requirement, not an optimization.
+    let raft_storage = Arc::new(
+        asteroidb_poc::control_plane::raft::storage::FileRaftStorage::new(data_dir.join("raft")),
+    );
+    let raft_node = match asteroidb_poc::control_plane::raft::RaftNode::new(
+        node_id.clone(),
+        cp_voters.clone(),
+        raft_config,
+        raft_storage,
+        raft_transport,
+        Arc::clone(&namespace),
+        Some(ns_persist_path.clone()),
+    ) {
+        Ok(node) => node,
+        Err(e) => {
+            // Fail-stop: booting with damaged Raft state could double-vote
+            // in an already-voted term (split-brain risk).
+            eprintln!(
+                "error: failed to load control-plane raft state: {e}\n\
+                 See docs/ops-guide.md (Control-plane Raft recovery runbook) before retrying."
+            );
+            std::process::exit(1);
+        }
+    };
+    if !cp_voters.contains(&node_id) {
+        eprintln!(
+            "warning: this node ({}) is NOT in ASTEROIDB_CONTROL_PLANE_NODES {:?}; \
+             it runs as an inert control-plane observer and will reject policy/authority \
+             mutations",
+            node_id.0,
+            cp_voters.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
+        );
+    }
+    if cp_voters.len() > 1 && raft_static_peers.is_empty() {
+        eprintln!(
+            "warning: multi-node control plane configured without ASTEROIDB_RAFT_PEERS; \
+             raft peer addresses will only resolve after gossip discovery (join), so \
+             leader election may be delayed on a cold start"
+        );
+    }
+    if cp_voters.len() == 1 && !raft_static_peers.is_empty() {
+        // The voter set silently defaulted to [self] while raft peers are
+        // configured — almost certainly a forgotten ASTEROIDB_CONTROL_PLANE_NODES
+        // on this node of a multi-node deployment. Such a node self-elects
+        // with majority=1 and diverges from the real cluster (its RPCs are
+        // rejected by correctly configured peers, see raft::core).
+        eprintln!(
+            "warning: ASTEROIDB_RAFT_PEERS is set but the control-plane voter set is \
+             just this node ({}); if this is a multi-node deployment, set \
+             ASTEROIDB_CONTROL_PLANE_NODES identically on EVERY node — a lone default \
+             self-elects with majority=1 and diverges from the real cluster",
+            node_id.0,
+        );
+    }
+    let consensus = Arc::new(Mutex::new(ControlPlaneConsensus::with_raft(Arc::clone(
+        &raft_node,
+    ))));
 
     // SLO tracker shared between HTTP handlers and NodeRunner.
     let slo_tracker = Arc::new(asteroidb_poc::ops::slo::SloTracker::new());
@@ -701,6 +828,15 @@ async fn main() {
     runner.set_topology_view(Arc::clone(&shared_topology_view));
 
     let shutdown_handle = runner.shutdown_handle();
+
+    // Control-plane Raft driver: randomized election timer + heartbeats,
+    // as an independent task (NodeRunner's select! stays clean), linked to
+    // the runner's shutdown channel. No special shutdown persistence is
+    // needed: every Raft state change is fsynced on the write path.
+    asteroidb_poc::control_plane::raft::spawn_raft_driver(
+        Arc::clone(&raft_node),
+        shutdown_handle.subscribe(),
+    );
 
     // Background persistence: WAL group-commit flushers + periodic
     // checkpoints (snapshot, then prune sealed WAL segments).

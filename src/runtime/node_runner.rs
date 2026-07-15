@@ -899,12 +899,29 @@ impl NodeRunner {
         // Apply fencing and refresh reporter.
         {
             let mut api = self.certified_api.lock().await;
-            for (prefix, old_version, _new_version) in &changes {
+            for (prefix, old_version, new_version) in &changes {
+                let key_range = KeyRange {
+                    prefix: prefix.clone(),
+                };
                 if old_version.0 > 0 {
-                    let key_range = KeyRange {
-                        prefix: prefix.clone(),
-                    };
                     api.fence_version(&key_range, *old_version);
+                }
+                // The NEW current version may have been fenced earlier: the
+                // replicated control-plane version counter can restart below
+                // versions this node already used (Bootstrap version_floor
+                // trailing a diverged pre-Raft namespace) and later re-assign
+                // a fenced version. Frontier reports for the current version
+                // would then be silently rejected, stalling certification —
+                // lift the fence (and drop its stale old-era entries).
+                if api.unfence_version(&key_range, *new_version) {
+                    tracing::warn!(
+                        prefix = prefix.as_str(),
+                        version = new_version.0,
+                        "policy version was re-assigned to a previously fenced \
+                         version; fence lifted so frontier tracking can resume \
+                         (replicated version counter restarted below local \
+                         versions — see ops-guide §14.2)"
+                    );
                 }
             }
 
@@ -4488,6 +4505,109 @@ mod tests {
             3,
             "authority should be recalculated after version bump"
         );
+    }
+
+    /// Fenced-version reuse: when the replicated version counter restarts
+    /// below versions this node already used (Bootstrap version_floor
+    /// trailing a diverged pre-Raft namespace) and later re-assigns a fenced
+    /// version as the CURRENT one, the fence must be lifted — otherwise all
+    /// frontier reports for the current version are silently rejected and
+    /// certification for the prefix stalls.
+    #[tokio::test]
+    async fn detect_version_changes_unfences_reassigned_current_version() {
+        use crate::authority::ack_frontier::AckFrontier;
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        // Pre-Raft divergence: the local namespace holds "user/" at v5.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(5), kr("user/"), 3))
+            .unwrap();
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![
+            make_node("n1", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n2", NodeMode::Store, &["dc:tokyo"]),
+            make_node("n3", NodeMode::Store, &["dc:tokyo"]),
+        ]));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes,
+        )
+        .await;
+        runner.detect_version_changes().await; // baseline: tracks v5
+
+        // Raft Bootstrap with a trailing floor re-imports "user/" at v3:
+        // the runner sees 5 -> 3 and fences ("user/", 5).
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(3), kr("user/"), 3))
+                .unwrap();
+        }
+        runner.detect_version_changes().await;
+        {
+            let api_lock = api.lock().await;
+            assert!(
+                api_lock.is_version_fenced(&kr("user/"), &PolicyVersion(5)),
+                "downgrade must fence the old (higher) version"
+            );
+        }
+
+        // The replicated counter later re-assigns v5 as the CURRENT version.
+        {
+            let api_lock = api.lock().await;
+            let mut ns = api_lock
+                .namespace()
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(5), kr("user/"), 3))
+                .unwrap();
+        }
+        runner.detect_version_changes().await;
+
+        let mut api_lock = api.lock().await;
+        assert!(
+            !api_lock.is_version_fenced(&kr("user/"), &PolicyVersion(5)),
+            "re-assigned current version must be unfenced"
+        );
+        assert!(
+            api_lock.is_version_fenced(&kr("user/"), &PolicyVersion(3)),
+            "the replaced version stays fenced"
+        );
+        // Frontier reports for the now-current version are accepted again
+        // (they would previously be silently rejected — certification stall).
+        let accepted = api_lock.update_frontier(AckFrontier {
+            authority_id: node_id("auth-1"),
+            frontier_hlc: crate::hlc::HlcTimestamp {
+                physical: 1_000,
+                logical: 0,
+                node_id: "auth-1".into(),
+            },
+            key_range: kr("user/"),
+            policy_version: PolicyVersion(5),
+            digest_hash: "d".into(),
+        });
+        assert!(accepted, "frontier updates for the current version resume");
     }
 
     // ---------------------------------------------------------------

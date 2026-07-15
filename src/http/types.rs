@@ -328,18 +328,23 @@ pub struct EquivocationReport {
 
 /// Request body for `PUT /api/control-plane/authorities`.
 ///
-/// Requires majority approval from authority nodes (FR-009).
+/// The update is committed through the control-plane Raft log (FR-009);
+/// the receiving node must be the current Raft leader.
 #[derive(Debug, Deserialize)]
 pub struct SetAuthorityDefinitionRequest {
     pub key_range_prefix: String,
     pub authority_nodes: Vec<String>,
-    /// Node IDs that have approved this update.
+    /// Deprecated: self-reported approvals from the pre-Raft consensus.
+    /// Accepted for wire compatibility with old clients but ignored —
+    /// agreement now comes from Raft log replication, not caller claims.
+    #[serde(default)]
     pub approvals: Vec<String>,
 }
 
 /// Request body for `PUT /api/control-plane/policies`.
 ///
-/// Requires majority approval from authority nodes (FR-009).
+/// The update is committed through the control-plane Raft log (FR-009);
+/// the receiving node must be the current Raft leader.
 #[derive(Debug, Deserialize)]
 pub struct SetPlacementPolicyRequest {
     pub key_range_prefix: String,
@@ -352,16 +357,21 @@ pub struct SetPlacementPolicyRequest {
     pub allow_local_write_on_partition: bool,
     #[serde(default)]
     pub certified: bool,
-    /// Node IDs that have approved this update.
+    /// Deprecated: self-reported approvals from the pre-Raft consensus.
+    /// Accepted for wire compatibility with old clients but ignored.
+    #[serde(default)]
     pub approvals: Vec<String>,
 }
 
 /// Request body for `DELETE /api/control-plane/policies/{prefix}`.
 ///
-/// Requires majority approval from authority nodes (FR-009).
+/// The removal is committed through the control-plane Raft log (FR-009);
+/// the receiving node must be the current Raft leader.
 #[derive(Debug, Deserialize)]
 pub struct RemovePolicyRequest {
-    /// Node IDs that have approved this removal.
+    /// Deprecated: self-reported approvals from the pre-Raft consensus.
+    /// Accepted for wire compatibility with old clients but ignored.
+    #[serde(default)]
     pub approvals: Vec<String>,
 }
 
@@ -393,6 +403,34 @@ pub struct PlacementPolicyResponse {
 pub struct VersionHistoryResponse {
     pub current_version: u64,
     pub history: Vec<u64>,
+}
+
+/// Response for `GET /api/control-plane/raft/status`.
+///
+/// Public read-only observability endpoint for the control-plane Raft
+/// consensus (same posture as `/api/metrics`). JSON-only external type, so
+/// `Option` fields are plain serde (no bincode concerns).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RaftStatusResponse {
+    /// This node's ID.
+    pub node_id: String,
+    /// Current role: `"leader"`, `"follower"`, `"candidate"`, or `"detached"`
+    /// (no Raft consensus configured).
+    pub role: String,
+    /// Current Raft term.
+    pub term: u64,
+    /// Known leader hint, if any.
+    pub leader_id: Option<String>,
+    /// Resolved address of the leader hint, if known.
+    pub leader_addr: Option<String>,
+    /// Highest committed log index.
+    pub commit_index: u64,
+    /// Highest log index applied to the state machine.
+    pub last_applied: u64,
+    /// Last index in the local log.
+    pub last_log_index: u64,
+    /// Static voter set (`ASTEROIDB_CONTROL_PLANE_NODES`).
+    pub voters: Vec<String>,
 }
 
 // ---------------------------------------------------------------
@@ -588,8 +626,27 @@ impl IntoResponse for ApiError {
                 "STORAGE_UNAVAILABLE",
                 msg.clone(),
             ),
+            // Not the control-plane Raft leader: retryable service condition.
+            // The response carries leader hint headers so the caller can
+            // re-send the request to the leader directly.
+            CrdtError::NotLeader {
+                leader_id,
+                leader_addr,
+            } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NOT_LEADER",
+                format!(
+                    "this node is not the control-plane leader; retry against the leader \
+                     (leader_id: {}, leader_addr: {})",
+                    leader_id.as_deref().unwrap_or("unknown"),
+                    leader_addr.as_deref().unwrap_or("unknown"),
+                ),
+            ),
         };
-        let retry_after = matches!(&self.0, CrdtError::SessionNotSatisfied { .. });
+        let retry_after = matches!(
+            &self.0,
+            CrdtError::SessionNotSatisfied { .. } | CrdtError::NotLeader { .. }
+        );
 
         let body = ErrorResponse {
             error_code: code.to_string(),
@@ -602,6 +659,22 @@ impl IntoResponse for ApiError {
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
             );
+        }
+        if let CrdtError::NotLeader {
+            leader_id,
+            leader_addr,
+        } = &self.0
+        {
+            if let Some(id) = leader_id
+                && let Ok(v) = axum::http::HeaderValue::from_str(id)
+            {
+                resp.headers_mut().insert("x-asteroidb-leader-id", v);
+            }
+            if let Some(addr) = leader_addr
+                && let Ok(v) = axum::http::HeaderValue::from_str(addr)
+            {
+                resp.headers_mut().insert("x-asteroidb-leader-addr", v);
+            }
         }
         resp
     }

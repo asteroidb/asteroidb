@@ -918,6 +918,16 @@ impl CertifiedApi {
         self.frontiers.is_version_fenced(range, version)
     }
 
+    /// Lift a fence because `version` became the CURRENT policy version for
+    /// `range` again (replicated version counter re-assigned a version this
+    /// node had already used and fenced — see
+    /// [`AckFrontierSet::unfence_version`]). Without this, all frontier
+    /// reports for the current version would be rejected and certification
+    /// for the range would stall. Returns `true` when a fence was lifted.
+    pub fn unfence_version(&mut self, range: &KeyRange, version: PolicyVersion) -> bool {
+        self.frontiers.unfence_version(range, version)
+    }
+
     /// Run garbage collection on stale frontier entries.
     ///
     /// Delegates to [`AckFrontierSet::gc_stale_entries`]. Returns the number

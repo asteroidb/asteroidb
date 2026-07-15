@@ -22,18 +22,18 @@ use crate::authority::equivocation::{
     EquivocationDetector, MAX_OBSERVED_PER_REQUEST, ObserveOutcome,
 };
 use crate::control_plane::consensus::ControlPlaneConsensus;
-use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
+use crate::control_plane::raft::types::{AuthoritySpec, PolicySpec};
+use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
 use crate::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloSnapshot, SloTracker};
 use crate::ops::write_atomic;
-use crate::placement::PlacementPolicy;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
 use crate::store::kv::CrdtValue;
 use crate::store::wal::{SyncPolicy, WalPos, WalSyncer};
-use crate::types::{KeyRange, NodeId, PolicyVersion};
+use crate::types::NodeId;
 
 use crate::network::PeerRegistry;
 use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
@@ -53,9 +53,9 @@ use super::types::{
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
     EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteRequest,
     FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, PeerInfo, PingRequest,
-    PingResponse, PlacementPolicyResponse, ProofBundleJson, RemovePolicyRequest,
-    SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest,
-    VerifyProofResponse, VersionHistoryResponse, WriteResponse,
+    PingResponse, PlacementPolicyResponse, ProofBundleJson, RaftStatusResponse,
+    RemovePolicyRequest, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse,
+    VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -802,41 +802,35 @@ pub async fn get_authority_definition(
 
 /// `PUT /api/control-plane/authorities`
 ///
-/// Sets an authority definition in the system namespace.
-/// Requires majority approval from authority nodes (FR-009).
+/// Sets an authority definition in the system namespace via the
+/// control-plane Raft log (FR-009). Only the current Raft leader accepts
+/// the request; followers answer 503 NOT_LEADER with leader hint headers.
+/// Serialization of concurrent updates is guaranteed by the leader's log
+/// order (which also assigns namespace effects deterministically), so no
+/// cross-request lock is needed here.
 pub async fn set_authority_definition(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetAuthorityDefinitionRequest>,
 ) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
-    let def = AuthorityDefinition {
-        key_range: KeyRange {
-            prefix: req.key_range_prefix.clone(),
-        },
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let spec = AuthoritySpec {
+        prefix: req.key_range_prefix.clone(),
         authority_nodes: req
             .authority_nodes
             .iter()
             .map(|n| NodeId(n.clone()))
             .collect(),
-        auto_generated: false,
     };
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    {
-        let consensus = state.consensus.lock().await;
-        consensus.propose_authority_update(def.clone(), &approvals)?;
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        ns.set_authority_definition(def);
-    }
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
+    // Clone the consensus handle out of the mutex and drop the lock BEFORE
+    // awaiting the proposal, so a slow commit never serializes unrelated
+    // requests behind it.
+    let consensus = state.consensus.lock().await.clone();
+    let def = consensus.propose_authority_update(spec).await?;
 
     Ok(Json(AuthorityDefinitionResponse {
-        key_range_prefix: req.key_range_prefix,
-        authority_nodes: req.authority_nodes,
+        key_range_prefix: def.key_range.prefix,
+        authority_nodes: def.authority_nodes.into_iter().map(|n| n.0).collect(),
     }))
 }
 
@@ -889,8 +883,12 @@ pub async fn get_policy(
 
 /// `PUT /api/control-plane/policies`
 ///
-/// Sets a placement policy in the system namespace.
-/// Requires majority approval from authority nodes (FR-009).
+/// Sets a placement policy in the system namespace via the control-plane
+/// Raft log (FR-009). Only the current Raft leader accepts the request.
+///
+/// The policy VERSION is assigned when the committed entry is APPLIED,
+/// from the replicated version counter — commit order determines versions
+/// identically on every node (never assigned at propose time).
 pub async fn set_placement_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetPlacementPolicyRequest>,
@@ -901,61 +899,22 @@ pub async fn set_placement_policy(
         )));
     }
 
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
-
-    // Build the policy template without a version; the actual version is
-    // assigned atomically inside the namespace write lock below to prevent
-    // concurrent requests from stamping different policies with the same
-    // version number.
-    let build_policy = |version: PolicyVersion| {
-        let mut policy = PlacementPolicy::new(
-            version,
-            KeyRange {
-                prefix: req.key_range_prefix.clone(),
-            },
-            req.replica_count,
-        );
-
-        if !req.required_tags.is_empty() {
-            policy = policy.with_required_tags(
-                req.required_tags
-                    .iter()
-                    .map(|t| crate::types::Tag(t.clone()))
-                    .collect(),
-            );
-        }
-        if !req.forbidden_tags.is_empty() {
-            policy = policy.with_forbidden_tags(
-                req.forbidden_tags
-                    .iter()
-                    .map(|t| crate::types::Tag(t.clone()))
-                    .collect(),
-            );
-        }
-        policy = policy.with_local_write_on_partition(req.allow_local_write_on_partition);
-        policy = policy.with_certified(req.certified);
-        policy
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let spec = PolicySpec {
+        prefix: req.key_range_prefix.clone(),
+        replica_count: req.replica_count,
+        required_tags: req.required_tags.iter().cloned().collect(),
+        forbidden_tags: req.forbidden_tags.iter().cloned().collect(),
+        allow_local_write_on_partition: req.allow_local_write_on_partition,
+        certified: req.certified,
+        max_read_latency_ms: None,
+        preferred_cost_tier: None,
     };
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    let policy = {
-        let provisional = build_policy(PolicyVersion(0));
-        let consensus = state.consensus.lock().await;
-        consensus.propose_policy_update(provisional, &approvals)?;
-
-        // Atomically read the current version, create the policy, and apply it
-        // inside a single write-lock scope to prevent version collisions.
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        let current_version = ns.version().0;
-        let policy = build_policy(PolicyVersion(current_version + 1));
-        ns.set_placement_policy(policy.clone()).map_err(ApiError)?;
-        policy
-    };
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
+    // Clone the consensus handle out of the mutex and drop the lock BEFORE
+    // awaiting the proposal (see set_authority_definition).
+    let consensus = state.consensus.lock().await.clone();
+    let policy = consensus.propose_policy_update(spec).await?;
 
     let resp = PlacementPolicyResponse {
         key_range_prefix: policy.key_range.prefix.clone(),
@@ -972,33 +931,26 @@ pub async fn set_placement_policy(
 
 /// `DELETE /api/control-plane/policies/{prefix}`
 ///
-/// Removes the placement policy for the given key range prefix.
-/// Requires majority approval from authority nodes (FR-009).
+/// Removes the placement policy for the given key range prefix via the
+/// control-plane Raft log (FR-009). Only the current Raft leader accepts
+/// the request. A committed removal of a non-existent prefix applies as a
+/// deterministic no-op and maps to 404 here.
 pub async fn remove_policy(
     State(state): State<Arc<AppState>>,
     Path(prefix): Path<String>,
     Json(req): Json<RemovePolicyRequest>,
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let _ = &req.approvals;
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    let removed = {
-        let consensus = state.consensus.lock().await;
-        consensus.propose_policy_removal(&prefix, &approvals)?;
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        ns.remove_placement_policy(&prefix)
-    };
+    let consensus = state.consensus.lock().await.clone();
+    let removed = consensus.propose_policy_removal(&prefix).await?;
 
     let removed = removed.ok_or_else(|| {
         ApiError(CrdtError::KeyNotFound(format!(
             "placement policy: {prefix}"
         )))
     })?;
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
 
     Ok(Json(PlacementPolicyResponse {
         key_range_prefix: removed.key_range.prefix.clone(),
@@ -1009,6 +961,116 @@ pub async fn remove_policy(
         allow_local_write_on_partition: removed.allow_local_write_on_partition,
         certified: removed.certified,
     }))
+}
+
+/// `GET /api/control-plane/raft/status`
+///
+/// Public read-only view of the control-plane Raft consensus (same posture
+/// as `/api/metrics`). Reports `role: "detached"` when no consensus is
+/// configured.
+pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftStatusResponse> {
+    let consensus = state.consensus.lock().await.clone();
+    let resp = match consensus.status() {
+        Some(status) => RaftStatusResponse {
+            node_id: status.node_id,
+            role: status.role,
+            term: status.term,
+            leader_id: status.leader_id,
+            leader_addr: status.leader_addr,
+            commit_index: status.commit_index,
+            last_applied: status.last_applied,
+            last_log_index: status.last_log_index,
+            voters: status.voters,
+        },
+        None => RaftStatusResponse {
+            node_id: state
+                .self_node_id
+                .as_ref()
+                .map(|n| n.0.clone())
+                .unwrap_or_default(),
+            role: "detached".to_string(),
+            term: 0,
+            leader_id: None,
+            leader_addr: None,
+            commit_index: 0,
+            last_applied: 0,
+            last_log_index: 0,
+            voters: Vec::new(),
+        },
+    };
+    Json(resp)
+}
+
+// ---------------------------------------------------------------
+// Internal Raft RPC handlers
+// ---------------------------------------------------------------
+
+/// Fetch the Raft node handle, or 503 when consensus is detached.
+async fn raft_node_or_unavailable(
+    state: &AppState,
+) -> Result<Arc<crate::control_plane::raft::RaftNode>, ApiError> {
+    let consensus = state.consensus.lock().await.clone();
+    consensus.raft_handle().ok_or_else(|| {
+        ApiError(CrdtError::Storage(
+            "control-plane raft consensus is not configured on this node".into(),
+        ))
+    })
+}
+
+/// `POST /api/internal/raft/vote`
+///
+/// RequestVote receiver. The response is only produced AFTER the vote (term
+/// / votedFor) has been fsynced (`RaftNode` invariant); a persistence
+/// failure surfaces as an error status and the candidate simply retries.
+pub async fn raft_vote(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::RequestVoteRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_request_vote(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
+/// `POST /api/internal/raft/append`
+///
+/// AppendEntries receiver. Appended entries are fsynced before the ack.
+pub async fn raft_append(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::AppendEntriesRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_append_entries(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
+/// `POST /api/internal/raft/snapshot`
+///
+/// InstallSnapshot receiver (single-message lite variant).
+pub async fn raft_install_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::InstallSnapshotRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_install_snapshot(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
 }
 
 /// `GET /api/control-plane/versions`
@@ -2101,33 +2163,6 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Persist the system namespace to disk (if a path is configured).
-///
-/// Serialises the namespace under a read-lock, then writes atomically via
-/// `write_atomic` on a blocking thread. Errors are logged but not propagated
-/// because namespace persistence is best-effort.
-async fn persist_namespace(state: &AppState) {
-    if let Some(path) = &state.namespace_persist_path {
-        let json = {
-            let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
-            match serde_json::to_string_pretty(&*ns) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("warning: failed to serialise system namespace: {e}");
-                    return;
-                }
-            }
-        };
-        let path = path.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        {
-            eprintln!("warning: failed to persist system namespace: {e}");
-        }
-    }
 }
 
 /// Maximum allowed absolute value for counter initialization via HTTP API.

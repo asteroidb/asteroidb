@@ -158,13 +158,14 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/metrics` | ランタイムメトリクス取得 |
 | `GET` | `/api/slo` | SLO ステータス取得 |
 | `GET` | `/api/topology` | クラスタトポロジービュー取得 |
-| `PUT` | `/api/control-plane/authorities` | Authority 定義の設定 (要過半数承認) |
+| `PUT` | `/api/control-plane/authorities` | Authority 定義の設定 (Raft リーダーのみ受理) |
 | `GET` | `/api/control-plane/authorities` | Authority 定義の一覧 |
 | `GET` | `/api/control-plane/authorities/{prefix}` | Authority 定義の取得 |
-| `PUT` | `/api/control-plane/policies` | 配置ポリシーの設定 (要過半数承認) |
+| `PUT` | `/api/control-plane/policies` | 配置ポリシーの設定 (Raft リーダーのみ受理) |
 | `GET` | `/api/control-plane/policies` | 配置ポリシーの一覧 |
 | `GET/DELETE` | `/api/control-plane/policies/{prefix}` | 配置ポリシーの取得/削除 |
 | `GET` | `/api/control-plane/versions` | ポリシーバージョン履歴 |
+| `GET` | `/api/control-plane/raft/status` | Control plane Raft コンセンサスの状態（役割・term・リーダーヒント） |
 
 > **パスルーティングに関する注意**: `{*key}` はキャッチオールルートのため、キーにスラッシュ (`/`) を含めてもそのまま使用できます。例: キー `sensor/temp` は `/api/eventual/sensor/temp` でアクセスできます（URL エンコード不要）。`{prefix}` パスは単一セグメントマッチです。
 
@@ -182,6 +183,9 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `POST` | `/api/internal/leave` | ノード離脱 |
 | `POST` | `/api/internal/announce` | ノードアナウンス |
 | `POST` | `/api/internal/ping` | ヘルスチェック + ピアディスカバリ |
+| `POST` | `/api/internal/raft/vote` | Control plane Raft: RequestVote RPC |
+| `POST` | `/api/internal/raft/append` | Control plane Raft: AppendEntries RPC（ハートビート兼ログ複製） |
+| `POST` | `/api/internal/raft/snapshot` | Control plane Raft: InstallSnapshot RPC（単一メッセージ） |
 
 #### Control Plane API
 
