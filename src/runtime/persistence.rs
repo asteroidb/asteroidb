@@ -171,22 +171,27 @@ impl PersistenceConfig {
 
 /// Recover a store from its snapshot + WAL and open a fresh WAL writer.
 ///
-/// Returns the recovered store and the writer. Fail-stop errors: damaged
-/// snapshot, or mid-log corruption without the truncate escape hatch.
+/// Returns the recovered store, the writer, and the WAL read outcome
+/// (input to the recovery-gap fence decision in [`recover_eventual`]).
+/// Fail-stop errors: damaged snapshot, or mid-log corruption without the
+/// truncate escape hatch.
 fn recover_store(
     label: &str,
     snapshot_path: &Path,
     wal_cfg: WalConfig,
     recover_truncate: bool,
-) -> io::Result<(Store, WalWriter)> {
+) -> io::Result<(Store, WalWriter, WalReadOutcome)> {
     let started = std::time::Instant::now();
     let mut store = Store::load_snapshot_bincode_or_default(snapshot_path).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
                 "failed to load {label} snapshot {}: {e}. A damaged snapshot is never \
-                 replaced silently — move the data directory aside and restart to rebuild \
-                 from peers via anti-entropy (see docs/ops-guide.md)",
+                 replaced silently — restore THIS FILE from a backup, or move aside only \
+                 the damaged store's snapshot+WAL. Only the eventual store can be rebuilt \
+                 from peers via anti-entropy; the certified store, raft/ vote state, and \
+                 equivocation evidence have NO rebuild path, so never discard the whole \
+                 data directory (see docs/ops-guide.md)",
                 snapshot_path.display()
             ),
         )
@@ -216,9 +221,13 @@ fn recover_store(
                     io::ErrorKind::InvalidData,
                     format!(
                         "{label} WAL in {} is corrupted mid-log: acked data may be damaged. \
-                         Either rebuild this node from peers (move the data directory aside \
-                         and restart) or set ASTEROIDB_WAL_RECOVER_TRUNCATE=1 to explicitly \
-                         truncate at the first invalid record (see docs/ops-guide.md)",
+                         Either restore this store's snapshot+WAL from a backup (for the \
+                         eventual store, moving aside ONLY its snapshot+WAL and re-filling \
+                         from peers via anti-entropy also works; the certified store has no \
+                         such rebuild path, and raft/ vote state and equivocation evidence \
+                         must never be discarded) or set ASTEROIDB_WAL_RECOVER_TRUNCATE=1 \
+                         to explicitly truncate at the first invalid record \
+                         (see docs/ops-guide.md)",
                         wal_cfg.dir.display()
                     ),
                 ));
@@ -258,28 +267,83 @@ fn recover_store(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "recovery complete"
     );
-    Ok((store, writer))
+    Ok((store, writer, read.outcome))
 }
 
 /// Recover the eventual store and build its API + WAL syncer.
+///
+/// Recovery-gap fence (session guarantees): when the WAL could not
+/// guarantee that every ACKED write survived — sync policy
+/// `interval`/`off`, persistence disabled, or a truncating corruption
+/// recovery — the local origin's applied frontier is fenced over the
+/// possibly-lost range (`EventualApi::install_recovery_fence`). Without
+/// the fence, the first post-restart local write max-merges
+/// `applied_origins[self]` past the hole and a session token for a lost
+/// acked write would return a FALSE success; with it, such tokens answer
+/// 412 until anti-entropy adoption proves the range re-covered. A clean
+/// or torn-tail read under `SyncPolicy::Always` loses only un-acked
+/// writes, so no fence is needed there.
+///
+/// **Fence durability**: `install_recovery_fence` only mutates the
+/// in-memory store, the WAL has no fence record, and the first periodic
+/// checkpoint runs a full `snapshot_interval` after startup (or never,
+/// when checkpoints are disabled) — so a SECOND crash before that
+/// checkpoint would silently drop the fence while the WAL replay of any
+/// post-recovery durable write re-advances `applied_origins[self]` past
+/// the old hole, reopening the exact false-success path the fence
+/// closes. Therefore a snapshot (fence included) is forced RIGHT HERE,
+/// before any traffic is served; failure to write it is fail-stop. The
+/// snapshot is written without rotating or pruning the WAL: retained
+/// segments are merely over-replayed on the next boot (harmless, same
+/// invariant as a checkpoint crash). With persistence disabled entirely
+/// there is nothing to persist — but then EVERY restart re-fences from
+/// zero, so no second-crash hole exists either.
 pub fn recover_eventual(
     node_id: NodeId,
     cfg: &PersistenceConfig,
 ) -> io::Result<(EventualApi, Option<Arc<WalSyncer>>)> {
     if !cfg.enabled {
-        return Ok((EventualApi::new(node_id), None));
+        // No durability at all: every acked write of a previous
+        // incarnation is gone. Fence from zero so old self-origin tokens
+        // cannot pass path A off this incarnation's fresh writes.
+        let mut api = EventualApi::new(node_id);
+        api.install_recovery_fence().map_err(io::Error::other)?;
+        return Ok((api, None));
     }
-    let (store, writer) = recover_store(
+    let (store, writer, outcome) = recover_store(
         "eventual",
         &cfg.data_dir.join(EVENTUAL_SNAPSHOT),
         cfg.wal_config(EVENTUAL_WAL_DIR),
         cfg.recover_truncate,
     )?;
     let syncer = Arc::new(writer.syncer());
-    Ok((
-        EventualApi::recovered(node_id, store, Some(writer)),
-        Some(syncer),
-    ))
+    let mut api = EventualApi::recovered(node_id, store, Some(writer));
+    let fence_needed = !matches!(cfg.sync, SyncPolicy::Always)
+        || (outcome == WalReadOutcome::Corruption && cfg.recover_truncate);
+    if fence_needed {
+        api.install_recovery_fence().map_err(io::Error::other)?;
+        // Make the fence durable BEFORE serving traffic (see the doc
+        // comment above). The atomic snapshot write (tmp + rename) means
+        // a crash during it leaves the previous snapshot in place — safe,
+        // because the vulnerable window only opens once post-recovery
+        // writes are durably logged, which cannot happen before this
+        // function returns.
+        let snapshot_path = cfg.data_dir.join(EVENTUAL_SNAPSHOT);
+        api.store()
+            .save_snapshot_bincode(&snapshot_path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to persist the recovery-gap fence snapshot {}: {e}. Serving \
+                         traffic without it would let a second crash silently drop the fence \
+                         and turn lost acked writes into false session successes",
+                        snapshot_path.display()
+                    ),
+                )
+            })?;
+    }
+    Ok((api, Some(syncer)))
 }
 
 /// Recover the certified store and build its API + WAL syncer.
@@ -291,7 +355,9 @@ pub fn recover_certified(
     if !cfg.enabled {
         return Ok((CertifiedApi::new(node_id, namespace), None));
     }
-    let (store, writer) = recover_store(
+    // No recovery-gap fence here: session tokens are an eventual-API-only
+    // contract (api-reference.md), so the certified store needs no fence.
+    let (store, writer, _outcome) = recover_store(
         "certified",
         &cfg.data_dir.join(CERTIFIED_SNAPSHOT),
         cfg.wal_config(CERTIFIED_WAL_DIR),
@@ -604,6 +670,212 @@ mod tests {
         assert!(
             api.get_eventual("a").is_none() && api.get_eventual("b").is_none(),
             "records at/after the corruption stay dropped"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Recovery gap fence (M-3): lost acked writes must answer 412,
+    // never a false success — until anti-entropy adoption re-covers them.
+    // ---------------------------------------------------------------
+
+    /// WAL sync=off: an ACKED suffix can be lost in a crash. After
+    /// recovery, the first local write leapfrogs `applied_origins[self]`
+    /// past the hole — without the fence, the lost write's session token
+    /// would wrongly pass evidence path A. With it, the token answers
+    /// 412 until a peer's applied frontier is adopted (proving the range
+    /// re-covered), after which it answers 200 again.
+    #[test]
+    fn lost_acked_suffix_fences_session_tokens_until_adopted() {
+        use crate::session::SessionToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path()); // SyncPolicy::Off
+
+        // Incarnation 1: one durable write, then one acked write whose
+        // WAL bytes never reach disk (simulated by truncating the file
+        // back to the pre-write length).
+        let wal_dir = dir.path().join(EVENTUAL_WAL_DIR);
+        let (lost_ts, token, seg_path, keep_len) = {
+            let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+            api.eventual_counter_inc("k").unwrap();
+            let (_, seg) = wal::list_segments(&wal_dir).unwrap().pop().unwrap();
+            let keep_len = std::fs::metadata(&seg).unwrap().len();
+            let lost_ts = api.eventual_counter_inc("k").unwrap(); // acked, then lost
+            (
+                lost_ts.clone(),
+                SessionToken::from_hlc(&lost_ts),
+                seg,
+                keep_len,
+            )
+        };
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seg_path)
+            .unwrap();
+        f.set_len(keep_len).unwrap();
+        drop(f);
+
+        // Incarnation 2: recovery + a fresh local write that advances the
+        // applied frontier PAST the lost HLC (the leapfrog of the bug).
+        let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+        api.eventual_counter_inc("other").unwrap();
+        assert!(
+            api.store().applied_origin("node-a").unwrap() > &lost_ts,
+            "precondition: the frontier has leapfrogged the lost write"
+        );
+        assert!(
+            !api.session_check("k", &token),
+            "a lost acked write's token must answer 412, not a false success"
+        );
+
+        // A peer that still holds the write proves re-coverage through
+        // frontier adoption — the token turns 200 again.
+        let mut applied = std::collections::HashMap::new();
+        applied.insert("node-a".to_string(), lost_ts);
+        api.adopt_session_claims(&applied, &std::collections::HashMap::new(), Vec::new())
+            .unwrap();
+        assert!(
+            api.session_check("k", &token),
+            "adoption must heal the fence and re-satisfy the token"
+        );
+    }
+
+    /// M-3 re-review regression: the fence must survive a SECOND crash
+    /// before the first periodic checkpoint. `install_recovery_fence`
+    /// only mutates the in-memory store and the WAL has no fence record,
+    /// so without the forced snapshot in `recover_eventual` this
+    /// three-incarnation sequence reopened the false-success path:
+    /// crash 1 loses an acked suffix; incarnation 2 installs the fence
+    /// and durably logs a fresh write ABOVE the fence ceiling; crash 2;
+    /// incarnation 3's WAL replay then advances `applied_origins[self]`
+    /// past the old ceiling while its own (new) fence spans a range above
+    /// it — the original hole would be unfenced and the lost write's
+    /// token would answer 200 off a store missing the data.
+    #[test]
+    fn recovery_fence_survives_a_second_crash_before_any_checkpoint() {
+        use crate::session::SessionToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg(dir.path()); // SyncPolicy::Off, no periodic checkpoints
+
+        // Incarnation 1: one durable write, then an acked write whose WAL
+        // bytes never reach disk (simulated by truncating the segment).
+        let wal_dir = dir.path().join(EVENTUAL_WAL_DIR);
+        let (lost_ts, token, seg_path, keep_len) = {
+            let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+            api.eventual_counter_inc("k").unwrap();
+            let (_, seg) = wal::list_segments(&wal_dir).unwrap().pop().unwrap();
+            let keep_len = std::fs::metadata(&seg).unwrap().len();
+            let lost_ts = api.eventual_counter_inc("k").unwrap(); // acked, then lost
+            (
+                lost_ts.clone(),
+                SessionToken::from_hlc(&lost_ts),
+                seg,
+                keep_len,
+            )
+        };
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&seg_path)
+            .unwrap();
+        f.set_len(keep_len).unwrap();
+        drop(f);
+
+        // Incarnation 2: the fence is installed (and force-snapshotted);
+        // a fresh local write above the fence ceiling is durably logged.
+        {
+            let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+            assert!(
+                !api.store().recovery_gaps().is_empty(),
+                "precondition: incarnation 2 installed a fence"
+            );
+            assert!(
+                !api.session_check("k", &token),
+                "incarnation 2 fences the lost write"
+            );
+            api.eventual_counter_inc("other").unwrap();
+        } // crash 2 — before any checkpoint ever ran
+
+        // Incarnation 3: WAL replay advances applied_origins[self] past
+        // the OLD fence ceiling. The persisted fence must still cover the
+        // original hole.
+        let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+        assert!(
+            api.store().applied_origin("node-a").unwrap() > &lost_ts,
+            "precondition: replay leapfrogged the lost write again"
+        );
+        assert!(
+            !api.session_check("k", &token),
+            "the lost write's token must STILL answer 412 after a second crash \
+             (the fence must be durable, not in-memory only)"
+        );
+
+        // Adoption still heals the persisted fence (tokens turn 200).
+        let mut applied = std::collections::HashMap::new();
+        applied.insert("node-a".to_string(), lost_ts);
+        api.adopt_session_claims(&applied, &std::collections::HashMap::new(), Vec::new())
+            .unwrap();
+        assert!(
+            api.session_check("k", &token),
+            "adoption must heal the persisted fence"
+        );
+    }
+
+    /// PERSISTENCE=off: every acked write of a previous incarnation is
+    /// gone on restart. The fresh incarnation's writes must not let a
+    /// prior incarnation's token pass path A.
+    #[test]
+    fn persistence_off_fences_prior_incarnation_tokens() {
+        use crate::session::SessionToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(dir.path());
+        cfg.enabled = false;
+
+        // Incarnation 1: a single acked write, then a crash losing it.
+        let token = {
+            let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+            let ts = api.eventual_counter_inc("k").unwrap();
+            SessionToken::from_hlc(&ts)
+        };
+
+        // A real restart never completes within the same wall-clock
+        // millisecond as the previous incarnation's writes (which the
+        // fence-installation clock bump stamped ~1 ms ahead); model that
+        // so the new incarnation's fence ceiling covers the lost write.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
+        // Incarnation 2: fresh in-memory store; a new local write
+        // advances applied_origins[self] past the lost token.
+        let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+        api.eventual_counter_inc("k").unwrap();
+        assert!(
+            !api.session_check("k", &token),
+            "a lost incarnation's token must answer 412, not a false success"
+        );
+    }
+
+    /// SyncPolicy::Always with a clean (or torn-tail) WAL loses only
+    /// un-acked writes: no fence is installed and pre-crash tokens keep
+    /// answering 200 immediately after recovery.
+    #[test]
+    fn sync_always_recovery_installs_no_fence() {
+        use crate::session::SessionToken;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg(dir.path());
+        cfg.sync = SyncPolicy::Always;
+
+        let token = {
+            let (mut api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+            let ts = api.eventual_counter_inc("k").unwrap();
+            SessionToken::from_hlc(&ts)
+        };
+        let (api, _s) = recover_eventual(NodeId("node-a".into()), &cfg).unwrap();
+        assert!(api.store().recovery_gaps().is_empty(), "no fence expected");
+        assert!(
+            api.session_check("k", &token),
+            "a durably-acked token must stay satisfied across recovery"
         );
     }
 

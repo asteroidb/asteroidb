@@ -31,11 +31,20 @@ use crate::store::kv::{CrdtValue, Store};
 /// Maximum number of `(origin, HLC)` entries a token may carry.
 ///
 /// Tokens larger than this are rejected on parse; response tokens are
-/// thinned to this cap (request-derived entries are kept preferentially,
-/// see [`SessionToken::merge_frontiers`]; [`SessionToken::encode`]
-/// enforces it again as a final guard). Thinning only weakens the
-/// guarantee to the retained origins — it can never produce a false
-/// success.
+/// thinned to this cap ([`SessionToken::encode`] drops the oldest-HLC
+/// entries as a final guard).
+///
+/// LIMITATION (bounded-token tradeoff): every entry records an origin the
+/// client has observed, so dropping one *does* weaken the client's
+/// monotonic-reads guarantee for that origin — a later read at a replica
+/// missing the dropped origin's writes can pass `is_satisfied` and serve a
+/// stale value. This is unavoidable in a stateless, size-bounded token
+/// scheme (a fully sound alternative needs unbounded tokens or server-side
+/// session state). The cap is deliberately larger than a typical cluster's
+/// node count so a single session rarely observes enough distinct origins to
+/// trigger thinning; encode preserves the freshest positions (oldest writes
+/// are the ones most likely already applied everywhere), which minimises but
+/// does not eliminate the exposure. See [`SessionToken::encode`].
 pub const MAX_TOKEN_ENTRIES: usize = 64;
 
 /// Maximum accepted token length in bytes (encoded form).
@@ -160,10 +169,12 @@ impl SessionToken {
     /// round-trips: when the encoded form would exceed
     /// [`MAX_TOKEN_ENTRIES`] or [`MAX_TOKEN_BYTES`] (possible with many
     /// origins and long node ids), entries with the OLDEST HLC positions
-    /// are dropped first. Dropping an entry only weakens the guarantee to
-    /// the retained origins (false-negative direction) — it never
-    /// fabricates coverage. An empty token encodes as `"v1:"`, which
-    /// parses back to an empty token.
+    /// are dropped first (they are the writes most likely already applied
+    /// everywhere). NOTE: dropping is NOT purely a false-negative — the
+    /// dropped origin is no longer checked, so a subsequent read at a
+    /// replica lacking that origin's writes can wrongly succeed; see the
+    /// LIMITATION on [`MAX_TOKEN_ENTRIES`]. An empty token encodes as
+    /// `"v1:"`, which parses back to an empty token.
     pub fn encode(&self) -> String {
         let mut entries: Vec<&HlcTimestamp> = self.entries.iter().collect();
         // Drop oldest positions first when over either cap. Sorting
@@ -279,16 +290,28 @@ impl SessionToken {
     /// Two sound evidence paths, per token entry:
     ///
     /// - **Path A (applied origins)**: `store.applied_origins()[origin] >=
-    ///   entry`. Sound because `applied_origins` only advances when the
-    ///   full write prefix of that origin has been applied (local
-    ///   mutation, complete delta pull, or frontier adoption). Disabled
-    ///   for keys poisoned by a failed merge (`merge_failed_keys`), whose
+    ///   entry`, with recovery-gap fencing (see
+    ///   [`Store::applied_origin_covers`]). Sound because `applied_origins`
+    ///   only advances when the full write prefix of that origin has been
+    ///   applied (local mutation, complete delta pull, or frontier
+    ///   adoption) — except across a durability-lossy crash recovery,
+    ///   where a post-restart local write can leapfrog a lost acked
+    ///   suffix; the recovery gap fence blocks exactly that range until
+    ///   anti-entropy adoption proves it re-covered. Disabled for keys
+    ///   poisoned by a failed merge (`merge_failed_keys`), whose
     ///   contributions may be missing even though the origin frontier
     ///   advanced on other keys.
     /// - **Path B (register value evidence)**: for LWW registers only,
     ///   the register's internal timestamp `>= entry` proves the write
     ///   would not change the visible value even if merged (LWW
-    ///   dominance). Value-level, hence sound even for poisoned keys.
+    ///   dominance). Disabled for poisoned keys: the dominance argument
+    ///   assumes the token's write was itself a register write to this
+    ///   key, but a poisoned key has dropped a DIFFERENT-typed remote
+    ///   contribution (e.g. an OrSet write rejected with TypeMismatch by
+    ///   this replica's Register) — the register timestamp then proves
+    ///   nothing about that dropped write, and answering success would be
+    ///   a read-your-writes lie. Gating on `!poisoned` only introduces
+    ///   false negatives, which the contract permits.
     ///
     /// Deliberately NOT used: per-key `timestamp_for` comparison (a
     /// concurrent write by another origin advances it without containing
@@ -301,11 +324,8 @@ impl SessionToken {
             _ => None,
         };
         self.entries.iter().all(|entry| {
-            let applied_ok = !poisoned
-                && store
-                    .applied_origin(&entry.node_id)
-                    .is_some_and(|applied| applied >= entry);
-            let register_ok = register_ts.is_some_and(|ts| ts >= entry);
+            let applied_ok = !poisoned && store.applied_origin_covers(&entry.node_id, entry);
+            let register_ok = !poisoned && register_ts.is_some_and(|ts| ts >= entry);
             applied_ok || register_ok
         })
     }

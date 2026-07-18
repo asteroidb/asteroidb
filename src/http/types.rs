@@ -91,6 +91,20 @@ impl EventualWriteRequest {
     }
 }
 
+/// Query parameters for `POST /api/eventual/write`.
+///
+/// Optional `session_token` carries the client's prior session state so a
+/// write folds its HLC into the existing per-origin vector. Without this,
+/// each write returns a fresh single-origin token and a session that writes
+/// through more than one coordinator loses its earlier writes'
+/// read-your-writes coverage. A request without the parameter behaves exactly
+/// like the pre-session API.
+#[derive(Debug, Default, Deserialize)]
+pub struct EventualWriteQuery {
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
 /// Request body for `POST /api/certified/write`.
 #[derive(Debug, Deserialize)]
 pub struct CertifiedWriteRequest {

@@ -51,11 +51,12 @@ use crate::session::SessionToken;
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteRequest,
-    FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse, PeerInfo, PingRequest,
-    PingResponse, PlacementPolicyResponse, ProofBundleJson, RaftStatusResponse,
-    RemovePolicyRequest, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest, StatusResponse,
-    VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
+    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteQuery,
+    EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse,
+    PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse, ProofBundleJson,
+    RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
+    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
+    VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -155,9 +156,25 @@ async fn wait_wal_durable(
 /// Accepts a typed CRDT operation and applies it to the eventual store.
 pub async fn eventual_write(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<EventualWriteQuery>,
     Json(req): Json<EventualWriteRequest>,
 ) -> Result<Json<WriteResponse>, ApiError> {
     let written_key = req.key().to_string();
+
+    // Read-your-writes across coordinators: fold this write into the client's
+    // prior session token (if presented) so the session accumulates its full
+    // per-origin write vector even when successive writes hit different
+    // coordinators. A malformed/oversized token is rejected (fail-closed).
+    let mut token = match query.session_token.as_deref() {
+        Some(s) if !s.is_empty() => {
+            let parsed = SessionToken::parse(s).map_err(ApiError)?;
+            parsed
+                .validate_bounds(crate::hlc::wall_clock_ms())
+                .map_err(ApiError)?;
+            parsed
+        }
+        _ => SessionToken::default(),
+    };
 
     let mut api = state.eventual.lock().await;
 
@@ -190,9 +207,10 @@ pub async fn eventual_write(
 
     state.metrics.record_write_op(&written_key);
 
+    token.merge_hlc(&ts);
     Ok(Json(WriteResponse {
         ok: true,
-        session_token: Some(SessionToken::from_hlc(&ts).encode()),
+        session_token: Some(token.encode()),
     }))
 }
 
@@ -246,10 +264,11 @@ pub async fn get_eventual(
             let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
             let session_token = want_session.then(|| {
                 let mut response_token = token.clone().unwrap_or_default();
-                // The read key's own change position is merged FIRST so it
-                // counts as request-derived and survives the entry cap —
-                // the origin contributing the observed value must not be
-                // silently thinned away (monotonic reads).
+                // Merge the read key's own change position so the origin
+                // contributing the observed value is covered (monotonic
+                // reads). If the session already spans MAX_TOKEN_ENTRIES
+                // distinct origins, encode() may still thin an entry — a
+                // documented bound, see session::MAX_TOKEN_ENTRIES.
                 if let Some(key_ts) = api.store().timestamp_for(&key) {
                     response_token.merge_hlc(key_ts);
                 }

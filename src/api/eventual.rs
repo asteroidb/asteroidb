@@ -85,6 +85,79 @@ impl EventualApi {
         }
     }
 
+    /// Fence the local origin's applied frontier against a possible lost
+    /// acked suffix (recovery gap, session guarantees).
+    ///
+    /// Called by crash recovery whenever the WAL could NOT guarantee that
+    /// every acked write survived: sync policy `interval`/`off`,
+    /// persistence disabled entirely, or an explicit truncating
+    /// corruption recovery. In those modes an acked suffix of this
+    /// node's writes may be gone while `applied_origins[self]` still
+    /// reads the pre-loss frontier — and the FIRST post-restart local
+    /// write would max-merge the frontier past the hole, so a session
+    /// token for a lost write would wrongly pass evidence path A
+    /// (`api-reference.md` promises 412, never a false success).
+    ///
+    /// The fence spans `(applied_origins[self] as recovered, ceiling]`
+    /// where the ceiling is the END of the current physical millisecond
+    /// (`(now_ms, u32::MAX)`): everything provably applied stays
+    /// covered, and the lost range answers 412 until anti-entropy
+    /// adoption ([`Store::merge_applied_origins`]) proves it re-covered
+    /// by a peer that still holds the writes — at which point tokens
+    /// turn 200 again. Until then the fence only produces
+    /// contract-permitted false negatives.
+    ///
+    /// The clock is then advanced past the ceiling so every post-restart
+    /// local write lands strictly above it (a node must never fence its
+    /// own fresh writes). Covering the whole millisecond matters: lost
+    /// pre-crash writes routinely share a physical millisecond with the
+    /// recovery instant at higher logical counters, and a `clock.now()`
+    /// ceiling would let exactly those slip past the fence. Residual
+    /// exposure: a pre-crash clock that ran AHEAD of this boot's wall
+    /// clock (peer-skew propagation, wall-clock regression across the
+    /// reboot) can have issued lost writes above the ceiling — the same
+    /// clock-trust assumption the rest of the HLC design makes.
+    ///
+    /// **Durability**: this only mutates the IN-MEMORY store — no WAL
+    /// record exists for fences, and `recovery_gaps` persist exclusively
+    /// via snapshots. The recovery caller (`persistence::recover_eventual`)
+    /// therefore forces a snapshot right after installing the fence,
+    /// before any traffic is served; otherwise a second crash before the
+    /// first periodic checkpoint would silently drop the fence while WAL
+    /// replay of post-recovery writes re-opens the false-success path.
+    ///
+    /// Not available on `wasm32` (no crash-recovery persistence there).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn install_recovery_fence(&mut self) -> Result<(), CrdtError> {
+        let floor = self
+            .store
+            .applied_origin(&self.node_id.0)
+            .cloned()
+            .unwrap_or(HlcTimestamp {
+                physical: 0,
+                logical: 0,
+                node_id: String::new(),
+            });
+        let now = self.clock.now()?;
+        let ceiling = HlcTimestamp {
+            physical: now.physical,
+            logical: u32::MAX,
+            node_id: self.node_id.0.clone(),
+        };
+        // Advance the clock past the ceiling (into the next physical
+        // millisecond) so no post-restart write can fall inside the gap.
+        // Running ≤1 ms ahead of the wall clock is well within the HLC's
+        // normal skew tolerance.
+        self.clock.seed_recovered(&HlcTimestamp {
+            physical: now.physical.saturating_add(1),
+            logical: 0,
+            node_id: self.node_id.0.clone(),
+        });
+        self.store
+            .add_recovery_gap(self.node_id.0.clone(), floor, ceiling);
+        Ok(())
+    }
+
     // ---------------------------------------------------------------
     // WAL plumbing
     // ---------------------------------------------------------------
@@ -200,6 +273,29 @@ impl EventualApi {
     #[cfg(target_arch = "wasm32")]
     fn wal_log_merge_failed(&mut self, _key: &str) {}
 
+    /// Finish a local write: record the change position, advance the applied
+    /// frontier, and log the post-state as an `UpsertApplied` record.
+    ///
+    /// If the WAL append fails, the key is poisoned exactly as
+    /// [`merge_remote`](Self::merge_remote) does: `note_applied` has already
+    /// advanced `applied_origins`, but the data record is NOT in the WAL,
+    /// while a *later* successful append (e.g. an adopted `SessionClaims` or
+    /// the next mutation) can still persist a frontier that covers this write.
+    /// Without the poison, recovery replays that later frontier, `note_applied`
+    /// re-advances past the never-logged record, and a read-your-writes token
+    /// for this write passes `session_check` on a store that is missing the
+    /// data — a false success the fail-closed design promises never happens.
+    fn finish_local_write(&mut self, key: &str, ts: &HlcTimestamp) -> Result<(), CrdtError> {
+        self.store.record_change(key, ts.clone());
+        self.store.note_applied(ts);
+        if let Err(e) = self.wal_log_applied(key, ts) {
+            self.store.note_merge_failed(key);
+            self.wal_log_merge_failed(key);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Position of the most recent WAL append (for durability waits).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn last_wal_pos(&self) -> Option<WalPos> {
@@ -247,9 +343,7 @@ impl EventualApi {
     ) -> Result<HlcTimestamp, CrdtError> {
         let ts = self.clock.now()?;
         self.store.merge_value(key.clone(), &value)?;
-        self.store.record_change(&key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(&key, &ts)?;
+        self.finish_local_write(&key, &ts)?;
         Ok(ts)
     }
 
@@ -276,9 +370,7 @@ impl EventualApi {
             c.increment(&self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -304,9 +396,7 @@ impl EventualApi {
             c.decrement(&self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -336,9 +426,7 @@ impl EventualApi {
             s.add(element, &self.node_id);
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -367,9 +455,7 @@ impl EventualApi {
             s.remove(&element.to_string());
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -400,9 +486,7 @@ impl EventualApi {
         if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
             m.set(map_key, map_value, ts.clone(), &self.node_id);
         }
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -431,9 +515,7 @@ impl EventualApi {
             m.delete(&map_key.to_string());
         }
         let ts = self.clock.now()?;
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -463,9 +545,7 @@ impl EventualApi {
         if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
             r.set(value, ts.clone());
         }
-        self.store.record_change(key, ts.clone());
-        self.store.note_applied(&ts);
-        self.wal_log_applied(key, &ts)?;
+        self.finish_local_write(key, &ts)?;
         Ok(ts)
     }
 
@@ -1327,8 +1407,8 @@ mod tests {
     }
 
     /// Path B: register value evidence satisfies a token when the LWW
-    /// timestamp dominates it, independently of applied_origins — and
-    /// even on a poisoned key (value-level evidence stays sound).
+    /// timestamp dominates it, independently of applied_origins — but
+    /// NEVER on a poisoned key (see the M-1 regression test below).
     #[test]
     fn register_value_evidence_path() {
         let mut api = EventualApi::new(node("node-b"));
@@ -1352,12 +1432,42 @@ mod tests {
         api.merge_remote("cnt".into(), &CrdtValue::Counter(c))
             .unwrap();
         assert!(!api.session_check("cnt", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+    }
 
-        // Path B stays sound on a poisoned key.
-        api.merge_remote("reg".into(), &CrdtValue::Counter(PnCounter::new()))
+    /// M-1 regression: register value evidence must NOT satisfy a token on
+    /// a poisoned key. The LWW-dominance argument assumes the token's
+    /// write was itself a register write; a poisoned key has DROPPED a
+    /// different-typed contribution (e.g. an OrSet write that hit
+    /// TypeMismatch against this replica's Register), so the register
+    /// timestamp proves nothing about the dropped write — answering 200
+    /// would be a read-your-writes lie. Only false negatives (412) are
+    /// contract-permitted.
+    #[test]
+    fn register_evidence_disabled_on_poisoned_key() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        // The key is a Register locally with a high LWW timestamp.
+        let mut reg = LwwRegister::new();
+        reg.set("v".to_string(), hlc_ts(1_000, 0, "node-b"));
+        api.merge_remote("k".into(), &CrdtValue::Register(reg))
+            .unwrap();
+
+        // node-a's OrSet write to the same key fails to merge → poison.
+        let mut set = OrSet::new();
+        set.add("member".to_string(), &node("node-a"));
+        let set_write_hlc = hlc_ts(500, 0, "node-a");
+        let err = api
+            .merge_remote_with_hlc("k".into(), &CrdtValue::Set(set), set_write_hlc.clone())
             .unwrap_err();
-        assert!(api.store().merge_failed_contains("reg"));
-        assert!(api.session_check("reg", &SessionToken::from_hlc(&hlc_ts(50, 0, "node-a"))));
+        assert!(matches!(err, CrdtError::TypeMismatch { .. }));
+        assert!(api.store().merge_failed_contains("k"));
+
+        // The register timestamp (1000) dominates the token (500), but the
+        // token's OrSet write was dropped: the session check must fail.
+        assert!(
+            !api.session_check("k", &SessionToken::from_hlc(&set_write_hlc)),
+            "register evidence must be disabled on a poisoned key"
+        );
     }
 
     /// The push path (merge_remote, no origin HLC) must only advance the
