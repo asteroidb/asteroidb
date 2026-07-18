@@ -402,7 +402,11 @@ impl WalWriter {
         state.file.sync_all()?;
         let sealed = state.seg_seq;
         let next = sealed + 1;
-        let file = create_segment(&self.cfg.dir, next)?;
+        // `next` is only ever `seg_seq + 1`, so a colliding file can only
+        // be our own torn create from an earlier failed rotation (ENOSPC
+        // etc.) — reclaim it instead of failing with AlreadyExists until
+        // restart (M-5).
+        let file = create_or_reclaim_segment(&self.cfg.dir, next)?;
         state.file = file;
         state.seg_seq = next;
         state.seg_bytes = SEGMENT_HEADER_LEN as u64;
@@ -556,21 +560,134 @@ fn segment_file_name(seq: u64) -> String {
     format!("wal-{seq:016x}.log")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: when `Some(n)`, `init_segment` writes only the first
+    /// `n` bytes of the header, then fails with ENOSPC (raw os error 28)
+    /// — the on-disk residue of a rotation that died mid-create. Consumed
+    /// (reset to `None`) when it fires; set it again for another failure.
+    static FAIL_SEGMENT_INIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Create segment `seq` in `dir`: header, file fsync, then directory fsync
 /// (so the new file's existence is itself durable).
+///
+/// Strict: an existing file at the target path is an error
+/// (`AlreadyExists`). Used by [`WalWriter::open`], where the sequence
+/// number comes from a fresh directory scan (max + 1), so a collision can
+/// only mean an unexpected concurrent writer — fail loud, never reclaim.
 fn create_segment(dir: &Path, seq: u64) -> io::Result<File> {
     let path = dir.join(segment_file_name(seq));
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create_new(true)
         .append(true)
         .open(&path)?;
+    init_segment(&path, file, dir)
+}
+
+/// Rotation-only variant of [`create_segment`]: reclaims a leftover from a
+/// previously failed rotation of THIS writer (a torn create: no longer
+/// than the bare header, hence zero frames). Callers must guarantee `seq`
+/// was derived as active `seg_seq + 1` — under that invariant a colliding
+/// file can only be our own torn create, and any file that could hold a
+/// frame is refused (never deleted, never truncated).
+///
+/// Orphan invariant: a torn create is always the MAXIMUM sequence number
+/// in the directory (= the last segment, so recovery reads it as a
+/// harmless torn tail). This rests on three properties: (a) rotation
+/// numbers the new segment `seg_seq + 1`, (b) [`remove_segments_up_to`]
+/// only deletes `seq <= sealed < active`, and (c) reclaim re-uses the SAME
+/// sequence number, so no gap is ever created. Any change to one of these
+/// requires re-validating this whole design.
+fn create_or_reclaim_segment(dir: &Path, seq: u64) -> io::Result<File> {
+    let path = dir.join(segment_file_name(seq));
+    let file = match OpenOptions::new().create_new(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => reclaim_orphan_segment(&path, seq)?,
+        Err(e) => return Err(e),
+    };
+    init_segment(&path, file, dir)
+}
+
+/// Write the segment header into a freshly created (or reclaimed and
+/// truncated) segment file, fsync it, then fsync the directory.
+///
+/// On failure the file is best-effort unlinked so no orphan is left to
+/// collide with the next rotation; the ORIGINAL error is returned either
+/// way. Correctness does not depend on the unlink being durable (or on
+/// any unlink→create persistence ordering): whatever survives a crash is
+/// an absent file, a partial header, or a bare header — always at the
+/// maximum sequence number — which recovery already handles as a torn
+/// tail / empty segment, and which a later rotation reclaims in place.
+fn init_segment(path: &Path, mut file: File, dir: &Path) -> io::Result<File> {
     let mut header = [0u8; SEGMENT_HEADER_LEN];
     header[..8].copy_from_slice(&WAL_MAGIC);
     header[8..12].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
     // bytes 12..16: reserved, zero.
-    file.write_all(&header)?;
-    file.sync_all()?;
-    fsync_dir(dir)?;
+    let result = (|| -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(n) = FAIL_SEGMENT_INIT.with(|cell| cell.take()) {
+            file.write_all(&header[..n.min(SEGMENT_HEADER_LEN)])?;
+            return Err(io::Error::from_raw_os_error(28)); // ENOSPC
+        }
+        file.write_all(&header)?;
+        file.sync_all()?;
+        fsync_dir(dir)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(file),
+        Err(e) => {
+            if let Err(unlink_err) = fs::remove_file(path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %unlink_err,
+                    "failed to unlink WAL segment after a failed init; \
+                     the next rotation will reclaim it in place"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// A file no longer than the segment header cannot contain any frame: it
+/// is a torn create, never acked data. (m-2 will reuse this predicate when
+/// classifying non-final short-header segments on the read side.)
+fn is_torn_create_len(len: u64) -> bool {
+    len <= SEGMENT_HEADER_LEN as u64
+}
+
+/// Open an orphan segment left by a previously failed rotation and
+/// truncate it back to empty for re-initialization. Refuses (without
+/// touching the file) anything large enough to hold a frame.
+fn reclaim_orphan_segment(path: &Path, seq: u64) -> io::Result<File> {
+    // No `create`: if the orphan vanished meanwhile, NotFound propagates
+    // and the next rotation retries with a clean create.
+    let file = OpenOptions::new().append(true).open(path)?;
+    // fstat on the open handle: no TOCTOU window against the path.
+    let len = file.metadata()?.len();
+    if !is_torn_create_len(len) {
+        tracing::error!(
+            seq,
+            len,
+            path = %path.display(),
+            "refusing to reclaim WAL segment: file is larger than a bare \
+             header and may hold frames; not touching it (see ops-guide)"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to reclaim segment {seq}: {len} bytes (not a torn create)"),
+        ));
+    }
+    tracing::warn!(
+        seq,
+        len,
+        path = %path.display(),
+        "reclaiming orphan WAL segment left by a previously failed rotation"
+    );
+    file.set_len(0)?; // O_APPEND: the header write lands at offset 0
     Ok(file)
 }
 
@@ -1454,6 +1571,159 @@ mod tests {
         let read = read_all_segments(dir.path()).unwrap();
         assert_eq!(read.outcome, WalReadOutcome::Clean);
         assert_eq!(read.records.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Rotation self-healing (M-5): orphan segments from failed rotations
+    // ---------------------------------------------------------------
+
+    /// Read every record key (all tests below append `upsert` records).
+    fn read_keys(dir: &Path) -> Vec<String> {
+        let read = read_all_segments(dir).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        read.records
+            .iter()
+            .map(|r| match r {
+                WalRecord::UpsertApplied { key, .. } => key.clone(),
+                other => panic!("unexpected record {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rotate_fails_cleanly_and_recovers_after_segment_init_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("a", 1, 1)).unwrap();
+        wal.append(&upsert("b", 1, 2)).unwrap();
+
+        // Header write dies mid-way (ENOSPC after 8 bytes).
+        FAIL_SEGMENT_INIT.with(|cell| cell.set(Some(8)));
+        let err = wal.rotate().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(28), "must surface the ENOSPC");
+        // Layer-1 cleanup: the partial segment must be unlinked, not left
+        // to collide with the next rotation.
+        assert_eq!(
+            list_segments(dir.path()).unwrap().len(),
+            1,
+            "a failed rotation must not leave an orphan segment behind"
+        );
+
+        // Same writer, no restart: the next rotation succeeds and seals
+        // the same segment the failed one tried to.
+        let sealed = wal.rotate().unwrap();
+        assert_eq!(sealed, 1, "the active segment never changed");
+        wal.append(&upsert("c", 1, 3)).unwrap();
+        drop(wal);
+        assert_eq!(read_keys(dir.path()), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn rotate_reclaims_orphan_torn_creates() {
+        // Every on-disk residue an ENOSPC'd create can leave: nothing
+        // written yet is covered by the clean-create path, so seed the
+        // three torn shapes a partial header write can persist.
+        let mut valid_header = [0u8; SEGMENT_HEADER_LEN];
+        valid_header[..8].copy_from_slice(&WAL_MAGIC);
+        valid_header[8..12].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        let orphans: [&[u8]; 3] = [&[], &valid_header[..7], &valid_header];
+
+        for orphan in orphans {
+            let dir = tempfile::tempdir().unwrap();
+            let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+            wal.append(&upsert("a", 1, 1)).unwrap();
+            // The orphan always sits at active seg_seq + 1 (see the
+            // invariant on `create_or_reclaim_segment`).
+            fs::write(dir.path().join(segment_file_name(2)), orphan).unwrap();
+
+            let sealed = wal.rotate().unwrap_or_else(|e| {
+                panic!(
+                    "rotate must reclaim a {}-byte torn create: {e}",
+                    orphan.len()
+                )
+            });
+            assert_eq!(sealed, 1);
+            wal.append(&upsert("b", 1, 2)).unwrap();
+            drop(wal);
+            assert_eq!(
+                read_keys(dir.path()),
+                ["a", "b"],
+                "{}-byte orphan: all records must survive reclaim",
+                orphan.len()
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_refuses_to_reclaim_files_with_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("a", 1, 1)).unwrap();
+
+        // A colliding file big enough to hold a frame must never be
+        // deleted or truncated (it cannot be our torn create).
+        let mut suspicious = Vec::from(WAL_MAGIC);
+        suspicious.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        suspicious.extend_from_slice(&[0u8; 4]);
+        suspicious.extend_from_slice(&[0xAB; 24]); // "frame" bytes
+        let path = dir.path().join(segment_file_name(2));
+        fs::write(&path, &suspicious).unwrap();
+
+        let err = wal.rotate().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            suspicious,
+            "the refused file must be bit-for-bit untouched"
+        );
+
+        // Degrade, don't crash: appends to the old segment keep working.
+        wal.append(&upsert("b", 1, 2)).unwrap();
+        drop(wal);
+        // (Not read via read_all_segments: the suspicious file is
+        // intentionally left in place and would read as corruption.)
+        let mut records = Vec::new();
+        let data = fs::read(dir.path().join(segment_file_name(1))).unwrap();
+        let (outcome, _) = parse_segment(&data, true, &mut records);
+        assert_eq!(outcome, WalReadOutcome::Clean);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn reclaim_reinit_failure_is_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("a", 1, 1)).unwrap();
+
+        // A 7-byte orphan from a previous failure, and the re-init of the
+        // reclaimed file fails too (ENOSPC persists).
+        fs::write(dir.path().join(segment_file_name(2)), [0xAA; 7]).unwrap();
+        FAIL_SEGMENT_INIT.with(|cell| cell.set(Some(4)));
+        let err = wal.rotate().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(28));
+
+        // Fully idempotent: once space is back, the same rotation goes
+        // through (whether or not the cleanup unlink succeeded).
+        let sealed = wal.rotate().unwrap();
+        assert_eq!(sealed, 1);
+        wal.append(&upsert("b", 1, 2)).unwrap();
+        drop(wal);
+        assert_eq!(read_keys(dir.path()), ["a", "b"]);
+    }
+
+    #[test]
+    fn create_segment_is_strict_about_existing_files() {
+        // The open path derives its sequence from a directory scan, so a
+        // collision there means a concurrent writer: reclaiming would risk
+        // stealing another writer's active segment. It must fail loud.
+        let dir = tempfile::tempdir().unwrap();
+        create_segment(dir.path(), 5).unwrap();
+        let err = create_segment(dir.path(), 5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            dir.path().join(segment_file_name(5)).exists(),
+            "the existing segment must survive the failed strict create"
+        );
     }
 
     #[test]

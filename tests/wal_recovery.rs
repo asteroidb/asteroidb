@@ -49,6 +49,12 @@ fn open_eventual(dir: &Path, node_id: &str) -> EventualApi {
         WalReadOutcome::Corruption,
         "tests never produce mid-log corruption unless they mean to"
     );
+    // Mirror production recovery (persistence::recover_store): physically
+    // repair the log to the replayed prefix BEFORE opening a new writer,
+    // so a torn tail never becomes mid-log corruption on the next reopen.
+    if read.outcome != WalReadOutcome::Clean {
+        wal::truncate_to_valid_prefix(&dir.join("wal"), &read).unwrap();
+    }
     let mut store = store;
     for record in read.records {
         wal::replay_record(&mut store, record);
@@ -749,12 +755,28 @@ fn open_eventual_tiny_segments(dir: &Path, node_id: &str) -> EventualApi {
     EventualApi::recovered(node(node_id), Store::new(), Some(writer))
 }
 
-fn set_wal_dir_mode(dir: &Path, mode: u32) {
+fn set_dir_mode(dir: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
-    let wal_dir = dir.join("wal");
-    let mut perms = std::fs::metadata(&wal_dir).unwrap().permissions();
+    let mut perms = std::fs::metadata(dir).unwrap().permissions();
     perms.set_mode(mode);
-    std::fs::set_permissions(&wal_dir, perms).unwrap();
+    std::fs::set_permissions(dir, perms).unwrap();
+}
+
+fn set_wal_dir_mode(dir: &Path, mode: u32) {
+    set_dir_mode(&dir.join("wal"), mode);
+}
+
+/// Seed an orphan segment at `max existing seq + 1` — the on-disk residue
+/// of a rotation that died mid-create (ENOSPC before/during the header
+/// write) — and return the orphan's sequence number.
+fn seed_orphan_segment(wal_dir: &Path, contents: &[u8]) -> u64 {
+    let (max_seq, _) = wal::list_segments(wal_dir).unwrap().pop().unwrap();
+    std::fs::write(
+        wal_dir.join(format!("wal-{:016x}.log", max_seq + 1)),
+        contents,
+    )
+    .unwrap();
+    max_seq + 1
 }
 
 /// A failed `MergeFailed` append must not lose the poison: it is queued
@@ -884,4 +906,191 @@ fn wal_append_failure_returns_storage_error_and_reads_continue() {
     let mut perms = std::fs::metadata(&wal_dir).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&wal_dir, perms).unwrap();
+}
+
+// ---------------------------------------------------------------
+// M-5: orphan segments from a failed rotation self-heal
+// ---------------------------------------------------------------
+
+/// Regression test for M-5. An orphan segment left by a rotation that
+/// died mid-create (ENOSPC) used to make EVERY later append and
+/// checkpoint fail with `AlreadyExists` until restart. Rotation must
+/// reclaim the orphan in place — and the reclaim needs no directory
+/// write permission (truncate + header rewrite + read-only dir fsync),
+/// so it works even while the disk-full/read-only condition persists
+/// for genuinely new files.
+#[test]
+fn orphan_segment_self_heals_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    {
+        let mut api = open_eventual_tiny_segments(dir.path(), "node-a");
+        for i in 0..3 {
+            api.eventual_counter_inc(&format!("k{i}")).unwrap();
+        }
+
+        // Partial-header orphan at max+1: exactly what a rotation killed
+        // mid-header-write leaves behind.
+        seed_orphan_segment(&wal_dir, &[0xAA; 7]);
+        set_wal_dir_mode(dir.path(), 0o555);
+
+        // The next write forces a rotation onto the orphan's sequence
+        // number. Pre-fix: permanent AlreadyExists. Post-fix: reclaimed,
+        // even though the directory itself is read-only.
+        api.eventual_counter_inc("healed").unwrap();
+
+        // A rotation that needs a genuinely NEW file still fails while
+        // the directory is read-only (degrade) ...
+        let err = api.eventual_counter_inc("denied").unwrap_err();
+        assert!(matches!(err, CrdtError::Storage(_)));
+        // ... reads keep working ...
+        assert!(api.get_eventual("healed").is_some());
+
+        set_wal_dir_mode(dir.path(), 0o755);
+        // ... and once the directory is writable again, writes succeed
+        // WITHOUT a restart.
+        api.eventual_counter_inc("after").unwrap();
+    } // crash
+
+    let api = open_eventual(dir.path(), "node-a");
+    for key in ["k0", "k1", "k2", "healed", "after"] {
+        assert!(
+            api.get_eventual(key).is_some(),
+            "acked write {key} must survive the crash"
+        );
+    }
+    // The un-acked write was never logged; its key stays poisoned
+    // (fail-closed) rather than resurrecting as data.
+    assert!(api.get_eventual("denied").is_none());
+    assert!(api.store().merge_failed_contains("denied"));
+}
+
+/// A crash can strike at any point of the (now self-healing) rotation:
+/// whatever the failed create persisted — nothing, a partial header, or a
+/// bare header — always sits at the maximum sequence number, so restart
+/// recovery must replay every acked record with zero loss.
+#[test]
+fn orphan_segment_recovers_across_restart() {
+    let mut valid_header = Vec::from(wal::WAL_MAGIC);
+    valid_header.extend_from_slice(&wal::WAL_FORMAT_VERSION.to_le_bytes());
+    valid_header.extend_from_slice(&[0u8; 4]);
+    let orphans: [&[u8]; 3] = [&[], &[0xAA; 7], &valid_header];
+
+    for orphan in orphans {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let before = {
+            let mut api = open_eventual(dir.path(), "node-a");
+            for i in 0..3 {
+                api.eventual_counter_inc(&format!("k{i}")).unwrap();
+            }
+            store_json(api.store())
+        }; // crash
+        seed_orphan_segment(&wal_dir, orphan);
+
+        let api = open_eventual(dir.path(), "node-a");
+        assert_eq!(
+            store_json(api.store()),
+            before,
+            "{}-byte orphan: acked state must recover with zero loss",
+            orphan.len()
+        );
+        drop(api);
+        // The repaired log must stay readable on the NEXT boot too (the
+        // orphan must not survive as a mid-log short segment).
+        let read = wal::read_all_segments(&wal_dir).unwrap();
+        assert_ne!(
+            read.outcome,
+            WalReadOutcome::Corruption,
+            "{}-byte orphan: recovery must not leave mid-log corruption",
+            orphan.len()
+        );
+    }
+}
+
+/// Checkpoint-level M-5 regression through the real persistence path
+/// (`checkpoint_eventual`): an orphan segment must not fail checkpoints
+/// until restart, a failing rotation must not delete any segment, and the
+/// next checkpoint after recovery must succeed and prune only sealed
+/// segments (the active one survives).
+#[tokio::test]
+async fn checkpoint_recovers_after_rotate_failure() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, checkpoint_eventual,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    // checkpoint_eventual hard-codes the production layout under data_dir.
+    let wal_dir = dir.path().join("wal").join("eventual");
+    let writer = WalWriter::open(wal_cfg(&wal_dir)).unwrap();
+    let api = Arc::new(tokio::sync::Mutex::new(EventualApi::recovered(
+        node("node-a"),
+        Store::new(),
+        Some(writer),
+    )));
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Off,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    api.lock().await.eventual_counter_inc("pre").unwrap();
+
+    // Pre-fix: this orphan made every checkpoint fail with AlreadyExists
+    // until restart. Post-fix: the checkpoint's rotation reclaims it.
+    let orphan_seq = seed_orphan_segment(&wal_dir, &[0xAA; 7]);
+    checkpoint_eventual(&api, &cfg)
+        .await
+        .expect("checkpoint must self-heal the orphan segment");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    assert_eq!(
+        segments.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        vec![orphan_seq],
+        "sealed segments pruned; the reclaimed orphan is the active segment"
+    );
+
+    api.lock().await.eventual_counter_inc("mid").unwrap();
+
+    // A checkpoint whose rotation fails outright must delete nothing.
+    set_dir_mode(&wal_dir, 0o555);
+    assert!(
+        checkpoint_eventual(&api, &cfg).await.is_err(),
+        "rotation into a read-only directory must fail the checkpoint"
+    );
+    set_dir_mode(&wal_dir, 0o755);
+    assert!(
+        !wal::list_segments(&wal_dir).unwrap().is_empty(),
+        "a failed checkpoint must not delete any segment"
+    );
+
+    // After the condition clears, the next checkpoint succeeds — no
+    // restart needed.
+    api.lock().await.eventual_counter_inc("post").unwrap();
+    checkpoint_eventual(&api, &cfg)
+        .await
+        .expect("checkpoint must recover once the directory is writable");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    assert_eq!(segments.len(), 1, "only the active segment remains");
+    assert!(segments[0].0 > orphan_seq);
+
+    // Everything acked recovers from snapshot + retained WAL.
+    drop(api); // crash
+    let mut store =
+        Store::load_snapshot_bincode_or_default(&dir.path().join("eventual.snapshot.bin")).unwrap();
+    let read = wal::read_all_segments(&wal_dir).unwrap();
+    assert_eq!(read.outcome, WalReadOutcome::Clean);
+    for record in read.records {
+        wal::replay_record(&mut store, record);
+    }
+    let api = EventualApi::recovered(node("node-a"), store, None);
+    for key in ["pre", "mid", "post"] {
+        assert!(
+            api.get_eventual(key).is_some(),
+            "checkpointed write {key} must recover"
+        );
+    }
 }

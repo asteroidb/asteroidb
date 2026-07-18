@@ -12,7 +12,7 @@
 
 1. ~~**M-8**(最優先)— tombstone GC が収束しない問題。~~ **完了**(per-value compaction floor +
    digest scheme v2。下記「M-8 クローズ記録」参照)。
-2. 可用性・DoS 系(M-5, M-4)
+2. 可用性・DoS 系(~~M-5~~ 完了, M-4)
 3. 効率系(M-6, M-7)
 4. 検知範囲・整合(M-12, M-14, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-8 は小規模コード修正でまとめて処理可能、m-9〜m-11 は docs、m-12 は任意)
@@ -50,8 +50,14 @@ digest/full sync 機会依存(意図的: GC ごとの delta ストーム回避)�
 - **M-4** `src/authority/attestation_pool.rs`: AttestationPool の scope 数に上限が無く、登録済み Authority 1 台が
   policy_version/key_range を変えるだけでメモリ枯渇 DoS 可能。equivocation.rs と同等の scope 数上限 +
   per-authority 上限 + policy_version の現行版検証を導入。
-- **M-5** `src/store/wal.rs`(rotate/create_segment): rotate 中の ENOSPC で orphan セグメントが残り、
-  以後の全 append・checkpoint が再起動まで `AlreadyExists` で恒久失敗。失敗時 unlink か seq 再取得で自己回復させる。
+- ~~**M-5**~~ **完了** — rotate 専用の `create_or_reclaim_segment` が自ライタの torn create
+  (ヘッダ長以下 = frame ゼロ)を truncate 再利用で冪等に回収し、`init_segment` 失敗時は
+  best-effort unlink で orphan 自体を残さない。frame を含み得る衝突ファイルは `InvalidData` で
+  拒否(fail-safe。ops-guide の永続化節に runbook 追記済み)。`WalWriter::open` 経路は厳格
+  create(AlreadyExists で fail-loud)のまま。派生フォローアップ: `rotate_locked` の
+  `advance_durable` を `sync_all` 成功直後(create 前)へ移動する件(rotate 失敗時に
+  `durable` が過小報告される。`SyncPolicy::Off` 構成で実益。前提: `appended` の増加が
+  state ロック下に限られること)は未着手の独立タスク。
 - **M-6** `src/api/eventual.rs`(merge_remote): 全受信エントリをローカル HLC で無条件再スタンプするため
   収束済みキーがフル CRDT 状態で恒久ピンポン(BP/RR 皆無)。merge_value に no-op 判定(RR)、
   可能なら origin タグで back-propagation 回避(BP)。
