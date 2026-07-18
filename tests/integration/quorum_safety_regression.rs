@@ -16,7 +16,6 @@ use asteroidb_poc::authority::certificate::{
     sign_message,
 };
 use asteroidb_poc::compaction::{CompactionConfig, CompactionEngine};
-use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::HlcTimestamp;
@@ -306,72 +305,352 @@ fn policy_version_rolling_upgrade_correctness() {
 // 3. Duplicate approval/signature/ack attack-style tests (#41, #42)
 // ===========================================================================
 
-// --- 3a. ControlPlaneConsensus duplicate approvals (#41) ---
+// --- 3a. Control-plane consensus quorum safety (#41, now Raft) ---
+//
+// The pre-Raft regression here was "self-claimed approvals must not inflate
+// the quorum". With real Raft consensus the attack surface changes shape:
+// there are no caller-supplied approvals at all, and the split-brain
+// equivalent is "both sides of a partition commit conflicting policies".
+// These tests exercise that directly on an in-process multi-node cluster.
 
-/// Duplicate approvals from the same node must not inflate quorum in
-/// control-plane consensus.
-#[test]
-fn duplicate_approval_does_not_inflate_control_plane_quorum() {
-    let consensus = ControlPlaneConsensus::new(vec![node("n1"), node("n2"), node("n3")]);
+mod control_plane_raft_quorum {
+    use super::*;
+    use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
+    use asteroidb_poc::control_plane::raft::node::{RaftConfig, RaftNode};
+    use asteroidb_poc::control_plane::raft::spawn_raft_driver;
+    use asteroidb_poc::control_plane::raft::storage::MemRaftStorage;
+    use asteroidb_poc::control_plane::raft::transport::ChannelNetwork;
+    use asteroidb_poc::control_plane::raft::types::PolicySpec;
+    use asteroidb_poc::error::CrdtError;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    use tokio::sync::watch;
 
-    // n1 approves 10 times — should still count as 1 unique approval
-    let approvals: Vec<NodeId> = (0..10).map(|_| node("n1")).collect();
-    assert!(
-        !consensus.has_majority(&approvals),
-        "duplicate approvals inflated quorum to majority"
-    );
-}
+    fn test_config() -> RaftConfig {
+        RaftConfig {
+            election_timeout_min: Duration::from_millis(100),
+            election_timeout_max: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(30),
+            propose_timeout: Duration::from_millis(1_500),
+            log_max: 4096,
+        }
+    }
 
-/// Non-authority approvals must not count toward quorum even when combined
-/// with duplicates.
-#[test]
-fn non_authority_plus_duplicate_does_not_reach_quorum() {
-    let consensus = ControlPlaneConsensus::new(vec![node("n1"), node("n2"), node("n3")]);
+    fn policy_spec(prefix: &str, replica_count: usize) -> PolicySpec {
+        PolicySpec {
+            prefix: prefix.into(),
+            replica_count,
+            required_tags: BTreeSet::new(),
+            forbidden_tags: BTreeSet::new(),
+            allow_local_write_on_partition: false,
+            certified: false,
+            max_read_latency_ms: None,
+            preferred_cost_tier: None,
+        }
+    }
 
-    // n1 (authority) + n99 (non-authority) repeated
-    let approvals = vec![
-        node("n1"),
-        node("n99"),
-        node("n99"),
-        node("n99"),
-        node("n1"),
-    ];
-    assert!(
-        !consensus.has_majority(&approvals),
-        "non-authority approvals + duplicates inflated quorum"
-    );
-}
+    struct Cluster {
+        ids: Vec<NodeId>,
+        nodes: Vec<Arc<RaftNode>>,
+        namespaces: Vec<Arc<RwLock<SystemNamespace>>>,
+        network: Arc<ChannelNetwork>,
+        shutdown: watch::Sender<bool>,
+    }
 
-/// Policy update must be rejected when approvals are all from the same node.
-#[test]
-fn duplicate_approval_policy_update_rejected() {
-    let consensus = ControlPlaneConsensus::new(vec![node("n1"), node("n2"), node("n3")]);
+    impl Cluster {
+        fn spawn(n: usize) -> Self {
+            let ids: Vec<NodeId> = (1..=n).map(|i| node(&format!("cp-{i}"))).collect();
+            let voters: BTreeSet<NodeId> = ids.iter().cloned().collect();
+            let network = ChannelNetwork::new();
+            let (shutdown, _) = watch::channel(false);
+            let mut nodes = Vec::new();
+            let mut namespaces = Vec::new();
+            for id in &ids {
+                let ns = wrap_ns(SystemNamespace::new());
+                let raft = RaftNode::new(
+                    id.clone(),
+                    voters.clone(),
+                    test_config(),
+                    Arc::new(MemRaftStorage::new()),
+                    network.transport_for(id.clone()),
+                    Arc::clone(&ns),
+                    None,
+                )
+                .expect("in-memory storage cannot fail");
+                network.register(id.clone(), &raft);
+                spawn_raft_driver(Arc::clone(&raft), shutdown.subscribe());
+                nodes.push(raft);
+                namespaces.push(ns);
+            }
+            Self {
+                ids,
+                nodes,
+                namespaces,
+                network,
+                shutdown,
+            }
+        }
 
-    let policy = PlacementPolicy::new(pv(1), key_range("user/"), 3);
-    let result = consensus.propose_policy_update(policy, &[node("n1"), node("n1"), node("n1")]);
+        async fn wait_for_leader(&self) -> usize {
+            self.wait_for_leader_among(&(0..self.nodes.len()).collect::<Vec<_>>())
+                .await
+        }
 
-    assert!(
-        result.is_err(),
-        "policy update should require unique majority"
-    );
-}
+        /// Wait until one of the given node indexes is leader.
+        async fn wait_for_leader_among(&self, candidates: &[usize]) -> usize {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                for &i in candidates {
+                    if self.nodes[i].is_leader() {
+                        return i;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no leader elected within 10s among {candidates:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
-/// Authority update must be rejected when approvals are duplicated.
-#[test]
-fn duplicate_approval_authority_update_rejected() {
-    let consensus = ControlPlaneConsensus::new(vec![node("n1"), node("n2"), node("n3")]);
+        /// Propose until committed, absorbing the poll-then-propose race: a
+        /// freshly-won leader can step down immediately when a concurrent
+        /// higher-term candidate campaigns (the prevote-lite guard
+        /// deliberately exempts leaders), so `wait_for_leader` followed by a
+        /// single propose is inherently racy — retry `NotLeader` against the
+        /// current leader among `candidates`. Returns the committing
+        /// leader's index and the applied policy.
+        async fn propose_committed(
+            &self,
+            candidates: &[usize],
+            spec: PolicySpec,
+        ) -> (usize, asteroidb_poc::placement::PlacementPolicy) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let leader = self.wait_for_leader_among(candidates).await;
+                let consensus = ControlPlaneConsensus::with_raft(Arc::clone(&self.nodes[leader]));
+                match consensus.propose_policy_update(spec.clone()).await {
+                    Ok(policy) => break (leader, policy),
+                    Err(CrdtError::NotLeader { .. }) => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "proposal kept losing leadership within 15s"
+                        );
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(other) => {
+                        panic!("proposal failed with a non-leadership error: {other:?}")
+                    }
+                }
+            }
+        }
 
-    let def = AuthorityDefinition {
-        key_range: key_range("order/"),
-        authority_nodes: vec![node("a1"), node("a2")],
-        auto_generated: false,
-    };
-    let result = consensus.propose_authority_update(def, &[node("n2"), node("n2")]);
+        async fn wait_for_policy_everywhere(&self, prefix: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let count = self
+                    .namespaces
+                    .iter()
+                    .filter(|ns| ns.read().unwrap().get_placement_policy(prefix).is_some())
+                    .count();
+                if count == self.namespaces.len() {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "policy {prefix} did not replicate to all nodes within 10s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 
-    assert!(
-        result.is_err(),
-        "authority update should require unique majority"
-    );
+    impl Drop for Cluster {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(true);
+        }
+    }
+
+    /// A leader partitioned into the minority side must NOT be able to
+    /// commit a policy update (its proposal times out), while the majority
+    /// side elects a fresh leader and keeps committing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minority_partition_cannot_commit_policy_update() {
+        let cluster = Cluster::spawn(3);
+        let old_leader = cluster.wait_for_leader().await;
+
+        // Isolate the leader (minority of 1 vs majority of 2).
+        cluster.network.isolate(&cluster.ids[old_leader]);
+
+        // The isolated leader cannot reach a majority: the proposal must
+        // fail (timeout waiting for commit, or an immediate NotLeader if
+        // it already noticed losing leadership) and never apply.
+        let consensus = ControlPlaneConsensus::with_raft(Arc::clone(&cluster.nodes[old_leader]));
+        let err = consensus
+            .propose_policy_update(policy_spec("minority/", 3))
+            .await
+            .expect_err("minority-side proposal must not commit");
+        assert!(
+            matches!(err, CrdtError::Timeout | CrdtError::NotLeader { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // The majority side elects a new leader and commits normally.
+        let majority: Vec<usize> = (0..3).filter(|i| *i != old_leader).collect();
+        cluster
+            .propose_committed(&majority, policy_spec("majority/", 3))
+            .await;
+
+        // The committed policy reaches every majority node (the follower
+        // learns the commit index with the next heartbeat), while the
+        // minority policy never appears anywhere.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let replicated = majority.iter().all(|&i| {
+                cluster.namespaces[i]
+                    .read()
+                    .unwrap()
+                    .get_placement_policy("majority/")
+                    .is_some()
+            });
+            if replicated {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "majority-side commit did not replicate within 10s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for &i in &majority {
+            let ns = cluster.namespaces[i].read().unwrap();
+            assert!(
+                ns.get_placement_policy("minority/").is_none(),
+                "uncommitted minority proposal must never apply"
+            );
+        }
+    }
+
+    /// The split-brain regression, stated directly: during a partition the
+    /// two sides must never both commit (conflicting) policy updates for
+    /// the same prefix — and after healing, every node converges on the
+    /// majority side's committed value while the stale leader's uncommitted
+    /// entry is overwritten. Committed entries are never lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conflicting_policies_cannot_commit_on_both_partition_sides() {
+        let cluster = Cluster::spawn(3);
+
+        // Commit one policy BEFORE the partition (must survive everything).
+        let (old_leader, committed) = cluster
+            .propose_committed(&[0, 1, 2], policy_spec("stable/", 3))
+            .await;
+        cluster.wait_for_policy_everywhere("stable/").await;
+
+        // Partition: old leader alone vs the other two.
+        cluster.network.isolate(&cluster.ids[old_leader]);
+
+        // Both sides attempt conflicting updates for the SAME prefix.
+        let minority_consensus =
+            ControlPlaneConsensus::with_raft(Arc::clone(&cluster.nodes[old_leader]));
+        let minority_attempt = tokio::spawn(async move {
+            minority_consensus
+                .propose_policy_update(policy_spec("contested/", 1))
+                .await
+        });
+
+        let majority: Vec<usize> = (0..3).filter(|i| *i != old_leader).collect();
+        let (_, majority_policy) = cluster
+            .propose_committed(&majority, policy_spec("contested/", 5))
+            .await;
+
+        // The minority attempt must fail — never a second, conflicting
+        // "committed" answer.
+        let minority_result = minority_attempt.await.unwrap();
+        let err = minority_result.expect_err("minority side must not commit");
+        assert!(
+            matches!(err, CrdtError::Timeout | CrdtError::NotLeader { .. }),
+            "unexpected error: {err:?}"
+        );
+
+        // Heal: the stale leader steps down, its uncommitted entry is
+        // overwritten, and everyone converges on the majority's value.
+        cluster.network.heal_all();
+        cluster.wait_for_policy_everywhere("contested/").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let converged = cluster.namespaces.iter().all(|ns| {
+                let ns = ns.read().unwrap();
+                ns.get_placement_policy("contested/")
+                    .is_some_and(|p| p.replica_count == 5 && p.version == majority_policy.version)
+                    && ns
+                        .get_placement_policy("stable/")
+                        .is_some_and(|p| p.version == committed.version)
+            });
+            if converged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cluster did not converge on the majority-committed policy"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !cluster.nodes[old_leader].is_leader(),
+            "stale leader fenced"
+        );
+    }
+
+    /// Followers refuse direct proposals outright (no self-approval path
+    /// exists anymore) and hand back the leader hint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follower_rejects_direct_proposal_with_leader_hint() {
+        let cluster = Cluster::spawn(3);
+        let leader = cluster.wait_for_leader().await;
+        let follower = (0..3).find(|i| *i != leader).unwrap();
+
+        let consensus = ControlPlaneConsensus::with_raft(Arc::clone(&cluster.nodes[follower]));
+        let err = consensus
+            .propose_policy_update(policy_spec("user/", 3))
+            .await
+            .expect_err("follower must reject proposals");
+        match err {
+            CrdtError::NotLeader { leader_id, .. } => {
+                assert_eq!(
+                    leader_id.as_deref(),
+                    Some(cluster.ids[leader].0.as_str()),
+                    "hint must point at the actual leader"
+                );
+            }
+            other => panic!("expected NotLeader, got {other:?}"),
+        }
+        // Nothing was applied anywhere.
+        for ns in &cluster.namespaces {
+            assert!(ns.read().unwrap().get_placement_policy("user/").is_none());
+        }
+    }
+
+    /// A committed policy update replicates to every voter with the SAME
+    /// commit-order version — the property the old approval counter only
+    /// pretended to provide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn committed_policy_replicates_with_identical_version() {
+        let cluster = Cluster::spawn(3);
+        let (_, applied) = cluster
+            .propose_committed(&[0, 1, 2], policy_spec("user/", 3))
+            .await;
+        cluster.wait_for_policy_everywhere("user/").await;
+
+        for (i, ns) in cluster.namespaces.iter().enumerate() {
+            let ns = ns.read().unwrap();
+            let p = ns.get_placement_policy("user/").unwrap();
+            assert_eq!(
+                p.version, applied.version,
+                "node {i} must hold the identical commit-order version"
+            );
+            assert_eq!(p.replica_count, 3);
+        }
+    }
 }
 
 // --- 3b. MajorityCertificate duplicate signatures (#42) ---

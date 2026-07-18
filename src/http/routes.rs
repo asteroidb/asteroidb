@@ -5,11 +5,12 @@ use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
     AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_eventual, get_internal_frontiers, get_metrics, get_policy, get_slo,
-    get_topology, get_version_history, healthz, internal_announce, internal_delta_sync,
-    internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
-    list_policies, post_internal_frontiers, remove_policy, set_authority_definition,
-    set_placement_policy, verify_proof,
+    get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
+    get_policy, get_raft_status, get_slo, get_topology, get_version_history, healthz,
+    internal_announce, internal_delta_sync, internal_digest_sync, internal_join, internal_keys,
+    internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
+    post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote, remove_policy,
+    set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -27,11 +28,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/internal/sync", post(internal_sync))
         .route("/api/internal/sync/delta", post(internal_delta_sync))
+        .route("/api/internal/sync/digest", post(internal_digest_sync))
         .route("/api/internal/keys", get(internal_keys))
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))
         .route("/api/internal/announce", post(internal_announce))
-        .route("/api/internal/ping", post(internal_ping));
+        .route("/api/internal/ping", post(internal_ping))
+        // Control-plane Raft RPCs. Protected by the same Bearer internal
+        // token middleware as the other internal routes; when no token is
+        // configured they are open (existing backwards-compat posture —
+        // see the ops guide security warning).
+        .route("/api/internal/raft/vote", post(raft_vote))
+        .route("/api/internal/raft/append", post(raft_append))
+        .route("/api/internal/raft/snapshot", post(raft_install_snapshot));
 
     // Control-plane mutation routes sub-router (PUT / DELETE).
     // These require internal token auth like the internal routes.
@@ -83,9 +92,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/control-plane/policies", get(list_policies))
         .route("/api/control-plane/policies/{prefix}", get(get_policy))
         .route("/api/control-plane/versions", get(get_version_history))
+        .route("/api/control-plane/raft/status", get(get_raft_status))
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
         .route("/api/slo", get(get_slo))
+        // Equivocation evidence is public read-only by design: the raw
+        // signed pairs already circulate via gossip, so there is nothing
+        // secret to protect, and operators need unauthenticated access
+        // during incident response (same posture as /api/metrics).
+        .route("/api/authority/equivocations", get(get_equivocations))
         // Health check endpoint — outside auth middleware for load balancer probes.
         .route("/healthz", get(healthz))
         .with_state(state)
@@ -142,6 +157,14 @@ mod tests {
 
         let namespace = Arc::new(RwLock::new(ns));
 
+        // Single-voter Raft that is already leader: control-plane mutations
+        // commit and apply within the handler call (no driver task needed).
+        let consensus =
+            crate::control_plane::consensus::ControlPlaneConsensus::single_node_for_test(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            );
+
         Arc::new(AppState {
             eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
             certified: Arc::new(Mutex::new(CertifiedApi::new(
@@ -153,13 +176,7 @@ mod tests {
             peers: None,
             peer_persist_path: None,
             namespace_persist_path: None,
-            consensus: Arc::new(Mutex::new(
-                crate::control_plane::consensus::ControlPlaneConsensus::new(vec![
-                    NodeId("auth-1".into()),
-                    NodeId("auth-2".into()),
-                    NodeId("auth-3".into()),
-                ]),
-            )),
+            consensus: Arc::new(Mutex::new(consensus)),
             internal_token: token,
             self_node_id: None,
             self_addr: None,
@@ -171,12 +188,87 @@ mod tests {
             ))),
             epoch_config: crate::authority::certificate::EpochConfig::default(),
             current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers: false,
+            equivocation: Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+                None,
+            )),
+            exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
         })
     }
 
     async fn body_string(body: Body) -> String {
         let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Test state with a populated keyset registry and configurable
+    /// signed-frontier requirement (signing pipeline tests).
+    fn test_state_signing(
+        registry: Option<crate::authority::certificate::KeysetRegistry>,
+        require_signed_frontiers: bool,
+    ) -> Arc<AppState> {
+        let node_id = NodeId("test-node".into());
+
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            authority_nodes: vec![
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            KeyRange {
+                prefix: String::new(),
+            },
+            3,
+        ))
+        .unwrap();
+
+        let namespace = Arc::new(RwLock::new(ns));
+
+        let consensus =
+            crate::control_plane::consensus::ControlPlaneConsensus::single_node_for_test(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            );
+
+        Arc::new(AppState {
+            eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(
+                node_id,
+                Arc::clone(&namespace),
+            ))),
+            namespace,
+            metrics: Arc::new(RuntimeMetrics::default()),
+            peers: None,
+            peer_persist_path: None,
+            namespace_persist_path: None,
+            consensus: Arc::new(Mutex::new(consensus)),
+            internal_token: None,
+            self_node_id: None,
+            self_addr: None,
+            latency_model: None,
+            cluster_nodes: None,
+            slo_tracker: Arc::new(crate::ops::slo::SloTracker::new()),
+            keyset_registry: registry.map(|r| Arc::new(RwLock::new(r))),
+            epoch_config: crate::authority::certificate::EpochConfig::default(),
+            current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers,
+            equivocation: Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+                None,
+            )),
+            exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
+        })
     }
 
     // ---------------------------------------------------------------
@@ -846,7 +938,8 @@ mod tests {
         let state = test_state();
         let app = router(state);
 
-        // Initial version history (namespace had 1 authority set + 1 placement policy -> version 3)
+        // Initial version history: authority set (2) + placement policy (3)
+        // + the raft leader's Bootstrap import (4).
         let req = Request::builder()
             .uri("/api/control-plane/versions")
             .body(Body::empty())
@@ -857,8 +950,8 @@ mod tests {
 
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 3);
-        assert_eq!(versions.history, vec![1, 2, 3]);
+        assert_eq!(versions.current_version, 4);
+        assert_eq!(versions.history, vec![1, 2, 3, 4]);
 
         // Set a policy -> version should increment
         let req = Request::builder()
@@ -880,8 +973,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        assert_eq!(versions.current_version, 4);
-        assert_eq!(versions.history, vec![1, 2, 3, 4]);
+        assert_eq!(versions.current_version, 5);
+        assert_eq!(versions.history, vec![1, 2, 3, 4, 5]);
     }
 
     #[tokio::test]
@@ -911,61 +1004,91 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_string(resp.into_body()).await;
         let versions: VersionHistoryResponse = serde_json::from_str(&body).unwrap();
-        // initial(1) + auth_def(2) + default_policy(3) + policy_set(4) + policy_set(5)
-        assert_eq!(versions.current_version, 5);
-        assert_eq!(versions.history.len(), 5);
+        // initial(1) + auth_def(2) + default_policy(3) + raft Bootstrap(4)
+        // + policy_set(5) + policy_set(6)
+        assert_eq!(versions.current_version, 6);
+        assert_eq!(versions.history.len(), 6);
     }
 
     // ---------------------------------------------------------------
-    // Control-plane: Consensus enforcement (FR-009)
+    // Control-plane: Consensus enforcement (FR-009, Raft semantics)
     // ---------------------------------------------------------------
 
+    /// Deprecated `approvals` are ignored: on the Raft leader a mutation
+    /// succeeds regardless of how many (or which) approvals are claimed —
+    /// agreement comes from log replication, not caller claims.
     #[tokio::test]
-    async fn control_plane_authority_without_majority_returns_403() {
+    async fn control_plane_approvals_field_is_ignored_on_leader() {
         let state = test_state();
         let app = router(state);
 
-        // Only 1 approval (need 2 of 3 for majority)
+        // Single self-claimed approval (previously rejected as sub-majority).
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/authorities")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"denied/","authority_nodes":["a1"],"approvals":["auth-1"]}"#,
+                r#"{"key_range_prefix":"ok/","authority_nodes":["a1"],"approvals":["auth-1"]}"#,
             ))
             .unwrap();
-
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = body_string(resp.into_body()).await;
-        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(err["error_code"], "POLICY_DENIED");
-
-        // Verify it was not applied
-        let req = Request::builder()
-            .uri("/api/control-plane/authorities/denied%2F")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn control_plane_policy_without_majority_returns_403() {
-        let state = test_state();
-        let app = router(state);
-
-        // Empty approvals (need 2 of 3 for majority)
+        // Empty approvals list.
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"denied/","replica_count":3,"approvals":[]}"#,
+                r#"{"key_range_prefix":"empty/","replica_count":3,"approvals":[]}"#,
             ))
             .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
+        // Approvals field omitted entirely (new-style client).
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"missingfield/","replica_count":3}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Approvals from unknown nodes are equally irrelevant.
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"bad/","replica_count":3,"approvals":["unknown-1","unknown-2"]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Without a configured consensus (detached mode, the old `new(vec![])`
+    /// scaffolding), every control-plane mutation is denied with 403.
+    #[tokio::test]
+    async fn control_plane_detached_consensus_returns_403() {
+        let state = test_state();
+        // Swap in a detached consensus.
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::new(vec![]);
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"denied/","replica_count":3,"approvals":["auth-1","auth-2"]}"#,
+            ))
+            .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
@@ -982,12 +1105,77 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A follower answers control-plane mutations with 503 NOT_LEADER and
+    /// leader hint headers so callers can retry against the leader.
     #[tokio::test]
-    async fn control_plane_authority_with_majority_succeeds() {
+    async fn control_plane_follower_returns_503_with_leader_hint() {
+        use crate::control_plane::raft::node::{RaftConfig, RaftNode};
+        use crate::control_plane::raft::storage::MemRaftStorage;
+        use crate::control_plane::raft::transport::NoopTransport;
+        use crate::control_plane::raft::types::AppendEntriesRequest;
+
+        let state = test_state();
+        // A two-voter node starts (and stays, without a driver) as follower.
+        let follower = RaftNode::new(
+            NodeId("test-node".into()),
+            [NodeId("test-node".into()), NodeId("cp-leader".into())]
+                .into_iter()
+                .collect(),
+            RaftConfig::default(),
+            std::sync::Arc::new(MemRaftStorage::new()),
+            std::sync::Arc::new(NoopTransport),
+            Arc::clone(&state.namespace),
+            None,
+        )
+        .unwrap();
+        // Learn the leader via a heartbeat.
+        follower
+            .handle_append_entries(AppendEntriesRequest {
+                term: 1,
+                leader_id: NodeId("cp-leader".into()),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            })
+            .unwrap();
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::with_raft(follower);
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/policies")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","replica_count":3,"approvals":[]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get("x-asteroidb-leader-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("cp-leader"),
+            "leader hint header expected"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error_code"], "NOT_LEADER");
+    }
+
+    #[tokio::test]
+    async fn control_plane_authority_update_succeeds() {
         let state = test_state();
         let app = router(state);
 
-        // 2 of 3 approvals = majority
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/authorities")
@@ -1015,11 +1203,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_plane_policy_with_majority_succeeds() {
+    async fn control_plane_policy_update_succeeds_with_commit_ordered_version() {
         let state = test_state();
-        let app = router(state);
+        let app = router(Arc::clone(&state));
 
-        // All 3 approvals
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
@@ -1031,38 +1218,66 @@ mod tests {
 
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let first: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
 
         // Verify it was applied
         let req = Request::builder()
             .uri("/api/control-plane/policies/ok%2F")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let body = body_string(resp.into_body()).await;
         let policy: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(policy.key_range_prefix, "ok/");
         assert_eq!(policy.replica_count, 5);
-    }
+        assert_eq!(policy.version, first.version);
 
-    #[tokio::test]
-    async fn control_plane_non_authority_approvals_rejected() {
-        let state = test_state();
-        let app = router(state);
-
-        // 2 approvals but from non-authority nodes
+        // A second update gets a strictly larger commit-ordered version.
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
             .header("content-type", "application/json")
             .body(Body::from(
-                r#"{"key_range_prefix":"bad/","replica_count":3,"approvals":["unknown-1","unknown-2"]}"#,
+                r#"{"key_range_prefix":"ok/","replica_count":4,"approvals":[]}"#,
             ))
             .unwrap();
-
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let second: PlacementPolicyResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            second.version > first.version,
+            "versions must increase with commit order: {} -> {}",
+            first.version,
+            second.version
+        );
+    }
+
+    /// The raft status endpoint reports leadership of the single-voter node.
+    #[tokio::test]
+    async fn control_plane_raft_status_endpoint() {
+        use crate::http::types::RaftStatusResponse;
+
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/control-plane/raft/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let status: RaftStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.role, "leader");
+        assert_eq!(status.node_id, "test-node");
+        assert_eq!(status.leader_id.as_deref(), Some("test-node"));
+        assert_eq!(status.voters, vec!["test-node".to_string()]);
+        assert!(status.commit_index >= 1, "noop + bootstrap committed");
+        assert_eq!(status.commit_index, status.last_applied);
     }
 
     // ---------------------------------------------------------------
@@ -1251,9 +1466,16 @@ mod tests {
     async fn certified_read_certified_has_proof() {
         use crate::authority::ack_frontier::AckFrontier;
         use crate::hlc::HlcTimestamp;
-        use crate::types::PolicyVersion;
 
         let state = test_state();
+
+        // The catch-all policy's version was re-assigned by the raft
+        // Bootstrap import; frontiers must report against the CURRENT
+        // version to count toward certification.
+        let current_pv = {
+            let ns = state.namespace.read().unwrap();
+            ns.get_placement_policy("").unwrap().version
+        };
 
         // Write a certified value and advance frontiers to certify it.
         {
@@ -1281,7 +1503,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: String::new(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: current_pv,
                 digest_hash: "h1".into(),
             });
             api.update_frontier(AckFrontier {
@@ -1294,7 +1516,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: String::new(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: current_pv,
                 digest_hash: "h2".into(),
             });
             api.process_certifications();
@@ -1415,7 +1637,201 @@ mod tests {
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
-        assert_eq!(result.required_count, 3); // 5/2+1 = 3
+        // The denominator comes from the server's authority definition
+        // (3 authorities), not the request's total_authorities=5: 3/2+1 = 2.
+        assert_eq!(result.required_count, 2);
+    }
+
+    /// The caller-supplied `total_authorities` must be ignored: shrinking the
+    /// denominator must not turn a sub-quorum signature set into a majority.
+    #[tokio::test]
+    async fn verify_proof_ignores_caller_supplied_total_authorities() {
+        use crate::authority::certificate::{
+            KeysetVersion, create_certificate_message, sign_message,
+        };
+        use crate::http::types::VerifyProofResponse;
+        use crate::types::PolicyVersion;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let kr = KeyRange {
+            prefix: "user/".into(),
+        };
+        let hlc = crate::hlc::HlcTimestamp {
+            physical: 1000,
+            logical: 0,
+            node_id: "auth-1".into(),
+        };
+        let pv = PolicyVersion(1);
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        // Only 2 of 5 authorities sign — a genuine sub-quorum.
+        let mut sigs_json = Vec::new();
+        let mut registry_keys = Vec::new();
+        for auth_id in ["auth-1", "auth-2"] {
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = sk.verifying_key();
+            let sig = sign_message(&sk, &message);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            registry_keys.push((NodeId(auth_id.to_string()), vk));
+            sigs_json.push(serde_json::json!({
+                "authority_id": auth_id,
+                "public_key": pk_hex,
+                "signature": sig_hex,
+                "keyset_version": 1
+            }));
+        }
+
+        let state = test_state();
+        {
+            // The server-side authority set for the range has 5 members.
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                authority_nodes: (1..=5).map(|i| NodeId(format!("auth-{i}"))).collect(),
+                auto_generated: false,
+            });
+        }
+        {
+            let registry_lock = state.keyset_registry.as_ref().unwrap();
+            let mut registry = registry_lock.write().unwrap();
+            registry
+                .register_keyset(KeysetVersion(1), 0, registry_keys)
+                .unwrap();
+        }
+        let app = router(state);
+
+        // The attacker claims total_authorities=3 so that 2 signatures
+        // would count as a majority (3/2+1 = 2).
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": ["auth-1", "auth-2"],
+            "total_authorities": 3,
+            "certificate": {
+                "keyset_version": 1,
+                "signatures": sigs_json
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result.required_count, 3,
+            "denominator must come from the 5-member authority definition"
+        );
+        assert!(!result.has_majority, "2 of 5 must not be a majority");
+        assert!(!result.valid, "sub-quorum proof must be invalid");
+    }
+
+    /// Valid signatures from authorities outside the range's authority set
+    /// must not count toward the majority.
+    #[tokio::test]
+    async fn verify_proof_rejects_non_member_signers() {
+        use crate::authority::certificate::{
+            KeysetVersion, create_certificate_message, sign_message,
+        };
+        use crate::http::types::VerifyProofResponse;
+        use crate::types::PolicyVersion;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let kr = KeyRange {
+            prefix: "order/".into(),
+        };
+        let hlc = crate::hlc::HlcTimestamp {
+            physical: 1000,
+            logical: 0,
+            node_id: "auth-1".into(),
+        };
+        let pv = PolicyVersion(1);
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        // auth-1/auth-2 are registered keys but NOT authorities of order/.
+        let mut sigs_json = Vec::new();
+        let mut registry_keys = Vec::new();
+        for auth_id in ["auth-1", "auth-2"] {
+            let sk = SigningKey::generate(&mut OsRng);
+            let vk = sk.verifying_key();
+            let sig = sign_message(&sk, &message);
+            let pk_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            let sig_hex: String = sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            registry_keys.push((NodeId(auth_id.to_string()), vk));
+            sigs_json.push(serde_json::json!({
+                "authority_id": auth_id,
+                "public_key": pk_hex,
+                "signature": sig_hex,
+                "keyset_version": 1
+            }));
+        }
+
+        let state = test_state();
+        {
+            // order/ is owned by a disjoint authority set.
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "order/".into(),
+                },
+                authority_nodes: vec![
+                    NodeId("auth-b1".into()),
+                    NodeId("auth-b2".into()),
+                    NodeId("auth-b3".into()),
+                ],
+                auto_generated: false,
+            });
+        }
+        {
+            let registry_lock = state.keyset_registry.as_ref().unwrap();
+            let mut registry = registry_lock.write().unwrap();
+            registry
+                .register_keyset(KeysetVersion(1), 0, registry_keys)
+                .unwrap();
+        }
+        let app = router(state);
+
+        let body_json = serde_json::json!({
+            "key_range_prefix": "order/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": ["auth-1", "auth-2"],
+            "total_authorities": 3,
+            "certificate": {
+                "keyset_version": 1,
+                "signatures": sigs_json
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let result: VerifyProofResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            !result.has_majority,
+            "signatures from non-members of the range must not count: {result:?}"
+        );
+        assert!(!result.valid);
+        assert_eq!(result.contributing_count, 0);
     }
 
     #[tokio::test]
@@ -1450,7 +1866,8 @@ mod tests {
         assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.contributing_count, 3);
-        assert_eq!(result.required_count, 3);
+        // Derived from the server's 3-member authority definition.
+        assert_eq!(result.required_count, 2);
     }
 
     #[tokio::test]
@@ -1483,7 +1900,8 @@ mod tests {
         assert!(!result.valid);
         assert!(!result.has_majority);
         assert_eq!(result.contributing_count, 1);
-        assert_eq!(result.required_count, 3);
+        // Derived from the server's 3-member authority definition.
+        assert_eq!(result.required_count, 2);
     }
 
     // ---------------------------------------------------------------
@@ -1889,15 +2307,17 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Control-plane: DELETE quorum enforcement
+    // Control-plane: DELETE consensus enforcement (Raft semantics)
     // ---------------------------------------------------------------
 
+    /// Removal on a detached consensus is denied and leaves the policy
+    /// intact; on the leader it succeeds regardless of claimed approvals.
     #[tokio::test]
-    async fn control_plane_remove_policy_without_majority_returns_403() {
+    async fn control_plane_remove_policy_consensus_enforcement() {
         let state = test_state();
-        let app = router(state);
+        let app = router(Arc::clone(&state));
 
-        // First set a policy
+        // First set a policy (on the single-voter leader).
         let req = Request::builder()
             .method("PUT")
             .uri("/api/control-plane/policies")
@@ -1908,23 +2328,929 @@ mod tests {
             .unwrap();
         app.clone().oneshot(req).await.unwrap();
 
-        // Try to remove with insufficient approvals (only 1 of 3)
+        // With a DETACHED consensus, removal is denied (403) and the
+        // policy survives.
+        let raft_consensus = state.consensus.lock().await.clone();
+        *state.consensus.lock().await =
+            crate::control_plane::consensus::ControlPlaneConsensus::new(vec![]);
         let req = Request::builder()
             .method("DELETE")
             .uri("/api/control-plane/policies/data%2F")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"approvals":["auth-1"]}"#))
             .unwrap();
-
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        // Policy should still exist
+        let req = Request::builder()
+            .uri("/api/control-plane/policies/data%2F")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Back on the leader, a single claimed approval (previously
+        // sub-majority) removes the policy through the raft log.
+        *state.consensus.lock().await = raft_consensus;
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/control-plane/policies/data%2F")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"approvals":["auth-1"]}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
         let req = Request::builder()
             .uri("/api/control-plane/policies/data%2F")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---------------------------------------------------------------
+    // Internal Raft endpoints: auth + codec
+    // ---------------------------------------------------------------
+
+    fn sample_vote_request_json() -> String {
+        r#"{"term":1,"candidate_id":"cp-2","last_log_index":0,"last_log_term":0}"#.to_string()
+    }
+
+    #[tokio::test]
+    async fn raft_internal_endpoints_require_token_when_configured() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+
+        for path in [
+            "/api/internal/raft/vote",
+            "/api/internal/raft/append",
+            "/api/internal/raft/snapshot",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(sample_vote_request_json()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be protected by the internal token"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_vote_endpoint_accepts_json_and_bincode() {
+        use crate::control_plane::raft::types::{RequestVoteRequest, RequestVoteResponse};
+        use crate::http::codec::{CONTENT_TYPE_BINCODE, serialize_internal};
+
+        let state = test_state();
+        let app = router(state);
+
+        // JSON request. The single-voter leader ignores foreign candidates
+        // (it is its own leader), but the endpoint must answer a valid
+        // RequestVoteResponse either way.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/raft/vote")
+            .header("content-type", "application/json")
+            .body(Body::from(sample_vote_request_json()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let vote: RequestVoteResponse = serde_json::from_str(&body).unwrap();
+        assert!(!vote.vote_granted, "leader's log/term wins");
+
+        // Bincode request + bincode response.
+        let raw = RequestVoteRequest {
+            term: 1,
+            candidate_id: NodeId("cp-2".into()),
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        let (bytes, ct) = serialize_internal(&raw, Some(CONTENT_TYPE_BINCODE)).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/raft/vote")
+            .header("content-type", ct)
+            .header("accept", CONTENT_TYPE_BINCODE)
+            .body(Body::from(bytes))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some(CONTENT_TYPE_BINCODE)
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let vote: RequestVoteResponse =
+            crate::http::codec::deserialize_internal(&bytes, Some(CONTENT_TYPE_BINCODE)).unwrap();
+        assert!(!vote.vote_granted);
+    }
+
+    // ---------------------------------------------------------------
+    // Signing pipeline: signed frontier push + end-to-end verify (FR-008)
+    // ---------------------------------------------------------------
+
+    use crate::authority::certificate::{KeysetRegistry, KeysetVersion};
+    use crate::authority::frontier_sig::NodeSigner;
+    use crate::hlc::HlcTimestamp;
+    use crate::network::frontier_sync::{FrontierPushRequest, FrontierPushResponse};
+
+    #[cfg(feature = "native-crypto")]
+    fn signing_test_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(NodeId(name.into()), &seed, true)
+    }
+
+    #[cfg(not(feature = "native-crypto"))]
+    fn signing_test_signer(name: &str, byte: u8) -> NodeSigner {
+        let mut seed = [0u8; 32];
+        seed[0] = byte;
+        NodeSigner::from_seed(NodeId(name.into()), &seed)
+    }
+
+    fn signing_registry(signers: &[&NodeSigner]) -> KeysetRegistry {
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                signers
+                    .iter()
+                    .map(|s| (s.node_id().clone(), s.verifying_key()))
+                    .collect(),
+            )
+            .unwrap();
+        #[cfg(feature = "native-crypto")]
+        {
+            let bls_keys: Vec<(
+                String,
+                crate::authority::bls::BlsPublicKey,
+                crate::authority::bls::BlsProofOfPossession,
+            )> = signers
+                .iter()
+                .filter_map(|s| {
+                    s.bls_public_key()
+                        .zip(s.bls_proof_of_possession())
+                        .map(|(pk, pop)| (s.node_id().0.clone(), pk, pop))
+                })
+                .collect();
+            if !bls_keys.is_empty() {
+                registry
+                    .register_bls_keys(&KeysetVersion(1), bls_keys)
+                    .unwrap();
+            }
+        }
+        registry
+    }
+
+    fn signed_push_body(signers: &[&NodeSigner], physical: u64) -> FrontierPushRequest {
+        signed_push_body_with_pv(signers, physical, PolicyVersion(1))
+    }
+
+    fn signed_push_body_with_pv(
+        signers: &[&NodeSigner],
+        physical: u64,
+        pv: PolicyVersion,
+    ) -> FrontierPushRequest {
+        let mut frontiers = Vec::new();
+        let mut signatures = Vec::new();
+        for signer in signers {
+            let frontier = crate::authority::ack_frontier::AckFrontier {
+                authority_id: signer.node_id().clone(),
+                frontier_hlc: HlcTimestamp {
+                    physical,
+                    logical: 0,
+                    node_id: signer.node_id().0.clone(),
+                },
+                key_range: KeyRange {
+                    prefix: String::new(),
+                },
+                policy_version: pv,
+                digest_hash: format!("{}-{physical}", signer.node_id().0),
+            };
+            let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+            frontiers.push(frontier);
+            signatures.push(Some(sig));
+        }
+        FrontierPushRequest {
+            frontiers,
+            signatures,
+            observed: vec![],
+        }
+    }
+
+    async fn push_frontiers(app: &Router, body: &FrontierPushRequest) -> FrontierPushResponse {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/frontiers")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn signed_frontier_push_verified_and_accepted() {
+        let s1 = signing_test_signer("auth-1", 61);
+        let s2 = signing_test_signer("auth-2", 62);
+        let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let app = router(state);
+
+        let body = signed_push_body(&[&s1, &s2], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 2,
+            "valid signed frontiers must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_signed_frontier_rejected() {
+        let s1 = signing_test_signer("auth-1", 63);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+
+        let mut body = signed_push_body(&[&s1], 10_500);
+        // Inflate the frontier after signing (attestation replay attack).
+        body.frontiers[0].frontier_hlc.physical += 60_000;
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 0, "tampered frontier must be rejected");
+    }
+
+    #[tokio::test]
+    async fn frontier_from_unregistered_authority_rejected() {
+        let s1 = signing_test_signer("auth-1", 64);
+        let rogue = signing_test_signer("auth-9", 65);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+
+        let body = signed_push_body(&[&rogue], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "signature from an unregistered authority must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsigned_frontier_policy_depends_on_require_flag() {
+        let s1 = signing_test_signer("auth-1", 66);
+
+        // Lenient (default): unsigned frontiers are accepted.
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let app = router(state);
+        let mut body = signed_push_body(&[&s1], 10_500);
+        body.signatures = vec![None];
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 1,
+            "lenient mode accepts unsigned frontiers"
+        );
+
+        // Strict: unsigned frontiers are rejected.
+        let state = test_state_signing(Some(signing_registry(&[&s1])), true);
+        let app = router(state);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 0, "strict mode rejects unsigned frontiers");
+    }
+
+    #[tokio::test]
+    async fn no_registry_accepts_unverified_frontiers() {
+        // Without a registry, the legacy unverified path applies even for
+        // payloads carrying (unverifiable) signatures.
+        let s1 = signing_test_signer("auth-1", 67);
+        let state = test_state_signing(None, false);
+        let app = router(state);
+        let body = signed_push_body(&[&s1], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_without_registry_rejects_all_frontiers() {
+        // require_signed_frontiers must fail closed when no registry is
+        // configured: nothing can be verified, so nothing may be accepted.
+        let s1 = signing_test_signer("auth-1", 70);
+        let state = test_state_signing(None, true);
+        let app = router(state);
+
+        // Signed payload: rejected (no keys to verify against).
+        let body = signed_push_body(&[&s1], 10_500);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "strict mode without a registry must reject signed frontiers"
+        );
+
+        // Unsigned payload: rejected as well.
+        let mut body = signed_push_body(&[&s1], 10_600);
+        body.signatures = vec![None];
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "strict mode without a registry must reject unsigned frontiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontier_from_non_member_of_range_authority_set_rejected() {
+        // auth-1 is registered in the keyset registry (its signature is
+        // cryptographically valid) but is NOT an authority for order/, so
+        // its frontier must not count toward order/'s majority.
+        let s1 = signing_test_signer("auth-1", 71);
+        let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        {
+            let mut ns = state.namespace.write().unwrap();
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "order/".into(),
+                },
+                authority_nodes: vec![
+                    NodeId("auth-b1".into()),
+                    NodeId("auth-b2".into()),
+                    NodeId("auth-b3".into()),
+                ],
+                auto_generated: false,
+            });
+        }
+        let app = router(Arc::clone(&state));
+
+        let make_body = |prefix: &str| {
+            let frontier = crate::authority::ack_frontier::AckFrontier {
+                authority_id: s1.node_id().clone(),
+                frontier_hlc: HlcTimestamp {
+                    physical: 10_500,
+                    logical: 0,
+                    node_id: s1.node_id().0.clone(),
+                },
+                key_range: KeyRange {
+                    prefix: prefix.into(),
+                },
+                policy_version: PolicyVersion(1),
+                digest_hash: format!("{}-10500", s1.node_id().0),
+            };
+            let sig = s1.sign_frontier(&frontier, KeysetVersion(1));
+            FrontierPushRequest {
+                frontiers: vec![frontier],
+                signatures: vec![Some(sig)],
+                observed: vec![],
+            }
+        };
+
+        // Frontier for order/ (owned by auth-b1..b3): rejected despite the
+        // valid signature.
+        let result = push_frontiers(&app, &make_body("order/")).await;
+        assert_eq!(
+            result.accepted, 0,
+            "registered authority outside the range's authority set must be rejected"
+        );
+
+        // Frontier for the catch-all range (auth-1 IS a member): accepted.
+        let result = push_frontiers(&app, &make_body("")).await;
+        assert_eq!(result.accepted, 1);
+    }
+
+    /// Full HTTP round-trip: certified write → signed frontier pushes →
+    /// certification → GET proof → POST the proof to /api/certified/verify.
+    #[tokio::test]
+    async fn certified_proof_round_trips_through_verify_endpoint() {
+        let s1 = signing_test_signer("auth-1", 68);
+        let s2 = signing_test_signer("auth-2", 69);
+        let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let app = router(Arc::clone(&state));
+
+        // 1. Certified write.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/write")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"key":"user1","value":{"type":"register","value":"v1"},"on_timeout":"pending"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 2. Majority of authorities push signed frontiers past the write's
+        //    next checkpoint boundary.
+        let write_ts = {
+            let api = state.certified.lock().await;
+            api.pending_writes()[0].timestamp.physical
+        };
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        // Frontiers must report against the CURRENT policy version (the
+        // catch-all policy was re-versioned by the raft Bootstrap import).
+        let current_pv = {
+            let ns = state.namespace.read().unwrap();
+            ns.get_placement_policy("").unwrap().version
+        };
+        let body = signed_push_body_with_pv(&[&s1, &s2], report_ts, current_pv);
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(result.accepted, 2);
+
+        // 3. Drive certification (normally done by the NodeRunner tick).
+        state.certified.lock().await.process_certifications();
+
+        // 4. Read the proof.
+        let req = Request::builder()
+            .uri("/api/certified/user1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let read: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert_eq!(read["status"], "Certified");
+        let proof = read["proof"].clone();
+        assert!(
+            proof["certificate"].is_object(),
+            "proof must carry a certificate: {proof}"
+        );
+
+        // 5. The proof JSON round-trips directly into the verify endpoint.
+        let verify = |payload: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/api/certified/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = body_string(resp.into_body()).await;
+                (status, body)
+            }
+        };
+
+        // Ed25519 path.
+        let mut ed_payload = proof.clone();
+        ed_payload["signature_algorithm"] = serde_json::json!("Ed25519");
+        let (status, body) = verify(ed_payload).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result["valid"], true,
+            "Ed25519 proof must verify end-to-end: {result}"
+        );
+
+        // Tampered signature must be rejected.
+        let mut tampered = proof.clone();
+        tampered["signature_algorithm"] = serde_json::json!("Ed25519");
+        let sig = tampered["certificate"]["signatures"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        tampered["certificate"]["signatures"][0]["signature"] =
+            serde_json::json!(format!("{flipped}{}", &sig[1..]));
+        let (status, body) = verify(tampered).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            result["valid"], false,
+            "tampered proof must not verify: {result}"
+        );
+
+        // BLS path (native-crypto only): the proof carries the aggregate.
+        #[cfg(feature = "native-crypto")]
+        {
+            assert_eq!(proof["signature_algorithm"], "Bls12_381");
+            assert!(proof["bls_aggregate_signature"].is_string());
+            let (status, body) = verify(proof.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                result["valid"], true,
+                "BLS proof must verify end-to-end: {result}"
+            );
+
+            // A missing signer breaks the aggregate.
+            let mut partial = proof.clone();
+            partial["bls_signer_ids"] = serde_json::json!(["auth-1"]);
+            partial["bls_public_keys"] =
+                serde_json::json!([proof["bls_public_keys"][0].as_str().unwrap()]);
+            let (status, body) = verify(partial).await;
+            assert_eq!(status, StatusCode::OK);
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                result["valid"], false,
+                "aggregate with a missing signer must not verify: {result}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Session guarantees (read-your-writes / monotonic reads)
+    // ---------------------------------------------------------------
+
+    /// A write response must carry a parseable single-entry session token
+    /// originating from this node.
+    #[tokio::test]
+    async fn eventual_write_returns_session_token() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"hits"}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let write_resp: WriteResponse = serde_json::from_str(&body).unwrap();
+        assert!(write_resp.ok);
+        let token =
+            crate::session::SessionToken::parse(&write_resp.session_token.unwrap()).unwrap();
+        assert_eq!(token.entries().len(), 1);
+        assert_eq!(token.entries()[0].node_id, "test-node");
+    }
+
+    /// Backward compatibility: without the session_token query parameter
+    /// the raw response JSON must not contain a session_token key.
+    #[tokio::test]
+    async fn eventual_read_without_token_param_is_byte_compatible() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/eventual/somekey")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 2, "only key and value expected: {body}");
+        assert!(json.get("session_token").is_none());
+    }
+
+    /// Read-your-writes on the same node: write → read with the write's
+    /// token → 200 with the value and a response token that dominates the
+    /// request token.
+    #[tokio::test]
+    async fn eventual_read_with_own_write_token_succeeds() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"register_set","key":"greeting","value":"hello"}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_string(resp.into_body()).await;
+        let write_resp: WriteResponse = serde_json::from_str(&body).unwrap();
+        let write_token_str = write_resp.session_token.unwrap();
+        let write_token = crate::session::SessionToken::parse(&write_token_str).unwrap();
+
+        let req = Request::builder()
+            .uri(format!(
+                "/api/eventual/greeting?session_token={write_token_str}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            read_resp.value,
+            Some(CrdtValueJson::Register {
+                value: Some("hello".into())
+            })
+        );
+        // The response token must dominate the request token (monotonic reads).
+        let response_token =
+            crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        for entry in write_token.entries() {
+            assert!(
+                response_token
+                    .entries()
+                    .iter()
+                    .any(|e| e.node_id == entry.node_id && e >= entry),
+                "response token must cover {entry:?}"
+            );
+        }
+    }
+
+    /// A token from an unknown origin must yield 412 (fail closed), with
+    /// the Retry-After header and error code, immediately when wait_ms is
+    /// zero or absent.
+    #[tokio::test]
+    async fn eventual_read_with_unknown_origin_token_returns_412() {
+        let state = test_state();
+        let app = router(state);
+
+        // counter key: register path B cannot fire.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"cnt"}"#))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let token = crate::session::SessionToken::from_hlc(&crate::hlc::HlcTimestamp {
+            physical: 1,
+            logical: 0,
+            node_id: "other-node".into(),
+        })
+        .encode();
+        let req = Request::builder()
+            .uri(format!("/api/eventual/cnt?session_token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = body_string(resp.into_body()).await;
+        assert!(body.contains("SESSION_NOT_SATISFIED"), "{body}");
+    }
+
+    /// wait_ms: a background merge that lands during the wait window turns
+    /// the 412 into a 200.
+    #[tokio::test]
+    async fn eventual_read_wait_ms_succeeds_after_background_merge() {
+        let state = test_state();
+        let app = router(Arc::clone(&state));
+
+        let write_hlc = crate::hlc::HlcTimestamp {
+            physical: 1_000,
+            logical: 0,
+            node_id: "origin-x".into(),
+        };
+        let token = crate::session::SessionToken::from_hlc(&write_hlc).encode();
+
+        // Background task simulating a CLAIMED delta pull landing after
+        // 100ms: entries are merged and the sender's applied_origins is
+        // adopted (merges alone never claim an origin).
+        let bg_state = Arc::clone(&state);
+        let bg_hlc = write_hlc.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut c = crate::crdt::pn_counter::PnCounter::new();
+            c.increment(&NodeId("origin-x".into()));
+            let mut api = bg_state.eventual.lock().await;
+            api.merge_remote_with_hlc(
+                "waited".into(),
+                &crate::store::kv::CrdtValue::Counter(c),
+                bg_hlc.clone(),
+            )
+            .unwrap();
+            let mut sender_applied = std::collections::HashMap::new();
+            sender_applied.insert("origin-x".to_string(), bg_hlc);
+            api.store_mut().merge_applied_origins(&sender_applied);
+        });
+
+        let req = Request::builder()
+            .uri(format!(
+                "/api/eventual/waited?session_token={token}&wait_ms=3000"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.value, Some(CrdtValueJson::Counter { value: 1 }));
+    }
+
+    /// Malformed tokens and far-future tokens must be rejected with 400.
+    #[tokio::test]
+    async fn eventual_read_invalid_or_future_token_returns_400() {
+        let state = test_state();
+        let app = router(state);
+
+        for bad in ["not-a-token", "v2:1.0.61", "v1:zz.0.61"] {
+            let req = Request::builder()
+                .uri(format!("/api/eventual/k?session_token={bad}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "token {bad:?} must be rejected"
+            );
+        }
+
+        // Clock-advance attack: physical 61s beyond the wall clock.
+        let future = crate::session::SessionToken::from_hlc(&crate::hlc::HlcTimestamp {
+            physical: crate::hlc::wall_clock_ms() + 61_000,
+            logical: 0,
+            node_id: "evil".into(),
+        })
+        .encode();
+        let req = Request::builder()
+            .uri(format!("/api/eventual/k?session_token={future}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An empty session_token means "no precondition, start a session":
+    /// 200 plus a response token even for a missing key.
+    #[tokio::test]
+    async fn eventual_read_empty_token_starts_session() {
+        let state = test_state();
+        let app = router(state);
+
+        // Seed the applied frontier with one write.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/eventual/write")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"type":"counter_inc","key":"seed"}"#))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+
+        let req = Request::builder()
+            .uri("/api/eventual/missing?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert!(read_resp.value.is_none());
+        let token = crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        assert_eq!(token.entries().len(), 1);
+        assert_eq!(token.entries()[0].node_id, "test-node");
+    }
+
+    /// An empty session_token on a COMPLETELY FRESH node (no writes, no
+    /// visible origins) issues an empty token ("v1:") — and that token
+    /// must round-trip: the client carries it to the next read, which
+    /// must answer 200, not 400.
+    #[tokio::test]
+    async fn eventual_read_empty_token_on_fresh_node_round_trips() {
+        let state = test_state();
+        let app = router(state);
+
+        let req = Request::builder()
+            .uri("/api/eventual/missing?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        let issued = read_resp.session_token.unwrap();
+        assert_eq!(issued, "v1:", "fresh node issues the empty token");
+
+        // Carrying the server-issued token back must not be rejected.
+        let req = Request::builder()
+            .uri(format!("/api/eventual/missing?session_token={issued}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "server-issued empty token must round-trip"
+        );
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.session_token.unwrap(), "v1:");
+    }
+
+    /// The response token must cover contributions that became visible
+    /// through UNCLAIMED merges (no applied claim): a reader that
+    /// observed such a value and then hops to a stale replica must get
+    /// 412 there, not an older value (monotonic reads).
+    #[tokio::test]
+    async fn eventual_read_response_token_covers_unclaimed_merges() {
+        let state = test_state();
+
+        // An unclaimed delta merge lands a foreign contribution.
+        let foreign_hlc = crate::hlc::HlcTimestamp {
+            physical: 2_000,
+            logical: 0,
+            node_id: "origin-z".into(),
+        };
+        {
+            let mut api = state.eventual.lock().await;
+            let mut c = crate::crdt::pn_counter::PnCounter::new();
+            c.increment(&NodeId("origin-z".into()));
+            api.merge_remote_with_hlc(
+                "cnt".into(),
+                &crate::store::kv::CrdtValue::Counter(c),
+                foreign_hlc.clone(),
+            )
+            .unwrap();
+            // No adoption: origin-z stays unclaimed.
+            assert!(api.store().applied_origin("origin-z").is_none());
+        }
+
+        let app = router(state);
+        let req = Request::builder()
+            .uri("/api/eventual/cnt?session_token=")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_string(resp.into_body()).await;
+        let read_resp: EventualReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(read_resp.value, Some(CrdtValueJson::Counter { value: 1 }));
+
+        // The token covers the observed (unclaimed) contribution.
+        let token = crate::session::SessionToken::parse(&read_resp.session_token.unwrap()).unwrap();
+        assert!(
+            token
+                .entries()
+                .iter()
+                .any(|e| e.node_id == "origin-z" && *e >= foreign_hlc),
+            "response token must cover the unclaimed observation: {token:?}"
+        );
+
+        // A stale replica (never saw origin-z) must refuse this token.
+        let stale = crate::api::eventual::EventualApi::new(NodeId("stale".into()));
+        assert!(
+            !token.is_satisfied(stale.store(), "cnt"),
+            "stale replica must refuse the token (no monotonic-reads lie)"
+        );
+    }
+
+    /// Internal sync responses must carry the session-guarantee metadata
+    /// (frontier adoption inputs).
+    #[tokio::test]
+    async fn internal_sync_responses_include_session_metadata() {
+        let state = test_state();
+
+        {
+            let mut api = state.eventual.lock().await;
+            api.eventual_counter_inc("k").unwrap();
+        }
+        let app = router(state);
+
+        // Delta sync response.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/sync/delta")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let delta: crate::network::sync::DeltaSyncResponse = serde_json::from_str(&body).unwrap();
+        assert!(delta.applied_origins.contains_key("test-node"));
+        assert!(delta.merge_failed_keys.is_empty());
+        assert!(delta.pruned_floor.is_none());
+        assert!(
+            delta.visible_origins.contains_key("test-node"),
+            "delta responses must carry the visible frontier"
+        );
+
+        // Full key dump.
+        let req = Request::builder()
+            .uri("/api/internal/keys")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let dump: crate::network::sync::KeyDumpResponse = serde_json::from_str(&body).unwrap();
+        assert!(dump.applied_origins.contains_key("test-node"));
+        assert!(dump.merge_failed_keys.is_empty());
+        assert!(
+            dump.visible_origins.contains_key("test-node"),
+            "key dumps must carry the visible frontier"
+        );
     }
 }

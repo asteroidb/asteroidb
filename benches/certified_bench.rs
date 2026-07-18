@@ -80,6 +80,7 @@ fn make_signed_proof(n_signers: usize, total: usize) -> ProofBundle {
         contributing_authorities: authorities,
         total_authorities: total,
         certificate: Some(cert),
+        bls_certificate: None,
     }
 }
 

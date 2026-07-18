@@ -79,6 +79,9 @@ These modules use tokio, axum, reqwest, or OS networking:
 These specific functions are unavailable on WASM:
 
 - `Store::save_snapshot`, `Store::load_snapshot`, `Store::load_snapshot_or_default`
+- `store/wal` (entire module: WAL segments, crash recovery replay) — on WASM
+  the `EventualApi`/`CertifiedApi` WAL hooks compile to no-ops
+- `Hlc::seed_recovered` (recovery-only clock seeding)
 - `CertificationTracker::save`, `CertificationTracker::load`
 - `AckFrontierSet::save`, `AckFrontierSet::load`
 - `SystemNamespace::save`, `SystemNamespace::load`

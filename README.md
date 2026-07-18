@@ -16,7 +16,7 @@
 - **SLO モニタリング** -- certification レイテンシ、sync 失敗率、frontier スキューの
   error budget トラッキングを内蔵。
 - **Control Plane** -- system namespace に配置ポリシーと Authority 定義を格納し、
-  quorum consensus で更新。
+  内蔵 Raft コンセンサス（静的投票者集合の過半数 commit）で更新。
 
 ## アーキテクチャ
 
@@ -53,7 +53,10 @@
 クライアントは暗号学的証明付きの Certified read を要求可能です。
 
 **Control Plane** -- `system namespace` で配置ポリシーと Authority 定義を管理。
-変更には control-plane Authority ノード群の quorum consensus が必要です。
+変更は内蔵 Raft コンセンサスで合意されます: 現在の Raft リーダーだけが
+書き込みを受理し（それ以外のノードは `503 NOT_LEADER` + リーダーヒントヘッダを
+返却）、`ASTEROIDB_CONTROL_PLANE_NODES` で定義した静的投票者集合の過半数で
+commit されてから応答します。
 
 ## クイックスタート
 
@@ -87,6 +90,11 @@ cargo run
 | `ASTEROIDB_CONFIG` | *(なし)* | JSON 設定ファイルのパス |
 | `ASTEROIDB_BLS_SEED` | *(なし)* | 16 進エンコードされた 32 バイト BLS 鍵シード |
 | `ASTEROIDB_AUTHORITY_NODES` | `auth-1,auth-2,auth-3` | Authority ノード ID のカンマ区切りリスト |
+| `ASTEROIDB_CONTROL_PLANE_NODES` | *(なし = 自ノードのみ)* | Control plane Raft の静的投票者集合（ノード ID のカンマ区切り）。**全ノードで同一の値**を設定すること。未設定時は自ノードのみの単一投票者クラスタ |
+| `ASTEROIDB_RAFT_PEERS` | *(なし)* | Raft ピアの静的アドレスマップ（`<node-id>=<host:port>` のカンマ区切り）。マルチノード制御プレーンで推奨（未設定時は gossip でアドレス解決） |
+
+Control plane Raft のチューニング（選挙タイムアウト等）や永続化・鍵配布
+関連の全環境変数は [運用ガイド](docs/ops-guide.md) を参照してください。
 
 ### Docker Compose で 3 ノードクラスタを実行
 
@@ -276,7 +284,7 @@ src/
     latency.rs            #   スライディングウィンドウ RTT モデル
     topology.rs           #   リージョン対応トポロジービュー
     rebalance.rs          #   リバランス計画の算出
-  control_plane/          # System namespace と quorum consensus
+  control_plane/          # System namespace と内蔵 Raft コンセンサス
   network/                # ピア管理と delta sync
     membership.rs         #   Fan-out join/leave プロトコル
     sync.rs               #   Anti-entropy delta sync（backoff 付き）

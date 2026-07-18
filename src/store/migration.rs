@@ -1,3 +1,15 @@
+//! Snapshot format migrations (JSON path).
+//!
+//! Scope note: the write-ahead log (`store::wal`) is an INDEPENDENT format
+//! with its own magic + `WAL_FORMAT_VERSION` header and is NOT managed by
+//! this registry. WAL records are idempotent redo records, so recovery
+//! needs no snapshot watermark and the `Store` layout (v4) is untouched by
+//! the WAL. If a future change embeds WAL metadata into the snapshot (or
+//! adds any `Store` field), it must bump `CURRENT_FORMAT_VERSION`, freeze
+//! the previous layout in a bincode decode type (see `StoreV3Layout`),
+//! AND register the next migration here — bincode is positional,
+//! `#[serde(default)]` cannot rescue old snapshots.
+
 use crate::error::CrdtError;
 
 /// A migration that transforms persisted data from one format version to the next.
@@ -116,10 +128,62 @@ impl Migration for V1ToV2 {
     }
 }
 
+/// Migration from v2 to v3: the session-guarantee fields
+/// (`applied_origins`, `merge_failed_keys`, `pruned_floor`,
+/// `visible_origins`) were added to `Store`.
+///
+/// A JSON no-op: the new fields carry `#[serde(default)]` and old
+/// snapshots simply omit them. (The bincode path cannot rely on serde
+/// defaults and uses a versioned decode type instead — see
+/// `Store::load_from_backend_bincode`.)
+pub struct V2ToV3;
+
+impl Migration for V2ToV3 {
+    fn source_version(&self) -> u32 {
+        2
+    }
+
+    fn target_version(&self) -> u32 {
+        3
+    }
+
+    fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+        // No-op for JSON: added fields default via serde.
+        Ok(data)
+    }
+}
+
+/// Migration from v3 to v4: an envelope-level CRC32 checksum (verified
+/// before this registry runs) and the `recovery_gaps` fence field were
+/// added.
+///
+/// A JSON no-op: `recovery_gaps` carries `#[serde(default)]` and old
+/// snapshots simply omit it; the checksum lives in the envelope, not the
+/// store value. (The bincode path uses the frozen `StoreV3Layout` decode
+/// type instead — see `Store::load_from_backend_bincode`.)
+pub struct V3ToV4;
+
+impl Migration for V3ToV4 {
+    fn source_version(&self) -> u32 {
+        3
+    }
+
+    fn target_version(&self) -> u32 {
+        4
+    }
+
+    fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+        // No-op for JSON: added fields default via serde.
+        Ok(data)
+    }
+}
+
 /// Build the default migration registry with all known migrations.
 pub fn default_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
     registry.register(Box::new(V1ToV2));
+    registry.register(Box::new(V2ToV3));
+    registry.register(Box::new(V3ToV4));
     registry
 }
 
@@ -235,11 +299,25 @@ mod tests {
         }
     }
 
-    /// Test a multi-step migration chain by adding a second migration.
+    /// Test a multi-step migration chain with transforming mocks (a fresh
+    /// registry — the default one already covers 1→2→3 with no-ops).
     #[test]
     fn registry_applies_chain_v1_to_v3() {
-        struct V2ToV3;
-        impl Migration for V2ToV3 {
+        struct MockV1ToV2;
+        impl Migration for MockV1ToV2 {
+            fn source_version(&self) -> u32 {
+                1
+            }
+            fn target_version(&self) -> u32 {
+                2
+            }
+            fn migrate(&self, mut data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+                data["migrated_to_v2"] = serde_json::Value::Bool(true);
+                Ok(data)
+            }
+        }
+        struct MockV2ToV3;
+        impl Migration for MockV2ToV3 {
             fn source_version(&self) -> u32 {
                 2
             }
@@ -253,11 +331,27 @@ mod tests {
             }
         }
 
-        let mut registry = default_registry();
-        registry.register(Box::new(V2ToV3));
+        let mut registry = MigrationRegistry::new();
+        registry.register(Box::new(MockV1ToV2));
+        registry.register(Box::new(MockV2ToV3));
 
         let data = json!({"data": {}});
         let result = registry.apply_migrations(data, 1, 3).unwrap();
+        assert_eq!(result["migrated_to_v2"], true);
         assert_eq!(result["migrated_to_v3"], true);
+    }
+
+    /// The default registry migrates v1 and v2 data all the way to the
+    /// current version (both built-in steps are JSON no-ops).
+    #[test]
+    fn default_registry_covers_v1_and_v2_to_current() {
+        let registry = default_registry();
+        let data = json!({"data": {"key": "value"}, "timestamps": {}});
+        for from in [1u32, 2] {
+            let result = registry
+                .apply_migrations(data.clone(), from, crate::store::kv::CURRENT_FORMAT_VERSION)
+                .unwrap();
+            assert_eq!(result, data, "v{from} migration chain must be a no-op");
+        }
     }
 }

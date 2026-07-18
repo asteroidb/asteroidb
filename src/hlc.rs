@@ -11,7 +11,10 @@ use crate::error::HlcError;
 /// `wall_clock + MAX_CLOCK_SKEW_MS`. A far-future physical timestamp would
 /// advance `self.physical` beyond the real wall clock, causing `now()` to
 /// stop advancing and eventually fail with `Overflow` — a DoS vector.
-const MAX_CLOCK_SKEW_MS: u64 = 60_000;
+///
+/// Public so that session-token bounds checking (`SessionToken::validate_bounds`)
+/// shares the same skew limit as the HLC itself.
+pub const MAX_CLOCK_SKEW_MS: u64 = 60_000;
 
 /// A snapshot of the Hybrid Logical Clock at a point in time.
 ///
@@ -166,6 +169,47 @@ impl Hlc {
             }
         }
     }
+
+    /// Seed the clock from a timestamp recovered from persistent state
+    /// (snapshot + WAL replay). RECOVERY PATH ONLY.
+    ///
+    /// Unlike [`update`](Self::update) this max-merge deliberately BYPASSES
+    /// the `ClockSkew` guard: the replayed timestamps may include HLCs this
+    /// very node issued in the past under clock skew, and refusing them
+    /// would make the node unable to start. Skipping the seed instead
+    /// would be worse — the recovered node would issue new timestamps
+    /// BELOW already-persisted ones, breaking LWW and delta sync
+    /// (clock rollback). A far-future seed is logged as a warning.
+    ///
+    /// `pub(crate)` so external callers cannot use it to poison the clock.
+    /// Not compiled on wasm32: recovery (like the WAL itself) is
+    /// filesystem-backed and native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn seed_recovered(&mut self, ts: &HlcTimestamp) {
+        let wall = physical_ms();
+        if ts.physical > wall.saturating_add(MAX_CLOCK_SKEW_MS) {
+            tracing::warn!(
+                recovered_physical = ts.physical,
+                wall_ms = wall,
+                max_skew_ms = MAX_CLOCK_SKEW_MS,
+                "recovered HLC is far ahead of the wall clock; seeding anyway to avoid rollback"
+            );
+        }
+        if ts.physical > self.physical
+            || (ts.physical == self.physical && ts.logical > self.logical)
+        {
+            self.physical = ts.physical;
+            self.logical = ts.logical;
+        }
+    }
+}
+
+/// Returns current wall-clock time in milliseconds since UNIX epoch.
+///
+/// Public so that other subsystems (e.g. the attestation pool's future-skew
+/// guard) share the same wall-clock source as the HLC.
+pub fn wall_clock_ms() -> u64 {
+    physical_ms()
 }
 
 /// Returns current wall-clock time in milliseconds since UNIX epoch.
@@ -430,6 +474,58 @@ mod tests {
             node_id: "peer".into(),
         };
         assert!(clock.update(&at_boundary).is_ok());
+    }
+
+    #[test]
+    fn seed_recovered_makes_next_now_strictly_greater() {
+        let mut clock = Hlc::new("node-a".into());
+        let recovered = HlcTimestamp {
+            physical: physical_ms() + 5_000,
+            logical: 7,
+            node_id: "node-a".into(),
+        };
+        clock.seed_recovered(&recovered);
+        let next = clock.now().expect("HLC overflow");
+        assert!(
+            next > recovered,
+            "post-recovery now() must be strictly greater than the recovered max"
+        );
+    }
+
+    #[test]
+    fn seed_recovered_accepts_far_future_timestamp() {
+        // Unlike update(), the recovery seed must not reject a timestamp
+        // beyond MAX_CLOCK_SKEW_MS — refusing it would either abort startup
+        // or roll the clock back below already-persisted HLCs.
+        let mut clock = Hlc::new("node-a".into());
+        let far_future = HlcTimestamp {
+            physical: physical_ms() + MAX_CLOCK_SKEW_MS + 10_000,
+            logical: 3,
+            node_id: "node-a".into(),
+        };
+        clock.seed_recovered(&far_future);
+        let next = clock.now().expect("HLC overflow");
+        assert!(
+            next > far_future,
+            "clock must be seeded past the far-future HLC"
+        );
+    }
+
+    #[test]
+    fn seed_recovered_never_regresses() {
+        let mut clock = Hlc::new("node-a".into());
+        let t1 = clock.now().expect("HLC overflow");
+        let past = HlcTimestamp {
+            physical: 1,
+            logical: 0,
+            node_id: "node-a".into(),
+        };
+        clock.seed_recovered(&past);
+        let t2 = clock.now().expect("HLC overflow");
+        assert!(
+            t2 > t1,
+            "seeding with an old timestamp must not regress the clock"
+        );
     }
 
     #[test]

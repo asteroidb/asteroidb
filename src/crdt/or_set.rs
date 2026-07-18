@@ -288,6 +288,49 @@ where
         });
     }
 
+    /// Snapshot the deferred (tombstone) dots as `(node_id, counter)`
+    /// pairs — the MARK phase of the gated mark-and-sweep tombstone GC
+    /// (see [`crate::crdt::gc::TombstoneGc`]).
+    pub fn deferred_dots(&self) -> HashSet<(NodeId, u64)> {
+        self.deferred
+            .iter()
+            .map(|d| (d.node_id.clone(), d.counter))
+            .collect()
+    }
+
+    /// Remove tombstone dots restricted to a MARKED candidate set — the
+    /// SWEEP phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// A dot is removed only when ALL of:
+    /// 1. it is in `candidates` (it existed at mark time, so the caller's
+    ///    replica-synchronisation gate covers it — every known replica
+    ///    has merged the post-remove state from after the mark);
+    /// 2. it is not referenced by any live element;
+    /// 3. it is locally dominated (`counter < max_counter` for its node,
+    ///    the same criterion as [`compact_deferred`](Self::compact_deferred)).
+    ///
+    /// Dots added AFTER the mark are never touched: they wait for the
+    /// next mark/sweep cycle, whose gate will cover them.
+    pub fn compact_deferred_marked(&mut self, candidates: &HashSet<(NodeId, u64)>) {
+        let live_dots: HashSet<&Dot> = self
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if !candidates.contains(&(d.node_id.clone(), d.counter)) {
+                return true;
+            }
+            if live_dots.contains(d) {
+                return true;
+            }
+            match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter >= max_counter,
+                None => true, // unknown node — keep to be safe
+            }
+        });
+    }
+
     /// Remove tombstone dots from `deferred` that are safe to garbage-collect
     /// according to local counter dominance or a cross-replica version floor.
     ///
@@ -351,6 +394,59 @@ where
             // Remove if either criterion is satisfied; keep otherwise.
             !(locally_dominated || below_floor)
         });
+    }
+}
+
+impl OrSet<String> {
+    /// Feed this set's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x03` ‖ live elements (byte order) with their dots (dot
+    /// order) ‖ counters (node-id order) ‖ deferred dots (dot order).
+    /// Elements whose dot set is empty are skipped: they are semantically
+    /// equivalent to absent entries (`merge` normally retains them away,
+    /// but the normalisation is specified defensively so representation
+    /// differences never cause false digest mismatches).
+    ///
+    /// The `deferred` (tombstone) set IS part of the digest: this makes
+    /// "digest matched" mean full CRDT-state equality, which is what lets
+    /// the sync layer adopt session claims on a match. The cost is a
+    /// false mismatch after asymmetric tombstone GC — bandwidth only,
+    /// never a correctness issue (false-negative direction).
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `OrSet`/`Dot` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound. Instantiating `OrSet`
+    /// for a new element type in `CrdtValue` requires defining that type's
+    /// canonical byte encoding here, plus a scheme version bump.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
+        use sha2::Digest as _;
+
+        hasher.update([0x03]);
+        let mut elems: Vec<(&String, &HashSet<Dot>)> = self
+            .elements
+            .iter()
+            .filter(|(_, dots)| !dots.is_empty())
+            .collect();
+        elems.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        write_u32(hasher, elems.len() as u32);
+        for (elem, dots) in elems {
+            write_str(hasher, elem);
+            write_dots(
+                hasher,
+                dots.iter().map(|d| (d.node_id.0.as_str(), d.counter)),
+            );
+        }
+        write_counters(hasher, &self.counters);
+        write_dots(
+            hasher,
+            self.deferred
+                .iter()
+                .map(|d| (d.node_id.0.as_str(), d.counter)),
+        );
     }
 }
 

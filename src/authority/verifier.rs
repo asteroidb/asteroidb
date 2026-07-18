@@ -2,7 +2,8 @@ use serde::Serialize;
 
 use crate::api::certified::ProofBundle;
 use crate::authority::certificate::{
-    CertError, EpochConfig, FormatVersionConfig, KeysetRegistry, create_certificate_message,
+    CertError, DualModeCertificate, EpochConfig, FormatVersionConfig, KeysetRegistry,
+    create_certificate_message,
 };
 
 /// Result of verifying a proof bundle.
@@ -163,6 +164,57 @@ pub fn verify_proof_with_registry(
     }
 }
 
+/// Verify a dual-mode (BLS-capable) certificate with keyset registry awareness.
+///
+/// The canonical message is recomputed from the certificate's own key range,
+/// frontier HLC, and policy version — exactly as `verify_proof_with_registry`
+/// does for Ed25519 proofs.  Keyset epoch validation, duplicate signer
+/// rejection, and the registry/embedded key match requirement are delegated
+/// to `DualModeCertificate::verify_with_registry`.
+///
+/// `has_majority` is judged independently from `signer_count()`, mirroring
+/// the Ed25519 verifier: `valid` requires both majority and valid signatures.
+/// When `format_config` is provided, the certificate's format version is
+/// checked first; an unacceptable version yields `signatures_valid = Some(false)`.
+pub fn verify_dual_proof_with_registry(
+    cert: &DualModeCertificate,
+    total_authorities: usize,
+    registry: &KeysetRegistry,
+    current_epoch: u64,
+    epoch_config: &EpochConfig,
+    format_config: Option<&FormatVersionConfig>,
+    elapsed_since_upgrade_secs: u64,
+) -> VerificationResult {
+    let required = total_authorities / 2 + 1;
+
+    let format_ok = format_config
+        .map(|fc| fc.is_version_acceptable(cert.format_version, elapsed_since_upgrade_secs))
+        .unwrap_or(true);
+
+    let message =
+        create_certificate_message(&cert.key_range, &cert.frontier_hlc, &cert.policy_version);
+
+    let (contributing_count, signatures_valid) = if !format_ok {
+        (cert.signer_count(), Some(false))
+    } else {
+        match cert.verify_with_registry(&message, registry, current_epoch, epoch_config) {
+            Ok(verified_signers) => (verified_signers.len(), Some(true)),
+            Err(_) => (cert.signer_count(), Some(false)),
+        }
+    };
+
+    let has_majority = contributing_count >= required;
+    let valid = has_majority && signatures_valid == Some(true);
+
+    VerificationResult {
+        valid,
+        has_majority,
+        contributing_count,
+        required_count: required,
+        signatures_valid,
+    }
+}
+
 /// Verify a proof bundle and return the keyset error details if validation fails.
 ///
 /// Like `verify_proof_with_registry` but returns the `CertError` on failure
@@ -196,10 +248,8 @@ pub fn verify_proof_with_registry_detailed(
         } else {
             cert.verify_signatures_with_registry(&message, registry, current_epoch, epoch_config)
         };
-        match result {
-            Ok(verified_signers) => (verified_signers.len(), Some(true)),
-            Err(e) => return Err(e),
-        }
+        let verified_signers = result?;
+        (verified_signers.len(), Some(true))
     } else {
         let unique: std::collections::HashSet<&crate::types::NodeId> =
             bundle.contributing_authorities.iter().collect();
@@ -291,6 +341,7 @@ mod tests {
             contributing_authorities: authorities,
             total_authorities: total,
             certificate,
+            bls_certificate: None,
         }
     }
 
@@ -418,6 +469,7 @@ mod tests {
             contributing_authorities: authorities,
             total_authorities: total,
             certificate: Some(cert),
+            bls_certificate: None,
         };
 
         (bundle, registry)
@@ -555,6 +607,7 @@ mod tests {
             contributing_authorities: vec![id1, id2, id3],
             total_authorities: 5,
             certificate: Some(cert),
+            bls_certificate: None,
         };
 
         let config = EpochConfig {
@@ -666,5 +719,221 @@ mod tests {
             result.valid,
             "without format config, old version should still pass"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // verify_dual_proof_with_registry (BLS aggregate path)
+    // ---------------------------------------------------------------
+
+    #[cfg(feature = "native-crypto")]
+    mod dual_proof {
+        use super::*;
+        use crate::authority::bls::{self, BlsKeypair, BlsPublicKey, BlsSignature};
+        use crate::authority::certificate::DualModeCertificate;
+
+        fn make_bls_keypair(seed: u8) -> BlsKeypair {
+            let mut ikm = [0u8; 32];
+            ikm[0] = seed;
+            ikm[31] = seed.wrapping_add(42);
+            BlsKeypair::generate(&ikm)
+        }
+
+        /// Build a BLS aggregate certificate signed by `signers` authorities
+        /// out of `total`, with all keys registered in the registry.
+        fn make_bls_cert(
+            signers: usize,
+            registered: usize,
+        ) -> (DualModeCertificate, KeysetRegistry, Vec<BlsKeypair>) {
+            let kr = sample_kr();
+            let hlc = sample_hlc();
+            let pv = sample_pv();
+            let message = create_certificate_message(&kr, &hlc, &pv);
+
+            let keypairs: Vec<BlsKeypair> = (0..registered.max(signers) as u8)
+                .map(|i| make_bls_keypair(i + 1))
+                .collect();
+
+            let mut registry = KeysetRegistry::new();
+            let mut ed_keys = Vec::new();
+            let mut bls_keys: Vec<(String, BlsPublicKey, bls::BlsProofOfPossession)> = Vec::new();
+            for (i, kp) in keypairs.iter().enumerate().take(registered) {
+                let (_, vk) = make_key_pair();
+                ed_keys.push((NodeId(format!("auth-{i}")), vk));
+                bls_keys.push((
+                    format!("auth-{i}"),
+                    kp.public_key.clone(),
+                    kp.proof_of_possession(),
+                ));
+            }
+            registry
+                .register_keyset(KeysetVersion(1), 0, ed_keys)
+                .unwrap();
+            registry
+                .register_bls_keys(&KeysetVersion(1), bls_keys)
+                .unwrap();
+
+            let mut cert = DualModeCertificate::new_bls(kr, hlc, pv, KeysetVersion(1));
+            let sigs: Vec<BlsSignature> = keypairs
+                .iter()
+                .take(signers)
+                .map(|kp| bls::sign_message(kp.secret_key(), &message))
+                .collect();
+            let agg = bls::aggregate_signatures(&sigs).unwrap();
+            let pairs: Vec<(NodeId, BlsPublicKey)> = keypairs
+                .iter()
+                .enumerate()
+                .take(signers)
+                .map(|(i, kp)| (NodeId(format!("auth-{i}")), kp.public_key.clone()))
+                .collect();
+            cert.set_bls_aggregate(pairs, agg);
+
+            (cert, registry, keypairs)
+        }
+
+        #[test]
+        fn dual_proof_valid_at_majority() {
+            let (cert, registry, _) = make_bls_cert(2, 3);
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                None,
+                0,
+            );
+            assert!(result.valid);
+            assert!(result.has_majority);
+            assert_eq!(result.signatures_valid, Some(true));
+            assert_eq!(result.contributing_count, 2);
+            assert_eq!(result.required_count, 2);
+        }
+
+        #[test]
+        fn dual_proof_majority_judged_independently_of_signatures() {
+            // 1 signer of 3: signatures are valid but majority is missing.
+            let (cert, registry, _) = make_bls_cert(1, 3);
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                None,
+                0,
+            );
+            assert!(!result.valid);
+            assert!(!result.has_majority);
+            assert_eq!(result.signatures_valid, Some(true));
+        }
+
+        #[test]
+        fn dual_proof_rejects_duplicate_signers() {
+            let (mut cert, registry, keypairs) = make_bls_cert(2, 3);
+            // Duplicate the first signer to inflate the count.
+            cert.bls_signer_ids.push(NodeId("auth-0".into()));
+            cert.bls_public_keys.push(keypairs[0].public_key.clone());
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                None,
+                0,
+            );
+            assert!(!result.valid);
+            assert_eq!(result.signatures_valid, Some(false));
+        }
+
+        #[test]
+        fn dual_proof_rejects_registry_key_mismatch() {
+            let (mut cert, registry, _) = make_bls_cert(2, 3);
+            // Swap in a key that is not the registered one for auth-0.
+            cert.bls_public_keys[0] = make_bls_keypair(99).public_key;
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                None,
+                0,
+            );
+            assert!(!result.valid);
+            assert_eq!(result.signatures_valid, Some(false));
+        }
+
+        #[test]
+        fn dual_proof_rejects_expired_format_version() {
+            let (mut cert, registry, _) = make_bls_cert(2, 3);
+            cert.format_version = 1;
+            let fc = FormatVersionConfig {
+                grace_period_secs: 100,
+            };
+
+            // Within grace: accepted.
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                Some(&fc),
+                50,
+            );
+            assert!(result.valid);
+
+            // Beyond grace: rejected.
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                Some(&fc),
+                101,
+            );
+            assert!(!result.valid);
+            assert_eq!(result.signatures_valid, Some(false));
+        }
+    }
+
+    #[cfg(not(feature = "native-crypto"))]
+    #[test]
+    fn dual_proof_always_invalid_without_native_crypto() {
+        use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
+        use crate::authority::certificate::DualModeCertificate;
+
+        let mut cert =
+            DualModeCertificate::new_bls(sample_kr(), sample_hlc(), sample_pv(), KeysetVersion(1));
+        cert.set_bls_aggregate(
+            vec![
+                (NodeId("auth-0".into()), BlsPublicKey("aa".repeat(48))),
+                (NodeId("auth-1".into()), BlsPublicKey("bb".repeat(48))),
+            ],
+            BlsSignature("cc".repeat(96)),
+        );
+
+        let mut registry = KeysetRegistry::new();
+        let (_, vk) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-0".into()), vk)])
+            .unwrap();
+
+        let result = verify_dual_proof_with_registry(
+            &cert,
+            3,
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
+        assert!(
+            !result.valid,
+            "BLS verification must be unavailable without native-crypto"
+        );
+        assert_eq!(result.signatures_valid, Some(false));
     }
 }

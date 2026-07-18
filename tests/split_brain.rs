@@ -18,10 +18,13 @@ use ed25519_dalek::SigningKey;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+#[cfg(feature = "native-crypto")]
 use asteroidb_poc::authority::bls::{self, BlsKeypair};
+#[cfg(feature = "native-crypto")]
+use asteroidb_poc::authority::certificate::DualModeCertificate;
 use asteroidb_poc::authority::certificate::{
-    AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate,
-    create_certificate_message, sign_message,
+    AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
+    sign_message,
 };
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -116,6 +119,7 @@ fn make_ed25519_keypair(seed: u8) -> (SigningKey, ed25519_dalek::VerifyingKey) {
 }
 
 /// Generate a deterministic BLS key pair from a seed byte.
+#[cfg(feature = "native-crypto")]
 fn make_bls_keypair(seed: u8) -> BlsKeypair {
     let mut ikm = [0u8; 32];
     ikm[0] = seed;
@@ -406,6 +410,7 @@ fn certificate_from_majority_has_majority() {
     assert_eq!(signers.len(), 2);
 }
 
+#[cfg(feature = "native-crypto")]
 #[test]
 fn dual_mode_bls_minority_cannot_reach_majority() {
     // BLS dual-mode certificate with only 1 signer out of 3.
@@ -427,6 +432,7 @@ fn dual_mode_bls_minority_cannot_reach_majority() {
     assert_eq!(dual.signer_count(), 1);
 }
 
+#[cfg(feature = "native-crypto")]
 #[test]
 fn dual_mode_bls_majority_can_reach_majority() {
     // BLS dual-mode certificate with 2 signers out of 3.
@@ -527,6 +533,7 @@ fn duplicate_authority_id_does_not_inflate_count() {
     assert!(!cert.has_majority(3));
 }
 
+#[cfg(feature = "native-crypto")]
 #[test]
 fn bls_duplicate_signer_ids_rejected() {
     // A BLS certificate with duplicate signer IDs should be rejected.

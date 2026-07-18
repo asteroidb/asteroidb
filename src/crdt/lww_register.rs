@@ -109,6 +109,31 @@ impl<T: Clone + Ord> LwwRegister<T> {
     }
 }
 
+impl LwwRegister<String> {
+    /// Feed this register's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x01` ‖ `Option(str(value))` ‖ `hlc(timestamp)`. The
+    /// timestamp's `node_id` is included so that equal values written by
+    /// different nodes produce different digests.
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `LwwRegister` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound. If new value types are
+    /// instantiated for `CrdtValue`, define their canonical byte encoding
+    /// here and bump the scheme version as well.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::{write_hlc, write_opt_str};
+        use sha2::Digest as _;
+
+        hasher.update([0x01]);
+        write_opt_str(hasher, self.value.as_deref());
+        write_hlc(hasher, &self.timestamp);
+    }
+}
+
 impl<T: Clone> Default for LwwRegister<T> {
     fn default() -> Self {
         Self::new()

@@ -151,6 +151,27 @@ impl PnCounter {
 
         if has_changes { Some(delta) } else { None }
     }
+
+    /// Feed this counter's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x02` ‖ P entries in node-id order ‖ N entries in node-id
+    /// order (each map length-prefixed). Sorting is mandatory: `p`/`n` are
+    /// `HashMap`s whose iteration order is non-deterministic.
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `PnCounter` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::write_counters;
+        use sha2::Digest as _;
+
+        hasher.update([0x02]);
+        write_counters(hasher, &self.p);
+        write_counters(hasher, &self.n);
+    }
 }
 
 impl Default for PnCounter {

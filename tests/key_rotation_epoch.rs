@@ -136,6 +136,7 @@ fn key_rotation_old_and_new_keys_coexist_during_grace() {
         contributing_authorities: vec![id_a.clone(), id_b.clone(), id_c.clone()],
         total_authorities: 5,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     // At epoch 5, version 1 (registered at epoch 0, grace 7) is still valid.
@@ -206,6 +207,7 @@ fn expired_keyset_rejected_after_grace_period() {
         contributing_authorities: vec![id_a],
         total_authorities: 1,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     // At epoch 3, version 1 (registered at 0, grace 3) is still valid (3 <= 0+3).
@@ -310,6 +312,7 @@ fn tampered_signature_detected_with_registry() {
         contributing_authorities: vec![id_a, id_b, id_c],
         total_authorities: 5,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     let config = EpochConfig::default();
@@ -353,6 +356,7 @@ fn full_epoch_lifecycle() {
             contributing_authorities: vec![id.clone()],
             total_authorities: 1,
             certificate: Some(cert),
+            bls_certificate: None,
         }
     };
 
@@ -432,6 +436,7 @@ fn backward_compatibility_verify_proof_without_registry() {
         contributing_authorities: (0..3).map(|i| NodeId(format!("auth-{i}"))).collect(),
         total_authorities: 5,
         certificate: Some(cert),
+        bls_certificate: None,
     };
 
     // verify_proof (non-registry) should still work.

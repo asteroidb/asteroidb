@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use tokio::sync::Mutex;
@@ -13,33 +13,50 @@ use super::codec::{deserialize_internal, internal_response};
 
 use crate::api::certified::{CertifiedApi, OnTimeout};
 use crate::api::eventual::EventualApi;
+#[cfg(feature = "native-crypto")]
+use crate::authority::bls::{BlsPublicKey, BlsSignature};
+#[cfg(not(feature = "native-crypto"))]
+use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{EpochConfig, KeysetRegistry};
+use crate::authority::equivocation::{
+    EquivocationDetector, MAX_FRONTIERS_PER_REQUEST, MAX_OBSERVED_PER_REQUEST, ObserveOutcome,
+};
 use crate::control_plane::consensus::ControlPlaneConsensus;
-use crate::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
+use crate::control_plane::raft::types::{AuthoritySpec, PolicySpec};
+use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::ops::metrics::{MetricsSnapshot, RuntimeMetrics};
 use crate::ops::slo::{SLO_CERTIFIED_READ_P99, SLO_EVENTUAL_READ_P99, SloSnapshot, SloTracker};
-use crate::placement::PlacementPolicy;
+use crate::ops::write_atomic;
 use crate::placement::latency::LatencyModel;
 use crate::placement::topology::TopologyView;
 use crate::store::kv::CrdtValue;
-use crate::types::{KeyRange, NodeId, PolicyVersion};
+use crate::store::wal::{SyncPolicy, WalPos, WalSyncer};
+use crate::types::NodeId;
 
 use crate::network::PeerRegistry;
 use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
 use crate::network::sync::{
-    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, KeyDumpResponse, SyncError, SyncRequest,
-    SyncResponse,
+    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, DigestSyncRequest, DigestSyncResponse,
+    KeyDumpResponse, SyncError, SyncRequest, SyncResponse,
 };
+use crate::store::digest::{
+    DIGEST_BUCKET_COUNT, DIGEST_LEN, DIGEST_SCHEME_VERSION, bucket_of, compute_store_digest,
+    mismatched_buckets,
+};
+
+use crate::session::SessionToken;
 
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EventualReadResponse, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
-    LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
-    ProofBundleJson, RemovePolicyRequest, SetAuthorityDefinitionRequest, SetPlacementPolicyRequest,
-    StatusResponse, VerifyProofRequest, VerifyProofResponse, VersionHistoryResponse, WriteResponse,
+    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteQuery,
+    EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse,
+    PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse, ProofBundleJson,
+    RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
+    SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
+    VersionHistoryResponse, WriteResponse,
 };
 
 /// Shared application state for HTTP handlers.
@@ -83,6 +100,51 @@ pub struct AppState {
     pub epoch_config: EpochConfig,
     /// Current epoch, used for keyset expiry checks during verification.
     pub current_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// When `true`, unsigned frontier pushes to `/api/internal/frontiers`
+    /// are rejected. Without a keyset registry this rejects *all* frontier
+    /// pushes (fail-closed), since no signature can be verified. Signed
+    /// frontiers that fail verification are always rejected regardless of
+    /// this flag.
+    pub require_signed_frontiers: bool,
+    /// Equivocation detector and evidence store. Shared (same `Arc`) with
+    /// `NodeRunner` so that evidence detected on the HTTP receive path is
+    /// gossiped by the runner's frontier push, and vice versa.
+    pub equivocation: Arc<EquivocationDetector>,
+    /// When `true`, attestations from authorities with recorded equivocation
+    /// evidence are excluded from certificate assembly (their frontiers still
+    /// advance — the max-monotone frontier value itself is low-poison).
+    /// Opt-in (`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES`); the safe-by-default
+    /// posture is detect-and-warn only, because exclusion can drop a scope
+    /// below majority and stall certificate production.
+    pub exclude_accused_authorities: bool,
+    /// Group-commit WAL syncer for the eventual store. `None` when
+    /// persistence is disabled. Under `SyncPolicy::Always`, write handlers
+    /// wait (OUTSIDE the API lock) for the mutation's WAL record to be
+    /// fdatasynced before acknowledging.
+    pub eventual_wal: Option<Arc<WalSyncer>>,
+    /// Group-commit WAL syncer for the certified store (see `eventual_wal`).
+    pub certified_wal: Option<Arc<WalSyncer>>,
+}
+
+/// Wait for a mutation's WAL record to become durable before ack
+/// (`SyncPolicy::Always` only; other policies acknowledge immediately).
+///
+/// Called AFTER the API lock is released so a slow fdatasync never blocks
+/// other handlers or the sync loop; the group-commit syncer coalesces
+/// concurrent waiters into one flush.
+async fn wait_wal_durable(
+    syncer: &Option<Arc<WalSyncer>>,
+    pos: Option<WalPos>,
+) -> Result<(), ApiError> {
+    if let (Some(syncer), Some(pos)) = (syncer, pos)
+        && syncer.policy() == SyncPolicy::Always
+    {
+        syncer
+            .wait_durable(pos)
+            .await
+            .map_err(|e| ApiError(CrdtError::Storage(format!("WAL sync wait failed: {e}"))))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------
@@ -94,64 +156,151 @@ pub struct AppState {
 /// Accepts a typed CRDT operation and applies it to the eventual store.
 pub async fn eventual_write(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<EventualWriteQuery>,
     Json(req): Json<EventualWriteRequest>,
 ) -> Result<Json<WriteResponse>, ApiError> {
     let written_key = req.key().to_string();
 
+    // Read-your-writes across coordinators: fold this write into the client's
+    // prior session token (if presented) so the session accumulates its full
+    // per-origin write vector even when successive writes hit different
+    // coordinators. A malformed/oversized token is rejected (fail-closed).
+    let mut token = match query.session_token.as_deref() {
+        Some(s) if !s.is_empty() => {
+            let parsed = SessionToken::parse(s).map_err(ApiError)?;
+            parsed
+                .validate_bounds(crate::hlc::wall_clock_ms())
+                .map_err(ApiError)?;
+            parsed
+        }
+        _ => SessionToken::default(),
+    };
+
     let mut api = state.eventual.lock().await;
 
-    match req {
-        EventualWriteRequest::CounterInc { key } => {
-            api.eventual_counter_inc(&key)?;
-        }
-        EventualWriteRequest::CounterDec { key } => {
-            api.eventual_counter_dec(&key)?;
-        }
-        EventualWriteRequest::SetAdd { key, element } => {
-            api.eventual_set_add(&key, element)?;
-        }
+    let ts = match req {
+        EventualWriteRequest::CounterInc { key } => api.eventual_counter_inc(&key)?,
+        EventualWriteRequest::CounterDec { key } => api.eventual_counter_dec(&key)?,
+        EventualWriteRequest::SetAdd { key, element } => api.eventual_set_add(&key, element)?,
         EventualWriteRequest::SetRemove { key, element } => {
-            api.eventual_set_remove(&key, &element)?;
+            api.eventual_set_remove(&key, &element)?
         }
         EventualWriteRequest::MapSet {
             key,
             map_key,
             map_value,
-        } => {
-            api.eventual_map_set(&key, map_key, map_value)?;
-        }
+        } => api.eventual_map_set(&key, map_key, map_value)?,
         EventualWriteRequest::MapDelete { key, map_key } => {
-            api.eventual_map_delete(&key, &map_key)?;
+            api.eventual_map_delete(&key, &map_key)?
         }
         EventualWriteRequest::RegisterSet { key, value } => {
-            api.eventual_register_set(&key, value)?;
+            api.eventual_register_set(&key, value)?
         }
-    }
+    };
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // The session token doubles as a durability receipt: under
+    // SyncPolicy::Always it must not be handed out until the WAL record
+    // is on disk. Waiting happens after the lock is released.
+    wait_wal_durable(&state.eventual_wal, wal_pos).await?;
 
     state.metrics.record_write_op(&written_key);
 
-    Ok(Json(WriteResponse { ok: true }))
+    token.merge_hlc(&ts);
+    Ok(Json(WriteResponse {
+        ok: true,
+        session_token: Some(token.encode()),
+    }))
 }
+
+/// Upper bound for the `wait_ms` query parameter of `GET /api/eventual/:key`.
+pub const MAX_SESSION_WAIT_MS: u64 = 5_000;
+
+/// Polling interval while waiting for a session precondition.
+const SESSION_POLL_INTERVAL_MS: u64 = 50;
 
 /// `GET /api/eventual/:key`
 ///
 /// Returns the local CRDT value for the given key.
+///
+/// Optional session guarantees (read-your-writes / monotonic reads): when
+/// the request carries a `session_token` query parameter, the value is only
+/// returned if the local replica provably contains all writes covered by
+/// the token; otherwise the handler polls for up to `wait_ms` (capped at
+/// [`MAX_SESSION_WAIT_MS`]) and then answers 412 `SESSION_NOT_SATISFIED`.
+/// Without the parameter the behaviour and response bytes are identical to
+/// the pre-session API (no extra cost for token-less reads).
 pub async fn get_eventual(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-) -> Json<EventualReadResponse> {
+    Query(query): Query<EventualReadQuery>,
+) -> Result<Json<EventualReadResponse>, ApiError> {
     let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let start = Instant::now();
-    let api = state.eventual.lock().await;
-    let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
-    drop(api);
+    let want_session = query.session_token.is_some();
+    // SECURITY: the client-supplied token must NEVER be fed into
+    // `Hlc::update` — a forged far-future physical would poison the local
+    // clock (clock-advance attack). It is parsed, bounds-checked, and used
+    // for comparison only.
+    let token = match query.session_token.as_deref() {
+        // Absent → legacy behaviour; empty → no precondition, token issuance only.
+        None | Some("") => None,
+        Some(s) => {
+            let token = SessionToken::parse(s)?;
+            token.validate_bounds(crate::hlc::wall_clock_ms())?;
+            Some(token)
+        }
+    };
+    let deadline = start
+        + std::time::Duration::from_millis(query.wait_ms.unwrap_or(0).min(MAX_SESSION_WAIT_MS));
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    state
-        .slo_tracker
-        .record_observation(SLO_EVENTUAL_READ_P99, elapsed_ms);
+    loop {
+        let api = state.eventual.lock().await;
+        let satisfied = token.as_ref().is_none_or(|t| api.session_check(&key, t));
+        if satisfied {
+            // Check-then-read under the same lock so the state cannot
+            // change between the session check and the value read.
+            let value = api.get_eventual(&key).map(CrdtValueJson::from_crdt_value);
+            let session_token = want_session.then(|| {
+                let mut response_token = token.clone().unwrap_or_default();
+                // Merge the read key's own change position so the origin
+                // contributing the observed value is covered (monotonic
+                // reads). If the session already spans MAX_TOKEN_ENTRIES
+                // distinct origins, encode() may still thin an entry — a
+                // documented bound, see session::MAX_TOKEN_ENTRIES.
+                if let Some(key_ts) = api.store().timestamp_for(&key) {
+                    response_token.merge_hlc(key_ts);
+                }
+                // Cover the full VISIBLE state, not just applied_origins:
+                // contributions merged through possibly-incomplete
+                // (unclaimed) deltas are readable here but make no applied
+                // claim; a token that omitted them would let a stale
+                // replica satisfy it while serving an older value — a
+                // monotonic-reads lie. Over-covering is safe (412s only).
+                response_token.merge_frontiers(api.store().visible_origins());
+                response_token.encode()
+            });
+            drop(api);
 
-    Json(EventualReadResponse { key, value })
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            state
+                .slo_tracker
+                .record_observation(SLO_EVENTUAL_READ_P99, elapsed_ms);
+
+            return Ok(Json(EventualReadResponse {
+                key,
+                value,
+                session_token,
+            }));
+        }
+        // Release the lock while sleeping so writes and sync can progress.
+        drop(api);
+        if Instant::now() >= deadline {
+            return Err(CrdtError::SessionNotSatisfied { key }.into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(SESSION_POLL_INTERVAL_MS)).await;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -180,6 +329,11 @@ pub async fn certified_write(
 
     let mut api = state.certified.lock().await;
     let status = api.certified_write(req.key, crdt_value, on_timeout)?;
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // Durability before ack (SyncPolicy::Always), outside the lock.
+    wait_wal_durable(&state.certified_wal, wal_pos).await?;
 
     state.metrics.record_write_op(&written_key);
 
@@ -206,7 +360,7 @@ pub async fn get_certified(
     });
 
     let proof = read.proof.map(|p| {
-        let certificate = p.certificate.map(|cert| {
+        let certificate = p.certificate.as_ref().map(|cert| {
             use super::types::{AuthoritySignatureJson, CertificateJson};
             CertificateJson {
                 keyset_version: cert.keyset_version.0,
@@ -236,6 +390,45 @@ pub async fn get_certified(
                     .collect(),
             }
         });
+
+        // BLS aggregate certificate fields (round-trippable into
+        // POST /api/certified/verify with signature_algorithm=Bls12_381).
+        let (signature_algorithm, keyset_version, bls_signer_ids, bls_public_keys, bls_agg) =
+            if let Some(bls_cert) = p.bls_certificate.as_ref() {
+                (
+                    Some("Bls12_381".to_string()),
+                    Some(bls_cert.keyset_version.0),
+                    Some(
+                        bls_cert
+                            .bls_signer_ids
+                            .iter()
+                            .map(|n| n.0.clone())
+                            .collect::<Vec<String>>(),
+                    ),
+                    Some(
+                        bls_cert
+                            .bls_public_keys
+                            .iter()
+                            .map(|pk| pk.to_hex())
+                            .collect::<Vec<String>>(),
+                    ),
+                    bls_cert
+                        .bls_aggregated_signature
+                        .as_ref()
+                        .map(|sig| sig.to_hex()),
+                )
+            } else if let Some(cert) = p.certificate.as_ref() {
+                (
+                    Some("Ed25519".to_string()),
+                    Some(cert.keyset_version.0),
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
         ProofBundleJson {
             key_range_prefix: p.key_range.prefix,
             frontier: FrontierJson {
@@ -251,6 +444,11 @@ pub async fn get_certified(
                 .collect(),
             total_authorities: p.total_authorities,
             certificate,
+            signature_algorithm,
+            keyset_version,
+            bls_signer_ids,
+            bls_public_keys,
+            bls_aggregate_signature: bls_agg,
         }
     });
 
@@ -290,26 +488,279 @@ pub async fn get_certification_status(
 ///
 /// Receives frontier updates from a peer and applies them to the local
 /// `AckFrontierSet`. Monotonicity is enforced by `AckFrontierSet::update()`.
+///
+/// When a keyset registry is configured, signed frontiers are verified
+/// (registry keys only) before the certified lock is taken; frontiers whose
+/// signatures fail verification are dropped. Unsigned frontiers are accepted
+/// unless `require_signed_frontiers` is enabled. Without a registry,
+/// frontiers are accepted unverified (backwards-compatible) — unless
+/// `require_signed_frontiers` is enabled, in which case everything is
+/// rejected (fail-closed) since no signature can be verified.
+///
+/// Independent of signature status, a frontier is only accepted if its
+/// authority is a member of the authority set defined for its key range
+/// (when such a definition exists): otherwise any registered authority
+/// could inflate the majority count of a range it does not own.
 pub async fn post_internal_frontiers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, super::codec::SerializationError> {
+    use crate::authority::frontier_sig::{VerifiedAttestation, verify_frontier_signature};
+
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
     let req: crate::network::frontier_sync::FrontierPushRequest =
         deserialize_internal(&body, content_type)?;
+    let crate::network::frontier_sync::FrontierPushRequest {
+        frontiers,
+        signatures,
+        observed,
+    } = req;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // Set when new equivocation evidence was recorded, so the evidence store
+    // is re-persisted after all sync guards are released.
+    let mut evidence_dirty = false;
+
+    // Verify signatures BEFORE taking the certified lock — signature
+    // verification is CPU-heavy and must not serialize with other handlers.
+    let mut signatures = signatures.into_iter();
+    let mut to_apply: Vec<(
+        crate::authority::ack_frontier::AckFrontier,
+        Option<VerifiedAttestation>,
+    )> = Vec::with_capacity(frontiers.len());
+
+    {
+        // Authority-set membership gate (FR-008): the sender must be one of
+        // the authorities defined for the frontier's key range. Signature
+        // verification only proves *who* signed, not that the signer owns
+        // the range. Ranges without an authority definition cannot certify
+        // writes anyway, so they are accepted for backwards compatibility.
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
+            match ns.get_authorities_for_key(&frontier.key_range.prefix) {
+                Some(def) => def.authority_nodes.contains(&frontier.authority_id),
+                None => true,
+            }
+        };
+
+        match &state.keyset_registry {
+            None => {
+                // Without a registry, relayed observations cannot be
+                // verified — and unverifiable pairs must never become
+                // evidence (they could frame an honest authority).
+                for frontier in frontiers.into_iter().take(MAX_FRONTIERS_PER_REQUEST) {
+                    if state.require_signed_frontiers {
+                        // Strict mode without a registry must fail closed:
+                        // there is no key material to verify any signature,
+                        // so accepting frontiers here would silently disable
+                        // the security control the operator asked for.
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            "rejecting frontier: require_signed_frontiers is set but no keyset registry is configured"
+                        );
+                        continue;
+                    }
+                    if !is_range_authority(&frontier) {
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            key_range = %frontier.key_range.prefix,
+                            "rejecting frontier from non-member of the range's authority set"
+                        );
+                        continue;
+                    }
+                    // No registry configured: legacy unverified acceptance.
+                    to_apply.push((frontier, None));
+                }
+            }
+            Some(registry_lock) => {
+                let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+                let current_epoch = state
+                    .current_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                for frontier in frontiers.into_iter().take(MAX_FRONTIERS_PER_REQUEST) {
+                    let signature = signatures.next().flatten();
+                    if !is_range_authority(&frontier) {
+                        tracing::warn!(
+                            authority = %frontier.authority_id.0,
+                            key_range = %frontier.key_range.prefix,
+                            "rejecting frontier from non-member of the range's authority set"
+                        );
+                        continue;
+                    }
+                    match signature {
+                        Some(sig) => match verify_frontier_signature(
+                            &frontier,
+                            &sig,
+                            &registry,
+                            current_epoch,
+                            &state.epoch_config,
+                        ) {
+                            Ok(att) => {
+                                // Equivocation check on the verified raw
+                                // (frontier, signature) pair — the report
+                                // signature binds digest_hash, so a
+                                // conflicting pair is non-repudiable.
+                                if let ObserveOutcome::Equivocation(ev) =
+                                    state.equivocation.observe(&frontier, &sig, now_ms)
+                                {
+                                    warn_equivocation(&ev);
+                                    state.metrics.record_equivocation_at(now_ms);
+                                    state.metrics.set_accused_authorities(
+                                        state.equivocation.accused_count(),
+                                    );
+                                    evidence_dirty = true;
+                                }
+                                // Optional exclusion from certificate assembly
+                                // (detect-only by default): the frontier value
+                                // itself still advances — it is a monotone max
+                                // and thus low-poison — but the attestation is
+                                // dropped so it cannot contribute to a
+                                // certificate. The majority denominator is
+                                // unchanged, so this only errs safe.
+                                let att = if state.exclude_accused_authorities
+                                    && state.equivocation.is_accused(&frontier.authority_id)
+                                {
+                                    None
+                                } else {
+                                    Some(att)
+                                };
+                                to_apply.push((frontier, att));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    authority = %frontier.authority_id.0,
+                                    error = %e,
+                                    "rejecting frontier with invalid signature"
+                                );
+                            }
+                        },
+                        None => {
+                            if state.require_signed_frontiers {
+                                tracing::warn!(
+                                    authority = %frontier.authority_id.0,
+                                    "rejecting unsigned frontier (require_signed_frontiers)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    authority = %frontier.authority_id.0,
+                                    "accepting unsigned frontier (lenient mode)"
+                                );
+                                to_apply.push((frontier, None));
+                            }
+                        }
+                    }
+                }
+
+                // Split-view lane (CT-gossip Protocol 2): attestations the
+                // sender observed elsewhere, relayed for cross-checking.
+                // Evidence only — never applied to frontier state. Each
+                // relayed pair is re-verified against the registry before it
+                // is allowed to become evidence, so a malicious relayer
+                // cannot frame an honest authority; a failed verification is
+                // *not* an accusation either, because the relayer of a
+                // forged pair cannot be identified from the payload.
+                for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
+                    if !is_range_authority(&obs.frontier) {
+                        continue;
+                    }
+                    // Byte-equivalent echoes skip re-verification (CPU DoS
+                    // mitigation): the exact (scope, hlc, digest) is already
+                    // indexed and would compare Consistent anyway.
+                    if state.equivocation.is_known_exact(&obs.frontier) {
+                        continue;
+                    }
+                    match verify_frontier_signature(
+                        &obs.frontier,
+                        &obs.signature,
+                        &registry,
+                        current_epoch,
+                        &state.epoch_config,
+                    ) {
+                        Ok(_) => {
+                            state.metrics.record_split_view_observation();
+                            if let ObserveOutcome::Equivocation(ev) =
+                                state
+                                    .equivocation
+                                    .observe(&obs.frontier, &obs.signature, now_ms)
+                            {
+                                warn_equivocation(&ev);
+                                state.metrics.record_equivocation_at(now_ms);
+                                state
+                                    .metrics
+                                    .set_accused_authorities(state.equivocation.accused_count());
+                                evidence_dirty = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "ignoring relayed observation with invalid signature"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Persist new evidence after every sync guard is released; the write
+    // itself happens on a blocking thread (never inside the detector lock)
+    // and concurrent writers are serialized inside `spawn_persist` so an
+    // older snapshot can never overwrite a newer one.
+    if evidence_dirty {
+        state.equivocation.spawn_persist();
+    }
 
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
-    for frontier in req.frontiers {
-        if api.update_frontier(frontier) {
+    for (frontier, attestation) in to_apply {
+        if api.update_frontier_verified(frontier, attestation) {
             accepted += 1;
         }
     }
     let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
     internal_response(&resp, accept)
+}
+
+/// Structured operator warning for a newly detected equivocation.
+fn warn_equivocation(ev: &crate::authority::equivocation::EquivocationEvidence) {
+    tracing::warn!(
+        authority = %ev.authority_id.0,
+        key_range = %ev.key_range.prefix,
+        policy_version = ev.policy_version.0,
+        frontier_hlc_physical = ev.frontier_hlc.physical,
+        frontier_hlc_logical = ev.frontier_hlc.logical,
+        digest_first = %ev.first.frontier.digest_hash,
+        digest_second = %ev.second.frontier.digest_hash,
+        "EQUIVOCATION DETECTED: authority signed conflicting frontier attestations; evidence stored"
+    );
+}
+
+/// `GET /api/authority/equivocations`
+///
+/// Operator-facing read-only endpoint returning all recorded equivocation
+/// evidence. Each evidence entry contains both conflicting signed
+/// attestations verbatim (hex signatures included), so the response is a
+/// third-party-verifiable proof of misbehaviour bundle.
+pub async fn get_equivocations(State(state): State<Arc<AppState>>) -> Json<EquivocationReport> {
+    let evidence = state.equivocation.evidence();
+    Json(EquivocationReport {
+        accused_authorities: state
+            .equivocation
+            .accused()
+            .into_iter()
+            .map(|n| n.0)
+            .collect(),
+        evidence_count: evidence.len(),
+        evidence_overflow_total: state.equivocation.evidence_overflow_total(),
+        evidence,
+    })
 }
 
 /// `GET /api/internal/frontiers`
@@ -370,41 +821,35 @@ pub async fn get_authority_definition(
 
 /// `PUT /api/control-plane/authorities`
 ///
-/// Sets an authority definition in the system namespace.
-/// Requires majority approval from authority nodes (FR-009).
+/// Sets an authority definition in the system namespace via the
+/// control-plane Raft log (FR-009). Only the current Raft leader accepts
+/// the request; followers answer 503 NOT_LEADER with leader hint headers.
+/// Serialization of concurrent updates is guaranteed by the leader's log
+/// order (which also assigns namespace effects deterministically), so no
+/// cross-request lock is needed here.
 pub async fn set_authority_definition(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetAuthorityDefinitionRequest>,
 ) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
-    let def = AuthorityDefinition {
-        key_range: KeyRange {
-            prefix: req.key_range_prefix.clone(),
-        },
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let spec = AuthoritySpec {
+        prefix: req.key_range_prefix.clone(),
         authority_nodes: req
             .authority_nodes
             .iter()
             .map(|n| NodeId(n.clone()))
             .collect(),
-        auto_generated: false,
     };
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    {
-        let consensus = state.consensus.lock().await;
-        consensus.propose_authority_update(def.clone(), &approvals)?;
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        ns.set_authority_definition(def);
-    }
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
+    // Clone the consensus handle out of the mutex and drop the lock BEFORE
+    // awaiting the proposal, so a slow commit never serializes unrelated
+    // requests behind it.
+    let consensus = state.consensus.lock().await.clone();
+    let def = consensus.propose_authority_update(spec).await?;
 
     Ok(Json(AuthorityDefinitionResponse {
-        key_range_prefix: req.key_range_prefix,
-        authority_nodes: req.authority_nodes,
+        key_range_prefix: def.key_range.prefix,
+        authority_nodes: def.authority_nodes.into_iter().map(|n| n.0).collect(),
     }))
 }
 
@@ -457,8 +902,12 @@ pub async fn get_policy(
 
 /// `PUT /api/control-plane/policies`
 ///
-/// Sets a placement policy in the system namespace.
-/// Requires majority approval from authority nodes (FR-009).
+/// Sets a placement policy in the system namespace via the control-plane
+/// Raft log (FR-009). Only the current Raft leader accepts the request.
+///
+/// The policy VERSION is assigned when the committed entry is APPLIED,
+/// from the replicated version counter — commit order determines versions
+/// identically on every node (never assigned at propose time).
 pub async fn set_placement_policy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetPlacementPolicyRequest>,
@@ -469,61 +918,22 @@ pub async fn set_placement_policy(
         )));
     }
 
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
-
-    // Build the policy template without a version; the actual version is
-    // assigned atomically inside the namespace write lock below to prevent
-    // concurrent requests from stamping different policies with the same
-    // version number.
-    let build_policy = |version: PolicyVersion| {
-        let mut policy = PlacementPolicy::new(
-            version,
-            KeyRange {
-                prefix: req.key_range_prefix.clone(),
-            },
-            req.replica_count,
-        );
-
-        if !req.required_tags.is_empty() {
-            policy = policy.with_required_tags(
-                req.required_tags
-                    .iter()
-                    .map(|t| crate::types::Tag(t.clone()))
-                    .collect(),
-            );
-        }
-        if !req.forbidden_tags.is_empty() {
-            policy = policy.with_forbidden_tags(
-                req.forbidden_tags
-                    .iter()
-                    .map(|t| crate::types::Tag(t.clone()))
-                    .collect(),
-            );
-        }
-        policy = policy.with_local_write_on_partition(req.allow_local_write_on_partition);
-        policy = policy.with_certified(req.certified);
-        policy
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let spec = PolicySpec {
+        prefix: req.key_range_prefix.clone(),
+        replica_count: req.replica_count,
+        required_tags: req.required_tags.iter().cloned().collect(),
+        forbidden_tags: req.forbidden_tags.iter().cloned().collect(),
+        allow_local_write_on_partition: req.allow_local_write_on_partition,
+        certified: req.certified,
+        max_read_latency_ms: None,
+        preferred_cost_tier: None,
     };
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    let policy = {
-        let provisional = build_policy(PolicyVersion(0));
-        let consensus = state.consensus.lock().await;
-        consensus.propose_policy_update(provisional, &approvals)?;
-
-        // Atomically read the current version, create the policy, and apply it
-        // inside a single write-lock scope to prevent version collisions.
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        let current_version = ns.version().0;
-        let policy = build_policy(PolicyVersion(current_version + 1));
-        ns.set_placement_policy(policy.clone()).map_err(ApiError)?;
-        policy
-    };
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
+    // Clone the consensus handle out of the mutex and drop the lock BEFORE
+    // awaiting the proposal (see set_authority_definition).
+    let consensus = state.consensus.lock().await.clone();
+    let policy = consensus.propose_policy_update(spec).await?;
 
     let resp = PlacementPolicyResponse {
         key_range_prefix: policy.key_range.prefix.clone(),
@@ -540,33 +950,26 @@ pub async fn set_placement_policy(
 
 /// `DELETE /api/control-plane/policies/{prefix}`
 ///
-/// Removes the placement policy for the given key range prefix.
-/// Requires majority approval from authority nodes (FR-009).
+/// Removes the placement policy for the given key range prefix via the
+/// control-plane Raft log (FR-009). Only the current Raft leader accepts
+/// the request. A committed removal of a non-existent prefix applies as a
+/// deterministic no-op and maps to 404 here.
 pub async fn remove_policy(
     State(state): State<Arc<AppState>>,
     Path(prefix): Path<String>,
     Json(req): Json<RemovePolicyRequest>,
 ) -> Result<Json<PlacementPolicyResponse>, ApiError> {
-    let approvals: Vec<NodeId> = req.approvals.iter().map(|a| NodeId(a.clone())).collect();
+    // `approvals` from old clients is accepted but ignored (deprecated).
+    let _ = &req.approvals;
 
-    // Hold consensus lock across both validation and mutation to prevent
-    // TOCTOU races where a concurrent request could invalidate the approval
-    // between the check and the namespace write.
-    let removed = {
-        let consensus = state.consensus.lock().await;
-        consensus.propose_policy_removal(&prefix, &approvals)?;
-        let mut ns = state.namespace.write().unwrap_or_else(|e| e.into_inner());
-        ns.remove_placement_policy(&prefix)
-    };
+    let consensus = state.consensus.lock().await.clone();
+    let removed = consensus.propose_policy_removal(&prefix).await?;
 
     let removed = removed.ok_or_else(|| {
         ApiError(CrdtError::KeyNotFound(format!(
             "placement policy: {prefix}"
         )))
     })?;
-
-    // Persist namespace after mutation.
-    persist_namespace(&state).await;
 
     Ok(Json(PlacementPolicyResponse {
         key_range_prefix: removed.key_range.prefix.clone(),
@@ -577,6 +980,116 @@ pub async fn remove_policy(
         allow_local_write_on_partition: removed.allow_local_write_on_partition,
         certified: removed.certified,
     }))
+}
+
+/// `GET /api/control-plane/raft/status`
+///
+/// Public read-only view of the control-plane Raft consensus (same posture
+/// as `/api/metrics`). Reports `role: "detached"` when no consensus is
+/// configured.
+pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftStatusResponse> {
+    let consensus = state.consensus.lock().await.clone();
+    let resp = match consensus.status() {
+        Some(status) => RaftStatusResponse {
+            node_id: status.node_id,
+            role: status.role,
+            term: status.term,
+            leader_id: status.leader_id,
+            leader_addr: status.leader_addr,
+            commit_index: status.commit_index,
+            last_applied: status.last_applied,
+            last_log_index: status.last_log_index,
+            voters: status.voters,
+        },
+        None => RaftStatusResponse {
+            node_id: state
+                .self_node_id
+                .as_ref()
+                .map(|n| n.0.clone())
+                .unwrap_or_default(),
+            role: "detached".to_string(),
+            term: 0,
+            leader_id: None,
+            leader_addr: None,
+            commit_index: 0,
+            last_applied: 0,
+            last_log_index: 0,
+            voters: Vec::new(),
+        },
+    };
+    Json(resp)
+}
+
+// ---------------------------------------------------------------
+// Internal Raft RPC handlers
+// ---------------------------------------------------------------
+
+/// Fetch the Raft node handle, or 503 when consensus is detached.
+async fn raft_node_or_unavailable(
+    state: &AppState,
+) -> Result<Arc<crate::control_plane::raft::RaftNode>, ApiError> {
+    let consensus = state.consensus.lock().await.clone();
+    consensus.raft_handle().ok_or_else(|| {
+        ApiError(CrdtError::Storage(
+            "control-plane raft consensus is not configured on this node".into(),
+        ))
+    })
+}
+
+/// `POST /api/internal/raft/vote`
+///
+/// RequestVote receiver. The response is only produced AFTER the vote (term
+/// / votedFor) has been fsynced (`RaftNode` invariant); a persistence
+/// failure surfaces as an error status and the candidate simply retries.
+pub async fn raft_vote(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::RequestVoteRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_request_vote(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
+/// `POST /api/internal/raft/append`
+///
+/// AppendEntries receiver. Appended entries are fsynced before the ack.
+pub async fn raft_append(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::AppendEntriesRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_append_entries(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
+/// `POST /api/internal/raft/snapshot`
+///
+/// InstallSnapshot receiver (single-message lite variant).
+pub async fn raft_install_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::InstallSnapshotRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.handle_install_snapshot(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
 }
 
 /// `GET /api/control-plane/versions`
@@ -601,6 +1114,11 @@ pub async fn get_version_history(
 /// Accepts a proof bundle and returns the verification result.
 /// External clients can use this to independently verify that a
 /// proof bundle represents genuine Authority consensus.
+///
+/// The majority denominator (`total_authorities`) and the eligible signer
+/// set are always derived from this node's authority definition for the
+/// proof's key range; the caller-supplied `total_authorities` field is
+/// ignored so the quorum cannot be understated by the requester.
 pub async fn verify_proof(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyProofRequest>,
@@ -627,11 +1145,126 @@ pub async fn verify_proof(
     };
     let policy_version = PolicyVersion(req.policy_version);
 
+    // The majority denominator and the eligible signer set come from this
+    // node's own authority definition for the key range. Trusting the
+    // caller-supplied `total_authorities` would let an attacker shrink the
+    // denominator and pass a sub-quorum proof (e.g. 2-of-5 presented as
+    // 2-of-3) off as a certified majority.
+    let (total_authorities, authority_members) = {
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let Some(def) = ns.get_authorities_for_key(&key_range.prefix) else {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!(
+                    "no authority definition covers key range '{}'; cannot determine the authority set",
+                    key_range.prefix
+                ),
+            ));
+        };
+        (
+            def.authority_nodes.len(),
+            def.authority_nodes
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<NodeId>>(),
+        )
+    };
+
     // Determine the signature algorithm from the request.
     let sig_algorithm = match req.signature_algorithm.as_deref() {
         Some("Bls12_381") => crate::authority::certificate::SignatureAlgorithm::Bls12_381,
         _ => crate::authority::certificate::SignatureAlgorithm::Ed25519,
     };
+
+    // BLS aggregate verification path: reconstruct a DualModeCertificate
+    // from the dedicated BLS fields and verify against the registry.
+    if sig_algorithm == crate::authority::certificate::SignatureAlgorithm::Bls12_381
+        && let (Some(agg_hex), Some(signer_ids), Some(pk_hexes)) = (
+            &req.bls_aggregate_signature,
+            &req.bls_signer_ids,
+            &req.bls_public_keys,
+        )
+    {
+        use crate::authority::certificate::DualModeCertificate;
+
+        if signer_ids.len() != pk_hexes.len() {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "bls_signer_ids and bls_public_keys must have the same length".to_string(),
+            ));
+        }
+
+        let keyset_version = KeysetVersion(
+            req.keyset_version
+                .or(req.certificate.as_ref().map(|c| c.keyset_version))
+                .unwrap_or(1),
+        );
+
+        let mut cert = DualModeCertificate::new_bls(
+            key_range.clone(),
+            frontier_hlc.clone(),
+            policy_version,
+            keyset_version,
+        );
+        if let Some(fv) = req.format_version {
+            cert.format_version = fv;
+        }
+
+        let aggregated = BlsSignature::from_hex(agg_hex).ok_or((
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid hex in bls_aggregate_signature".to_string(),
+        ))?;
+        let mut signers = Vec::with_capacity(signer_ids.len());
+        for (id, pk_hex) in signer_ids.iter().zip(pk_hexes.iter()) {
+            let pk = BlsPublicKey::from_hex(pk_hex).ok_or((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid hex in bls_public_keys for signer {id}"),
+            ))?;
+            signers.push((NodeId(id.clone()), pk));
+        }
+        // Every aggregate signer must belong to the range's authority set;
+        // an aggregate cannot be partially discounted, so any outside signer
+        // invalidates the proof as a whole.
+        if signers
+            .iter()
+            .any(|(id, _)| !authority_members.contains(id))
+        {
+            return Ok(Json(VerifyProofResponse {
+                valid: false,
+                has_majority: false,
+                contributing_count: signers
+                    .iter()
+                    .filter(|(id, _)| authority_members.contains(id))
+                    .count(),
+                required_count: total_authorities / 2 + 1,
+            }));
+        }
+        cert.set_bls_aggregate(signers, aggregated);
+
+        let format_config = req
+            .format_version
+            .map(|_| crate::authority::certificate::FormatVersionConfig::default());
+        let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+        let current_epoch = state
+            .current_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = verifier::verify_dual_proof_with_registry(
+            &cert,
+            total_authorities,
+            &registry,
+            current_epoch,
+            &state.epoch_config,
+            format_config.as_ref(),
+            0,
+        );
+
+        return Ok(Json(VerifyProofResponse {
+            valid: result.valid,
+            has_majority: result.has_majority,
+            contributing_count: result.contributing_count,
+            required_count: result.required_count,
+        }));
+    }
 
     // Reconstruct the certificate from the HTTP payload, if provided.
     // Apply caller-specified format_version and signature_algorithm so that
@@ -649,6 +1282,11 @@ pub async fn verify_proof(
         cert.signature_algorithm = sig_algorithm;
 
         for sig_json in &cert_json.signatures {
+            // Signatures from authorities outside the range's authority set
+            // do not count toward the majority, however valid they are.
+            if !authority_members.contains(&NodeId(sig_json.authority_id.clone())) {
+                continue;
+            }
             let pk_bytes = hex_to_bytes_32(&sig_json.public_key)?;
             let sig_bytes = hex_to_bytes_64(&sig_json.signature)?;
             let public_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).ok()?;
@@ -677,9 +1315,11 @@ pub async fn verify_proof(
             .contributing_authorities
             .into_iter()
             .map(NodeId)
+            .filter(|id| authority_members.contains(id))
             .collect(),
-        total_authorities: req.total_authorities,
+        total_authorities,
         certificate,
+        bls_certificate: None,
     };
 
     let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
@@ -763,6 +1403,17 @@ pub async fn internal_sync(
             }
         }
     }
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+
+    // One durability wait for the whole batch (SyncPolicy::Always): the
+    // pushing peer advances its push frontier on our ack, so acking
+    // un-synced merges could strand them on a crash. A wait error is only
+    // possible when the flusher is gone (which fail-stops the process on
+    // fsync errors), so it is logged rather than surfaced.
+    if let Err(e) = wait_wal_durable(&state.eventual_wal, wal_pos).await {
+        tracing::warn!(error = ?e.0, "internal sync WAL durability wait failed");
+    }
 
     let resp = SyncResponse { merged, errors };
     internal_response(&resp, accept)
@@ -797,11 +1448,20 @@ pub async fn internal_keys(
         }
     }
     let frontier = store.current_frontier();
+    // Session-guarantee metadata must be snapshotted in the same lock
+    // scope as `entries`/`frontier`: adoption on the receiving side is
+    // only sound when the applied frontier describes exactly this state.
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let visible_origins = store.visible_origins().clone();
 
     let resp = KeyDumpResponse {
         entries,
         frontier,
         timestamps,
+        applied_origins,
+        merge_failed_keys,
+        visible_origins,
     };
     internal_response(&resp, accept)
 }
@@ -831,11 +1491,178 @@ pub async fn internal_delta_sync(
         .collect();
 
     let sender_frontier = store.current_frontier();
+    // Snapshot the session-guarantee metadata in the same lock scope as
+    // the delta entries (see internal_keys). `pruned_floor` lets the
+    // receiver decide whether adopting `applied_origins` is sound.
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let pruned_floor = store.pruned_floor().cloned();
+    let visible_origins = store.visible_origins().clone();
+
+    // Untracked-key compensation for COMPLETE pulls. A zero request
+    // frontier means "send me everything" and the receiver treats the
+    // response as a complete transfer (adopting the whole applied_origins
+    // map) — but `delta_entries_since` scans only the timestamps map, so
+    // keys without a tracked HLC (v1/v2-migrated stores) would be
+    // silently omitted: the receiver would claim writes it never got and
+    // the pull path would never converge on those keys. The full-dump
+    // handler (`internal_keys`) has always compensated; do the same here.
+    //
+    // Skipped entirely once this store has COMPACTED (`pruned_floor`
+    // set): `untracked_entries()` then matches every compaction-pruned
+    // key too (pruning removes timestamps while keeping data), which
+    // would put a full-dump-sized payload on the delta path — for
+    // nothing, because the receiver's floor gate (`request_frontier >=
+    // pruned_floor`, i.e. `zero >= floor`) is guaranteed to reject the
+    // claims of a zero-frontier pull against a compacted sender and
+    // fall back to full sync anyway. The fallback (digest sync or full
+    // dump) is the designed convergence path for those keys.
+    let is_complete_request = req.frontier.physical == 0 && req.frontier.logical == 0;
+    let untracked_entries: std::collections::HashMap<String, crate::store::kv::CrdtValue> =
+        if is_complete_request && pruned_floor.is_none() {
+            store
+                .untracked_entries()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let resp = DeltaSyncResponse {
         entries,
         sender_frontier,
+        applied_origins,
+        merge_failed_keys,
+        pruned_floor,
+        visible_origins,
+        untracked_entries,
     };
+    internal_response(&resp, accept)
+}
+
+/// `POST /api/internal/sync/digest`
+///
+/// Digest-based stepwise diff (anti-entropy). The requester sends its
+/// two-level key-range digest; this handler compares it against the local
+/// state and answers in one round trip:
+/// - root match → `root_matched = true`, zero entries;
+/// - mismatch → the full entries of every mismatched bucket (when
+///   `include_entries` is set), plus timestamps.
+///
+/// The digest input, entries, frontier and session-guarantee metadata are
+/// all snapshotted in a SINGLE lock scope (same invariant as
+/// `internal_keys`): the receiver may adopt `applied_origins` after
+/// applying the mismatched entries precisely because matched buckets are
+/// byte-identical to this snapshot and mismatched buckets are transferred
+/// in full — completeness equivalent to a full dump. The O(state size)
+/// hashing runs OFF the lock in `spawn_blocking`.
+///
+/// Read-only: no `wait_wal_durable` is needed (nothing is acknowledged).
+pub async fn internal_digest_sync(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Scheme validation: a version or shape mismatch is NOT an error —
+    // answer 200 with `scheme_ok = false` so the requester falls back to
+    // the legacy full sync (rolling-upgrade safe in both directions).
+    let scheme_valid = req.scheme_version == DIGEST_SCHEME_VERSION
+        && req.root.len() == DIGEST_LEN
+        && req
+            .buckets
+            .iter()
+            .all(|b| (b.index as usize) < DIGEST_BUCKET_COUNT && b.digest.len() == DIGEST_LEN);
+    if !scheme_valid {
+        tracing::debug!(
+            sender = %req.sender,
+            scheme_version = req.scheme_version,
+            "digest sync request with unsupported scheme; answering scheme_ok=false"
+        );
+        return internal_response(&DigestSyncResponse::default(), accept);
+    }
+
+    // Single-lock-scope snapshot: digest material, entries, frontier and
+    // session claims must all describe exactly the same state T0.
+    let api = state.eventual.lock().await;
+    let store = api.store();
+    let data: std::collections::BTreeMap<String, CrdtValue> = store
+        .all_entries()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut timestamps = std::collections::HashMap::new();
+    for (k, _, hlc) in store.all_entries_with_hlc() {
+        timestamps.insert(k.clone(), hlc.clone());
+    }
+    let frontier = store.current_frontier();
+    let applied_origins = store.applied_origins().clone();
+    let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
+    let visible_origins = store.visible_origins().clone();
+    drop(api);
+
+    let resp = tokio::task::spawn_blocking(move || {
+        let local = compute_store_digest(&data);
+        let total_keys = local.total_keys;
+
+        if req.root.as_slice() == local.root {
+            return DigestSyncResponse {
+                scheme_ok: true,
+                root_matched: true,
+                frontier,
+                applied_origins,
+                visible_origins,
+                merge_failed_keys,
+                total_keys,
+                ..DigestSyncResponse::default()
+            };
+        }
+
+        let remote: Vec<(u16, [u8; DIGEST_LEN])> = req
+            .buckets
+            .iter()
+            .map(|b| {
+                let mut digest = [0u8; DIGEST_LEN];
+                digest.copy_from_slice(&b.digest);
+                (b.index, digest)
+            })
+            .collect();
+        let mismatched = mismatched_buckets(&local, &remote);
+
+        let mut entries = std::collections::HashMap::new();
+        let mut entry_timestamps = std::collections::HashMap::new();
+        if req.include_entries {
+            let mismatched_set: std::collections::HashSet<u16> =
+                mismatched.iter().copied().collect();
+            for (key, value) in data {
+                if mismatched_set.contains(&(bucket_of(&key) as u16)) {
+                    if let Some(ts) = timestamps.get(&key) {
+                        entry_timestamps.insert(key.clone(), ts.clone());
+                    }
+                    entries.insert(key, value);
+                }
+            }
+        }
+
+        DigestSyncResponse {
+            scheme_ok: true,
+            root_matched: false,
+            mismatched_buckets: mismatched,
+            entries,
+            timestamps: entry_timestamps,
+            frontier,
+            applied_origins,
+            visible_origins,
+            merge_failed_keys,
+            total_keys,
+        }
+    })
+    .await
+    .expect("spawn_blocking panicked");
+
     internal_response(&resp, accept)
 }
 
@@ -1330,44 +2157,6 @@ pub async fn healthz() -> Json<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------
 
-/// Write `data` to `path` atomically: write to a uniquely-named sibling temp
-/// file, fsync, then rename. The unique suffix (pid + counter) avoids temp
-/// file contention when multiple handlers persist concurrently.
-fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        ".tmp.{}.{}.{}",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
-        seq,
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    let mut file = std::fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
-    file.write_all(data).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        // Clean up stranded temp file on rename failure.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.to_string());
-    }
-    // Fsync the parent directory so the rename is durable.
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
-
 /// Validate that `addr` is a bare host:port address.
 ///
 /// Rejects addresses containing schemes (`http://`, `ftp://`), paths, or query
@@ -1425,39 +2214,28 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Persist the system namespace to disk (if a path is configured).
-///
-/// Serialises the namespace under a read-lock, then writes atomically via
-/// `write_atomic` on a blocking thread. Errors are logged but not propagated
-/// because namespace persistence is best-effort.
-async fn persist_namespace(state: &AppState) {
-    if let Some(path) = &state.namespace_persist_path {
-        let json = {
-            let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
-            match serde_json::to_string_pretty(&*ns) {
-                Ok(j) => j,
-                Err(e) => {
-                    eprintln!("warning: failed to serialise system namespace: {e}");
-                    return;
-                }
-            }
-        };
-        let path = path.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || write_atomic(&path, json.as_bytes()))
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        {
-            eprintln!("warning: failed to persist system namespace: {e}");
-        }
-    }
-}
-
 /// Maximum allowed absolute value for counter initialization via HTTP API.
 ///
 /// Values exceeding this limit are rejected with `InvalidArgument` to prevent
 /// resource exhaustion. This is a defense-in-depth measure; the O(1) constructor
 /// already prevents CPU-based DoS.
 const MAX_COUNTER_MAGNITUDE: i64 = 1_000_000_000;
+
+/// Process-wide monotonic clock for the `http-writer` pseudo-node.
+///
+/// LWW register and OR-map timestamps must be strictly increasing across HTTP
+/// writes: a *fresh* `Hlc` per call resets the logical counter to 0, so two
+/// writes in the same wall-clock millisecond produce equal timestamps and
+/// `LwwRegister::merge` tie-breaks by value order — silently dropping the
+/// later write. A single reused clock guarantees each `now()` strictly
+/// exceeds the previous one, so ordering reflects write order.
+static HTTP_WRITER_CLOCK: std::sync::Mutex<Option<crate::hlc::Hlc>> = std::sync::Mutex::new(None);
+
+fn http_writer_now() -> Result<crate::hlc::HlcTimestamp, CrdtError> {
+    let mut guard = HTTP_WRITER_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let clock = guard.get_or_insert_with(|| crate::hlc::Hlc::new("http-writer".into()));
+    Ok(clock.now()?)
+}
 
 /// Convert a JSON CRDT value representation into an internal `CrdtValue`.
 ///
@@ -1468,7 +2246,6 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
     use crate::crdt::lww_register::LwwRegister;
     use crate::crdt::or_map::OrMap;
     use crate::crdt::or_set::OrSet;
-    use crate::hlc::Hlc;
     use crate::types::NodeId;
 
     let writer = NodeId("http-writer".into());
@@ -1493,9 +2270,8 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
         }
         CrdtValueJson::Map { entries } => {
             let mut map = OrMap::new();
-            let mut clock = Hlc::new("http-writer".into());
             for (k, v) in entries {
-                let ts = clock.now()?;
+                let ts = http_writer_now()?;
                 map.set(k.clone(), v.clone(), ts, &writer);
             }
             Ok(CrdtValue::Map(map))
@@ -1503,8 +2279,7 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
         CrdtValueJson::Register { value } => {
             let mut reg = LwwRegister::new();
             if let Some(v) = value {
-                let mut clock = Hlc::new("http-writer".into());
-                let ts = clock.now()?;
+                let ts = http_writer_now()?;
                 reg.set(v.clone(), ts);
             }
             Ok(CrdtValue::Register(reg))

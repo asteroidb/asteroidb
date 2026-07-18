@@ -97,6 +97,13 @@ async fn spawn_node_with_latency(
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     });
 
     let app = router(state.clone());

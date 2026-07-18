@@ -290,8 +290,16 @@ fn bls_certificate_with_registry_verification() {
         .register_bls_keys(
             &version,
             vec![
-                ("auth-1".into(), kp1.public_key.clone()),
-                ("auth-2".into(), kp2.public_key.clone()),
+                (
+                    "auth-1".into(),
+                    kp1.public_key.clone(),
+                    kp1.proof_of_possession(),
+                ),
+                (
+                    "auth-2".into(),
+                    kp2.public_key.clone(),
+                    kp2.proof_of_possession(),
+                ),
             ],
         )
         .unwrap();
@@ -391,13 +399,14 @@ async fn bls_mode_after_registry_registration() {
         .rotate_keyset(now_secs, vec![(node_id("auth-1"), vk)])
         .unwrap();
 
-    // Register BLS key for this node.
+    // Register BLS key for this node (with its proof of possession).
     let bls_pk = runner.bls_keypair().unwrap().public_key.clone();
+    let bls_pop = runner.bls_keypair().unwrap().proof_of_possession();
     let version = runner.epoch_manager().registry().current_version();
     runner
         .epoch_manager_mut()
         .registry_mut()
-        .register_bls_keys(&version, vec![("auth-1".into(), bls_pk)])
+        .register_bls_keys(&version, vec![("auth-1".into(), bls_pk, bls_pop)])
         .unwrap();
 
     assert_eq!(
@@ -600,4 +609,111 @@ fn bls_majority_threshold_with_5_authorities() {
 
     let valid = cert.verify(msg).unwrap();
     assert_eq!(valid.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Rogue-key attack is real without PoP and blocked by registration
+// ---------------------------------------------------------------------------
+
+/// Compute `pk_a - pk_b` as compressed G1 bytes using raw blst point
+/// arithmetic — the classic rogue-key construction: the attacker publishes
+/// `pk_rogue = pk_attacker - pk_victim` so that
+/// `pk_victim + pk_rogue = pk_attacker`.
+fn g1_subtract(pk_a: &[u8; 48], pk_b: &[u8; 48]) -> [u8; 48] {
+    unsafe {
+        let mut a_aff = blst::blst_p1_affine::default();
+        assert_eq!(
+            blst::blst_p1_uncompress(&mut a_aff, pk_a.as_ptr()),
+            blst::BLST_ERROR::BLST_SUCCESS
+        );
+        let mut b_aff = blst::blst_p1_affine::default();
+        assert_eq!(
+            blst::blst_p1_uncompress(&mut b_aff, pk_b.as_ptr()),
+            blst::BLST_ERROR::BLST_SUCCESS
+        );
+        let mut a = blst::blst_p1::default();
+        blst::blst_p1_from_affine(&mut a, &a_aff);
+        let mut b = blst::blst_p1::default();
+        blst::blst_p1_from_affine(&mut b, &b_aff);
+        blst::blst_p1_cneg(&mut b, true);
+        let mut out = blst::blst_p1::default();
+        blst::blst_p1_add_or_double(&mut out, &a, &b);
+        let mut compressed = [0u8; 48];
+        blst::blst_p1_compress(compressed.as_mut_ptr(), &out);
+        compressed
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// End-to-end rogue-key demonstration and its PoP-based mitigation:
+///
+/// (a) The attack is real: an attacker who registers
+///     `pk_rogue = pk_attacker - pk_victim` can forge an "aggregate" of
+///     `{pk_victim, pk_rogue}` with a signature only *it* produced —
+///     `fast_aggregate_verify` accepts it because the key sum collapses to
+///     `pk_attacker`.
+/// (b) The attacker cannot produce a proof of possession for `pk_rogue`
+///     (it does not know the corresponding secret key), so any PoP it can
+///     actually generate fails `verify_pop`.
+/// (c) `KeysetRegistry::register_bls_keys` therefore rejects the rogue key,
+///     which keeps the attack out of every registry-backed verification path.
+#[test]
+fn rogue_key_attack_blocked_by_pop() {
+    use asteroidb_poc::authority::bls::{BlsPublicKey, aggregate_verify, sign_message, verify_pop};
+    use asteroidb_poc::authority::certificate::{CertError, KeysetRegistry};
+
+    let victim = BlsKeypair::generate(&[201u8; 32]);
+    let attacker = BlsKeypair::generate(&[202u8; 32]);
+
+    // Rogue key: pk_attacker - pk_victim (compressed G1 arithmetic).
+    let attacker_pk: [u8; 48] = attacker.public_key.0.to_bytes();
+    let victim_pk: [u8; 48] = victim.public_key.0.to_bytes();
+    let rogue_bytes = g1_subtract(&attacker_pk, &victim_pk);
+    let rogue_pk =
+        BlsPublicKey::from_hex(&to_hex(&rogue_bytes)).expect("rogue key is a valid G1 point");
+
+    // (a) The attack is real: the attacker signs on its own, yet the forged
+    //     aggregate over {victim, rogue} verifies because the key sum collapses
+    //     to the attacker's public key.
+    let msg = b"checkpoint-message-for-rogue-key-attack";
+    let attacker_sig = sign_message(attacker.secret_key(), msg);
+    assert!(
+        aggregate_verify(
+            &[victim.public_key.clone(), rogue_pk.clone()],
+            msg,
+            &attacker_sig
+        ),
+        "rogue-key forgery must pass fast_aggregate_verify (the vulnerability PoP closes)"
+    );
+
+    // (b) The attacker cannot produce a valid proof of possession for the rogue
+    //     key. The best it can do is present a PoP over a key it controls, which
+    //     does not verify against the rogue public key.
+    let attacker_pop = attacker.proof_of_possession();
+    assert!(
+        !verify_pop(&rogue_pk, &attacker_pop),
+        "no PoP the attacker can produce verifies against the rogue key"
+    );
+
+    // (c) Registration therefore rejects the rogue key, keeping it out of every
+    //     registry-backed verification path.
+    let mut registry = KeysetRegistry::new();
+    registry
+        .register_keyset(KeysetVersion(1), 0, Vec::new())
+        .unwrap();
+    let result = registry.register_bls_keys(
+        &KeysetVersion(1),
+        vec![("rogue".into(), rogue_pk, attacker_pop)],
+    );
+    assert!(
+        matches!(result, Err(CertError::InvalidProofOfPossession(ref id)) if id == "rogue"),
+        "register_bls_keys must reject the rogue key, got: {result:?}"
+    );
+    assert!(
+        registry.get_bls_key(&KeysetVersion(1), "rogue").is_none(),
+        "the rogue key must not have entered the registry"
+    );
 }

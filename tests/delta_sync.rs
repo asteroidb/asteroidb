@@ -68,6 +68,13 @@ fn test_state() -> Arc<AppState> {
         keyset_registry: None,
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
     })
 }
 
@@ -517,4 +524,130 @@ async fn partial_failure_does_not_skip_entries() {
     let remaining_keys: Vec<&str> = remaining.iter().map(|(k, _, _)| k.as_str()).collect();
     assert!(remaining_keys.contains(&"entry-3"));
     assert!(remaining_keys.contains(&"entry-4"));
+}
+
+// ---------------------------------------------------------------
+// Untracked-key compensation (M-2)
+// ---------------------------------------------------------------
+
+/// A zero-frontier ("complete") pull must include keys with NO tracked
+/// per-key HLC (v1/v2-migrated stores): `delta_entries_since` scans only
+/// the timestamps map, so without the `untracked_entries` compensation
+/// the receiver would treat the response as complete — adopting the
+/// sender's whole applied_origins map — while these keys never transfer
+/// through the pull path (read-your-writes false success + permanent
+/// divergence). Incremental pulls omit the field (they never adopt
+/// third-origin claims).
+#[tokio::test]
+async fn zero_frontier_delta_includes_untracked_entries() {
+    use asteroidb_poc::crdt::pn_counter::PnCounter;
+
+    let state = test_state();
+
+    // One tracked write plus one migrated (timestamp-less) key.
+    {
+        let mut api = state.eventual.lock().await;
+        api.eventual_counter_inc("tracked-key").unwrap();
+        let mut migrated = PnCounter::new();
+        migrated.increment(&node_id("old-writer"));
+        migrated.increment(&node_id("old-writer"));
+        // Plain put() without record_change: exactly the shape a v1/v2
+        // snapshot migration leaves behind.
+        api.store_mut()
+            .put("migrated-key".into(), CrdtValue::Counter(migrated));
+        assert!(api.store().timestamp_for("migrated-key").is_none());
+    }
+
+    // Complete pull (zero frontier): the untracked key must ride along.
+    let req_body = serde_json::to_string(&DeltaSyncRequest {
+        sender: "node-2".into(),
+        frontier: hlc(0, 0, ""),
+    })
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/internal/sync/delta")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let delta: DeltaSyncResponse =
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+
+    assert_eq!(delta.entries.len(), 1, "tracked key rides the delta scan");
+    assert_eq!(delta.entries[0].key, "tracked-key");
+    match delta.untracked_entries.get("migrated-key") {
+        Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+        other => panic!("untracked key must be compensated, got {other:?}"),
+    }
+
+    // Incremental pull (non-zero frontier): no compensation payload.
+    let req_body = serde_json::to_string(&DeltaSyncRequest {
+        sender: "node-2".into(),
+        frontier: hlc(1, 0, "node-2"),
+    })
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/internal/sync/delta")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let delta: DeltaSyncResponse =
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+    assert!(
+        delta.untracked_entries.is_empty(),
+        "incremental pulls carry no untracked compensation"
+    );
+}
+
+/// A COMPACTED sender (`pruned_floor` set) must NOT ship its pruned
+/// keyspace as `untracked_entries` on a zero-frontier pull: pruning
+/// removes per-key timestamps while keeping data, so every pruned key
+/// matches the untracked predicate — a full-dump-sized payload on the
+/// delta path — while the receiver's floor gate (`zero >= pruned_floor`)
+/// is guaranteed to reject the claims and fall back to full sync anyway.
+#[tokio::test]
+async fn compacted_sender_ships_no_untracked_entries() {
+    let state = test_state();
+
+    // Two tracked writes, then compaction prunes both timestamps.
+    {
+        let mut api = state.eventual.lock().await;
+        api.eventual_counter_inc("pruned-1").unwrap();
+        api.eventual_counter_inc("pruned-2").unwrap();
+        let frontier = api.store().current_frontier().unwrap();
+        let pruned = api.store_mut().prune_timestamps_before("", &frontier);
+        assert_eq!(pruned, 2, "both timestamps pruned");
+        assert!(api.store().pruned_floor().is_some());
+        assert!(api.store().timestamp_for("pruned-1").is_none());
+    }
+
+    let req_body = serde_json::to_string(&DeltaSyncRequest {
+        sender: "node-2".into(),
+        frontier: hlc(0, 0, ""),
+    })
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/internal/sync/delta")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let delta: DeltaSyncResponse =
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+
+    assert!(
+        delta.pruned_floor.is_some(),
+        "the floor rides the response so the receiver rejects the claims"
+    );
+    assert!(
+        delta.untracked_entries.is_empty(),
+        "a compacted sender must not dump its pruned keyspace on the delta path"
+    );
 }

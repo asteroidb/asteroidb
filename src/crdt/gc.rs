@@ -1,22 +1,56 @@
 //! Tombstone garbage collection for OR-Set and OR-Map CRDTs.
 //!
-//! The `deferred` (tombstone) sets in [`OrSet`] and [`OrMap`] grow unboundedly
-//! over time because every remove operation appends dots. This module provides
-//! a `TombstoneGc` that periodically reclaims tombstones that are provably safe
-//! to discard.
+//! The `deferred` (tombstone) sets in [`crate::crdt::or_set::OrSet`] and
+//! [`crate::crdt::or_map::OrMap`] grow unboundedly over time because every
+//! remove operation appends dots. This module provides a `TombstoneGc`
+//! that periodically reclaims tombstones that are provably safe to
+//! discard.
 //!
 //! # Safety criterion
 //!
 //! A tombstone dot `(node_id, counter)` is safe to GC when:
-//! 1. All known replicas have already incorporated it (their version for the
-//!    node is past this counter), AND
-//! 2. The dot is not referenced by any live element in the CRDT.
+//! 1. All known replicas have already incorporated it (they can never
+//!    again offer the removed dot as live state in a merge), AND
+//! 2. The dot is not referenced by any live element in the CRDT, AND
+//! 3. The dot is locally dominated (`counter < max_counter` for its
+//!    node), so no future dot can collide with it.
 //!
-//! The GC tracks a **version floor** per node — the minimum known version
-//! across all replicas. Dots strictly below this floor satisfy criterion (1).
-//! Criterion (2) is checked by `compact_deferred()` on the CRDT itself.
+//! Criterion (1) is what a purely local check can NEVER establish: a
+//! replica partitioned away for longer than any wall-clock retention
+//! window still holds the pre-remove state, and merging it after the
+//! tombstone is gone permanently resurrects the removed element.
+//!
+//! # Gated mark-and-sweep
+//!
+//! [`TombstoneGc::mark_and_sweep`] therefore runs in two passes:
+//!
+//! - **Mark**: snapshot the current deferred dots (per store key) and
+//!   record the mark's wall-clock time `mark_ms`.
+//! - **Sweep** (a later pass, at least `retention_period` after the
+//!   mark): the CALLER evaluates its replica-synchronisation gates
+//!   against `mark_ms` (see `NodeRunner::run_gc`: every authority's ack
+//!   frontier AND every registered peer's push evidence — the local
+//!   wall-clock time of the last fully-successful push — must have
+//!   passed `mark_ms`) and passes the verdict in. Only when the gates
+//!   pass are the MARKED dots collected (still subject to criteria 2
+//!   and 3); dots that appeared after the mark wait for the next cycle.
+//!
+//! "Collected dots existed at mark time, and every known replica has
+//! provably synchronised past the mark" is what makes the sweep safe: a
+//! replica that has consumed state as of `mark_ms` has consumed the
+//! post-remove state, so it can never re-offer the removed dots. When
+//! the gates fail (partition, lagging authority, dead peer still in the
+//! registry) the mark is simply KEPT and nothing is collected —
+//! tombstones accumulate until the cluster heals (fail-closed).
+//!
+//! The legacy per-node **version floor** machinery
+//! (`compact_deferred_with_floor`) is retained for callers that obtain
+//! genuine cross-replica dot-counter floors out of band; the runtime GC
+//! does not use it (no protocol currently transports per-key dot
+//! counters — see P1-10 for why HLC frontiers must never be used as
+//! counter floors).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::store::kv::{CrdtValue, Store};
@@ -50,14 +84,15 @@ pub struct TombstoneGc {
     pub retention_period: Duration,
     /// Wall-clock millisecond timestamp of the last GC run.
     last_gc_ms: u64,
-    /// Whether `gc_tombstones` has been called at least once.
-    ///
-    /// Separate from `last_gc_ms` so that a first call with `now_ms = 0`
-    /// (e.g. in unit tests) does not leave `last_gc_ms == 0` and cause every
-    /// subsequent call to re-enter the first-run bypass indefinitely.
-    has_run: bool,
     /// Cumulative count of tombstones removed across all GC runs.
     total_collected: u64,
+    /// Mark-and-sweep state: deferred dots snapshotted per store key at
+    /// [`marked_at_ms`](Self::pending_mark_ms). Only these candidates may
+    /// be collected by the next sweep.
+    marked: HashMap<String, HashSet<(NodeId, u64)>>,
+    /// Wall-clock time of the pending mark; `None` when no mark is
+    /// outstanding (the next pass will mark, not sweep).
+    marked_at_ms: Option<u64>,
 }
 
 impl Default for TombstoneGc {
@@ -68,8 +103,9 @@ impl Default for TombstoneGc {
             gc_interval: Duration::from_secs(60),
             retention_period: Duration::from_secs(300),
             last_gc_ms: 0,
-            has_run: false,
             total_collected: 0,
+            marked: HashMap::new(),
+            marked_at_ms: None,
         }
     }
 }
@@ -83,8 +119,9 @@ impl TombstoneGc {
             gc_interval,
             retention_period,
             last_gc_ms: 0,
-            has_run: false,
             total_collected: 0,
+            marked: HashMap::new(),
+            marked_at_ms: None,
         }
     }
 
@@ -143,123 +180,120 @@ impl TombstoneGc {
 
     /// Check whether enough time has elapsed since `last_gc_ms` was last set.
     ///
-    /// `last_gc_ms` is set on the very first call to
-    /// [`gc_tombstones`](Self::gc_tombstones) (even with an empty store), and
-    /// thereafter only when at least one tombstone is actually collected.  On
-    /// no-op runs after the first, `last_gc_ms` is left unchanged so subsequent
-    /// calls to `should_run` return `true` again once `gc_interval` has elapsed
-    /// from the last successful collection.  This prevents the GC interval from
-    /// resetting on empty-store no-op runs and ensures the scheduler re-checks
-    /// promptly when the store is initially empty.
+    /// `last_gc_ms` advances only when a sweep actually collects
+    /// tombstones, so after a collection the next ATTEMPT waits a full
+    /// `gc_interval`; while nothing is collected (no mark yet, gates
+    /// blocked, nothing eligible) every call past the interval attempts
+    /// again promptly.
     ///
     /// **`gc_interval = 0` note**: the comparison uses a minimum of 1 ms to prevent
     /// callers that loop on `should_run` from busy-polling at nanosecond cadence.
     /// In tests that want "run immediately", set the interval to `Duration::from_millis(1)`.
     ///
     /// The `gc_interval` field controls *how often to attempt* a GC pass.
-    /// The `retention_period` field, checked inside `gc_tombstones`, controls
-    /// the *minimum quiet time* between successive actual collections.
+    /// The `retention_period` field, checked inside
+    /// [`mark_and_sweep`](Self::mark_and_sweep), is the *minimum age* a
+    /// mark must reach before its sweep may collect.
     pub fn should_run(&self, now_ms: u64) -> bool {
         let interval_ms = self.gc_interval.as_millis() as u64;
         let interval_ms = interval_ms.max(1);
         now_ms.saturating_sub(self.last_gc_ms) >= interval_ms
     }
 
-    /// Run garbage collection on all CRDT values in the store.
+    /// Wall-clock time (ms) of the pending mark, if one is outstanding.
     ///
-    /// Iterates over every `CrdtValue::Set` and `CrdtValue::Map` in the store
-    /// and calls `compact_deferred()` on each, which removes tombstone dots
-    /// that are below the node's known counter and not referenced by any live
-    /// element.
-    ///
-    /// # Timing semantics
-    ///
-    /// Two independent timing fields govern when collection actually happens:
-    ///
-    /// - **`gc_interval`** (checked by [`should_run`](Self::should_run)): how
-    ///   often the caller should *attempt* a GC pass. Callers are expected to
-    ///   call `should_run` before calling this method.
-    /// - **`retention_period`** (checked here): the minimum quiet time that must
-    ///   elapse between successive *successful* collections. This prevents
-    ///   premature GC of tombstones that slow replicas may not have merged yet.
-    ///
-    /// `last_gc_ms` is updated when at least one tombstone is collected, **or**
-    /// on the very first invocation (even with an empty store) to start the
-    /// retention clock. On subsequent no-op runs `last_gc_ms` is left unchanged
-    /// so that `should_run` continues to return `true` and the caller re-checks
-    /// promptly without waiting a full `gc_interval`.
-    ///
-    /// Returns the number of tombstones removed in this run.
-    pub fn gc_tombstones(&mut self, store: &mut Store, now_ms: u64) -> u64 {
-        // Determine whether this is the very first invocation.
-        //
-        // On the first call we always proceed (bypass retention) so a freshly-started
-        // node can collect immediately. We also record now_ms as the retention baseline
-        // regardless of whether any tombstones exist. Without this, a node that starts
-        // with an empty store (last_gc_ms stays 0 across all no-op calls) would bypass
-        // the retention check the first time tombstones appear, potentially GC-ing them
-        // before slow replicas have had retention_period to merge them.
-        //
-        // `has_run` is used rather than `last_gc_ms == 0` to avoid an infinite
-        // first-run loop when `now_ms = 0` (e.g. in unit tests): without this flag,
-        // setting `last_gc_ms = 0` on the first call would leave the sentinel
-        // unchanged and every subsequent call would re-enter the first-run bypass.
-        let is_first_run = !self.has_run;
+    /// The caller evaluates its replica-synchronisation gates against
+    /// this value before the sweep pass: collection is safe only when
+    /// every known replica has provably synchronised past the mark (see
+    /// the module docs and `NodeRunner::run_gc`).
+    pub fn pending_mark_ms(&self) -> Option<u64> {
+        self.marked_at_ms
+    }
 
-        if !is_first_run {
-            let retention_ms = self.retention_period.as_millis() as u64;
-            if now_ms.saturating_sub(self.last_gc_ms) < retention_ms {
-                return 0;
-            }
-        }
-
+    /// Gated mark-and-sweep over all CRDT values in the store.
+    ///
+    /// - With no outstanding mark, this pass MARKS: the current deferred
+    ///   dots are snapshotted per key and `now_ms` is recorded; nothing
+    ///   is collected.
+    /// - With an outstanding mark that is at least `retention_period`
+    ///   old AND `gates_passed == true` (the caller verified every known
+    ///   replica synchronised past [`pending_mark_ms`](Self::pending_mark_ms)),
+    ///   this pass SWEEPS: marked dots that are not live and are locally
+    ///   dominated are removed, then a fresh mark is taken.
+    /// - Otherwise (mark too young, or gates failed) nothing happens:
+    ///   the mark is KEPT so the same `mark_ms` keeps being re-evaluated
+    ///   — a partition or a lagging replica stalls collection entirely
+    ///   (fail-closed) and it resumes automatically once the gates pass.
+    ///
+    /// The two-pass structure is what makes collection safe against
+    /// resurrection: every collected dot existed at mark time, and the
+    /// gates prove every known replica consumed post-remove state from
+    /// AFTER the mark — so no known replica can re-offer the dot as live
+    /// state. A purely wall-clock retention (the previous design) could
+    /// not exclude a replica partitioned for longer than the retention
+    /// window.
+    ///
+    /// Returns the number of tombstones removed in this pass.
+    pub fn mark_and_sweep(&mut self, store: &mut Store, now_ms: u64, gates_passed: bool) -> u64 {
         let mut collected = 0u64;
-        let has_floor = !self.version_floor.is_empty() || self.global_floor.is_some();
+        let retention_ms = self.retention_period.as_millis() as u64;
+        let sweep_ready = self
+            .marked_at_ms
+            .is_some_and(|mark| now_ms.saturating_sub(mark) >= retention_ms);
 
-        for key in store.keys().into_iter().cloned().collect::<Vec<_>>() {
-            if let Some(value) = store.get_mut(&key) {
-                match value {
-                    CrdtValue::Set(set) => {
-                        let before = set.deferred_len();
-                        if has_floor {
-                            set.compact_deferred_with_floor(&self.version_floor, self.global_floor);
-                        } else {
-                            set.compact_deferred();
+        if sweep_ready && gates_passed {
+            for key in store.keys().into_iter().cloned().collect::<Vec<_>>() {
+                let Some(candidates) = self.marked.get(&key) else {
+                    continue;
+                };
+                if let Some(value) = store.get_mut(&key) {
+                    match value {
+                        CrdtValue::Set(set) => {
+                            let before = set.deferred_len();
+                            set.compact_deferred_marked(candidates);
+                            collected += before.saturating_sub(set.deferred_len()) as u64;
                         }
-                        let after = set.deferred_len();
-                        collected += before.saturating_sub(after) as u64;
-                    }
-                    CrdtValue::Map(map) => {
-                        let before = map.deferred_len();
-                        if has_floor {
-                            map.compact_deferred_with_floor(&self.version_floor, self.global_floor);
-                        } else {
-                            map.compact_deferred();
+                        CrdtValue::Map(map) => {
+                            let before = map.deferred_len();
+                            map.compact_deferred_marked(candidates);
+                            collected += before.saturating_sub(map.deferred_len()) as u64;
                         }
-                        let after = map.deferred_len();
-                        collected += before.saturating_sub(after) as u64;
-                    }
-                    CrdtValue::Counter(_) | CrdtValue::Register(_) => {
-                        // No tombstones for counters or registers.
+                        CrdtValue::Counter(_) | CrdtValue::Register(_) => {
+                            // No tombstones for counters or registers.
+                        }
                     }
                 }
             }
+            // The mark is consumed regardless of how much was collected;
+            // a fresh mark is taken below for the next cycle.
+            self.marked.clear();
+            self.marked_at_ms = None;
+            if collected > 0 {
+                self.total_collected += collected;
+                self.last_gc_ms = now_ms;
+            }
         }
 
-        // Advance the GC timestamp when tombstones were collected, OR on the very
-        // first run (even with an empty store) to start the retention clock.
-        // On subsequent no-op runs last_gc_ms is left unchanged so that should_run()
-        // keeps returning true, ensuring the scheduler re-checks promptly without
-        // waiting a full gc_interval. The two timing fields remain orthogonal:
-        // gc_interval = attempt cadence, retention_period = minimum gap between
-        // actual collections.
-        if collected > 0 {
-            self.total_collected += collected;
+        // (Re-)mark when no mark is outstanding. A blocked sweep
+        // (gates_passed == false) deliberately KEEPS its mark: re-marking
+        // would slide mark_ms forward and a cluster that heals more
+        // slowly than the attempt cadence could never collect.
+        if self.marked_at_ms.is_none() {
+            let mut marked: HashMap<String, HashSet<(NodeId, u64)>> = HashMap::new();
+            for (key, value) in store.all_entries() {
+                let dots = match value {
+                    CrdtValue::Set(set) => set.deferred_dots(),
+                    CrdtValue::Map(map) => map.deferred_dots(),
+                    CrdtValue::Counter(_) | CrdtValue::Register(_) => continue,
+                };
+                if !dots.is_empty() {
+                    marked.insert(key.clone(), dots);
+                }
+            }
+            self.marked = marked;
+            self.marked_at_ms = Some(now_ms);
         }
-        if collected > 0 || is_first_run {
-            self.last_gc_ms = now_ms;
-        }
-        self.has_run = true;
+
         collected
     }
 }
@@ -355,55 +389,61 @@ mod tests {
         assert_eq!(gc.floor_for(&n), Some(20));
     }
 
-    #[test]
-    fn gc_removes_tombstones_from_or_set() {
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
-        let mut store = Store::new();
+    /// Build a store with one OrSet holding a locally-dominated tombstone
+    /// dot (A,1): add x → remove x → add y (counter advances past 1).
+    fn store_with_set_tombstone() -> Store {
         let n = node("A");
-
-        // Build an OrSet with tombstones.
-        // compact_deferred() only removes dots where counter < max_counter
-        // for the node, so we need at least one more add after the remove
-        // to advance the counter past the tombstoned dot.
         let mut set = OrSet::new();
         set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) goes to deferred
-        set.add("y".to_string(), &n); // counter=2, advancing past the tombstoned dot
-        // deferred has dot (A,1); max counter for A is 2; 1 < 2 → safe to GC.
+        set.remove(&"x".to_string()); // dot (A,1) in deferred
+        set.add("y".to_string(), &n); // counter=2, dominance
         assert_eq!(set.deferred_len(), 1);
-
+        let mut store = Store::new();
         store.put("myset".into(), CrdtValue::Set(set));
+        store
+    }
 
-        let collected = gc.gc_tombstones(&mut store, 1000);
+    const RET: u64 = 300_000; // 300s retention in ms
+
+    #[test]
+    fn mark_and_sweep_collects_or_set_after_mark_retention_and_gates() {
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        let mut store = store_with_set_tombstone();
+
+        // Pass 1: marks only — nothing is collected even with gates open.
+        let collected = gc.mark_and_sweep(&mut store, 1_000, true);
+        assert_eq!(collected, 0, "first pass only marks");
+        assert_eq!(gc.pending_mark_ms(), Some(1_000));
+
+        // Pass 2 after retention with gates passed: sweep collects.
+        let collected = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert_eq!(collected, 1);
         assert_eq!(gc.total_collected(), 1);
-
-        // Verify the deferred set is now empty.
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
         } else {
             panic!("expected Set");
         }
+        // A fresh mark was taken for the next cycle.
+        assert_eq!(gc.pending_mark_ms(), Some(1_000 + RET));
     }
 
     #[test]
-    fn gc_removes_tombstones_from_or_map() {
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
+    fn mark_and_sweep_collects_or_map() {
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = Store::new();
         let n = node("A");
 
         let mut map: OrMap<String, String> = OrMap::new();
         map.set("k1".into(), "v1".into(), ts(100, 0, "A"), &n); // counter=1
-        map.delete(&"k1".to_string()); // dot (A,1) goes to deferred
-        // Add another key to advance the counter past the tombstoned dot.
+        map.delete(&"k1".to_string()); // dot (A,1) in deferred
         map.set("k2".into(), "v2".into(), ts(200, 0, "A"), &n); // counter=2
         assert!(map.deferred_len() > 0);
-
         store.put("mymap".into(), CrdtValue::Map(map));
 
-        let collected = gc.gc_tombstones(&mut store, 1000);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
+        let collected = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert!(collected > 0);
-
         if let Some(CrdtValue::Map(m)) = store.get("mymap") {
             assert_eq!(m.deferred_len(), 0);
         } else {
@@ -412,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn gc_skips_counters_and_registers() {
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
+    fn mark_and_sweep_skips_counters_and_registers() {
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = Store::new();
 
         let mut counter = crate::crdt::pn_counter::PnCounter::new();
@@ -424,157 +464,162 @@ mod tests {
         reg.set("hello".to_string(), ts(100, 0, "A"));
         store.put("reg".into(), CrdtValue::Register(reg));
 
-        let collected = gc.gc_tombstones(&mut store, 1000);
-        assert_eq!(collected, 0);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 0);
+    }
+
+    /// The sweep may only run once the mark is at least `retention_period`
+    /// old — a young mark is kept, not consumed.
+    #[test]
+    fn sweep_requires_mark_age_of_retention_period() {
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        let mut store = store_with_set_tombstone();
+
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0); // mark
+        // Too young: even with gates open nothing is collected and the
+        // mark is retained.
+        assert_eq!(gc.mark_and_sweep(&mut store, 2_000, true), 0);
+        assert_eq!(gc.pending_mark_ms(), Some(1_000), "young mark is kept");
+        // Old enough: collect.
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 1);
+    }
+
+    /// C-2 regression (resurrection prevention): while any known replica
+    /// has NOT synchronised past the mark (gates fail — e.g. a network
+    /// partition longer than the retention window), the sweep must not
+    /// collect. A lagging replica's stale state can then still be merged
+    /// WITHOUT resurrecting the removed element; under the old
+    /// wall-clock-only design the tombstone would already be gone and the
+    /// remove would silently undo itself cluster-wide.
+    #[test]
+    fn blocked_gates_prevent_resurrection_after_long_partition() {
+        let n = node("A");
+
+        // Replica state before the partition: both sides hold {x}.
+        let mut local = OrSet::new();
+        local.add("x".to_string(), &n); // dot (A,1)
+        let lagging_replica: OrSet<String> = local.clone();
+
+        // Local removes x during the partition (tombstone A,1) and keeps
+        // writing (dominance).
+        local.remove(&"x".to_string());
+        local.add("y".to_string(), &n); // dot (A,2)
+        let mut store = Store::new();
+        store.put("myset".into(), CrdtValue::Set(local));
+
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, false), 0); // mark
+
+        // The partition outlives the retention window: gates still fail,
+        // so NOTHING is collected — no matter how much wall-clock time
+        // has passed.
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000 + 10 * RET, false),
+            0,
+            "gates must stall collection through arbitrarily long partitions"
+        );
+        assert_eq!(
+            gc.pending_mark_ms(),
+            Some(1_000),
+            "the blocked mark is kept, not re-taken"
+        );
+
+        // Partition heals: the lagging replica pushes its STALE state.
+        // The retained tombstone absorbs the old dot — no resurrection.
+        if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
+            s.merge(&lagging_replica);
+            assert!(
+                !s.contains(&"x".to_string()),
+                "remove must survive a stale merge while the tombstone is retained"
+            );
+        } else {
+            panic!("expected Set");
+        }
+
+        // The replica has now provably synchronised past the mark: gates
+        // pass and the ORIGINAL mark is finally swept.
+        let collected = gc.mark_and_sweep(&mut store, 1_000 + 11 * RET, true);
+        assert_eq!(collected, 1, "healing the cluster resumes collection");
+        if let Some(CrdtValue::Set(s)) = store.get("myset") {
+            assert_eq!(s.deferred_len(), 0);
+            assert!(!s.contains(&"x".to_string()));
+        }
+    }
+
+    /// The sweep only collects dots that existed at mark time: tombstones
+    /// created after the mark survive and wait for the next cycle (whose
+    /// gate will cover them).
+    #[test]
+    fn sweep_only_collects_marked_dots() {
+        let n = node("A");
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        let mut store = store_with_set_tombstone(); // tombstone (A,1)
+
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0); // marks (A,1)
+
+        // A remove AFTER the mark: dot (A,2) enters deferred, dominated
+        // by a later add (A,3).
+        if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
+            s.remove(&"y".to_string());
+            s.add("z".to_string(), &n);
+            assert_eq!(s.deferred_len(), 2);
+        }
+
+        // Sweep collects only the marked (A,1); the younger (A,2) stays.
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 1);
+        if let Some(CrdtValue::Set(s)) = store.get("myset") {
+            assert_eq!(s.deferred_len(), 1, "post-mark tombstone must survive");
+        }
+
+        // The re-mark taken at sweep time covers it for the next cycle.
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true), 1);
+        if let Some(CrdtValue::Set(s)) = store.get("myset") {
+            assert_eq!(s.deferred_len(), 0);
+        }
     }
 
     #[test]
-    fn gc_retention_period_prevents_early_collection() {
+    fn mark_and_sweep_handles_multiple_values() {
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = Store::new();
         let n = node("A");
 
-        // compact_deferred only removes dots where counter < max_counter,
-        // so we need add->remove->add to ensure the counter advances.
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
-        store.put("myset".into(), CrdtValue::Set(set));
-
-        // First run always proceeds.
-        let collected = gc.gc_tombstones(&mut store, 1000);
-        assert_eq!(collected, 1);
-
-        // Re-add and remove to create more tombstones, then add again to advance.
-        if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
-            s.add("z".to_string(), &n); // counter=3
-            s.remove(&"z".to_string()); // dot (A,3) in deferred
-            s.add("w".to_string(), &n); // counter=4, advances past
-        }
-
-        // Second run at 2000ms: retention period (300s) not elapsed.
-        let collected = gc.gc_tombstones(&mut store, 2000);
-        assert_eq!(collected, 0, "should skip due to retention period");
-
-        // After retention period.
-        let collected = gc.gc_tombstones(&mut store, 301_001);
-        assert_eq!(collected, 1, "should collect after retention period");
-    }
-
-    #[test]
-    fn gc_multiple_values_in_store() {
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
-        let mut store = Store::new();
-        let n = node("A");
-
-        // Two OrSets with tombstones.
-        // Need add->remove->add to advance counter past the tombstoned dot.
         let mut set1 = OrSet::new();
-        set1.add("a".to_string(), &n); // counter=1
-        set1.remove(&"a".to_string()); // dot (A,1) in deferred
-        set1.add("a2".to_string(), &n); // counter=2
+        set1.add("a".to_string(), &n);
+        set1.remove(&"a".to_string());
+        set1.add("a2".to_string(), &n);
 
         let nb = node("B");
         let mut set2 = OrSet::new();
-        set2.add("b".to_string(), &nb); // counter=1
-        set2.remove(&"b".to_string()); // dot (B,1) in deferred
-        set2.add("b2".to_string(), &nb); // counter=2
+        set2.add("b".to_string(), &nb);
+        set2.remove(&"b".to_string());
+        set2.add("b2".to_string(), &nb);
 
         store.put("s1".into(), CrdtValue::Set(set1));
         store.put("s2".into(), CrdtValue::Set(set2));
 
-        let collected = gc.gc_tombstones(&mut store, 1000);
-        assert_eq!(collected, 2);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 2);
         assert_eq!(gc.total_collected(), 2);
     }
 
+    /// `last_gc_ms` advances only when a sweep collects, so `should_run`
+    /// keeps attempting while marks are pending or gates are blocked.
     #[test]
-    fn gc_updates_last_gc_ms_on_first_run_and_on_collection() {
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
-        let mut store = Store::new();
+    fn last_gc_ms_advances_only_on_collection() {
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        let mut store = store_with_set_tombstone();
 
-        // First run on an empty store: last_gc_ms MUST advance to start the
-        // retention clock, even though no tombstones are collected.  Without
-        // this, tombstones created later would bypass the retention check
-        // because last_gc_ms would still be 0 when they first appear.
         assert_eq!(gc.last_gc_ms(), 0);
-        let collected = gc.gc_tombstones(&mut store, 5000);
-        assert_eq!(collected, 0);
-        assert_eq!(
-            gc.last_gc_ms(),
-            5000,
-            "first run must advance last_gc_ms to start the retention clock"
-        );
+        gc.mark_and_sweep(&mut store, 5_000, true); // mark
+        assert_eq!(gc.last_gc_ms(), 0, "marking must not advance last_gc_ms");
 
-        // Add a tombstone-bearing OrSet; with retention=0 the second call collects.
-        let n = node("A");
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
-        store.put("s".into(), CrdtValue::Set(set));
+        gc.mark_and_sweep(&mut store, 5_000 + RET, false); // blocked sweep
+        assert_eq!(gc.last_gc_ms(), 0, "blocked sweep must not advance");
 
-        let collected = gc.gc_tombstones(&mut store, 9000);
+        let collected = gc.mark_and_sweep(&mut store, 5_000 + 2 * RET, true);
         assert_eq!(collected, 1);
-        assert_eq!(
-            gc.last_gc_ms(),
-            9000,
-            "last_gc_ms must advance when tombstones are collected"
-        );
-
-        // Third call with empty deferred: last_gc_ms must NOT advance so
-        // should_run keeps returning true until the next collection.
-        let collected = gc.gc_tombstones(&mut store, 12_000);
-        assert_eq!(collected, 0);
-        assert_eq!(
-            gc.last_gc_ms(),
-            9000,
-            "last_gc_ms must not advance on subsequent no-op runs after first"
-        );
-    }
-
-    #[test]
-    fn gc_first_run_starts_retention_clock_for_late_tombstones() {
-        // Regression test: a node that starts with an empty store should NOT
-        // bypass the retention check when tombstones appear later.  Previously,
-        // last_gc_ms stayed 0 across all empty-store calls, so the first call
-        // with tombstones would see last_gc_ms==0 and skip the retention check.
-        let retention = Duration::from_secs(300);
-        let mut gc = TombstoneGc::new(Duration::from_secs(0), retention);
-        let mut store = Store::new();
-        let n = node("A");
-
-        // First call at T=1000: empty store, starts the retention clock.
-        let collected = gc.gc_tombstones(&mut store, 1_000);
-        assert_eq!(collected, 0);
-        assert_eq!(
-            gc.last_gc_ms(),
-            1_000,
-            "first call must start retention clock"
-        );
-
-        // Tombstones appear shortly after at T=2000 (well within retention window).
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2, advances past tombstoned dot
-        store.put("s".into(), CrdtValue::Set(set));
-
-        // T=2001: retention=300s, elapsed=1001ms < 300_000ms → skip.
-        let collected = gc.gc_tombstones(&mut store, 2_001);
-        assert_eq!(
-            collected, 0,
-            "tombstones within retention window must not be collected"
-        );
-
-        // T=302001: 301001ms has elapsed since first run (T=1000);
-        // retention=300_000ms → collect the deferred tombstone.
-        let collected = gc.gc_tombstones(&mut store, 302_001);
-        assert_eq!(
-            collected, 1,
-            "tombstone must be collected after retention window expires"
-        );
+        assert_eq!(gc.last_gc_ms(), 5_000 + 2 * RET);
     }
 
     #[test]

@@ -128,6 +128,42 @@ impl SystemNamespace {
             .map(|(_, def)| def)
     }
 
+    /// Replace the replicated control-plane core in one shot.
+    ///
+    /// All placement policies and all MANUAL (`auto_generated == false`)
+    /// authority definitions are replaced by the given sets. Auto-generated
+    /// definitions and the version history are untouched — they are
+    /// node-local derivations, not part of the replicated state. Bumps the
+    /// namespace version exactly once.
+    ///
+    /// Used by the control-plane Raft state machine for `Bootstrap` entries
+    /// and snapshot installation (reset-and-import semantics). Policies
+    /// removed by the replacement are detected by the `NodeRunner` version
+    /// polling, which fences their old versions automatically.
+    ///
+    /// The caller (the Raft state machine) is responsible for validating
+    /// `replica_count >= 1` on every policy before committing it to the log.
+    pub fn replace_control_plane_core(
+        &mut self,
+        policies: Vec<PlacementPolicy>,
+        manual_authorities: Vec<AuthorityDefinition>,
+    ) {
+        self.placement_policies.clear();
+        for policy in policies {
+            let prefix = policy.key_range.prefix.clone();
+            self.placement_policies.insert(prefix, policy);
+        }
+        // Keep auto-generated definitions (node-local derivations); replace
+        // only the manual ones.
+        self.authority_definitions
+            .retain(|_, def| def.auto_generated);
+        for def in manual_authorities {
+            let prefix = def.key_range.prefix.clone();
+            self.authority_definitions.insert(prefix, def);
+        }
+        self.bump_version();
+    }
+
     /// Recalculate authority definitions from placement policies and available nodes.
     ///
     /// For each placement policy with `certified == true`, selects candidate

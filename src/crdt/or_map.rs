@@ -330,6 +330,48 @@ where
         });
     }
 
+    /// Snapshot the deferred (tombstone) dots as `(node_id, counter)`
+    /// pairs — the MARK phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// See [`OrSet::deferred_dots`] for semantics.
+    ///
+    /// [`OrSet::deferred_dots`]: crate::crdt::or_set::OrSet::deferred_dots
+    pub fn deferred_dots(&self) -> HashSet<(NodeId, u64)> {
+        self.deferred
+            .iter()
+            .map(|d| (d.node_id.clone(), d.counter))
+            .collect()
+    }
+
+    /// Remove tombstone dots restricted to a MARKED candidate set — the
+    /// SWEEP phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// See [`OrSet::compact_deferred_marked`] for the full safety
+    /// argument: only dots that existed at mark time (covered by the
+    /// caller's replica-synchronisation gate), are not live, and are
+    /// locally dominated are removed.
+    ///
+    /// [`OrSet::compact_deferred_marked`]: crate::crdt::or_set::OrSet::compact_deferred_marked
+    pub fn compact_deferred_marked(&mut self, candidates: &HashSet<(NodeId, u64)>) {
+        let live_dots: HashSet<&Dot> = self
+            .entries
+            .values()
+            .flat_map(|(dots, _)| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if !candidates.contains(&(d.node_id.clone(), d.counter)) {
+                return true;
+            }
+            if live_dots.contains(d) {
+                return true;
+            }
+            match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter >= max_counter,
+                None => true, // unknown node — keep to be safe
+            }
+        });
+    }
+
     /// Remove tombstone dots from `deferred` that are safe to garbage-collect
     /// according to local counter dominance or a cross-replica version floor.
     ///
@@ -385,6 +427,56 @@ where
     /// Check whether the map has no present keys.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl OrMap<String, String> {
+    /// Feed this map's canonical byte representation into `hasher`
+    /// (digest-based anti-entropy).
+    ///
+    /// Stream: `0x04` ‖ live entries (key byte order), each as
+    /// `str(key)` ‖ dots (dot order) ‖ LWW-register canonical stream ‖
+    /// counters (node-id order) ‖ deferred dots (dot order). Entries whose
+    /// dot set is empty are skipped (normalisation: semantically equal to
+    /// absent entries). The `deferred` set is included — see
+    /// [`OrSet::digest_into`](crate::crdt::or_set::OrSet::digest_into)
+    /// for the equality-vs-GC trade-off.
+    ///
+    /// # MAINTAINER CONTRACT
+    /// Adding a field to `OrMap`/`Dot` REQUIRES updating this method and
+    /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
+    /// replicas that differ only in the new field report "digest matched"
+    /// and session-guarantee claims become unsound. Instantiating `OrMap`
+    /// for new key/value types in `CrdtValue` requires defining their
+    /// canonical byte encoding here, plus a scheme version bump.
+    pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
+        use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
+        use sha2::Digest as _;
+
+        hasher.update([0x04]);
+        type MapEntryRef<'a> = (&'a String, &'a (HashSet<Dot>, LwwRegister<String>));
+        let mut items: Vec<MapEntryRef<'_>> = self
+            .entries
+            .iter()
+            .filter(|(_, (dots, _))| !dots.is_empty())
+            .collect();
+        items.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        write_u32(hasher, items.len() as u32);
+        for (key, (dots, reg)) in items {
+            write_str(hasher, key);
+            write_dots(
+                hasher,
+                dots.iter().map(|d| (d.node_id.0.as_str(), d.counter)),
+            );
+            reg.digest_into(hasher);
+        }
+        write_counters(hasher, &self.counters);
+        write_dots(
+            hasher,
+            self.deferred
+                .iter()
+                .map(|d| (d.node_id.0.as_str(), d.counter)),
+        );
     }
 }
 

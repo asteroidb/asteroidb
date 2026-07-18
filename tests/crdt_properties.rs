@@ -640,3 +640,95 @@ proptest! {
         prop_assert_eq!(merged.get().cloned(), expected_val);
     }
 }
+
+// ---------------------------------------------------------------
+// Canonical digest determinism (digest-based anti-entropy)
+// ---------------------------------------------------------------
+//
+// The digest sync protocol requires "identical CRDT state → identical
+// digest" regardless of insertion order, merge order or serde round-trips
+// (which reseed every internal HashMap/HashSet). A violation would cause
+// false mismatches (wasted bandwidth) — or, for the reverse property,
+// false matches corrupting session-guarantee claims.
+
+use asteroidb_poc::store::digest::compute_store_digest;
+use asteroidb_poc::store::kv::CrdtValue;
+use std::collections::BTreeMap;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Store insertion order must not affect the digest.
+    #[test]
+    fn digest_insertion_order_invariant(
+        counter in arb_pn_counter(),
+        set in arb_or_set(),
+        map in arb_or_map(),
+        reg in arb_lww_register_multi(),
+    ) {
+        let entries: Vec<(String, CrdtValue)> = vec![
+            ("a/counter".into(), CrdtValue::Counter(counter)),
+            ("b/set".into(), CrdtValue::Set(set)),
+            ("c/map".into(), CrdtValue::Map(map)),
+            ("d/reg".into(), CrdtValue::Register(reg)),
+        ];
+        let forward: BTreeMap<String, CrdtValue> = entries.clone().into_iter().collect();
+        let reversed: BTreeMap<String, CrdtValue> =
+            entries.into_iter().rev().collect();
+
+        prop_assert_eq!(
+            compute_store_digest(&forward).root,
+            compute_store_digest(&reversed).root
+        );
+    }
+
+    /// A serde round-trip rebuilds every internal HashMap/HashSet with a
+    /// fresh layout; the digest must be unchanged.
+    #[test]
+    fn digest_serde_roundtrip_invariant(
+        counter in arb_pn_counter(),
+        set in arb_or_set(),
+        map in arb_or_map(),
+    ) {
+        let original: BTreeMap<String, CrdtValue> = [
+            ("counter".to_string(), CrdtValue::Counter(counter)),
+            ("set".to_string(), CrdtValue::Set(set)),
+            ("map".to_string(), CrdtValue::Map(map)),
+        ]
+        .into_iter()
+        .collect();
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: BTreeMap<String, CrdtValue> = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(
+            compute_store_digest(&original).root,
+            compute_store_digest(&restored).root
+        );
+    }
+
+    /// Merge order must not affect the digest of the converged state
+    /// (merge is commutative, so the states are equal — the digest must
+    /// agree even though the internal hash containers were built along
+    /// different paths).
+    #[test]
+    fn digest_merge_order_invariant(a in arb_or_set(), b in arb_or_set()) {
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        // Cross-merge once more so both sides reach the same join.
+        ab.merge(&ba);
+        ba.merge(&ab);
+
+        let store_ab: BTreeMap<String, CrdtValue> =
+            [("k".to_string(), CrdtValue::Set(ab))].into_iter().collect();
+        let store_ba: BTreeMap<String, CrdtValue> =
+            [("k".to_string(), CrdtValue::Set(ba))].into_iter().collect();
+
+        prop_assert_eq!(
+            compute_store_digest(&store_ab).root,
+            compute_store_digest(&store_ba).root
+        );
+    }
+}

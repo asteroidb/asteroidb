@@ -14,5 +14,6 @@ pub mod ops;
 pub mod placement;
 #[cfg(feature = "native-runtime")]
 pub mod runtime;
+pub mod session;
 pub mod store;
 pub mod types;

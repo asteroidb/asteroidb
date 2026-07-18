@@ -13,6 +13,7 @@
 4. [エラーレスポンス](#エラーレスポンス)
 5. [Public API](#public-api)
    - [Eventual API](#eventual-api)
+   - [セッショントークン](#セッショントークン)
    - [Certified API](#certified-api)
    - [Status API](#status-api)
    - [Control Plane API (読み取り)](#control-plane-api-読み取り)
@@ -44,7 +45,7 @@ API は大きく3つのカテゴリに分かれる:
 |----------|-------------------|------|------|
 | Public API | `/api/eventual/*`, `/api/certified/*`, `/api/status/*` | 不要 | クライアントからのデータ読み書き |
 | Internal API | `/api/internal/*` | Bearer Token (設定時) | ノード間通信 (sync, membership) |
-| Control Plane (書き込み) | `PUT /api/control-plane/*`, `DELETE /api/control-plane/*` | Bearer Token (設定時) | Authority 定義・配置ポリシーの変更 |
+| Control Plane (書き込み) | `PUT /api/control-plane/*`, `DELETE /api/control-plane/*` | Bearer Token (設定時) | Authority 定義・配置ポリシーの変更（Raft リーダーのみ受理 — 下記参照） |
 
 Control Plane の読み取りエンドポイント (`GET`) は認証不要で誰でもアクセス可能。
 
@@ -154,7 +155,10 @@ HTTP ステータスコードはエラー種別に応じて設定される。詳
 
 - **認証**: 不要
 - **パスパラメータ**: `key` - 取得対象のキー
-- **レスポンス**: `200 OK`
+- **クエリパラメータ** (省略可、[セッショントークン](#セッショントークン) 参照):
+  - `session_token` - 過去の write/read が返したトークン。ローカルレプリカがトークンの示す書き込みまで追いついている場合のみ値を返す（read-your-writes / monotonic reads）。空文字を渡すと前提条件なしでセッションを開始し、応答トークンのみ受け取る
+  - `wait_ms` - 追いつくまで待機する最大時間（ミリ秒、サーバ側上限 5000）。超過時は 412
+- **レスポンス**: `200 OK`、トークン不充足時 `412 Precondition Failed`、不正トークン時 `400 Bad Request`
 
 **レスポンスボディ:**
 
@@ -177,6 +181,27 @@ HTTP ステータスコードはエラー種別に応じて設定される。詳
 }
 ```
 
+`session_token` クエリパラメータを付けた場合のみ、応答に `session_token` フィールドが追加される（付けない場合の応答バイト列は完全に従来通り）:
+
+```json
+{
+  "key": "hits",
+  "value": { "type": "counter", "value": 42 },
+  "session_token": "v1:19704a1b2c3.0.6e6f64652d61"
+}
+```
+
+ローカルレプリカがトークンの示す書き込みまで追いついていない場合、`wait_ms` の待機後も不充足なら 412 を返す（嘘の成功は返さない）:
+
+```json
+// HTTP 412 Precondition Failed
+// Retry-After: 1
+{
+  "error_code": "SESSION_NOT_SATISFIED",
+  "message": "session token not satisfied for key hits; retry, increase wait_ms, or try another replica"
+}
+```
+
 **curl 例:**
 
 ```bash
@@ -185,6 +210,15 @@ curl http://localhost:3000/api/eventual/hits
 
 # ネストしたキーの取得
 curl http://localhost:3000/api/eventual/users/alice/profile
+
+# write が返したトークン付きで読む（read-your-writes）
+curl "http://localhost:3000/api/eventual/hits?session_token=v1:19704a1b2c3.0.6e6f64652d61"
+
+# 追いつくまで最大 3 秒待つ
+curl "http://localhost:3000/api/eventual/hits?session_token=v1:19704a1b2c3.0.6e6f64652d61&wait_ms=3000"
+
+# write なしでセッション開始（応答トークンのみ受け取る）
+curl "http://localhost:3000/api/eventual/hits?session_token="
 ```
 
 ---
@@ -196,6 +230,12 @@ CRDT 操作をローカルの eventual ストアに適用する。
 - **認証**: 不要
 - **Content-Type**: `application/json`
 - **レスポンス**: `200 OK`
+
+**クエリパラメータ:**
+
+| パラメータ | 型 | 必須 | 説明 |
+|-----------|-----|------|------|
+| `session_token` | string | いいえ | クライアントが保持している直前のセッショントークン。指定すると、この書き込みの HLC 位置を**提示トークンにマージ（折り畳み）した累積トークン**が応答で返る。複数コーディネータに跨って書き込むセッションが read-your-writes を維持するにはこの持ち回りが必須（トークンは不透明であり、クライアント側で複数トークンをマージすることはできない）。空文字列は「トークン無し」と同義。不正な形式・制限超過・サーバ時計 + 60 秒を超えるトークンは `400` で拒否され、**書き込み自体も適用されない** |
 
 **リクエストボディ** (tagged union 形式):
 
@@ -276,9 +316,20 @@ CRDT 操作をローカルの eventual ストアに適用する。
 
 ```json
 {
-  "ok": true
+  "ok": true,
+  "session_token": "v1:19704a1b2c3.0.6e6f64652d61"
 }
 ```
+
+`session_token` は常に返却される。`session_token` クエリパラメータ無しの
+リクエストでは**この書き込みの HLC 位置のみ**を表し、提示ありのリクエスト
+では**提示トークンにこの書き込みの位置をマージした累積トークン**を表す。
+次の `GET /api/eventual/{key}?session_token=...` に添付すると
+read-your-writes が保証される。同一セッションで複数回書き込む場合
+（特にコーディネータを跨ぐ場合）は、**毎回の write に直前の応答トークンを
+渡して累積させる**こと — 最後の write の応答トークンだけを read に添付する
+方式では、先行 write の origin 位置がトークンに含まれず read-your-writes が
+保証されない。詳細は [セッショントークン](#セッショントークン) を参照。
 
 **curl 例:**
 
@@ -320,6 +371,139 @@ curl -X POST http://localhost:3000/api/eventual/write \
   "error_code": "TYPE_MISMATCH",
   "message": "expected Set, got Counter"
 }
+```
+
+---
+
+### セッショントークン
+
+Eventual API のオプション拡張として、クライアントセッション保証
+（read-your-writes / monotonic reads）を提供する。サーバはセッション状態を
+一切持たない（ステートレス）: 書き込み応答が返す不透明なトークンをクライアント
+が次の読み取りに添付する方式である。
+
+#### 保証内容
+
+- **read-your-writes**: write が返したトークン付きの read が `200` を返すなら、
+  応答値はその write を適用済み（または LWW 順序で支配済み）の状態から読まれて
+  いる。追いついていないレプリカは `412` を返す — **嘘の成功は絶対に返さない**
+  （不要な 412 = 偽陰性はあり得る）
+- **monotonic reads**: read 応答のトークン（観測位置）を次の read に持ち回る
+  ことで、別レプリカに切り替えても読み取りが時間的に巻き戻らない
+
+#### トークン形式 (v1)
+
+```text
+token   := "v1:" entry ("," entry)*
+entry   := physical-hex "." logical-hex "." nodeid-hex
+```
+
+- `physical`: u64 の 16 進表現（書き込み HLC の物理時刻 ms）
+- `logical`: u32 の 16 進表現
+- `nodeid-hex`: 起点ノード ID の UTF-8 バイト列の 16 進表現
+
+例: `v1:19704a1b2c3.2.6e6f64652d61,19704b00000.0.6e6f64652d62`
+
+文字集合は `[0-9a-f.,:v]` のみで URL エンコード不要。クライアントはトークンを
+**不透明な文字列として扱う**こと（中身に依存しない）。
+
+制約: 全長 8192 バイト以下、エントリ数 64 以下、ノード ID 128 バイト以下。
+サーバが発行する応答トークンはこの制限内に収まるよう間引かれる（古い HLC の
+エントリから削除）ため、**サーバ発行のトークンは常に次のリクエストでパース可能**。
+エントリ 0 個の `v1:` は有効な空トークン（前提条件なし）で、可視 origin の
+無い起動直後のレプリカが発行し得る。
+`physical` がサーバ時計 + 60 秒を超えるトークンは 400 で拒否される
+（クロック前進攻撃対策。トークンがサーバの HLC に取り込まれることはない）。
+
+#### 寿命
+
+トークンに有効期限はない。判定材料（origin 別適用済みフロンティア）は単調増加
+かつ compaction の対象外のため、**古いトークンほど充足しやすい**。再起動後も
+スナップショットに永続化される。
+
+#### 保証の限界（重要）
+
+- 保証は「トークンに記載された各 origin ノードの書き込み prefix の包含」のみの
+  **保守的判定**である。線形化可能性や完全な因果一貫性は主張しない
+  （HLC スカラ列による判定は過剰包含になり得る）
+- Counter / Set キーは push 型複製のみの区間では pull 同期周期
+  （デフォルト 2 秒）ぶんの 412 が発生し得る。Register キーは値レベル判定
+  （LWW タイムスタンプ比較）により即時充足しやすい
+- origin フロンティアの前進（applied claim）は「完全な受信」を証明できる
+  転送に限られる: 送信側の `applied_origins` の養子縁組（要求 frontier が
+  検証済み受信 prefix 以下、かつ送信側の prune フロア以上の pull）とフル
+  ダンプのみ。**delta エントリ単体から entry の origin を claim することは
+  ない**（送信側完全性は「受信側 ⊇ 送信側」しか証明せず、第三者 origin の
+  prefix 保持を証明しないため）
+- pull の要求 frontier は検証済み受信 prefix を基準にするため、push で
+  同期フロンティアが先行しても claim は次の pull 周期（デフォルト 2 秒）で
+  回復する。claim が作れない pull（送信側が prune 済み等）は同一周期内に
+  フルシンクへフォールバックして検証済み受信 prefix を再確立する
+- CRDT 型衝突（`TYPE_MISMATCH`）が発生したキーはセッション保証の対象外となる
+  （恒久的に 412。トークン無しの read は引き続き可能）
+- 可視性順序の保証であり、耐久性は WAL の fsync モードに従属する。
+  `ASTEROIDB_WAL_SYNC=always`（既定）では ack 済み書き込み（= トークンを
+  返した書き込み）は再起動・電源断を生き延び、トークンは再起動後も充足
+  される。`interval` / `off` では OS クラッシュで直近の ack 済み書き込みが
+  ローカル喪失し得るが、その場合も自レプリカは 412 を返すだけで嘘は
+  返さない（fail-closed。詳細は ops-guide の耐久性保証表を参照）
+- トークンは eventual ストア専用。certified read に流用しても充足しない
+  （412 になるだけで害はない）
+- 応答トークンはエントリ数上限 64・全長 8192 バイトに収めるため間引かれ得る。
+  間引きは HLC の新しい順にソートして**古いエントリから機械的に切り捨てる**
+  だけであり、リクエスト由来のエントリや直前に読んだキーの変更位置を優先
+  保持する仕組みは**ない**（当該エントリが最古ならそれが落ちる）。落ちた
+  origin は以後の判定から消えるため、間引きは単なる偽陰性（保証の弱化）では
+  **済まない**: 間引かれた origin の書き込みを持たないレプリカでの次の read
+  が誤って成功し、**観測済みの値より古い値が返り得る**（monotonic reads の
+  巻き戻り）。ノード ID が長い場合はバイト上限により origin 数が 64 以下でも
+  間引きが起き得る。完全な monotonic reads が必要な場合は、書き込み origin
+  数を 64 以下に保ち、かつトークンが 8192 バイトに収まるようノード ID を
+  短く保つこと
+- 応答トークンは applied claim 済みの origin だけでなく**可視状態全体**
+  （unclaimed マージで見えるようになった寄与を含む）を被覆する。観測した値を
+  被覆しないトークンを発行すると、別レプリカでの巻き戻り（monotonic reads の
+  嘘）につながるため。過剰被覆は偽陰性（412）方向にしか作用しない
+- トークンは無署名である。偽造・改竄されたトークンは自分の read が 412/400 に
+  なるだけで他クライアントやサーバに害を与えない（BFT 拡張時に Ed25519 署名を
+  検討予定）
+
+#### 内部プロトコル互換性(運用注意)
+
+セッション保証の導入で `DeltaSyncResponse` / `KeyDumpResponse`(Internal API)に
+フィールドが追加された。JSON では後方互換だが、bincode
+(`application/octet-stream`)は位置依存のため旧ノードの bincode 応答は新ノード
+でデコードできない。新ノードの pull はデコード失敗時に **JSON で自動リトライ**
+するため、ローリングアップグレード中も pull ベースの anti-entropy は JSON
+経路で継続する(帯域効率は落ちる)。混在期間を短くするためアップグレードは
+ロックステップ推奨(`KeyDumpResponse.timestamps` 追加時と同じ前例)。
+
+スナップショット形式もバージョン 3 に更新された(セッション関連フィールドの
+追加)。v1/v2 スナップショット(JSON / bincode とも)はロード時に自動マイグレー
+ションされるが、v3 スナップショットを旧バージョンのコードで読むことはできない
+(ダウングレード時はスナップショットの取り直しが必要)。
+
+#### 利用例
+
+```bash
+# 1. 書き込み → トークンを得る
+TOKEN=$(curl -s -X POST http://node-a:3000/api/eventual/write \
+  -H "Content-Type: application/json" \
+  -d '{"type":"register_set","key":"greeting","value":"hello"}' | jq -r .session_token)
+
+# 2. 続けて書き込む場合（別コーディネータでも可）: 直前のトークンを
+#    write に渡して累積させる（渡さないと先行 write の位置が失われる）
+TOKEN=$(curl -s -X POST "http://node-c:3000/api/eventual/write?session_token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"register_set","key":"farewell","value":"bye"}' | jq -r .session_token)
+
+# 3. 別ノードでトークン付き read（追いついていなければ 412）
+curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN"
+
+# 4. 412 の場合: wait_ms 付きでリトライ（複製が届き次第 200）
+curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN&wait_ms=3000"
+
+# 5. 応答の session_token を次の read に持ち回る（monotonic reads）
 ```
 
 ---
@@ -499,9 +683,16 @@ curl http://localhost:3000/api/certified/sensor-1
 | `certificate` | CertificateJson | いいえ | 暗号署名付き証明書 |
 | `format_version` | u32 | いいえ | 証明書フォーマットバージョン（指定時にバージョン互換チェック実施） |
 | `signature_algorithm` | string | いいえ | 署名アルゴリズム: `"Ed25519"` (デフォルト) または `"Bls12_381"` |
-| `bls_aggregate_signature` | string | いいえ | hex エンコード BLS 集約署名（将来用） |
-| `bls_signer_ids` | string[] | いいえ | BLS 署名者ノード ID |
-| `bls_public_keys` | string[] | いいえ | hex エンコード BLS 公開鍵 |
+| `keyset_version` | u64 | いいえ | BLS 検証で使用する keyset バージョン（省略時は `certificate.keyset_version`、それも無ければ 1） |
+| `bls_aggregate_signature` | string | いいえ | hex エンコード BLS 集約署名。`bls_signer_ids` / `bls_public_keys` と共に指定し `signature_algorithm` が `"Bls12_381"` の場合、keyset registry に対する BLS 集約検証を実施 |
+| `bls_signer_ids` | string[] | いいえ | BLS 署名者ノード ID（`bls_public_keys` と同順） |
+| `bls_public_keys` | string[] | いいえ | hex エンコード BLS 公開鍵（registry 鍵との一致を要求） |
+
+> `GET /api/certified/{key}` の `proof` オブジェクトはこのリクエストボディとして
+> そのまま送信できる（round-trip 可能）。署名パイプラインが有効な場合、`proof` には
+> `signature_algorithm` / `keyset_version` / BLS フィールドが自動的に含まれる。
+> 証明書の `frontier` は Authority が署名したチェックポイント HLC
+> （1 秒単位に床丸めされた値、`logical=0`, `node_id=""`）である点に注意。
 
 **レスポンスボディ:**
 
@@ -695,6 +886,48 @@ curl http://localhost:3000/api/control-plane/versions
 
 ---
 
+#### GET /api/control-plane/raft/status
+
+Control plane Raft コンセンサスの状態を返す（`/api/metrics` と同じく認証
+不要の読み取り専用観測エンドポイント）。書き込み前のリーダー特定や、
+`NOT_LEADER` 受信後のリトライ先の確認に使う。
+
+- **レスポンス**: `200 OK`
+
+```json
+{
+  "node_id": "node-1",
+  "role": "leader",
+  "term": 3,
+  "leader_id": "node-1",
+  "leader_addr": null,
+  "commit_index": 12,
+  "last_applied": 12,
+  "last_log_index": 12,
+  "voters": ["node-1", "node-2", "node-3"]
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `node_id` | string | このノードの ID |
+| `role` | string | `"leader"` / `"follower"` / `"candidate"` / `"detached"`（Raft 未構成） |
+| `term` | u64 | 現在の Raft term |
+| `leader_id` | string \| null | 既知のリーダーのヒント |
+| `leader_addr` | string \| null | リーダーの解決済みアドレス（既知の場合） |
+| `commit_index` | u64 | commit 済みログの最大 index |
+| `last_applied` | u64 | 状態機械へ適用済みの最大 index |
+| `last_log_index` | u64 | ローカルログの末尾 index |
+| `voters` | string[] | 静的投票者集合（`ASTEROIDB_CONTROL_PLANE_NODES`） |
+
+**curl 例:**
+
+```bash
+curl http://localhost:3000/api/control-plane/raft/status
+```
+
+---
+
 ### Metrics / SLO / Topology
 
 #### GET /api/metrics
@@ -733,9 +966,9 @@ curl http://localhost:3000/api/control-plane/versions
   "rebalance_keys_failed": 0,
   "rebalance_complete_total": 3,
   "rebalance_duration_sum_us": 5000000,
-  "key_rotation_total": 2,
-  "key_rotation_last_version": 3,
-  "key_rotation_last_time_ms": 1700000000000,
+  "key_rotation_total": 0,
+  "key_rotation_last_version": 0,
+  "key_rotation_last_time_ms": 0,
   "write_ops_total": 25000,
   "delta_sync_count": 8000
 }
@@ -757,9 +990,9 @@ curl http://localhost:3000/api/control-plane/versions
 | `rebalance_keys_failed` | u64 | 累計リバランス失敗キー数 |
 | `rebalance_complete_total` | u64 | 累計リバランス完了回数 |
 | `rebalance_duration_sum_us` | u64 | リバランス所要時間合計 (マイクロ秒) |
-| `key_rotation_total` | u64 | 累計鍵ローテーション回数 |
-| `key_rotation_last_version` | u64 | 最新 keyset バージョン |
-| `key_rotation_last_time_ms` | u64 | 最新ローテーション時刻 (ミリ秒) |
+| `key_rotation_total` | u64 | 累計鍵ローテーション回数。**自動ローテーション未配線のため現状は常に 0**（`docs/runbook/key-rotation.md` 参照） |
+| `key_rotation_last_version` | u64 | 最後にローテーションで適用された keyset バージョン。**自動ローテーション未配線のため現状は常に 0**（メトリクスの初期値。keyset レジストリの初期バージョン 1 とは別物であり、0 は鍵レジストリの初期化不良を意味しない） |
+| `key_rotation_last_time_ms` | u64 | 最新ローテーション時刻 (ミリ秒)。**現状は常に 0** |
 | `write_ops_total` | u64 | 累計書き込みオペレーション数 |
 | `delta_sync_count` | u64 | 累計デルタ同期回数 |
 | `full_sync_fallback_count` | u64 | 累計フルシンクフォールバック回数 |
@@ -999,6 +1232,14 @@ curl -X POST http://localhost:3000/api/internal/sync \
     "physical": 1700000001000,
     "logical": 0,
     "node_id": "node-1"
+  },
+  "applied_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "merge_failed_keys": [],
+  "pruned_floor": null,
+  "visible_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
   }
 }
 ```
@@ -1007,6 +1248,10 @@ curl -X POST http://localhost:3000/api/internal/sync \
 |-----------|-----|------|
 | `entries` | array | frontier 以降に変更されたエントリ |
 | `sender_frontier` | HlcTimestamp \| null | 送信元の現在の frontier |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の origin 別適用済みフロンティア（セッション保証のフロンティア養子縁組に使用） |
+| `merge_failed_keys` | array<string> | 応答側でマージ失敗（型衝突）したキー |
+| `pruned_floor` | HlcTimestamp \| null | 応答側の prune 済みフロンティア。要求 frontier がこれ未満の場合、受信側は `applied_origins` を採用しない |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の origin 別**可視**フロンティア（`applied_origins` の上位集合）。受信側は無条件に max マージし、応答セッショントークンの被覆に使う |
 
 **curl 例:**
 
@@ -1014,6 +1259,65 @@ curl -X POST http://localhost:3000/api/internal/sync \
 curl -X POST http://localhost:3000/api/internal/sync/delta \
   -H "Content-Type: application/json" \
   -d '{"sender":"node-2","frontier":{"physical":0,"logical":0,"node_id":"node-2"}}'
+```
+
+---
+
+### Digest Sync
+
+#### POST /api/internal/sync/digest
+
+digest 段階 diff 同期（フルシンクの前段）。要求側の 2 層キー範囲 digest
+（ルート + 非空バケット、SHA-256）を受け取り、応答側の単一スナップショットと
+比較して 1 往復で応答する: ルート一致なら `root_matched = true`（転送ゼロ）、
+不一致なら不一致バケット所属キーの実データを返す。詳細は
+`docs/architecture.md` の anti-entropy 節を参照。
+
+- **認証**: Bearer Token (設定時)
+- **Content-Type**: `application/json` または `application/octet-stream`
+- **Accept**: `application/json` または `application/octet-stream`
+
+**リクエストボディ (JSON):**
+
+```json
+{
+  "sender": "node-2",
+  "scheme_version": 1,
+  "root": [18, 52, "..."],
+  "buckets": [{ "index": 7, "digest": [171, 205, "..."] }],
+  "include_entries": true
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `sender` | string | 送信元ノード ID |
+| `scheme_version` | u32 | digest スキームバージョン（現行 1）。不一致は `scheme_ok=false` |
+| `root` | bytes (32) | 要求側のルート digest |
+| `buckets` | array | 要求側の非空バケット digest のスパース列（不在 = 空バケット） |
+| `include_entries` | bool | `true`（pull）: 不一致バケットの実データを返す。`false`（push probe）: 不一致バケット番号のみ |
+
+**レスポンスボディ:**
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `scheme_ok` | bool | `false` = バージョン/形式非対応（要求側は従来フルシンクへ） |
+| `root_matched` | bool | `true` = 状態完全一致、転送ゼロで完了 |
+| `mismatched_buckets` | array<u16> | digest が不一致だったバケット番号（双方向差） |
+| `entries` | map<string, CrdtValue> | 不一致バケット所属キーの全データ（`include_entries=true` 時のみ） |
+| `timestamps` | map<string, HlcTimestamp> | `entries` の per-key HLC |
+| `frontier` | HlcTimestamp \| null | 応答側スナップショット時点の frontier |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の適用済みフロンティア（digest 応答はスナップショットに対し完全なので受信側は適用後に無条件採用できる） |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の可視フロンティア（無条件 max マージ） |
+| `merge_failed_keys` | array<string> | 応答側の poison 済みキー（採用時に union） |
+| `total_keys` | u64 | 応答側スナップショットの総キー数（転送削減量の推定に使用） |
+
+**curl 例（空ストアの digest で全量取得）:**
+
+```bash
+curl -X POST http://localhost:3000/api/internal/sync/digest \
+  -H "Content-Type: application/json" \
+  -d '{"sender":"node-2","scheme_version":1,"root":['"$(python3 -c 'import hashlib;print(",".join(str(b) for b in hashlib.sha256(bytes(8192)).digest()))')"'],"buckets":[],"include_entries":true}'
 ```
 
 ---
@@ -1043,6 +1347,13 @@ eventual ストアの全キーバリューペアを、ストアの現在 frontie
   },
   "timestamps": {
     "hits": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "applied_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
+  },
+  "merge_failed_keys": [],
+  "visible_origins": {
+    "node-1": { "physical": 1700000001000, "logical": 0, "node_id": "node-1" }
   }
 }
 ```
@@ -1052,6 +1363,9 @@ eventual ストアの全キーバリューペアを、ストアの現在 frontie
 | `entries` | map<string, CrdtValue> | 全キーバリューペア |
 | `frontier` | HlcTimestamp \| null | ストアの現在 frontier |
 | `timestamps` | map<string, HlcTimestamp> | キーごとの HLC タイムスタンプ |
+| `applied_origins` | map<string, HlcTimestamp> | 応答側の origin 別適用済みフロンティア。フルダンプは完全状態のため、受信側は全エントリ適用後に無条件で採用してよい |
+| `merge_failed_keys` | array<string> | 応答側でマージ失敗（型衝突）したキー |
+| `visible_origins` | map<string, HlcTimestamp> | 応答側の origin 別可視フロンティア（`applied_origins` の上位集合、応答セッショントークンの被覆に使用） |
 
 **curl 例:**
 
@@ -1351,7 +1665,30 @@ curl -X POST http://localhost:3000/api/internal/ping \
 
 ## Control Plane API (書き込み)
 
-以下のエンドポイントは全て、Authority ノードの過半数承認 (FR-009) と Bearer Token 認証（設定時）が必要。
+以下のエンドポイントは全て、**control-plane Raft ログでの合意 (FR-009)** と
+Bearer Token 認証（設定時）が必要。リクエストを受理できるのは**現在の Raft
+リーダーのみ**で、更新はリーダーのログに追記され、静的投票者集合
+（`ASTEROIDB_CONTROL_PLANE_NODES`）の過半数で commit されてから応答が返る。
+
+リーダー以外のノードに送ると `503 Service Unavailable` + `error_code:
+NOT_LEADER` が返る（`Retry-After: 1` 付き）。応答ヘッダ
+`x-asteroidb-leader-id` / `x-asteroidb-leader-addr` にリーダーのヒントが
+入るので、クライアントはヒント先へ再送すること（サーバー側転送は行わない）。
+リーダーが不明な場合は `GET /api/control-plane/raft/status` で確認できる。
+
+```json
+// HTTP 503 Service Unavailable（Retry-After: 1、
+// x-asteroidb-leader-id / x-asteroidb-leader-addr ヘッダ付き）
+{
+  "error_code": "NOT_LEADER",
+  "message": "this node is not the control-plane leader; retry against the leader (leader_id: node-2, leader_addr: 10.0.0.2:3000)"
+}
+```
+
+> **`approvals` フィールドは deprecated**: pre-Raft の承認カウント合意で
+> 使われていた自己申告の承認リスト。旧クライアントとのワイヤ互換のため
+> 受理はされるが**完全に無視**される — 合意は Raft ログ複製が担う。
+> 新規クライアントは送らないこと。
 
 ### PUT /api/control-plane/authorities
 
@@ -1359,14 +1696,14 @@ Authority 定義を設定する。
 
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
 ```json
 {
   "key_range_prefix": "user/",
-  "authority_nodes": ["auth-1", "auth-2", "auth-3"],
-  "approvals": ["auth-1", "auth-2"]
+  "authority_nodes": ["auth-1", "auth-2", "auth-3"]
 }
 ```
 
@@ -1374,7 +1711,7 @@ Authority 定義を設定する。
 |-----------|-----|------|
 | `key_range_prefix` | string | 対象キー範囲プレフィックス |
 | `authority_nodes` | string[] | Authority ノード ID のリスト |
-| `approvals` | string[] | この更新を承認したノード ID（過半数必要） |
+| `approvals` | string[] | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
 
 **レスポンスボディ:**
 
@@ -1388,13 +1725,12 @@ Authority 定義を設定する。
 **curl 例:**
 
 ```bash
-curl -X PUT http://localhost:3000/api/control-plane/authorities \
+curl -X PUT http://<leader-addr>/api/control-plane/authorities \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "user/",
-    "authority_nodes": ["auth-1", "auth-2", "auth-3"],
-    "approvals": ["auth-1", "auth-2"]
+    "authority_nodes": ["auth-1", "auth-2", "auth-3"]
   }'
 ```
 
@@ -1402,10 +1738,13 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 
 ### PUT /api/control-plane/policies
 
-配置ポリシーを設定する。バージョンは自動的にインクリメントされる。
+配置ポリシーを設定する。バージョンは commit 済みエントリの**適用時**に
+複製されたバージョンカウンタから採番される（commit 順が全ノードで同一の
+バージョンを決める）。
 
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
@@ -1416,8 +1755,7 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
   "required_tags": ["region:ap-northeast-1"],
   "forbidden_tags": ["decommissioned"],
   "allow_local_write_on_partition": true,
-  "certified": true,
-  "approvals": ["auth-1", "auth-2"]
+  "certified": true
 }
 ```
 
@@ -1429,7 +1767,7 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 | `forbidden_tags` | string[] | いいえ | `[]` | 禁止タグ |
 | `allow_local_write_on_partition` | bool | いいえ | `false` | ネットワーク分断時のローカル書き込み許可 |
 | `certified` | bool | いいえ | `false` | 認証が必要なキー範囲かどうか |
-| `approvals` | string[] | はい | - | 承認ノード ID（過半数必要） |
+| `approvals` | string[] | いいえ | `[]` | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
 
 **レスポンスボディ:**
 
@@ -1449,10 +1787,10 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 
 ```bash
 # replica_count が 0 の場合
-curl -X PUT http://localhost:3000/api/control-plane/policies \
+curl -X PUT http://<leader-addr>/api/control-plane/policies \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
-  -d '{"key_range_prefix":"","replica_count":0,"approvals":["auth-1","auth-2"]}'
+  -d '{"key_range_prefix":"","replica_count":0}'
 ```
 
 ```json
@@ -1466,7 +1804,7 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 **curl 例:**
 
 ```bash
-curl -X PUT http://localhost:3000/api/control-plane/policies \
+curl -X PUT http://<leader-addr>/api/control-plane/policies \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1475,8 +1813,7 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
     "required_tags": [],
     "forbidden_tags": [],
     "allow_local_write_on_partition": false,
-    "certified": false,
-    "approvals": ["auth-1", "auth-2"]
+    "certified": false
   }'
 ```
 
@@ -1489,14 +1826,15 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
 - **パスパラメータ**: `prefix` - 削除対象のキー範囲プレフィックス
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
 ```json
-{
-  "approvals": ["auth-1", "auth-2"]
-}
+{}
 ```
+
+（`approvals` フィールドは deprecated — 受理されるが無視される）
 
 **レスポンスボディ:**
 
@@ -1519,10 +1857,10 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 **curl 例:**
 
 ```bash
-curl -X DELETE http://localhost:3000/api/control-plane/policies/user%2F \
+curl -X DELETE http://<leader-addr>/api/control-plane/policies/user%2F \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
-  -d '{"approvals":["auth-1","auth-2"]}'
+  -d '{}'
 ```
 
 ---
@@ -1538,6 +1876,9 @@ curl -X DELETE http://localhost:3000/api/control-plane/policies/user%2F \
 | `STALE_VERSION` | 409 Conflict | 古いバージョンでの書き込み | 最新値を再取得してリトライする |
 | `POLICY_DENIED` | 403 Forbidden | 配置ポリシーによる拒否 | 対象キー範囲の配置ポリシーを確認する |
 | `TIMEOUT` | 504 Gateway Timeout | Authority 合意がタイムアウト | Authority ノードの稼働状況を確認する。`on_timeout=pending` で再試行可能 |
+| `SESSION_NOT_SATISFIED` | 412 Precondition Failed | セッショントークンの示す書き込みまでローカルレプリカが追いついていない | `Retry-After` に従いリトライ、`wait_ms` を増やす、または別レプリカに問い合わせる |
+| `NOT_LEADER` | 503 Service Unavailable | Control plane 書き込みを Raft リーダー以外のノードが受信した | 応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` のヒント先へ再送する（`Retry-After: 1` 付き）。リーダー不明なら `GET /api/control-plane/raft/status` で確認 |
+| `STORAGE_UNAVAILABLE` | 503 Service Unavailable | 書き込みの WAL 追記に失敗し耐久性を確立できない（例: ディスクフル） | ディスク容量・I/O 状態を確認してリトライする。読み取りは継続可能 |
 | `INCOMPATIBLE_VERSION` | 500 Internal Server Error | データバージョンとコードバージョンの不整合 | AsteroidDB を最新版に更新するか、データマイグレーションを実行する |
 | `MIGRATION_FAILED` | 500 Internal Server Error | データマイグレーション失敗 | ログを確認し、データの整合性を検証する |
 | `INTERNAL` | 500 Internal Server Error | 内部エラー | サーバーログを確認する |
@@ -1616,8 +1957,8 @@ Last-Writer-Wins セマンティクスのレジスタ。
 | CLI コマンド | HTTP メソッド | エンドポイント | 説明 |
 |-------------|-------------|---------------|------|
 | `asteroidb-cli status` | GET | `/api/metrics` | ノードステータスのサマリ表示 |
-| `asteroidb-cli get <key>` | GET | `/api/eventual/{key}` | eventual ストアからの値取得 |
-| `asteroidb-cli put <key> <value>` | POST | `/api/eventual/write` | LWW-Register への値書き込み |
+| `asteroidb-cli get <key>` | GET | `/api/eventual/{key}` | eventual ストアからの値取得。`--session-token <tok>` / `--session` / `--wait-ms <n>` でセッション保証付き読み取り |
+| `asteroidb-cli put <key> <value>` | POST | `/api/eventual/write` | LWW-Register への値書き込み。`OK` の次行に `session_token: <tok>` を表示 |
 | `asteroidb-cli metrics` | GET | `/api/metrics` | 詳細ランタイムメトリクス |
 | `asteroidb-cli slo` | GET | `/api/slo` | SLO バジェット状況 |
 

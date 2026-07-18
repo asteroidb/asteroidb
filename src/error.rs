@@ -54,6 +54,17 @@ pub enum CrdtError {
     #[error("certification timeout: local write committed but certification did not complete")]
     CertificationTimeout,
 
+    /// A session-token-guarded read could not be satisfied: the local
+    /// replica has not (provably) applied all writes covered by the token.
+    ///
+    /// This is a fail-closed refusal, never a stale answer: the client can
+    /// retry, wait longer (`wait_ms`), or try another replica. Maps to
+    /// HTTP 412 PRECONDITION_FAILED with a `Retry-After` header.
+    #[error(
+        "session token not satisfied for key {key}: local replica has not applied the requested writes yet"
+    )]
+    SessionNotSatisfied { key: String },
+
     #[error("incompatible format version: data={data_version}, code={code_version}")]
     IncompatibleVersion {
         data_version: u32,
@@ -62,6 +73,32 @@ pub enum CrdtError {
 
     #[error("migration failed from v{from} to v{to}: {reason}")]
     MigrationFailed { from: u32, to: u32, reason: String },
+
+    /// A durability-layer (WAL append) failure: the mutation was applied
+    /// in memory but could NOT be recorded in the write-ahead log, so it
+    /// must not be acknowledged as durable.
+    ///
+    /// This is a degrade signal (e.g. disk full): reads keep working and
+    /// the un-acked in-memory effect will converge via anti-entropy. Maps
+    /// to HTTP 503 SERVICE_UNAVAILABLE.
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    /// The control-plane consensus rejected the operation because this node
+    /// is not the current Raft leader.
+    ///
+    /// Callers should retry the request against the hinted leader (when a
+    /// hint is present). Maps to HTTP 503 SERVICE_UNAVAILABLE with the
+    /// `NOT_LEADER` error code plus `x-asteroidb-leader-id` /
+    /// `x-asteroidb-leader-addr` hint headers and `Retry-After: 1`.
+    #[error(
+        "not the control-plane leader (leader hint: {})",
+        .leader_id.as_deref().unwrap_or("unknown")
+    )]
+    NotLeader {
+        leader_id: Option<String>,
+        leader_addr: Option<String>,
+    },
 
     #[error("internal error: {0}")]
     Internal(String),
