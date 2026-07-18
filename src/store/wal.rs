@@ -21,9 +21,14 @@
 //! ```text
 //! offset  size  content
 //! 0       8     magic  = b"ADBWAL\x00\x01"
-//! 8       4     wal_format_version: u32 LE = 1
+//! 8       4     wal_format_version: u32 LE = 2
 //! 12      4     reserved: u32 LE = 0
 //! ```
+//!
+//! Version history: v1 predates the `compaction_floor` field on
+//! `OrSet`/`OrMap`; v1 segments are still readable (records decode via
+//! the frozen [`WalRecordV1`] shape and convert with empty floors), but
+//! writing is always v2 — the same one-way constraint as snapshot v4→v5.
 //!
 //! followed by length-prefixed, CRC-protected record frames:
 //!
@@ -68,12 +73,15 @@ pub const WAL_MAGIC: [u8; 8] = *b"ADBWAL\x00\x01";
 
 /// Current WAL segment format version.
 ///
+/// v2: `CrdtValue` payloads gained the `compaction_floor` field inside
+/// `OrSet`/`OrMap` (M-8). v1 segments decode via [`WalRecordV1`].
+///
 /// MAINTAINER WARNING: the record payload is bincode — positional and
 /// non-self-describing. Any change to [`WalRecord`] variants or fields
 /// requires bumping this version and adding a versioned decode arm in
-/// [`read_all_segments`] (the snapshot format's `StoreV2Layout` is the
-/// pattern to follow).
-pub const WAL_FORMAT_VERSION: u32 = 1;
+/// [`parse_segment`] (as [`WalRecordV1`] does for v1, sharing the frozen
+/// v4 CRDT shapes with the snapshot path).
+pub const WAL_FORMAT_VERSION: u32 = 2;
 
 /// Size of the segment header in bytes.
 const SEGMENT_HEADER_LEN: usize = 16;
@@ -124,6 +132,58 @@ pub enum WalRecord {
         visible: HashMap<String, HlcTimestamp>,
         failed: Vec<String>,
     },
+}
+
+/// Frozen decode shape of [`WalRecord`] for WAL format v1 (pre-
+/// `compaction_floor` CRDT layouts, shared with the snapshot path via
+/// [`CrdtValueV4`](crate::store::kv)). Read-only: writing is always v2.
+#[derive(Debug, Deserialize)]
+enum WalRecordV1 {
+    UpsertApplied {
+        key: String,
+        value: crate::store::kv::CrdtValueV4,
+        hlc: HlcTimestamp,
+    },
+    UpsertVisible {
+        key: String,
+        value: crate::store::kv::CrdtValueV4,
+        hlc: HlcTimestamp,
+    },
+    MergeFailed {
+        keys: Vec<String>,
+    },
+    SessionClaims {
+        applied: HashMap<String, HlcTimestamp>,
+        visible: HashMap<String, HlcTimestamp>,
+        failed: Vec<String>,
+    },
+}
+
+impl From<WalRecordV1> for WalRecord {
+    fn from(old: WalRecordV1) -> Self {
+        match old {
+            WalRecordV1::UpsertApplied { key, value, hlc } => WalRecord::UpsertApplied {
+                key,
+                value: value.into(),
+                hlc,
+            },
+            WalRecordV1::UpsertVisible { key, value, hlc } => WalRecord::UpsertVisible {
+                key,
+                value: value.into(),
+                hlc,
+            },
+            WalRecordV1::MergeFailed { keys } => WalRecord::MergeFailed { keys },
+            WalRecordV1::SessionClaims {
+                applied,
+                visible,
+                failed,
+            } => WalRecord::SessionClaims {
+                applied,
+                visible,
+                failed,
+            },
+        }
+    }
 }
 
 /// When to fdatasync the WAL relative to acknowledging writes.
@@ -705,8 +765,9 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
         return (WalReadOutcome::Corruption, 0);
     }
     let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    if version != WAL_FORMAT_VERSION {
-        // Unknown version: refuse to guess at the layout.
+    if version == 0 || version > WAL_FORMAT_VERSION {
+        // Unknown version: refuse to guess at the layout. (v1 is decoded
+        // via the frozen WalRecordV1 shape below.)
         return (WalReadOutcome::Corruption, 0);
     }
 
@@ -755,11 +816,21 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
             }
             return (WalReadOutcome::Corruption, off as u64);
         }
-        match bincode::serde::decode_from_slice::<WalRecord, _>(
-            payload,
-            bincode::config::standard(),
-        ) {
-            Ok((record, _)) => out.push(record),
+        let decoded = match version {
+            // v1: pre-floor CRDT layouts — decode via the frozen shape.
+            1 => bincode::serde::decode_from_slice::<WalRecordV1, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .map(|(record, _)| WalRecord::from(record)),
+            _ => bincode::serde::decode_from_slice::<WalRecord, _>(
+                payload,
+                bincode::config::standard(),
+            )
+            .map(|(record, _)| record),
+        };
+        match decoded {
+            Ok(record) => out.push(record),
             // Valid CRC but undecodable payload: a format-level problem,
             // never a torn write. Fail-stop material.
             Err(_) => return (WalReadOutcome::Corruption, off as u64),
@@ -1401,5 +1472,168 @@ mod tests {
         let msg = wal_sync_failure_message(&io::Error::other("boom"));
         assert!(msg.contains("boom"));
         assert!(msg.contains("aborting"));
+    }
+
+    // ---------------------------------------------------------------
+    // WAL v1 compatibility (pre-compaction_floor CRDT layouts)
+    // ---------------------------------------------------------------
+
+    /// Serialisable mirrors of the exact WAL v1 record layout (OrSet
+    /// without `compaction_floor`). Variant order pins the bincode
+    /// variant indexes of `WalRecord` / `CrdtValue`.
+    #[derive(serde::Serialize)]
+    struct V1Dot {
+        node_id: NodeId,
+        counter: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct V1OrSet {
+        elements: HashMap<String, Vec<V1Dot>>,
+        counters: HashMap<NodeId, u64>,
+        deferred: Vec<V1Dot>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[allow(dead_code)]
+    enum V1CrdtValue {
+        Counter(PnCounter),
+        Set(V1OrSet),
+        Map(()),
+        Register(()),
+    }
+
+    #[derive(serde::Serialize)]
+    #[allow(dead_code)]
+    enum V1Record {
+        UpsertApplied {
+            key: String,
+            value: V1CrdtValue,
+            hlc: HlcTimestamp,
+        },
+        UpsertVisible {
+            key: String,
+            value: V1CrdtValue,
+            hlc: HlcTimestamp,
+        },
+        MergeFailed {
+            keys: Vec<String>,
+        },
+    }
+
+    /// Write a raw v1 segment: v1 header + framed v1-layout records.
+    fn write_v1_segment(dir: &Path, records: &[V1Record]) {
+        let mut data = Vec::new();
+        let mut header = [0u8; SEGMENT_HEADER_LEN];
+        header[..8].copy_from_slice(&WAL_MAGIC);
+        header[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&header);
+        for record in records {
+            let payload =
+                bincode::serde::encode_to_vec(record, bincode::config::standard()).unwrap();
+            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            data.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            data.extend_from_slice(&payload);
+        }
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(segment_file_name(1)), data).unwrap();
+    }
+
+    /// A v1 segment (pre-floor CRDT layouts) replays through the frozen
+    /// `WalRecordV1` decode shape: elements, tombstones and session
+    /// metadata survive; floors come up empty.
+    #[test]
+    fn v1_segment_replays_via_frozen_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = NodeId("A".into());
+        let set = V1OrSet {
+            elements: HashMap::from([(
+                "alice".to_string(),
+                vec![V1Dot {
+                    node_id: n.clone(),
+                    counter: 1,
+                }],
+            )]),
+            counters: HashMap::from([(n.clone(), 2)]),
+            deferred: vec![V1Dot {
+                node_id: n.clone(),
+                counter: 2,
+            }],
+        };
+        write_v1_segment(
+            dir.path(),
+            &[
+                V1Record::UpsertApplied {
+                    key: "users".into(),
+                    value: V1CrdtValue::Set(set),
+                    hlc: ts(100, 0, "A"),
+                },
+                V1Record::MergeFailed {
+                    keys: vec!["bad".into()],
+                },
+            ],
+        );
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        assert_eq!(read.records.len(), 2);
+
+        let mut store = Store::new();
+        for record in read.records {
+            replay_record(&mut store, record);
+        }
+        match store.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert_eq!(s.deferred_len(), 1, "v1 tombstone must survive replay");
+                assert!(s.compaction_floor().is_empty(), "floor defaults to empty");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+        assert!(store.merge_failed_contains("bad"));
+        assert_eq!(store.applied_origin("A"), Some(&ts(100, 0, "A")));
+    }
+
+    /// v2 writers stamp the new version; v2 round trips preserve the
+    /// compaction floor inside CRDT payloads.
+    #[test]
+    fn v2_round_trip_preserves_compaction_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = NodeId("A".into());
+        let mut set = crate::crdt::or_set::OrSet::new();
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.compact_deferred_certified(&set.deferred_dots(), None);
+        assert_eq!(set.compaction_floor().get(&n), Some(&1));
+
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&WalRecord::UpsertApplied {
+            key: "users".into(),
+            value: CrdtValue::Set(set),
+            hlc: ts(100, 0, "A"),
+        })
+        .unwrap();
+        drop(wal);
+
+        // Header carries version 2.
+        let (_, path) = list_segments(dir.path()).unwrap().pop().unwrap();
+        let data = fs::read(&path).unwrap();
+        let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        assert_eq!(version, WAL_FORMAT_VERSION);
+        assert_eq!(version, 2);
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        let mut store = Store::new();
+        for record in read.records {
+            replay_record(&mut store, record);
+        }
+        match store.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert_eq!(s.compaction_floor().get(&n), Some(&1));
+                assert_eq!(s.deferred_len(), 0);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
     }
 }

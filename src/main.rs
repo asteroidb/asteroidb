@@ -768,6 +768,17 @@ async fn main() {
             .unwrap_or(300),
     );
 
+    // Stage 2 tombstone-GC hole-jump (default off, fail-closed). Enable
+    // only after a Stage 1 soak: `gc_floor_stalled_hole_dots`
+    // persisting non-zero identifies legacy holes the pre-floor sweep
+    // left behind — see docs/ops-guide.md for the procedure.
+    let gc_hole_jump_enabled = std::env::var("ASTEROIDB_GC_HOLE_JUMP")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
     let runner_config = NodeRunnerConfig {
         bls_config,
         node_signer,
@@ -777,6 +788,7 @@ async fn main() {
         equivocation: Some(Arc::clone(&equivocation)),
         digest_sync_enabled,
         gc_retention,
+        gc_hole_jump_enabled,
         ..NodeRunnerConfig::default()
     };
 

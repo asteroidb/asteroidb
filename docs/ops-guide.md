@@ -180,6 +180,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
+| `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
 ### Control plane Raft コンセンサス
@@ -331,6 +332,10 @@ curl -s http://localhost:3000/api/slo | jq .
 | `digest_push_probe_total` | u64 | push 側 digest probe 試行累計 |
 | `digest_push_match_total` | u64 | probe 一致によるフル push スキップ累計 |
 | `digest_push_keys_pushed_total` | u64 | digest subset push で送ったキー数累計 |
+| `gc_floor_stalled_hole_dots` | u64 (gauge) | 直近に**実行された** GC sweep で legacy hole に停止した floor 走査数。mark のみ・ゲート不合格の tick では上書きされず、次の sweep 実行まで値を保持する。恒常的に非ゼロなら Stage 2 hole-jump の有効化を検討（3.7） |
+| `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
+| `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
+| `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
 | `rebalance_keys_migrated` | u64 | リバランス移行キー累計 |
@@ -504,10 +509,17 @@ digest を比較し、不一致バケットのみを転送します（設計は
   エンドポイント未実装）またはスキームバージョン不一致のノードが残存。
   ローリングアップグレードの完了を確認する。非対応ピアは 10 分 TTL で
   キャッシュされ、TTL 経過後に自動で再 probe される。
-- `digest_sync_partial_total` が恒常的に増える（root match がほぼない）のに
-  データが収束している場合、tombstone GC の非対称による偽不一致が疑わしい。
-  正しさへの影響はなく帯域のみのコスト。GC 周期（`gc_interval`）を揃えると
-  減少する。
+- `digest_sync_partial_total`: GC 直後の不一致はバケット転送が compaction
+  floor を伝播して **1 往復で自己治癒**する（scheme v2、3.7 を参照）ため、
+  一時的な増加は正常。**恒常的な増加が続く場合**は、旧ノード混在
+  （`gc_floor_rejected_dots_total` の増加を併確認）、hole 停滞
+  （`gc_floor_stalled_hole_dots`）、dead peer を疑う。
+  **歴史的注記（scheme v1 クラスタ向け）**: v1 では「GC 非対称の偽不一致は
+  帯域のみのコスト」と記載していたが、これは誤りだった。実際にはバケット
+  転送のマージが旧ピアの stale tombstone を再注入して GC を巻き戻すため、
+  持続的フォールバック下では tombstone GC がクラスタ全体で収束しない
+  ライブロックがあった（M-8）。v1 のまま運用する場合の暫定緩和は
+  `ASTEROIDB_DIGEST_SYNC_DISABLED=1`（本節冒頭のキルスイッチ）。
 - `digest_sync_failed_total` の増加はネットワーク/デコード失敗。従来フル
   シンクで救済されるため正しさは不変だが、リンク品質を確認する。
 
@@ -522,11 +534,53 @@ digest を比較し、不一致バケットのみを転送します（設計は
 3. 問題が解消しない場合、digest 同期は原因ではない。
 
 **ローリングアップグレード時の挙動**: 旧ノードは
-`POST /api/internal/sync/digest` に 404 を返し、新ノードはそれを検知して
-従来フルシンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
+`POST /api/internal/sync/digest` に 404 を返し（またはスキームバージョン
+不一致で `scheme_ok=false` を返し）、新ノードはそれを検知して従来フル
+シンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
 混在期間中は帯域削減効果がないだけで、収束の正しさ・セッション保証は不変。
 全ノードのアップグレード完了後、10 分以内（再 probe TTL）に digest 同期が
 自動的に有効化される。
+
+scheme v2（compaction floor）への更新に固有の注意:
+
+- **GC 収束（floor 伝播）は全ノード更新後に発効する**。混在期の旧ノードは
+  floor を発行も解釈もしないため、旧ノード同士では v1 のライブロックが
+  残存する（fail-safe: tombstone が溜まる方向）。旧ノードへの remove
+  伝播は origin-retention 則により tombstone が担い続けるので、C-2 の
+  ゲート保証はそのまま旧ノードを守る。
+- **スナップショット v5 / WAL v2 は片方向アップグレード**。v5/v2 を書いた
+  ノードを旧バイナリに戻すと読めない（v3→v4 と同じ制約）。ロールバック時、
+  旧バイナリが floor を落とす方向は fail-safe（tombstone 蓄積側）。
+- 混在期の残余 corner（設計で文書化済み）: 他ノードの sweep が live として
+  跨いだ dot を並行 remove し、その tombstone がゲート通過前に floor 継承で
+  剥がれたケースでは、旧ノードへの当該 remove の伝播が full-state 経路
+  依存になる。全ノード v2 なら floor kill で完全に安全。
+
+### 3.7 tombstone GC（compaction floor）と Stage 2 hole-jump
+
+トゥームストーン GC は certified sweep（mark → retention → 二重ゲート）
+通過後、tombstone を per-(key, writer) の **compaction floor** に畳み込んで
+物理削除する。floor はマージで pointwise max 継承され（撤回不能）、stale
+tombstone / stale live dot をマージ時に棄却するため、GC はクラスタ全体で
+単調に収束する（v1 のライブロックの修正、M-8）。
+
+- 通常運用（Stage 1）で必要な操作はない。`gc_floor_stalled_uncandidated_dots`
+  は mark 後に増えた tombstone による一時停滞で、次サイクルで解消する。
+- `gc_floor_stalled_hole_dots` が **soak 後も恒常的に非ゼロ**の場合、旧方式
+  sweep が痕跡なく削除した dot（legacy hole）で floor が停止している。
+  クラスタのどこかに tombstone が残っていれば anti-entropy が hole を埋めて
+  自己治癒するため、まず数 GC サイクル分待つこと。
+- **Stage 2 有効化手順**: (1) 全ノードが v2 で soak 済みであることを確認
+  （`gc_floor_rejected_dots_total` が横ばい）。(2) `gc_floor_stalled_hole_dots`
+  が恒常非ゼロのノードに `ASTEROIDB_GC_HOLE_JUMP=1` を設定して再起動。
+  (3) hole-jump は既存の二重ゲートに加え、mark 以降に全 registry peer の
+  全量状態をエラーなしで取り込んだ **inbound ゲート**の成立時のみ発火する
+  （fail-closed）。さらに跨げるのは **mark 時点で既に hole だった dot のみ**
+  （mark が per-node カウンタをスナップショットし、それ以下の hole だけを
+  跳ぶ）。mark 後の inbound merge が新たに作った hole は対象外で次の mark を
+  待つ。ゲージが 0 に落ちたら Stage 2 は外してもよい（残すのも安全）。
+- `gc_interval` の短縮は hole 停滞・ゲート不合格には**効かない**（12.3 も
+  参照）。停滞の原因はゲート（dead peer / 分断 / hole）であり周期ではない。
 
 ---
 
@@ -817,7 +871,7 @@ Compaction が進まない場合は Authority ノードの可用性を確認し�
 | 低レイテンシ環境（同一DC内） | `sync_interval` を 1 秒に短縮 |
 | 高レイテンシ環境（WAN） | `sync_interval` を 5-10 秒に延長 |
 | 書き込み負荷が高い | `full_sync_threshold` を 0.3 に下げて早めにフルシンク |
-| メモリ使用量が多い | `gc_interval` を 30 秒に短縮 |
+| メモリ使用量が多い | `gc_interval` を 30 秒に短縮（ただしゲート不合格・hole 停滞による tombstone 蓄積には効かない — 3.7 / 12.3 を参照） |
 | フルシンク比率が高い | `sync_interval` を短縮して差分を小さく保つ |
 
 ### 7.3 バッチサイズ
@@ -1144,7 +1198,7 @@ ufw allow from 10.0.1.0/24 to any port 3000 proto tcp comment "AsteroidDB intern
 | コンポーネント | 見積もり方 |
 |--------------|-----------|
 | CRDT メタデータ | 値あたり約 100-200 バイト（HLC タイムスタンプ、ドット情報） |
-| トゥームストーン | OR-Set/OR-Map の場合、削除操作 1 件あたり約 50 バイト（GC で回収） |
+| トゥームストーン | OR-Set/OR-Map の場合、削除操作 1 件あたり約 50 バイト。certified sweep 到達後は (key, writer) ペアあたり約 50 バイト定数の compaction floor（NodeId 文字列 + カウンタ。tombstone 1 件と同程度のフットプリント）に圧縮される。優位性は 1 件あたりのサイズではなく「削除件数に比例して無制限に増える tombstone → writer 数に対して定数の floor」という件数の圧縮にある |
 | チェックポイント | キー範囲あたり最大 10 世代（アダプティブモード時） |
 | ピアレジストリ | ノード 1 台あたり約 200 バイト |
 | システム名前空間 | ポリシー数 x 約 500 バイト |
@@ -1298,7 +1352,7 @@ curl -s http://localhost:3000/api/internal/keys | jq '.entries | length'
 
 | 原因 | 対処 |
 |------|------|
-| トゥームストーン蓄積 | `gc_interval` を短縮（デフォルト 60 秒） |
+| トゥームストーン蓄積 | まず原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
 | ack-frontier エントリの蓄積 | `frontier_gc_interval` を短縮、`frontier_gc_max_retained_versions` を縮小 |
 | Compaction が進まない | Authority 可用性を確認（過半数必要） |
 | pending_count が高い | Certified Write のタイムアウト設定を見直す |

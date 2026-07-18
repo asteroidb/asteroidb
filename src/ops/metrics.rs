@@ -319,6 +319,37 @@ pub struct RuntimeMetrics {
     /// relative to the legacy full dump.
     pub digest_sync_keys_skipped_total: AtomicU64,
 
+    /// Gauge: per-node dot-floor walks stalled on a LEGACY HOLE at the
+    /// latest EXECUTED tombstone-GC sweep (a dot the pre-floor sweep
+    /// physically deleted cluster-wide). Mark-only and gate-blocked GC
+    /// ticks do NOT overwrite this gauge (they run ~4 ticks out of 5
+    /// under the default interval/retention and would flap a persistent
+    /// stall to 0); the value holds until the next sweep actually runs.
+    /// A persistent non-zero value is the signal to enable Stage 2
+    /// hole-jump (`ASTEROIDB_GC_HOLE_JUMP=1`) after a Stage 1 soak — see
+    /// docs/ops-guide.md.
+    pub gc_floor_stalled_hole_dots: AtomicU64,
+
+    /// Gauge: floor walks stalled on a post-mark tombstone at the latest
+    /// EXECUTED sweep (transient — the next gated cycle covers them).
+    /// Like `gc_floor_stalled_hole_dots`, only updated by passes that
+    /// actually swept.
+    pub gc_floor_stalled_uncandidated_dots: AtomicU64,
+
+    /// Cumulative incoming tombstones REJECTED because the merged
+    /// compaction floor already covers them (redundant with
+    /// "floor + absence"). Sustained growth during a rolling upgrade
+    /// means v1 peers are still re-offering stale tombstones — the
+    /// completion signal for the upgrade.
+    pub gc_floor_rejected_dots_total: AtomicU64,
+
+    /// Cumulative stale live dots suppressed by the compaction floor on
+    /// merge (local dots killed via a peer's floor + incoming stale dots
+    /// rejected by ours): removes learned from the floor alone, e.g.
+    /// from replicas that missed the tombstone (unknown replicas,
+    /// delayed pushes).
+    pub gc_floor_killed_by_floor_total: AtomicU64,
+
     /// Cumulative number of digest push probes (before a full-state push).
     pub digest_push_probe_total: AtomicU64,
 
@@ -410,6 +441,10 @@ impl Default for RuntimeMetrics {
             digest_sync_failed_total: AtomicU64::default(),
             digest_sync_keys_transferred_total: AtomicU64::default(),
             digest_sync_keys_skipped_total: AtomicU64::default(),
+            gc_floor_stalled_hole_dots: AtomicU64::default(),
+            gc_floor_stalled_uncandidated_dots: AtomicU64::default(),
+            gc_floor_rejected_dots_total: AtomicU64::default(),
+            gc_floor_killed_by_floor_total: AtomicU64::default(),
             digest_push_probe_total: AtomicU64::default(),
             digest_push_match_total: AtomicU64::default(),
             digest_push_keys_pushed_total: AtomicU64::default(),
@@ -702,6 +737,14 @@ impl RuntimeMetrics {
             digest_push_keys_pushed_total: self
                 .digest_push_keys_pushed_total
                 .load(Ordering::Relaxed),
+            gc_floor_stalled_hole_dots: self.gc_floor_stalled_hole_dots.load(Ordering::Relaxed),
+            gc_floor_stalled_uncandidated_dots: self
+                .gc_floor_stalled_uncandidated_dots
+                .load(Ordering::Relaxed),
+            gc_floor_rejected_dots_total: self.gc_floor_rejected_dots_total.load(Ordering::Relaxed),
+            gc_floor_killed_by_floor_total: self
+                .gc_floor_killed_by_floor_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -804,6 +847,17 @@ pub struct MetricsSnapshot {
     pub digest_push_match_total: u64,
     /// Keys pushed via digest subset pushes (instead of the full store).
     pub digest_push_keys_pushed_total: u64,
+    /// Gauge: floor walks stalled on legacy holes at the latest GC sweep
+    /// (Stage 2 hole-jump resolves; see docs/ops-guide.md).
+    pub gc_floor_stalled_hole_dots: u64,
+    /// Gauge: floor walks stalled on post-mark tombstones at the latest
+    /// GC sweep (transient).
+    pub gc_floor_stalled_uncandidated_dots: u64,
+    /// Cumulative incoming tombstones rejected as floor-covered (v1
+    /// re-injection pressure during rolling upgrades).
+    pub gc_floor_rejected_dots_total: u64,
+    /// Cumulative stale live dots suppressed by the compaction floor.
+    pub gc_floor_killed_by_floor_total: u64,
 }
 
 #[cfg(test)]

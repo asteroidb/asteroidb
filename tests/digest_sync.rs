@@ -1435,3 +1435,485 @@ async fn runner_transient_digest_failure_falls_back_without_caching() {
         other => panic!("expected Counter, got {other:?}"),
     }
 }
+
+// ===========================================================================
+// M-8: tombstone GC convergence under sustained digest fallback
+// ===========================================================================
+
+/// Like [`test_state`] but sharing the given eventual API (so a NodeRunner
+/// and this HTTP surface serve the same store) and WITHOUT authority
+/// definitions — the tombstone-GC authority gate is then vacuous and the
+/// peer gate (push evidence) governs collection, matching a data-plane
+/// only deployment.
+fn shared_state(name: &str, eventual: Arc<Mutex<EventualApi>>) -> Arc<AppState> {
+    let nid = node_id(name);
+    let namespace = Arc::new(RwLock::new(SystemNamespace::new()));
+
+    Arc::new(AppState {
+        eventual,
+        certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
+        namespace,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
+        peer_persist_path: None,
+        namespace_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
+        internal_token: None,
+        self_node_id: None,
+        self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
+    })
+}
+
+/// A NodeRunner over a SHARED eventual API with a fast sync interval,
+/// caller-chosen GC cadence and an authority-free namespace (vacuous
+/// authority gate).
+async fn gc_runner(
+    name: &str,
+    eventual: Arc<Mutex<EventualApi>>,
+    peer_name: &str,
+    peer_addr: &str,
+    gc_interval: Duration,
+    gc_retention: Duration,
+) -> (NodeRunner, Arc<RuntimeMetrics>) {
+    let ns = Arc::new(RwLock::new(SystemNamespace::new()));
+    let certified = Arc::new(Mutex::new(CertifiedApi::new(node_id(name), ns)));
+    let registry = PeerRegistry::new(
+        node_id(name),
+        vec![PeerConfig {
+            node_id: node_id(peer_name),
+            addr: peer_addr.to_string(),
+        }],
+    )
+    .unwrap();
+    let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+
+    let config = NodeRunnerConfig {
+        certification_interval: Duration::from_millis(500),
+        cleanup_interval: Duration::from_secs(60),
+        compaction_check_interval: Duration::from_secs(60),
+        frontier_report_interval: Duration::from_secs(60),
+        sync_interval: Some(Duration::from_millis(25)),
+        ping_interval: None,
+        gc_interval,
+        gc_retention,
+        digest_sync_enabled: true,
+        ..NodeRunnerConfig::default()
+    };
+
+    let metrics = Arc::new(RuntimeMetrics::default());
+    let runner = NodeRunner::with_sync(
+        node_id(name),
+        certified,
+        CompactionEngine::with_defaults(),
+        config,
+        sync_client,
+        eventual,
+        metrics.clone(),
+    )
+    .await;
+    (runner, metrics)
+}
+
+/// Inspect the "team" set of a store: (deferred_len, floor_advanced).
+async fn team_gc_state(api: &Arc<Mutex<EventualApi>>) -> Option<(usize, bool)> {
+    let api = api.lock().await;
+    match api.get_eventual("team") {
+        Some(CrdtValue::Set(s)) => Some((s.deferred_len(), !s.compaction_floor().is_empty())),
+        _ => None,
+    }
+}
+
+/// M-8 livelock regression, end to end: two live NodeRunners with GC and
+/// bidirectional digest sync under a GENUINELY sustained digest regime —
+/// both servers expose no delta endpoint (`no_delta_router`), so every
+/// pull cycle 404s on delta, retries, and lands on the digest path (the
+/// production scenario in which v1's GC never converged: each bucket
+/// transfer union-merged the peer's stale tombstones back in).
+///
+/// The healing channel is pinned down by ASYMMETRY: only A ever sweeps
+/// (B's gc_interval/retention are an hour, so B's GC can mark at most
+/// once and never reaches a sweep), sweeps do not advance per-key HLCs
+/// (so A's post-sweep delta pushes carry nothing), and the delta pull
+/// route does not exist — B can lose its tombstone and gain a floor
+/// ONLY by inheriting them through a digest bucket transfer from A.
+/// Under v1 merge semantics that same transfer direction is exactly the
+/// one that reinjects tombstones, so this test fails if the
+/// covered-deferred rejection in `merge` regresses (verified by
+/// mutation: restoring the old unconditional deferred union makes
+/// Phase 1 time out).
+///
+/// With the compaction floor, GC must converge cluster-wide: both nodes
+/// reach zero tombstones, the floors advance, canonical digests match
+/// (root-match equivalent), and the partial-transfer counter flat-lines
+/// while digest attempts keep running.
+#[tokio::test]
+async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
+    let api_a = Arc::new(Mutex::new(EventualApi::new(node_id("gc-a"))));
+    let api_b = Arc::new(Mutex::new(EventualApi::new(node_id("gc-b"))));
+    let state_a = shared_state("gc-a", api_a.clone());
+    let state_b = shared_state("gc-b", api_b.clone());
+    // No delta endpoints: every pull falls back to the digest path.
+    let (addr_a, server_a) = serve(no_delta_router(state_a.clone())).await;
+    let (addr_b, server_b) = serve(no_delta_router(state_b.clone())).await;
+
+    // Common state on both replicas.
+    {
+        let mut api = api_a.lock().await;
+        api.eventual_set_add("team", "alice".into()).unwrap();
+        api.eventual_set_add("team", "bob".into()).unwrap();
+    }
+    mirror_api(&api_a, &api_b).await;
+
+    // The remove whose tombstone must be collected cluster-wide. A's
+    // initial full push (taken before its first sweep can pass the
+    // retention gate) hands B the tombstone; from then on B's only way
+    // back to a clean state is inheriting A's floor via digest sync.
+    {
+        let mut api = api_a.lock().await;
+        api.eventual_set_remove("team", "bob").unwrap();
+    }
+
+    // A sweeps quickly; B is configured so it CANNOT sweep in this test.
+    let hour = Duration::from_secs(3600);
+    let (runner_a, metrics_a) = gc_runner(
+        "gc-a",
+        api_a.clone(),
+        "gc-b",
+        &addr_b.to_string(),
+        Duration::from_millis(25),
+        Duration::from_millis(100),
+    )
+    .await;
+    let (runner_b, metrics_b) = gc_runner(
+        "gc-b",
+        api_b.clone(),
+        "gc-a",
+        &addr_a.to_string(),
+        hour,
+        hour,
+    )
+    .await;
+    let stop_a = runner_a.shutdown_handle();
+    let stop_b = runner_b.shutdown_handle();
+    let task_a = tokio::spawn(async move {
+        let mut runner = runner_a;
+        runner.run().await
+    });
+    let task_b = tokio::spawn(async move {
+        let mut runner = runner_b;
+        runner.run().await
+    });
+
+    // Phase 1: GC convergence — zero tombstones on BOTH nodes and an
+    // advanced floor on both. A's floor comes from its sweep; B's can
+    // only come from floor inheritance over a digest bucket transfer
+    // (B never sweeps, and the sweep left no delta to push).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let a = team_gc_state(&api_a).await;
+        let b = team_gc_state(&api_b).await;
+        if let (Some((0, true)), Some((0, true))) = (a, b) {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let _ = stop_a.send(true);
+            let _ = stop_b.send(true);
+            panic!(
+                "tombstone GC did not converge under sustained digest fallback \
+                 (a={a:?}, b={b:?}) — the M-8 livelock"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    // Regime asserts: this was actually the digest regime, not a delta
+    // or push side channel. Every sync cycle attempts a digest pull, and
+    // B's healing required at least one mismatched bucket transfer.
+    assert!(
+        metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed) >= 2
+            && metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed) >= 2,
+        "every pull cycle must land on the digest path (a={}, b={})",
+        metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed),
+        metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed),
+    );
+    assert!(
+        metrics_b.digest_sync_partial_total.load(Ordering::Relaxed) >= 1,
+        "B's floor can only arrive via a digest bucket transfer, so at \
+         least one partial (mismatched-bucket) sync must have happened"
+    );
+
+    // Removed element stays removed; the survivor survives.
+    for api in [&api_a, &api_b] {
+        let api = api.lock().await;
+        match api.get_eventual("team") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert!(!s.contains(&"bob".to_string()), "remove must hold");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    // Phase 2: fixed point. Canonical digests match (the root-match
+    // condition of the digest protocol) and the partial-transfer counter
+    // flat-lines over many further digest sync cycles — v1's livelock
+    // signature was this counter climbing forever. The attempt counter
+    // must KEEP growing over the same window (the digest regime is still
+    // active; a flat-line by silence would prove nothing).
+    let digest_a = compute_store_digest(&snapshot_data_api(&api_a).await);
+    let digest_b = compute_store_digest(&snapshot_data_api(&api_b).await);
+    assert_eq!(
+        digest_a.root, digest_b.root,
+        "canonical states must have converged (root-match equivalent)"
+    );
+
+    let partial_before = metrics_a.digest_sync_partial_total.load(Ordering::Relaxed)
+        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed);
+    let attempts_before = metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed)
+        + metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(750)).await; // ≳25 sync cycles
+    let partial_after = metrics_a.digest_sync_partial_total.load(Ordering::Relaxed)
+        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed);
+    let attempts_after = metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed)
+        + metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed);
+    assert!(
+        attempts_after > attempts_before,
+        "digest attempts must keep running after convergence \
+         (before={attempts_before}, after={attempts_after})"
+    );
+    assert!(
+        partial_after - partial_before <= 1,
+        "digest partial transfers must flat-line after convergence \
+         (before={partial_before}, after={partial_after}); sustained growth is the livelock"
+    );
+
+    let _ = stop_a.send(true);
+    let _ = stop_b.send(true);
+    let _ = task_a.await;
+    let _ = task_b.await;
+    server_a.abort();
+    server_b.abort();
+}
+
+/// Regression guard: the tombstoned-remove propagation test above
+/// (`digest_sync_propagates_tombstoned_remove`) must keep passing with
+/// the v2 scheme; additionally, a GC'd sender must not resurrect the
+/// removed element on the receiver — the receiver inherits the floor and
+/// drops its stale tombstone in the same round trip.
+#[tokio::test]
+async fn digest_sync_floor_propagates_and_heals_receiver() {
+    let server = test_state("server");
+    {
+        let mut api = server.eventual.lock().await;
+        api.eventual_set_add("team", "alice".into()).unwrap();
+        api.eventual_set_add("team", "bob".into()).unwrap();
+        api.eventual_set_remove("team", "bob").unwrap();
+    }
+    let requester = test_state("requester");
+    mirror_state(&server, &requester.eventual).await;
+
+    // Server sweeps its tombstone (ungated here: the CRDT-level safety
+    // is timing-independent; the runtime gates protect pre-floor peers).
+    {
+        let mut api = server.eventual.lock().await;
+        match api.store_mut().get_mut("team") {
+            Some(CrdtValue::Set(s)) => {
+                let candidates = s.deferred_dots();
+                s.compact_deferred_certified(&candidates, None);
+                assert_eq!(s.deferred_len(), 0);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    // States now differ (floor vs tombstone) → mismatch → transfer.
+    let digest = compute_store_digest(&snapshot_data(&requester).await);
+    let req = DigestSyncRequest::from_digest("requester", &digest, true);
+    let app = router(server.clone());
+    let (_, resp) = post_digest_request(&app, &req).await;
+    let resp = resp.unwrap();
+    assert!(resp.scheme_ok);
+    assert!(!resp.root_matched, "floor difference must mismatch");
+    assert!(resp.entries.contains_key("team"));
+
+    // Apply like the sync loop does: the receiver inherits the floor,
+    // drops its now-absorbed tombstone, and does NOT resurrect "bob".
+    {
+        let mut api = requester.eventual.lock().await;
+        for (key, value) in &resp.entries {
+            match resp.timestamps.get(key) {
+                Some(ts) => api
+                    .merge_remote_with_hlc(key.clone(), value, ts.clone())
+                    .unwrap(),
+                None => api.merge_remote(key.clone(), value).unwrap(),
+            }
+        }
+    }
+    {
+        let api = requester.eventual.lock().await;
+        match api.get_eventual("team") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert!(!s.contains(&"bob".to_string()), "no resurrection");
+                assert_eq!(s.deferred_len(), 0, "stale tombstone absorbed by the floor");
+                assert!(!s.compaction_floor().is_empty(), "floor inherited");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    // Reverse direction: the healed receiver's state no longer differs.
+    let digest = compute_store_digest(&snapshot_data(&requester).await);
+    let req = DigestSyncRequest::from_digest("requester", &digest, true);
+    let (_, resp) = post_digest_request(&app, &req).await;
+    assert!(
+        resp.unwrap().root_matched,
+        "one round trip must heal the GC asymmetry"
+    );
+}
+
+// ===========================================================================
+// Stage 2 hole-jump: inbound reconciliation evidence record points
+// ===========================================================================
+
+/// Run the runner until `check` returns true, then shut it down and
+/// return it (for post-run state inspection).
+async fn run_until_owned<F, Fut>(mut runner: NodeRunner, check: F) -> NodeRunner
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bool> + Send,
+{
+    let shutdown = runner.shutdown_handle();
+    let waiter = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if check().await {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = shutdown.send(true);
+                panic!("timed out waiting for sync condition");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = shutdown.send(true);
+    });
+    runner.run().await;
+    waiter.await.expect("sync condition waiter failed");
+    runner
+}
+
+/// Record point (a): a digest pull that ROOT-MATCHES records inbound
+/// reconciliation evidence stamped no earlier than the pre-request wall
+/// clock (never overstated).
+#[tokio::test]
+async fn digest_root_match_records_pull_reconciliation_evidence() {
+    let server = test_state("server");
+    {
+        let mut api = server.eventual.lock().await;
+        api.eventual_counter_inc("k").unwrap();
+    }
+    let (addr, server_handle) = serve(no_delta_router(server.clone())).await;
+    let mut harness = runner_against(&addr.to_string(), true).await;
+    mirror_state(&server, &harness.local_api).await;
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(1, 0, "stale"));
+
+    let before_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let metrics_check = harness.metrics.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let m = metrics_check.clone();
+        async move { m.digest_sync_root_match_total.load(Ordering::Relaxed) > 0 }
+    })
+    .await;
+    server_handle.abort();
+
+    let reconciled = runner
+        .pull_reconciled_for(&addr.to_string())
+        .expect("root match must record inbound reconciliation evidence");
+    assert!(
+        reconciled >= before_ms,
+        "evidence must be stamped at request start ({reconciled} >= {before_ms})"
+    );
+}
+
+/// Record point (b): a digest pull that merges EVERY mismatched bucket
+/// cleanly records the evidence too.
+#[tokio::test]
+async fn digest_partial_merge_records_pull_reconciliation_evidence() {
+    let server = test_state("server");
+    {
+        let mut api = server.eventual.lock().await;
+        for i in 0..10 {
+            api.eventual_counter_inc(&format!("k-{i}")).unwrap();
+        }
+    }
+    let (addr, server_handle) = serve(no_delta_router(server.clone())).await;
+    let mut harness = runner_against(&addr.to_string(), true).await;
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(1, 0, "stale"));
+
+    let metrics_check = harness.metrics.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let m = metrics_check.clone();
+        async move { m.digest_sync_partial_total.load(Ordering::Relaxed) > 0 }
+    })
+    .await;
+    server_handle.abort();
+
+    assert!(
+        runner.pull_reconciled_for(&addr.to_string()).is_some(),
+        "a clean full-bucket merge must record inbound reconciliation evidence"
+    );
+}
+
+/// Record point (c): a legacy full-dump pull (digest-unsupported peer)
+/// that merges cleanly records the evidence as well.
+#[tokio::test]
+async fn legacy_full_sync_records_pull_reconciliation_evidence() {
+    let server = test_state("server");
+    {
+        let mut api = server.eventual.lock().await;
+        api.eventual_counter_inc("legacy-key").unwrap();
+    }
+    let (addr, server_handle) = serve(legacy_router(server.clone())).await;
+    let mut harness = runner_against(&addr.to_string(), true).await;
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(1, 0, "stale"));
+
+    let local_check = harness.local_api.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let api = local_check.clone();
+        async move {
+            let api = api.lock().await;
+            api.get_eventual("legacy-key").is_some()
+        }
+    })
+    .await;
+    server_handle.abort();
+
+    assert!(
+        runner.pull_reconciled_for(&addr.to_string()).is_some(),
+        "a clean legacy full-dump pull must record inbound reconciliation evidence"
+    );
+}

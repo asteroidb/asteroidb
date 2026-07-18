@@ -5,9 +5,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::crdt::MergeEffects;
 use crate::crdt::lww_register::LwwRegister;
-use crate::crdt::or_map::OrMap;
-use crate::crdt::or_set::OrSet;
+use crate::crdt::or_map::{OrMap, OrMapV4Layout};
+use crate::crdt::or_set::{OrSet, OrSetV4Layout};
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
@@ -17,6 +18,13 @@ use crate::store::backend::StorageBackend;
 use crate::store::migration;
 
 /// Current persistence format version written by this code.
+///
+/// v5: `OrSet`/`OrMap` gained the `compaction_floor` field (M-8 tombstone
+/// GC convergence). bincode is positional, so every pre-v5 snapshot must
+/// be decoded through the frozen [`CrdtValueV4`] shape (empty floor on
+/// conversion); the WAL has the parallel v1→v2 bump (`store::wal`).
+/// Upgrade is one-way: a v5 snapshot cannot be read by pre-v5 binaries
+/// (same constraint as v3→v4).
 ///
 /// v4: added an end-to-end CRC32 checksum to both snapshot encodings
 /// (bincode: a 4-byte LE checksum between the version prefix and the
@@ -35,7 +43,7 @@ use crate::store::migration;
 /// (bincode is positional — the v3 struct layout is frozen there).
 /// v1/v2 snapshots contain only `data` + `timestamps` and are migrated on
 /// load (JSON via the migration registry, bincode via [`StoreV2Layout`]).
-pub const CURRENT_FORMAT_VERSION: u32 = 4;
+pub const CURRENT_FORMAT_VERSION: u32 = 5;
 
 /// Versioned envelope for persisted store data.
 ///
@@ -216,6 +224,16 @@ pub struct Store {
     /// [`note_applied`]: Self::note_applied
     #[serde(default)]
     recovery_gaps: Vec<RecoveryGap>,
+    /// Accumulated compaction-floor merge diagnostics (never persisted).
+    ///
+    /// [`merge_value`](Self::merge_value) is the chokepoint every remote
+    /// merge path funnels through (push, delta pull via
+    /// `merge_delta_value`'s sibling, digest bucket transfer, full sync,
+    /// WAL replay); the per-merge [`MergeEffects`] are summed here and
+    /// drained by the GC tick into `RuntimeMetrics`
+    /// (`take_floor_effects`).
+    #[serde(skip)]
+    floor_effects: MergeEffects,
 }
 
 /// One recovery gap fence: evidence path A is disabled for `node_id`
@@ -234,13 +252,41 @@ pub struct RecoveryGap {
     pub ceiling: HlcTimestamp,
 }
 
+/// Frozen decode shape of [`CrdtValue`] as persisted before the
+/// `compaction_floor` field was added to `OrSet`/`OrMap` (snapshot
+/// formats v1–v4, WAL format v1). bincode is positional, so every pre-v5
+/// payload embedding CRDT values must decode through this enum and
+/// convert (`From`, empty floor).
+#[derive(Debug, Deserialize)]
+pub(crate) enum CrdtValueV4 {
+    Counter(PnCounter),
+    Set(OrSetV4Layout<String>),
+    Map(OrMapV4Layout<String, String>),
+    Register(LwwRegister<String>),
+}
+
+impl From<CrdtValueV4> for CrdtValue {
+    fn from(old: CrdtValueV4) -> Self {
+        match old {
+            CrdtValueV4::Counter(c) => CrdtValue::Counter(c),
+            CrdtValueV4::Set(s) => CrdtValue::Set(s.into()),
+            CrdtValueV4::Map(m) => CrdtValue::Map(m.into()),
+            CrdtValueV4::Register(r) => CrdtValue::Register(r),
+        }
+    }
+}
+
+fn upgrade_v4_data(data: BTreeMap<String, CrdtValueV4>) -> BTreeMap<String, CrdtValue> {
+    data.into_iter().map(|(k, v)| (k, v.into())).collect()
+}
+
 /// Structural layout of `Store` persisted by format versions 1 and 2
 /// (bincode is positional and non-self-describing, so old snapshots must
 /// be decoded with the exact old field layout — `#[serde(default)]` on
 /// the current struct cannot rescue missing trailing fields).
 #[derive(Debug, Deserialize)]
 struct StoreV2Layout {
-    data: BTreeMap<String, CrdtValue>,
+    data: BTreeMap<String, CrdtValueV4>,
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
 }
@@ -248,13 +294,14 @@ struct StoreV2Layout {
 impl From<StoreV2Layout> for Store {
     fn from(old: StoreV2Layout) -> Self {
         let mut store = Store {
-            data: old.data,
+            data: upgrade_v4_data(old.data),
             timestamps: old.timestamps,
             applied_origins: HashMap::new(),
             merge_failed_keys: HashSet::new(),
             pruned_floor: None,
             visible_origins: HashMap::new(),
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
         };
         store.rebuild_visible_origins();
         store
@@ -265,9 +312,9 @@ impl From<StoreV2Layout> for Store {
 /// v4 appended `recovery_gaps`, and bincode cannot default a missing
 /// trailing field, so v3 snapshots must be decoded with exactly this
 /// layout).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct StoreV3Layout {
-    data: BTreeMap<String, CrdtValue>,
+    data: BTreeMap<String, CrdtValueV4>,
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
     #[serde(default)]
@@ -283,13 +330,52 @@ struct StoreV3Layout {
 impl From<StoreV3Layout> for Store {
     fn from(old: StoreV3Layout) -> Self {
         let mut store = Store {
-            data: old.data,
+            data: upgrade_v4_data(old.data),
             timestamps: old.timestamps,
             applied_origins: old.applied_origins,
             merge_failed_keys: old.merge_failed_keys,
             pruned_floor: old.pruned_floor,
             visible_origins: old.visible_origins,
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
+        };
+        store.rebuild_visible_origins();
+        store
+    }
+}
+
+/// Structural layout of `Store` persisted by format version 4 (frozen —
+/// v5 changed the embedded `OrSet`/`OrMap` layouts by appending
+/// `compaction_floor`, so v4 snapshots must decode their CRDT values
+/// through [`CrdtValueV4`]).
+#[derive(Debug, Deserialize)]
+struct StoreV4Layout {
+    data: BTreeMap<String, CrdtValueV4>,
+    #[serde(default)]
+    timestamps: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    applied_origins: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    merge_failed_keys: HashSet<String>,
+    #[serde(default)]
+    pruned_floor: Option<HlcTimestamp>,
+    #[serde(default)]
+    visible_origins: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    recovery_gaps: Vec<RecoveryGap>,
+}
+
+impl From<StoreV4Layout> for Store {
+    fn from(old: StoreV4Layout) -> Self {
+        let mut store = Store {
+            data: upgrade_v4_data(old.data),
+            timestamps: old.timestamps,
+            applied_origins: old.applied_origins,
+            merge_failed_keys: old.merge_failed_keys,
+            pruned_floor: old.pruned_floor,
+            visible_origins: old.visible_origins,
+            recovery_gaps: old.recovery_gaps,
+            floor_effects: MergeEffects::default(),
         };
         store.rebuild_visible_origins();
         store
@@ -345,7 +431,21 @@ impl Store {
             pruned_floor: None,
             visible_origins: HashMap::new(),
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
         }
+    }
+
+    /// Drain the accumulated compaction-floor merge diagnostics
+    /// (see [`Store::floor_effects`]). Called by the GC tick to feed
+    /// `RuntimeMetrics`.
+    pub fn take_floor_effects(&mut self) -> MergeEffects {
+        std::mem::take(&mut self.floor_effects)
+    }
+
+    /// Peek at the accumulated compaction-floor merge diagnostics without
+    /// draining them (tests / debugging).
+    pub fn floor_effects(&self) -> MergeEffects {
+        self.floor_effects
     }
 
     /// Get a reference to the value associated with `key`.
@@ -610,32 +710,18 @@ impl Store {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 old.into()
             }
-            // v4+: `[version][crc32][payload]` — verify the payload CRC
-            // BEFORE decoding. Fail-stop on mismatch: a damaged snapshot
-            // must never be loaded (a bit flip that still decodes would
-            // poison every peer via anti-entropy max-merges), same
-            // discipline as a corrupt WAL frame.
+            // v4: checksummed envelope, pre-floor CRDT layouts — decode
+            // through the frozen StoreV4Layout (empty floors).
+            4 => {
+                let payload = Self::verify_checksummed_payload(&bytes)?;
+                let (old, _len): (StoreV4Layout, _) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                old.into()
+            }
+            // v5+: `[version][crc32][payload]`, current layout.
             _ => {
-                if bytes.len() < 8 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "bincode snapshot too short for v4 header (version + crc32)",
-                    ));
-                }
-                let expected_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                let payload = &bytes[8..];
-                let actual_crc = crc32fast::hash(payload);
-                if actual_crc != expected_crc {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "bincode snapshot checksum mismatch (expected {expected_crc:#010x}, \
-                             got {actual_crc:#010x}): the snapshot is damaged and must not be \
-                             loaded. Restore it from a backup — or, for the eventual store only, \
-                             re-fill from peers via anti-entropy (see docs/ops-guide.md)"
-                        ),
-                    ));
-                }
+                let payload = Self::verify_checksummed_payload(&bytes)?;
                 let (store, _len): (Self, _) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -644,6 +730,37 @@ impl Store {
         };
         store.rebuild_visible_origins();
         Ok(store)
+    }
+
+    /// Verify the `[version][crc32][payload]` envelope of a v4+ bincode
+    /// snapshot and return the payload slice.
+    ///
+    /// The CRC is verified BEFORE decoding. Fail-stop on mismatch: a
+    /// damaged snapshot must never be loaded (a bit flip that still
+    /// decodes would poison every peer via anti-entropy max-merges),
+    /// same discipline as a corrupt WAL frame.
+    fn verify_checksummed_payload(bytes: &[u8]) -> io::Result<&[u8]> {
+        if bytes.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bincode snapshot too short for v4+ header (version + crc32)",
+            ));
+        }
+        let expected_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let payload = &bytes[8..];
+        let actual_crc = crc32fast::hash(payload);
+        if actual_crc != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bincode snapshot checksum mismatch (expected {expected_crc:#010x}, \
+                     got {actual_crc:#010x}): the snapshot is damaged and must not be \
+                     loaded. Restore it from a backup — or, for the eventual store only, \
+                     re-fill from peers via anti-entropy (see docs/ops-guide.md)"
+                ),
+            ));
+        }
+        Ok(payload)
     }
 
     /// Load a store from a versioned JSON snapshot at the given path.
@@ -788,10 +905,12 @@ impl Store {
                     a.merge(b);
                 }
                 (CrdtValue::Set(a), CrdtValue::Set(b)) => {
-                    a.merge(b);
+                    let fx = a.merge(b);
+                    self.floor_effects.absorb(fx);
                 }
                 (CrdtValue::Map(a), CrdtValue::Map(b)) => {
-                    a.merge(b);
+                    let fx = a.merge(b);
+                    self.floor_effects.absorb(fx);
                 }
                 (CrdtValue::Register(a), CrdtValue::Register(b)) => {
                     a.merge(b);
@@ -2521,29 +2640,72 @@ mod tests {
         assert!(loaded.contains_key("reg"));
     }
 
-    /// Serialisable mirror of the exact struct layout persisted by format
-    /// versions 1 and 2 ({data, timestamps} only), used to craft genuine
-    /// old-format snapshots in tests.
+    /// Serialisable mirrors of the exact PRE-v5 layouts (no
+    /// `compaction_floor` inside `OrSet`/`OrMap`), used to craft genuine
+    /// old-format snapshots in tests. Variant order MUST match
+    /// `CrdtValue` (bincode encodes the variant index).
+    #[derive(serde::Serialize)]
+    struct OldDotV4 {
+        node_id: NodeId,
+        counter: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct OldOrSetV4 {
+        elements: HashMap<String, Vec<OldDotV4>>,
+        counters: HashMap<NodeId, u64>,
+        deferred: Vec<OldDotV4>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[allow(dead_code)] // Map/Register variants exist to pin the indexes
+    enum OldCrdtValueV4 {
+        Counter(PnCounter),
+        Set(OldOrSetV4),
+        Map(()),
+        Register(LwwRegister<String>),
+    }
+
+    /// Old {data, timestamps}-only store layout (formats 1 and 2).
     #[derive(serde::Serialize)]
     struct OldStoreLayoutV2 {
-        data: BTreeMap<String, CrdtValue>,
+        data: BTreeMap<String, OldCrdtValueV4>,
         timestamps: HashMap<String, HlcTimestamp>,
     }
 
-    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
+    fn old_layout_data() -> BTreeMap<String, OldCrdtValueV4> {
         let mut counter = PnCounter::new();
         counter.increment(&node("A"));
         counter.increment(&node("A"));
-        let mut set = OrSet::new();
-        set.add("alice".to_string(), &node("A"));
+        let set = OldOrSetV4 {
+            elements: HashMap::from([(
+                "alice".to_string(),
+                vec![OldDotV4 {
+                    node_id: node("A"),
+                    counter: 1,
+                }],
+            )]),
+            counters: HashMap::from([(node("A"), 2)]),
+            deferred: vec![OldDotV4 {
+                node_id: node("A"),
+                counter: 2,
+            }],
+        };
 
         let mut data = BTreeMap::new();
-        data.insert("hits".to_string(), CrdtValue::Counter(counter));
-        data.insert("users".to_string(), CrdtValue::Set(set));
+        data.insert("hits".to_string(), OldCrdtValueV4::Counter(counter));
+        data.insert("users".to_string(), OldCrdtValueV4::Set(set));
+        data
+    }
+
+    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
         let mut timestamps = HashMap::new();
         timestamps.insert("hits".to_string(), ts(42, 0, "A"));
 
-        let old = OldStoreLayoutV2 { data, timestamps };
+        let old = OldStoreLayoutV2 {
+            data: old_layout_data(),
+            timestamps,
+        };
         let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
             .expect("bincode encode failed");
 
@@ -2551,6 +2713,169 @@ mod tests {
         bytes.extend_from_slice(&version.to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    /// Old v4 store layout (checksummed envelope, pre-floor CRDTs).
+    #[derive(serde::Serialize)]
+    struct OldStoreLayoutV4 {
+        data: BTreeMap<String, OldCrdtValueV4>,
+        timestamps: HashMap<String, HlcTimestamp>,
+        applied_origins: HashMap<String, HlcTimestamp>,
+        merge_failed_keys: HashSet<String>,
+        pruned_floor: Option<HlcTimestamp>,
+        visible_origins: HashMap<String, HlcTimestamp>,
+        recovery_gaps: Vec<RecoveryGap>,
+    }
+
+    fn v4_bincode_snapshot() -> Vec<u8> {
+        let mut timestamps = HashMap::new();
+        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
+        let mut applied = HashMap::new();
+        applied.insert("A".to_string(), ts(42, 0, "A"));
+
+        let old = OldStoreLayoutV4 {
+            data: old_layout_data(),
+            timestamps,
+            applied_origins: applied,
+            merge_failed_keys: HashSet::from(["bad".to_string()]),
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+            recovery_gaps: vec![RecoveryGap {
+                node_id: "A".to_string(),
+                floor: ts(1, 0, "A"),
+                ceiling: ts(10, 0, "A"),
+            }],
+        };
+        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
+            .expect("bincode encode failed");
+
+        let mut bytes = Vec::with_capacity(8 + payload.len());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    /// A genuine v4 bincode snapshot (checksummed, pre-floor CRDT
+    /// layouts) must load through the frozen `StoreV4Layout` with all
+    /// fields intact and empty compaction floors.
+    #[test]
+    fn bincode_v4_snapshot_migrates_on_load() {
+        use crate::store::backend::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        backend.save(&v4_bincode_snapshot()).unwrap();
+
+        let loaded = Store::load_from_backend_bincode(&backend)
+            .unwrap_or_else(|e| panic!("v4 bincode snapshot should load: {e}"));
+
+        assert_eq!(loaded.len(), 2);
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert_eq!(s.deferred_len(), 1, "old tombstone must survive");
+                assert!(
+                    s.compaction_floor().is_empty(),
+                    "pre-floor snapshot converts with an empty floor"
+                );
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+        assert_eq!(loaded.timestamp_for("hits"), Some(&ts(42, 0, "A")));
+        assert_eq!(loaded.applied_origin("A"), Some(&ts(42, 0, "A")));
+        assert!(loaded.merge_failed_contains("bad"));
+        assert_eq!(loaded.recovery_gaps().len(), 1);
+    }
+
+    /// A corrupted v4 snapshot still fails the checksum (the v4 decode
+    /// arm shares the fail-stop envelope verification).
+    #[test]
+    fn bincode_v4_snapshot_bit_flip_is_fail_stop() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut bytes = v4_bincode_snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let backend = MemoryBackend::new();
+        backend.save(&bytes).unwrap();
+
+        let err = Store::load_from_backend_bincode(&backend).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    /// v5 round trip preserves the compaction floor (bincode + JSON).
+    #[test]
+    fn snapshot_round_trip_preserves_compaction_floor() {
+        use crate::store::backend::MemoryBackend;
+
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.compact_deferred_certified(&set.deferred_dots(), None);
+        assert_eq!(set.compaction_floor().get(&n), Some(&1));
+
+        let mut store = Store::new();
+        store.put("users".into(), CrdtValue::Set(set));
+
+        for json in [false, true] {
+            let backend = MemoryBackend::new();
+            if json {
+                store.save_to_backend(&backend).unwrap();
+            } else {
+                store.save_to_backend_bincode(&backend).unwrap();
+            }
+            let loaded = if json {
+                Store::load_from_backend(&backend).unwrap()
+            } else {
+                Store::load_from_backend_bincode(&backend).unwrap()
+            };
+            match loaded.get("users") {
+                Some(CrdtValue::Set(s)) => {
+                    assert_eq!(
+                        s.compaction_floor().get(&n),
+                        Some(&1),
+                        "floor must persist (json={json})"
+                    );
+                    assert_eq!(s.deferred_len(), 0);
+                }
+                other => panic!("expected Set, got {:?}", other),
+            }
+        }
+    }
+
+    /// v4 JSON snapshots (no `compaction_floor` field anywhere) load via
+    /// the migration registry with empty floors.
+    #[test]
+    fn json_v4_snapshot_loads_with_default_floor() {
+        let raw = r#"{
+            "format_version": 4,
+            "store": {
+                "data": {
+                    "users": {"Set": {"elements": {"alice": [{"node_id": "A", "counter": 1}]}, "counters": {"A": 2}, "deferred": [{"node_id": "A", "counter": 2}]}}
+                },
+                "timestamps": {},
+                "applied_origins": {},
+                "merge_failed_keys": [],
+                "pruned_floor": null,
+                "visible_origins": {},
+                "recovery_gaps": []
+            }
+        }"#;
+        let loaded = Store::deserialize_snapshot(raw).unwrap();
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert_eq!(s.deferred_len(), 1);
+                assert!(s.compaction_floor().is_empty());
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
     }
 
     /// v1/v2 bincode snapshots use the old {data, timestamps} layout;

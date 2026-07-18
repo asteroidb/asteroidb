@@ -340,13 +340,16 @@ pull 側の claims 不成立（送信側の change-log prune を含む）・デ�
 近づいていた帯域消費を、実際に発散している部分だけの転送に置き換えます
 （衛星リンク等の高遅延・低帯域リンクが想定ユースケース）。
 
-#### 2 層キー範囲 digest（DIGEST_SCHEME_VERSION = 1）
+#### 2 層キー範囲 digest（DIGEST_SCHEME_VERSION = 2）
 
 `src/store/digest.rs` が定義する固定深さ 2 層の digest:
 
 - **per-key digest**: `D(k) = SHA256( str(k) ‖ CRDT 正準ストリーム )`。
   CRDT 正準ストリームは各 CRDT 型（`src/crdt/*.rs` の `digest_into`）が
   型タグ（0x01 Register / 0x02 Counter / 0x03 Set / 0x04 Map）付きで生成する。
+  scheme v2（M-8）で OrSet/OrMap のストリームは
+  `live 要素 ‖ counters ‖ compaction_floor ‖ uncovered deferred`
+  （floor に覆われた deferred dot は除外）の**正準形**になった。
 - **バケット割当**: `bucket(k) = SHA256(k)[0]`（256 バケット固定）。
   レプリカ・挿入順に依存しない決定的な割当。
 - **バケット digest**: `B_i = SHA256( D(k_1) ‖ D(k_2) ‖ … )`
@@ -367,18 +370,29 @@ digest の材料に関する設計判断:
 - **`Store::timestamps`（per-key HLC）は含めない**: push 経路の merge は
   ローカル clock で再スタンプし、prune は片側だけでエントリを消すため、
   per-key HLC はレプリカ間で収束せず、恒常的な偽不一致を生む。
-- **deferred tombstone / counters は含める**: これにより
-  「digest 一致 ⟺ CRDT 状態の完全一致（SHA-256 衝突を除く）」が成立し、
-  一致時のセッション claims 採用がフルダンプと同等の健全性を持つ。
-  また pending の remove（tombstone 差のみの発散）も digest 経路で伝播する。
-  代償は tombstone GC がレプリカ間で非対称に走った直後の偽不一致で、
-  影響は帯域のみ（false-negative 方向で安全）。両側の GC 完了後は一致に戻る。
+- **counters / compaction floor / uncovered deferred は含める（正準形、
+  scheme v2）**: digest は live・counters・floor・**uncovered** deferred の
+  正準形を含む。「digest 一致 ⟺ 正準状態一致（= 意味論的完全一致、SHA-256
+  衝突を除く）⟺ 双方向マージが可観測状態に対し no-op」が成立し、一致時の
+  セッション claims 採用はフルダンプと同等に健全。pending の remove
+  （uncovered tombstone 差のみの発散）も digest 経路で伝播する。
+  floor に**覆われた** deferred dot（floor 未達の origin が gated sweep まで
+  保持する fresh tombstone）は「floor + 不在」と情報等価なので正準化で
+  除外する — 含めると remove のたびに origin のゲート通過まで偽不一致が
+  続くため。deferred / floor は単調格子（union / pointwise max）に載る。
+  **v1 の教訓（M-8）**: v1 は全 deferred を digest に含める一方 GC が
+  tombstone を無痕跡に物理削除したため、GC 非対称 → 真の不一致 → バケット
+  転送 → 旧 merge が stale tombstone を union で再注入 → GC 巻き戻し、の
+  ライブロックがあった。v2 では sweep が情報等価な圧縮（floor への畳み込み）
+  になり、同じバケット転送が floor を運んで 1 往復で自己治癒する。
 
 **保守契約**: CRDT 型へのフィールド追加・正準エンコーディングの変更は
 `DIGEST_SCHEME_VERSION` の bump と golden テストの更新を必須とする
 （怠ると「一致」が嘘になり claims が不健全化する）。バージョン不一致の
 ピアは `scheme_ok = false` を返し、要求側は従来フルシンクへフォールバック
-する。
+する。bump 記録: v1 → v2（M-8）で OrSet/OrMap に `compaction_floor` を
+追加し、正準形（floor 包含 + covered deferred 除外）へ改版、golden を
+再生成した。
 
 #### プロトコル（往復数を固定）
 
@@ -552,7 +566,10 @@ shutdown 時に実行する。順序規律は **rotate → clone → save → de
 だけ）。スナップショット失敗時はセグメントを一切削除しない——WAL は次回
 成功まで伸び続けるため、ディスク使用量の監視対象になる。compaction /
 tombstone GC の効果は WAL に載せず、次回スナップショットで捕捉する
-（クラッシュで GC 前状態に戻っても再 GC されるだけ）。
+（クラッシュで GC 前状態に戻っても再 GC されるだけ）。GC の compaction
+floor も同じ論法で安全: クラッシュで floor がスナップショット時点へ戻る
+のは低い側 = 保守的（tombstone が復活するだけで over-collect は起きない）
+で、再 sweep か peer からのマージ（pointwise max）で回復する。
 
 ### リカバリと破損判定
 

@@ -10,19 +10,43 @@
 
 ## 推奨着手順
 
-1. **M-8**(最優先)— tombstone GC が収束しない問題。今回の C-2(GC ゲート)と地続きで、
-   project-context の筆頭リスク「トゥームストーン肥大」そのもの。GC を入れたのに肥大が止まらない状態の解消。
+1. ~~**M-8**(最優先)— tombstone GC が収束しない問題。~~ **完了**(per-value compaction floor +
+   digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(M-5, M-4)
 3. 効率系(M-6, M-7)
 4. 検知範囲・整合(M-12, M-14, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-8 は小規模コード修正でまとめて処理可能、m-9〜m-11 は docs、m-12 は任意)
 
+## M-8 クローズ記録(実装済み)
+
+**方式**: `OrSet`/`OrMap` に per-value・per-node の単調ベクタ `compaction_floor` を追加。
+certified sweep(mark → retention → C-2 二重ゲート)は tombstone を floor の連続前進に
+畳み込む情報等価な圧縮になり、merge は floor を pointwise max で継承(撤回不能)して
+covered な stale tombstone / stale live dot を棄却する。digest は scheme v2 の正準形
+(live + counters + floor + uncovered deferred)。スナップショット v5 / WAL v2(旧形式は
+凍結 decode 型経由で読める・片方向)。Stage 2 hole-jump(`ASTEROIDB_GC_HOLE_JUMP`、既定 off)は
+inbound ゲート成立時のみ legacy hole を跨ぐ。
+
+**残タスク**:
+
+- (a) Stage 2 hole-jump の soak 後有効化(運用判断。手順は ops-guide 3.7。
+  `gc_floor_stalled_hole_dots` が恒常非ゼロのクラスタのみ)。
+- (b) dead peer による GC 停止 — C-2 既存限界は不変(registry に残る dead peer が
+  outbound/inbound ゲートを塞ぐ)。floor 化により、将来の過半数ゲート +
+  ラガードの floor 追認(復帰時に floor を継承するだけで安全)の下地はできた。
+- (c) **floor の認証**: floor は無認証の pointwise max で kill 力を持つため、敵対的 peer の
+  水増し floor は撤回不能に live dot を破壊できる(偽造 tombstone と同クラスの脅威だが
+  一撃性が高い)。将来 authority 署名付き certificate へ昇格する拡張点。
+
+**受容した限界**: (1) 混在期間は GC 収束が発効しない(fail-safe)。(2) dead peer 停止は上記 (b)。
+(3) legacy hole は Stage 2 有効化まで停滞(`gc_floor_stalled_hole_dots` で可観測、fail-safe)。
+(4) floor は per-(key,writer) ~50B(NodeId 文字列 + カウンタ、tombstone 1 件と同程度)が恒久残存(件数無制限の tombstone → writer 数定数への圧縮で優位)。
+(5) floor は無認証(上記 (c))。(6) sweep は per-key HLC を進めないため floor 伝播は
+digest/full sync 機会依存(意図的: GC ごとの delta ストーム回避)。
+
 ## 残 major(マージ後速やかに)
 
-- **M-8** `src/store/digest.rs` / `src/crdt/or_set.rs`: digest が deferred(tombstone)集合を含む一方で
-  GC は片側的なため、バケット転送のマージが GC を巻き戻し、持続的フォールバック下で tombstone GC が
-  クラスタ全体で収束しない(ライブロック)。C-2 の GC 協調(floor 配線)とセットで設計し直すか、
-  digest から deferred を除外できるスキーム改版へ。ops-guide の「帯域のみのコスト」記述も訂正対象。
+- ~~**M-8**~~ **完了** — 上記クローズ記録参照。
 - **M-4** `src/authority/attestation_pool.rs`: AttestationPool の scope 数に上限が無く、登録済み Authority 1 台が
   policy_version/key_range を変えるだけでメモリ枯渇 DoS 可能。equivocation.rs と同等の scope 数上限 +
   per-authority 上限 + policy_version の現行版検証を導入。

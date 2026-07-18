@@ -784,3 +784,112 @@ fn empty_components_survive_crash() {
     let tracker = CertificationTracker::load(&tracker_path).unwrap();
     assert_eq!(tracker.total_count(), 0);
 }
+
+// ---------------------------------------------------------------
+// M-8: compaction floor across crash/recovery
+// ---------------------------------------------------------------
+
+/// A crash between a certified sweep and the next snapshot loses the
+/// floor advance — the fail-safe direction (tombstones re-appear, floor
+/// sits lower, nothing was over-collected). Recovery from the older
+/// snapshot must (a) still hold the tombstone, (b) regain the floor via
+/// a peer merge (pointwise max), and (c) tolerate a duplicate sweep.
+#[test]
+fn compaction_floor_regression_recovers_from_snapshot_and_peer_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pre-sweep.json");
+    let n = node("A");
+
+    let mut set = OrSet::new();
+    set.add("x".to_string(), &n);
+    set.remove(&"x".to_string());
+    set.add("y".to_string(), &n);
+
+    // Snapshot BEFORE the sweep (what survives the crash).
+    let mut store = Store::new();
+    store.put("team".into(), CrdtValue::Set(set.clone()));
+    store.save_snapshot(&path).unwrap();
+
+    // Sweep AFTER the snapshot: floor advances in memory only, and a
+    // peer receives the post-sweep state.
+    set.compact_deferred_certified(&set.deferred_dots(), None);
+    let peer_state = set.clone();
+    assert_eq!(peer_state.compaction_floor().get(&n), Some(&2));
+    assert_eq!(peer_state.deferred_len(), 0);
+
+    // Crash + recovery: the floor is back at zero, the tombstone back in
+    // place — conservative, no resurrection possible.
+    let mut recovered = Store::load_snapshot(&path).unwrap();
+    match recovered.get("team") {
+        Some(CrdtValue::Set(s)) => {
+            assert!(
+                s.compaction_floor().is_empty(),
+                "floor regressed (fail-safe)"
+            );
+            assert_eq!(s.deferred_len(), 1, "tombstone survives the regression");
+        }
+        other => panic!("expected Set, got {other:?}"),
+    }
+
+    // Anti-entropy heals: the peer's floor is inherited (max) and the
+    // absorbed tombstone dropped.
+    recovered
+        .merge_value("team".into(), &CrdtValue::Set(peer_state))
+        .unwrap();
+    match recovered.get_mut("team") {
+        Some(CrdtValue::Set(s)) => {
+            assert_eq!(s.compaction_floor().get(&n), Some(&2), "floor recovered");
+            assert_eq!(s.deferred_len(), 0);
+            assert!(!s.contains(&"x".to_string()));
+            assert!(s.contains(&"y".to_string()));
+
+            // A duplicate sweep over the recovered state is harmless.
+            let candidates = s.deferred_dots();
+            let outcome = s.compact_deferred_certified(&candidates, None);
+            assert_eq!(outcome.collected, 0);
+            assert_eq!(s.compaction_floor().get(&n), Some(&2));
+        }
+        other => panic!("expected Set, got {other:?}"),
+    }
+}
+
+/// The floor itself is durable: a post-sweep snapshot round-trips it
+/// (both a swept OrSet and a swept OrMap), so recovery does not restart
+/// GC from scratch when the snapshot was taken after the sweep.
+#[test]
+fn compaction_floor_survives_snapshot_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("post-sweep.json");
+    let n = node("A");
+
+    let mut set = OrSet::new();
+    set.add("x".to_string(), &n);
+    set.remove(&"x".to_string());
+    set.compact_deferred_certified(&set.deferred_dots(), None);
+
+    let mut map: OrMap<String, String> = OrMap::new();
+    map.set("k".into(), "v".into(), ts(100, 0, "A"), &n);
+    map.delete(&"k".to_string());
+    map.compact_deferred_certified(&map.deferred_dots(), None);
+
+    let mut store = Store::new();
+    store.put("set".into(), CrdtValue::Set(set));
+    store.put("map".into(), CrdtValue::Map(map));
+    store.save_snapshot(&path).unwrap();
+
+    let recovered = Store::load_snapshot(&path).unwrap();
+    match recovered.get("set") {
+        Some(CrdtValue::Set(s)) => {
+            assert_eq!(s.compaction_floor().get(&n), Some(&1));
+            assert_eq!(s.deferred_len(), 0);
+        }
+        other => panic!("expected Set, got {other:?}"),
+    }
+    match recovered.get("map") {
+        Some(CrdtValue::Map(m)) => {
+            assert_eq!(m.compaction_floor().get(&n), Some(&1));
+            assert_eq!(m.deferred_len(), 0);
+        }
+        other => panic!("expected Map, got {other:?}"),
+    }
+}

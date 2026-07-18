@@ -8,7 +8,7 @@
 //! the keys in mismatched buckets. A root match completes with zero data
 //! transfer.
 //!
-//! Layout (scheme version 1):
+//! Layout (scheme version 2):
 //! - per-key digest: `D(k) = SHA256( str(k) ‖ canonical CRDT stream )`
 //!   (see [`CrdtValue::canonical_digest_into`])
 //! - bucket assignment: `bucket(k) = SHA256(k)[0]` — deterministic and
@@ -19,16 +19,30 @@
 //!
 //! Because the per-bucket key order is a subsequence of the global
 //! lexicographic order, one in-order pass over the store's `BTreeMap`
-//! computes every bucket. Identical key sets with identical CRDT states
-//! produce identical digests on every replica — the property the whole
-//! protocol rests on ("digest matched" ⟺ CRDT state equality up to
-//! SHA-256 collisions), and what makes adopting the sender's session
-//! claims on a match as sound as after a full dump.
+//! computes every bucket. Identical key sets with identical CANONICAL
+//! CRDT states produce identical digests on every replica — the property
+//! the whole protocol rests on ("digest matched" ⟺ canonical state
+//! equality up to SHA-256 collisions), and what makes adopting the
+//! sender's session claims on a match as sound as after a full dump.
 //!
 //! The digest deliberately EXCLUDES `Store::timestamps` (per-key HLCs):
 //! push-path merges re-stamp entries with a local clock tick and pruning
 //! removes entries one-sidedly, so per-key HLCs never converge across
 //! replicas and would cause permanent false mismatches.
+//!
+//! Scheme v2 (M-8): `OrSet`/`OrMap` streams now include the per-value
+//! `compaction_floor` and EXCLUDE deferred (tombstone) dots covered by
+//! it (the canonical form). A covered own tombstone — a fresh remove
+//! below the floor, retained only for its origin's gated sweep — is
+//! information-equivalent to "floor + absence", so including it would
+//! cause a false mismatch on every remove until the origin sweeps.
+//! Under v1 the situation was worse than a false mismatch: the sweep
+//! physically deleted tombstones, the resulting genuine mismatch caused
+//! a bucket transfer, and the old union-merge re-adopted the peer's
+//! stale tombstones — rolling GC back on every exchange, so tombstone GC
+//! never converged cluster-wide under sustained digest fallback (the M-8
+//! livelock). In v2 the same transfer propagates the floor instead and
+//! the asymmetry heals in one round trip.
 
 use std::collections::BTreeMap;
 
@@ -41,7 +55,10 @@ use crate::store::kv::CrdtValue;
 /// streams). Bump on ANY change to the canonical encoding — peers with a
 /// different version answer `scheme_ok = false` and the requester falls
 /// back to the legacy full sync (rolling-upgrade safe).
-pub const DIGEST_SCHEME_VERSION: u32 = 1;
+///
+/// v2: `OrSet`/`OrMap` streams include the `compaction_floor` and
+/// exclude floor-covered deferred dots (M-8 canonical form).
+pub const DIGEST_SCHEME_VERSION: u32 = 2;
 
 /// Number of key-range buckets (fixed; part of the wire scheme).
 pub const DIGEST_BUCKET_COUNT: usize = 256;
@@ -318,6 +335,8 @@ mod tests {
 
     #[test]
     fn deferred_tombstone_difference_changes_digest() {
+        // UNCOVERED tombstone difference → mismatch (a pending remove is
+        // propagated by the digest path).
         let mut with_tombstone = OrSet::new();
         with_tombstone.add("x".to_string(), &node("node-a"));
         let without_tombstone = with_tombstone.clone();
@@ -330,6 +349,72 @@ mod tests {
         let a = to_btree(vec![("k".into(), CrdtValue::Set(with_tombstone))]);
         let b = to_btree(vec![("k".into(), CrdtValue::Set(without_tombstone))]);
         assert_ne!(compute_store_digest(&a).root, compute_store_digest(&b).root);
+    }
+
+    /// Scheme v2 canonical form: two stores that differ ONLY in a
+    /// floor-COVERED own tombstone (a fresh remove below the floor,
+    /// origin-retained for its gated sweep) must digest identically —
+    /// AND merging either way must be a no-op on observable state, which
+    /// is exactly what justifies adopting session claims on a match.
+    #[test]
+    fn covered_own_tombstone_is_canonical_invisible_and_merge_is_noop() {
+        let n = node("node-a");
+        let mut base = OrSet::new();
+        base.add("keep".to_string(), &n); // (a,1)
+        base.add("x".to_string(), &n); // (a,2)
+        base.remove(&"x".to_string());
+        // Certified sweep: floor reaches 2, tombstone (a,2) dropped.
+        base.compact_deferred_certified(&base.deferred_dots(), None);
+
+        // Replica A: fresh remove below the floor (covered own tombstone).
+        let mut set_a = base.clone();
+        set_a.remove(&"keep".to_string()); // tombstone (a,1), covered
+        // Replica B: learned the remove (kill) but rejected the covered
+        // tombstone — the post-merge normal form.
+        let mut set_b = base.clone();
+        set_b.merge(&set_a);
+        assert_eq!(set_a.deferred_len(), 1);
+        assert_eq!(set_b.deferred_len(), 0);
+
+        let store_a = to_btree(vec![("k".into(), CrdtValue::Set(set_a.clone()))]);
+        let store_b = to_btree(vec![("k".into(), CrdtValue::Set(set_b.clone()))]);
+        assert_eq!(
+            compute_store_digest(&store_a).root,
+            compute_store_digest(&store_b).root,
+            "covered own tombstone must be canonical-invisible"
+        );
+
+        // Bidirectional merge is a no-op on observable state (claims
+        // adoption soundness: match ⟹ nothing to transfer either way).
+        let mut a2 = set_a.clone();
+        a2.merge(&set_b);
+        let mut b2 = set_b.clone();
+        b2.merge(&set_a);
+        assert_eq!(a2.elements(), set_a.elements());
+        assert_eq!(b2.elements(), set_b.elements());
+        assert!(!a2.contains(&"keep".to_string()));
+        assert!(!b2.contains(&"keep".to_string()));
+    }
+
+    /// Scheme v2: a floor-only difference IS a digest mismatch — the
+    /// floor is semantic state (it kills and rejects dots) and must be
+    /// propagated by the bucket transfer (the self-healing round trip).
+    #[test]
+    fn floor_only_difference_changes_digest() {
+        let n = node("node-a");
+        let mut unswept = OrSet::new();
+        unswept.add("x".to_string(), &n);
+        unswept.remove(&"x".to_string());
+        let mut swept = unswept.clone();
+        swept.compact_deferred_certified(&swept.deferred_dots(), None);
+
+        let a = to_btree(vec![("k".into(), CrdtValue::Set(unswept))]);
+        let b = to_btree(vec![("k".into(), CrdtValue::Set(swept))]);
+        assert_ne!(
+            compute_store_digest(&a).root,
+            compute_store_digest(&b).root,
+            "an advanced floor must mismatch so the transfer can propagate it"
+        );
     }
 
     #[test]
@@ -447,18 +532,41 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Golden digest — freezes the wire contract of scheme version 1.
+    // Golden digest — freezes the wire contract of scheme version 2.
     // ---------------------------------------------------------------
 
     /// If this test fails you have changed the canonical digest encoding.
     /// That is a WIRE CONTRACT change: bump `DIGEST_SCHEME_VERSION`, update
     /// this expected value, and note the change in docs/architecture.md.
     #[test]
-    fn golden_root_digest_scheme_v1() {
+    fn golden_root_digest_scheme_v2() {
         let digest = compute_store_digest(&to_btree(fixture_entries()));
         assert_eq!(
             hex::encode(digest.root),
-            "b6dfe8dcb7f9c9023a4649c8f0c010578991d53867def4c1e30601442ca9b67b",
+            "c307197eecba4be1fe66034db3437ad98ee60e8123f76d50e76bc65e9dfb8372",
+            "canonical digest encoding changed — see test doc comment"
+        );
+    }
+
+    /// Golden digest of a floor-bearing state (freezes the v2 floor
+    /// encoding and the covered-deferred exclusion, which the base
+    /// fixture — floors empty — does not exercise).
+    #[test]
+    fn golden_root_digest_scheme_v2_with_floor() {
+        let n = node("node-a");
+        let mut set = OrSet::new();
+        set.add("alice".to_string(), &n);
+        set.add("bob".to_string(), &n);
+        set.remove(&"bob".to_string());
+        set.compact_deferred_certified(&set.deferred_dots(), None);
+        // Fresh covered tombstone (canonical-invisible).
+        set.remove(&"alice".to_string());
+
+        let entries = to_btree(vec![("set/users".to_string(), CrdtValue::Set(set))]);
+        let digest = compute_store_digest(&entries);
+        assert_eq!(
+            hex::encode(digest.root),
+            "b0376ffa17bd9e9c8c8251f99be5ef3c726e27b8d8cf6dd021d573ce65ce8843",
             "canonical digest encoding changed — see test doc comment"
         );
     }

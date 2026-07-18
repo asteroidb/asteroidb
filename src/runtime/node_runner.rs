@@ -101,6 +101,18 @@ pub struct NodeRunnerConfig {
     /// collect (`ASTEROIDB_GC_RETENTION_SECS` in the binary).
     /// Default: 300 seconds. See [`TombstoneGc::mark_and_sweep`].
     pub gc_retention: Duration,
+    /// Stage 2 tombstone-GC hole-jump (`ASTEROIDB_GC_HOLE_JUMP=1`).
+    /// Default: false (Stage 1, fail-closed on legacy holes).
+    ///
+    /// When enabled, a sweep whose INBOUND gate also holds (every
+    /// registry peer's complete state merged since the mark — see
+    /// [`NodeRunner::run_gc`]) may advance the per-value compaction floor
+    /// across legacy holes: dots that a pre-floor sweep physically
+    /// deleted cluster-wide. Enable only after a Stage 1 soak
+    /// (`gc_floor_stalled_hole_dots` identifies the stalled remainder);
+    /// see
+    /// docs/ops-guide.md.
+    pub gc_hole_jump_enabled: bool,
     /// Epoch configuration for key rotation (FR-008).
     /// Default: 24h epoch duration, 7 grace epochs.
     ///
@@ -169,6 +181,7 @@ impl Default for NodeRunnerConfig {
             epoch_check_interval: Duration::from_secs(60),
             gc_interval: Duration::from_secs(60),
             gc_retention: Duration::from_secs(300),
+            gc_hole_jump_enabled: false,
             epoch_config: EpochConfig::default(),
             bls_config: None,
             frontier_gc_interval: Duration::from_secs(60),
@@ -269,6 +282,22 @@ pub struct NodeRunner {
     /// otherwise a push-advanced request frontier would hide sender
     /// entries this node never received and the claim would be a lie.
     pull_verified_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer LOCAL wall-clock time (ms) at which this node last
+    /// STARTED a pull that went on to absorb the peer's COMPLETE state
+    /// with zero per-key errors and no poisoned keys: a digest pull that
+    /// root-matched, a digest pull whose every mismatched bucket merged
+    /// cleanly, or a legacy full-dump pull that merged cleanly.
+    ///
+    /// This is the INBOUND evidence consumed by the Stage 2 tombstone-GC
+    /// hole-jump gate (`gc_inbound_gate_passed`):
+    /// `pull_reconciled_wall_ms[peer] >= mark_ms` proves this node has
+    /// seen everything the peer held at some point after the mark, so a
+    /// dot that is still a hole (neither live nor deferred anywhere we
+    /// looked) is live on no registry peer — i.e. removed. Recorded at
+    /// request-START time (this node's clock, before the peer snapshots)
+    /// so it can never overstate freshness; symmetric counterpart of the
+    /// OUTBOUND `push_acked_wall_ms` evidence.
+    pull_reconciled_wall_ms: HashMap<String, u64>,
     /// Per-peer exponential backoff state for sync retries.
     /// Tracks consecutive failures and gates retry attempts.
     peer_backoffs: HashMap<String, PeerBackoff>,
@@ -552,6 +581,7 @@ impl NodeRunner {
             push_frontiers: HashMap::new(),
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
+            pull_reconciled_wall_ms: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             cluster_nodes,
@@ -657,6 +687,7 @@ impl NodeRunner {
             push_frontiers: HashMap::new(),
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
+            pull_reconciled_wall_ms: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             cluster_nodes,
@@ -759,6 +790,13 @@ impl NodeRunner {
         // Simulate "successfully pushed up to `frontier`" so the delta
         // push path scans from it (mirrors what a real clean push sets).
         self.push_frontiers.insert(peer_addr.to_string(), frontier);
+    }
+
+    /// Inbound reconciliation evidence recorded for a peer, if any
+    /// (test observability for the Stage 2 hole-jump gate — see
+    /// `pull_reconciled_wall_ms`).
+    pub fn pull_reconciled_for(&self, peer_addr: &str) -> Option<u64> {
+        self.pull_reconciled_wall_ms.get(peer_addr).copied()
     }
 
     /// Return a reference to the node ID.
@@ -2440,6 +2478,7 @@ impl NodeRunner {
                     &mut self.peer_frontiers,
                     &mut self.pull_verified_frontiers,
                     &mut self.digest_unsupported,
+                    &mut self.pull_reconciled_wall_ms,
                 )
                 .await;
                 if matches!(outcome, DigestPullOutcome::Synced) {
@@ -2469,8 +2508,9 @@ impl NodeRunner {
             // `apply_complete_state`, which is shared with the digest
             // sync path precisely so the claims/frontier/poison semantics
             // cannot diverge between the two.
+            let full_pull_start_wall_ms = crate::hlc::wall_clock_ms();
             if let Some(dump) = sync_client.pull_all_keys(&peer.addr).await {
-                Self::apply_complete_state(
+                let merge_errors = Self::apply_complete_state(
                     &mut self.peer_frontiers,
                     &mut self.pull_verified_frontiers,
                     eventual_api,
@@ -2485,6 +2525,19 @@ impl NodeRunner {
                     "full sync",
                 )
                 .await;
+                // Inbound evidence (Stage 2 hole-jump gate): a legacy
+                // full dump is the peer's complete state; record only a
+                // clean, poison-free absorption (fail-closed).
+                if merge_errors == 0 {
+                    let poisoned = {
+                        let api = eventual_api.lock().await;
+                        !api.store().merge_failed_keys().is_empty()
+                    };
+                    if !poisoned {
+                        self.pull_reconciled_wall_ms
+                            .insert(peer_key.clone(), full_pull_start_wall_ms);
+                    }
+                }
 
                 any_success = true;
                 let elapsed = peer_start.elapsed();
@@ -2520,6 +2573,8 @@ impl NodeRunner {
         self.push_acked_wall_ms
             .retain(|addr, _| active_addrs.contains(addr));
         self.pull_verified_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.pull_reconciled_wall_ms
             .retain(|addr, _| active_addrs.contains(addr));
         self.peer_backoffs
             .retain(|addr, _| active_addrs.contains(addr));
@@ -2742,17 +2797,38 @@ impl NodeRunner {
     ///
     /// Residual limits (also documented): frontiers are key-range
     /// consumption reports, not per-dot acks; replicas this node has
-    /// never heard of are outside the gate; majority-reach GC is an open
-    /// design question.
+    /// never heard of are outside the gate (although post-floor their
+    /// stale live dots are killed/rejected by the floor on merge);
+    /// majority-reach GC is an open design question.
+    ///
+    /// **Stage 2 hole-jump** (`gc_hole_jump_enabled`, default off): in
+    /// addition to the dual OUTBOUND gate above, the sweep may cross
+    /// legacy holes (dots the pre-floor sweep physically deleted) when
+    /// the INBOUND gate holds — every registry peer has
+    /// `pull_reconciled_wall_ms` evidence (a complete, error-free pull
+    /// STARTED) at/after the mark. Having absorbed every known peer's
+    /// full state since the mark, a dot that was ALREADY a hole at mark
+    /// time and is still a hole is live nowhere known, i.e. removed. The
+    /// sweep enforces the "at mark time" part itself: the mark snapshots
+    /// each value's per-node counters and the walk only jumps holes at
+    /// or below that snapshot — a hole minted AFTER the mark by an
+    /// inbound partial delta (counters ride deltas in full while an
+    /// entry below the requested frontier is filtered out) may be live
+    /// on the pushing peer, and the pull evidence, taken earlier, proves
+    /// nothing about it (see the `TombstoneGc` module docs). Fail-closed:
+    /// a missing entry or a disabled flag keeps the walk stalled
+    /// (`gc_floor_stalled_hole_dots`).
     ///
     /// **P1-10 note** (why the gate compares HLC *time*, never counters):
     /// dot counters are per-CRDT/per-writer small integers and no
-    /// cross-replica protocol transports them, so `frontier_hlc` values
-    /// must NEVER be fed into `compact_deferred_with_floor` as counter
-    /// floors (units mismatch, ~10^12 vs small ints — the original
-    /// P1-10 bug). The mark-and-sweep design only ever compares
-    /// wall-clock mark times against frontier *times*; dot identity is
-    /// handled by the marked candidate sets.
+    /// cross-replica protocol transports them as floors; the legacy
+    /// version-floor APIs were REPLACED by the per-value
+    /// `compaction_floor`, which lives in dot space and advances only
+    /// through the certified contiguous walk and merge inheritance
+    /// (units mismatch, ~10^12 vs small ints, was the original P1-10
+    /// bug). The mark-and-sweep design only ever compares wall-clock
+    /// mark times against frontier *times*; dot identity is handled by
+    /// the marked candidate sets.
     async fn run_gc(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2773,19 +2849,83 @@ impl NodeRunner {
             None => false,
         };
 
+        // Stage 2 hole-jump requires the ADDITIONAL inbound gate.
+        let allow_hole_jump = self.config.gc_hole_jump_enabled
+            && gates_passed
+            && match self.tombstone_gc.pending_mark_ms() {
+                Some(mark_ms) => {
+                    if let Some(sync_client) = &self.sync_client {
+                        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+                        Self::gc_inbound_gate_passed(&peers, &self.pull_reconciled_wall_ms, mark_ms)
+                    } else {
+                        // No sync layer — no peers exist to hold a hole
+                        // dot live (single-node case).
+                        true
+                    }
+                }
+                None => false,
+            };
+
         let mut api = eventual_api.lock().await;
-        let collected = self
-            .tombstone_gc
-            .mark_and_sweep(api.store_mut(), now_ms, gates_passed);
+        let stats = self.tombstone_gc.mark_and_sweep(
+            api.store_mut(),
+            now_ms,
+            gates_passed,
+            allow_hole_jump,
+        );
+        let floor_fx = api.store_mut().take_floor_effects();
         drop(api);
-        if collected > 0 {
+
+        // Publish floor observability: stall gauges reflect the latest
+        // EXECUTED sweep; merge-effect counters accumulate across ticks.
+        // Mark-only and gate-blocked passes return zeroed stats
+        // (`swept == false`) and must NOT overwrite the gauges: with the
+        // default 60s interval / 300s retention only ~1 tick in 5 sweeps,
+        // and zeroing on the other ticks would flap a persistent hole
+        // stall to 0 for most scrapes — the exact signal ops-guide 3.7
+        // uses to decide on Stage 2 (and 12.3 to diagnose blocked gates).
+        if stats.swept {
+            self.metrics
+                .gc_floor_stalled_hole_dots
+                .store(stats.stalled_holes, Ordering::Relaxed);
+            self.metrics
+                .gc_floor_stalled_uncandidated_dots
+                .store(stats.stalled_uncandidated, Ordering::Relaxed);
+        }
+        self.metrics
+            .gc_floor_rejected_dots_total
+            .fetch_add(floor_fx.rejected_covered_deferred, Ordering::Relaxed);
+        self.metrics.gc_floor_killed_by_floor_total.fetch_add(
+            floor_fx.killed_by_floor + floor_fx.rejected_stale_live,
+            Ordering::Relaxed,
+        );
+
+        if stats.collected > 0 {
             tracing::info!(
                 node_id = %self.node_id.0,
-                collected,
+                collected = stats.collected,
+                stalled_holes = stats.stalled_holes,
+                stalled_uncandidated = stats.stalled_uncandidated,
                 total = self.tombstone_gc.total_collected(),
                 "tombstone GC completed"
             );
         }
+    }
+
+    /// Stage 2 INBOUND gate: every registered peer's complete state has
+    /// been absorbed by a clean pull STARTED at/after the mark (see
+    /// `pull_reconciled_wall_ms`). A peer without an entry fails the
+    /// gate (fail-closed). Vacuously true with an empty registry.
+    fn gc_inbound_gate_passed(
+        peers: &[crate::network::PeerConfig],
+        pull_reconciled_wall_ms: &HashMap<String, u64>,
+        mark_ms: u64,
+    ) -> bool {
+        peers.iter().all(|peer| {
+            pull_reconciled_wall_ms
+                .get(&peer.addr)
+                .is_some_and(|reconciled| *reconciled >= mark_ms)
+        })
     }
 
     /// Evaluate the tombstone-GC dual gate against `mark_ms` (see
@@ -3354,10 +3494,16 @@ impl NodeRunner {
         peer_frontiers: &mut HashMap<String, HlcTimestamp>,
         pull_verified_frontiers: &mut HashMap<String, HlcTimestamp>,
         digest_unsupported: &mut HashMap<String, Instant>,
+        pull_reconciled_wall_ms: &mut HashMap<String, u64>,
     ) -> DigestPullOutcome {
         metrics
             .digest_sync_attempt_total
             .fetch_add(1, Ordering::Relaxed);
+
+        // Captured BEFORE the request: the peer's answering snapshot is
+        // taken after this instant, so recording it as inbound evidence
+        // (`pull_reconciled_wall_ms`) can never overstate freshness.
+        let request_start_wall_ms = crate::hlc::wall_clock_ms();
 
         let (digest, _data, _frontier) = Self::snapshot_store_digest(eventual_api).await;
         let request = DigestSyncRequest::from_digest(node_id, &digest, true);
@@ -3397,7 +3543,7 @@ impl NodeRunner {
                         "digest sync: transferring mismatched buckets only"
                     );
                 }
-                Self::apply_complete_state(
+                let merge_errors = Self::apply_complete_state(
                     peer_frontiers,
                     pull_verified_frontiers,
                     eventual_api,
@@ -3412,6 +3558,20 @@ impl NodeRunner {
                     "digest sync",
                 )
                 .await;
+                // Inbound evidence (Stage 2 hole-jump gate): a root match
+                // or a clean full-bucket merge absorbed the peer's
+                // complete state. Poisoned keys fail the record — a
+                // type-mismatched key may hide a live dot we could not
+                // absorb (fail-closed).
+                if merge_errors == 0 {
+                    let poisoned = {
+                        let api = eventual_api.lock().await;
+                        !api.store().merge_failed_keys().is_empty()
+                    };
+                    if !poisoned {
+                        pull_reconciled_wall_ms.insert(peer_key.to_string(), request_start_wall_ms);
+                    }
+                }
                 DigestPullOutcome::Synced
             }
             DigestSyncResult::Ok(_) => {
@@ -6470,5 +6630,237 @@ mod tests {
             !NodeRunner::gc_peer_gate_passed(&peers, &push_acked, mark_ms),
             "a pull-advanced peer frontier must not open the GC gate"
         );
+    }
+
+    /// Stage 2 INBOUND gate: hole-jump requires reconciliation evidence
+    /// (a complete, error-free pull STARTED at/after the mark) from
+    /// EVERY registered peer — fail-closed on missing or stale entries.
+    #[test]
+    fn gc_inbound_gate_requires_all_registered_peers_reconciled_past_mark() {
+        let peer = |name: &str, addr: &str| crate::network::PeerConfig {
+            node_id: node_id(name),
+            addr: addr.into(),
+        };
+        let mark_ms = 8_000;
+        let mut reconciled: HashMap<String, u64> = HashMap::new();
+
+        // Empty registry: vacuously true (no peer can hold a hole dot live).
+        assert!(NodeRunner::gc_inbound_gate_passed(
+            &[],
+            &reconciled,
+            mark_ms
+        ));
+
+        // A registered peer with no reconciliation evidence: fail-closed.
+        let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
+        reconciled.insert("p1:9000".into(), 9_000);
+        assert!(!NodeRunner::gc_inbound_gate_passed(
+            &peers,
+            &reconciled,
+            mark_ms
+        ));
+
+        // Evidence from BEFORE the mark: fail (the peer's state as of the
+        // mark was never absorbed).
+        reconciled.insert("p2:9000".into(), 7_999);
+        assert!(!NodeRunner::gc_inbound_gate_passed(
+            &peers,
+            &reconciled,
+            mark_ms
+        ));
+
+        // All peers reconciled at/after the mark: pass.
+        reconciled.insert("p2:9000".into(), 8_000);
+        assert!(NodeRunner::gc_inbound_gate_passed(
+            &peers,
+            &reconciled,
+            mark_ms
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // run_gc Stage 2 wiring (config flag ∧ outbound gates ∧ inbound
+    // evidence against the PENDING mark) — exercised end-to-end so a
+    // future refactor (`&&` → `||`, comparing against the wrong
+    // timestamp, mis-keyed peer addresses, …) cannot silently turn the
+    // fail-closed hole-jump into a fail-open one.
+    // -----------------------------------------------------------------
+
+    /// Build a runner whose store holds a legacy-hole OrSet — counters
+    /// `A=2`, live `(A,2)` swept away by a remove into tombstone `(A,2)`,
+    /// and `(A,1)` neither live nor deferred (a pre-floor sweep's hole) —
+    /// with one registered peer, an empty authority namespace (authority
+    /// gate vacuous), a 1ms GC interval and zero retention so run_gc
+    /// passes chain immediately (pass 1 marks, pass 2 may sweep).
+    async fn legacy_hole_runner(
+        hole_jump_enabled: bool,
+    ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
+        use crate::api::eventual::EventualApi;
+
+        let api = wrap_api(CertifiedApi::new(
+            node_id("node-1"),
+            wrap_ns(SystemNamespace::new()),
+        ));
+        let config = NodeRunnerConfig {
+            gc_interval: Duration::from_millis(1),
+            gc_retention: Duration::ZERO,
+            gc_hole_jump_enabled: hole_jump_enabled,
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));
+        {
+            let mut ea = eventual_api.lock().await;
+            let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
+            let mut set: crate::crdt::or_set::OrSet<String> =
+                serde_json::from_str(json).expect("legacy state");
+            set.remove(&"y".to_string()); // tombstone (A,2) above the hole (A,1)
+            ea.eventual_write("myset".to_string(), CrdtValue::Set(set))
+                .expect("seed store");
+        }
+
+        let peer_addr = "p1:9000".to_string();
+        let registry = crate::network::PeerRegistry::new(
+            node_id("node-1"),
+            vec![crate::network::PeerConfig {
+                node_id: node_id("p1"),
+                addr: peer_addr.clone(),
+            }],
+        )
+        .expect("valid registry");
+        let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            api,
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_api.clone());
+        runner.set_sync_client(sync_client);
+        (runner, eventual_api, peer_addr)
+    }
+
+    async fn hole_state(eventual_api: &Arc<Mutex<EventualApi>>) -> (HashMap<NodeId, u64>, usize) {
+        let ea = eventual_api.lock().await;
+        match ea.store().get("myset") {
+            Some(CrdtValue::Set(s)) => (s.compaction_floor().clone(), s.deferred_len()),
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    /// Stage 2 disabled: even with full outbound AND inbound evidence the
+    /// sweep must stall on the legacy hole (fail-closed) and report it on
+    /// the stall gauge — and a subsequent BLOCKED pass must not zero that
+    /// gauge (ops-guide 3.7's "persistently non-zero" Stage 2 signal).
+    #[tokio::test]
+    async fn run_gc_stage1_stalls_on_legacy_hole_despite_full_evidence() {
+        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(false).await;
+
+        runner.run_gc().await; // pass 1: mark
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner
+            .pull_reconciled_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep (gates pass, flag off)
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert!(floor.is_empty(), "disabled flag must keep the walk stalled");
+        assert_eq!(deferred, 1, "the tombstone above the hole must survive");
+        assert_eq!(
+            runner
+                .metrics
+                .gc_floor_stalled_hole_dots
+                .load(Ordering::Relaxed),
+            1,
+            "the executed sweep must report the hole stall"
+        );
+
+        // A gate-blocked pass (outbound evidence gone) must keep the
+        // last executed sweep's gauge instead of flapping it to zero.
+        runner.push_acked_wall_ms.clear();
+        runner.run_gc().await;
+        assert_eq!(
+            runner
+                .metrics
+                .gc_floor_stalled_hole_dots
+                .load(Ordering::Relaxed),
+            1,
+            "a blocked (non-sweep) pass must not overwrite the stall gauge"
+        );
+    }
+
+    /// Stage 2 enabled but the inbound evidence predates the mark: the
+    /// hole-jump must stay off (fail-closed) — the pull proves nothing
+    /// about state the peer held at the mark.
+    #[tokio::test]
+    async fn run_gc_stage2_requires_inbound_evidence_after_the_mark() {
+        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(true).await;
+
+        runner.run_gc().await; // pass 1: mark
+        let mark_ms = runner
+            .tombstone_gc
+            .pending_mark_ms()
+            .expect("mark must be pending");
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner
+            .pull_reconciled_wall_ms
+            .insert(peer_addr.clone(), mark_ms.saturating_sub(1)); // STALE
+
+        runner.run_gc().await; // pass 2: sweep, hole-jump must be denied
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert!(
+            floor.is_empty(),
+            "stale inbound evidence must keep the hole-jump fail-closed"
+        );
+        assert_eq!(deferred, 1);
+        assert_eq!(
+            runner
+                .metrics
+                .gc_floor_stalled_hole_dots
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Stage 2 enabled with post-mark inbound evidence from every
+    /// registry peer: the walk crosses the legacy hole, the floor reaches
+    /// the marked tombstone and collection proceeds.
+    #[tokio::test]
+    async fn run_gc_stage2_jumps_legacy_hole_with_fresh_inbound_evidence() {
+        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(true).await;
+
+        runner.run_gc().await; // pass 1: mark
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner
+            .pull_reconciled_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep with hole-jump authorised
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert_eq!(
+            floor.get(&NodeId("A".into())),
+            Some(&2),
+            "the floor must cross the legacy hole and absorb the tombstone"
+        );
+        assert_eq!(deferred, 0, "the marked tombstone must be collected");
+        assert_eq!(
+            runner
+                .metrics
+                .gc_floor_stalled_hole_dots
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(runner.tombstone_gc.total_collected() >= 1);
     }
 }

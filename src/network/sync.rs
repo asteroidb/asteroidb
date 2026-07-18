@@ -153,6 +153,14 @@ pub struct DeltaSyncResponse {
     /// `skip_serializing_if` (same rule as `KeyDumpResponse`). Old
     /// senders omit this field (JSON retry path defaults it to empty);
     /// their migrated untracked keys still converge only via full sync.
+    ///
+    /// The same rule applies to fields INSIDE `CrdtValue` payloads:
+    /// `OrSet`/`OrMap` appended `compaction_floor` (`#[serde(default)]`,
+    /// M-8). Mixed-version note: old→new decodes with an empty floor
+    /// (JSON) and new→old rides the existing `send_with_json_fallback`
+    /// path (bincode positional decode fails on the old side, the JSON
+    /// retry drops the unknown field) — same rolling-upgrade mechanics
+    /// as the `deferred` field addition.
     #[serde(default)]
     pub untracked_entries: HashMap<String, CrdtValue>,
 }
@@ -1895,7 +1903,10 @@ mod tests {
         let (back, _): (DigestSyncRequest, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back.sender, "node-1");
-        assert_eq!(back.scheme_version, 1);
+        assert_eq!(
+            back.scheme_version,
+            crate::store::digest::DIGEST_SCHEME_VERSION
+        );
         assert_eq!(back.root, vec![7u8; 32]);
         assert_eq!(back.buckets.len(), 1);
         assert_eq!(back.buckets[0].index, 12);
