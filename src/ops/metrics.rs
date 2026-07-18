@@ -350,6 +350,16 @@ pub struct RuntimeMetrics {
     /// delayed pushes).
     pub gc_floor_killed_by_floor_total: AtomicU64,
 
+    /// Cumulative remote merges skipped by the RR gate (redundant-relay
+    /// suppression, M-6): the received value did not inflate local state
+    /// and the key was already delta-visible, so no local re-stamp /
+    /// change-log / WAL write happened. Mirrored from
+    /// `EventualApi::redundant_merge_skips` on each GC tick. A steadily
+    /// growing value in an idle cluster is HEALTHY (converged keys'
+    /// echoes being absorbed); a value stuck at 0 under bidirectional
+    /// sync of a converged store indicates the ping-pong regression.
+    pub sync_redundant_merge_skips_total: AtomicU64,
+
     /// Cumulative number of digest push probes (before a full-state push).
     pub digest_push_probe_total: AtomicU64,
 
@@ -465,6 +475,7 @@ impl Default for RuntimeMetrics {
             gc_floor_stalled_uncandidated_dots: AtomicU64::default(),
             gc_floor_rejected_dots_total: AtomicU64::default(),
             gc_floor_killed_by_floor_total: AtomicU64::default(),
+            sync_redundant_merge_skips_total: AtomicU64::default(),
             digest_push_probe_total: AtomicU64::default(),
             digest_push_match_total: AtomicU64::default(),
             digest_push_keys_pushed_total: AtomicU64::default(),
@@ -814,6 +825,9 @@ impl RuntimeMetrics {
             gc_floor_killed_by_floor_total: self
                 .gc_floor_killed_by_floor_total
                 .load(Ordering::Relaxed),
+            sync_redundant_merge_skips_total: self
+                .sync_redundant_merge_skips_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -942,6 +956,9 @@ pub struct MetricsSnapshot {
     pub gc_floor_rejected_dots_total: u64,
     /// Cumulative stale live dots suppressed by the compaction floor.
     pub gc_floor_killed_by_floor_total: u64,
+    /// Cumulative remote merges skipped by the RR gate (no-op merge on an
+    /// already delta-visible key; M-6).
+    pub sync_redundant_merge_skips_total: u64,
 }
 
 #[cfg(test)]

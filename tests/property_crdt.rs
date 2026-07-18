@@ -770,3 +770,67 @@ proptest! {
         prop_assert_eq!(canonical_digest_map(&aa), canonical_digest_map(&a));
     }
 }
+
+// ---------------------------------------------------------------
+// Merge `changed` flag properties (M-6, RR gate)
+//
+// Ground truth: `changed == (before != after)` over the PHYSICAL state
+// (`PartialEq` covers all components), and merge idempotency implies the
+// second application of the same input is always a reported no-op.
+// ---------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn pn_counter_changed_matches_ground_truth(a in arb_pn_counter(), b in arb_pn_counter()) {
+        let mut merged = a.clone();
+        let changed = merged.merge(&b);
+        prop_assert_eq!(changed, merged != a, "changed must equal pre/post difference");
+
+        // Second merge of the same input must be a reported no-op.
+        let snapshot = merged.clone();
+        let changed_again = merged.merge(&b);
+        prop_assert!(!changed_again, "idempotent re-merge must report no-op");
+        prop_assert_eq!(merged, snapshot);
+    }
+
+    #[test]
+    fn or_set_changed_matches_ground_truth(a in arb_or_set(), b in arb_or_set()) {
+        let mut merged = a.clone();
+        let fx = merged.merge(&b);
+        prop_assert_eq!(fx.changed, merged != a, "changed must equal pre/post difference");
+
+        let snapshot = merged.clone();
+        let fx_again = merged.merge(&b);
+        prop_assert!(!fx_again.changed, "idempotent re-merge must report no-op");
+        prop_assert_eq!(merged, snapshot);
+    }
+
+    #[test]
+    fn or_map_changed_matches_ground_truth(a in arb_or_map(), b in arb_or_map()) {
+        let mut merged = a.clone();
+        let fx = merged.merge(&b);
+        prop_assert_eq!(fx.changed, merged != a, "changed must equal pre/post difference");
+
+        let snapshot = merged.clone();
+        let fx_again = merged.merge(&b);
+        prop_assert!(!fx_again.changed, "idempotent re-merge must report no-op");
+        prop_assert_eq!(merged, snapshot);
+    }
+
+    #[test]
+    fn lww_register_changed_matches_ground_truth(
+        a in arb_lww_register(),
+        b in arb_lww_register()
+    ) {
+        let mut merged = a.clone();
+        let changed = merged.merge(&b);
+        prop_assert_eq!(changed, merged != a, "changed must equal pre/post difference");
+
+        let snapshot = merged.clone();
+        let changed_again = merged.merge(&b);
+        prop_assert!(!changed_again, "idempotent re-merge must report no-op");
+        prop_assert_eq!(merged, snapshot);
+    }
+}

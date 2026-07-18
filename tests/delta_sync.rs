@@ -3,18 +3,26 @@
 //! Tests verify that delta sync correctly synchronizes only changed entries
 //! between nodes, and falls back to full sync when delta sync is unavailable.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
+use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
-use asteroidb_poc::network::sync::{DeltaSyncRequest, DeltaSyncResponse};
+use asteroidb_poc::network::sync::{
+    DeltaSyncRequest, DeltaSyncResponse, SyncClient, SyncRequest, SyncResponse,
+};
+use asteroidb_poc::network::{PeerConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::kv::CrdtValue;
 use asteroidb_poc::types::{KeyRange, NodeId};
 
@@ -650,4 +658,530 @@ async fn compacted_sender_ships_no_untracked_entries() {
         delta.untracked_entries.is_empty(),
         "a compacted sender must not dump its pruned keyspace on the delta path"
     );
+}
+
+// ---------------------------------------------------------------
+// RR gate: converged keys stop retransmitting (M-6)
+// ---------------------------------------------------------------
+
+/// Snapshot the per-key HLC timestamps of a node's eventual store.
+async fn key_timestamps(state: &Arc<AppState>) -> Vec<(String, HlcTimestamp)> {
+    let api = state.eventual.lock().await;
+    let mut snap: Vec<(String, HlcTimestamp)> = api
+        .store()
+        .keys()
+        .into_iter()
+        .filter_map(|k| {
+            api.store()
+                .timestamp_for(k)
+                .map(|ts| (k.clone(), ts.clone()))
+        })
+        .collect();
+    snap.sort();
+    snap
+}
+
+/// One push half-round, modelled on the runner: scan the sender's delta
+/// entries since `frontier`, POST them to the receiver's
+/// `/api/internal/sync` (the `merge_remote` push path), and advance the
+/// sender's push frontier to the batch max HLC. Returns the batch size.
+async fn push_round(
+    source: &Arc<AppState>,
+    target: &Arc<AppState>,
+    frontier: &mut HlcTimestamp,
+) -> usize {
+    let entries: Vec<(String, CrdtValue, HlcTimestamp)> = {
+        let api = source.eventual.lock().await;
+        api.store().delta_entries_since(frontier)
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    *frontier = entries.last().unwrap().2.clone();
+
+    let req_entries: std::collections::HashMap<String, CrdtValue> = entries
+        .iter()
+        .map(|(k, v, _)| (k.clone(), v.clone()))
+        .collect();
+    let req_body = serde_json::to_string(&SyncRequest {
+        sender: "rr-test".into(),
+        entries: req_entries,
+    })
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/internal/sync")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router(target.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sync_resp: SyncResponse =
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+    assert!(sync_resp.errors.is_empty(), "push merge must not error");
+    entries.len()
+}
+
+/// M-6 ping-pong reproduction (RED before the RR gate): once two nodes
+/// have converged, bidirectional push sync must go quiet. The old
+/// `merge_remote` re-stamped EVERY received entry with a fresh local
+/// HLC, so each push re-injected the converged keys into the receiver's
+/// delta scan and full CRDT state ping-ponged forever.
+#[tokio::test]
+async fn converged_key_stops_retransmitting() {
+    let state_a = test_state();
+    let state_b = test_state();
+
+    // Node A writes, node B converges via a delta pull (the
+    // two_node_delta_sync_convergence harness shape).
+    {
+        let mut api = state_a.eventual.lock().await;
+        api.eventual_counter_inc("shared-counter").unwrap();
+        api.eventual_counter_inc("shared-counter").unwrap();
+        api.eventual_set_add("users", "alice".into()).unwrap();
+    }
+    let req_body = serde_json::to_string(&DeltaSyncRequest {
+        sender: "node-b".into(),
+        frontier: hlc(0, 0, ""),
+    })
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/internal/sync/delta")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body))
+        .unwrap();
+    let resp = router(state_a.clone()).oneshot(req).await.unwrap();
+    let delta: DeltaSyncResponse =
+        serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+    {
+        let mut api = state_b.eventual.lock().await;
+        for entry in &delta.entries {
+            api.merge_remote_with_hlc(entry.key.clone(), &entry.value, entry.hlc.clone())
+                .unwrap();
+        }
+    }
+
+    // Converged. Snapshot per-key timestamps and frontiers on both sides.
+    let ts_a = key_timestamps(&state_a).await;
+    let ts_b = key_timestamps(&state_b).await;
+    let frontier_a = state_a.eventual.lock().await.store().current_frontier();
+    let frontier_b = state_b.eventual.lock().await.store().current_frontier();
+
+    // Bidirectional push sync, 3 rounds, runner-style frontier tracking.
+    let zero = hlc(0, 0, "");
+    let mut push_frontier_ab = zero.clone();
+    let mut push_frontier_ba = zero;
+    for round in 0..3 {
+        let sent_ab = push_round(&state_a, &state_b, &mut push_frontier_ab).await;
+        let sent_ba = push_round(&state_b, &state_a, &mut push_frontier_ba).await;
+        if round == 0 {
+            // The first round legitimately re-offers the converged state
+            // (the push baseline starts at zero) — it must be absorbed as
+            // a no-op on both sides.
+            assert!(sent_ab > 0 && sent_ba > 0, "round 0 sends the backlog");
+        } else {
+            // RED before the RR gate: the receiver's re-stamp made every
+            // later round re-send the converged keys forever.
+            assert_eq!(
+                sent_ab, 0,
+                "converged A->B push must go quiet (round {round})"
+            );
+            assert_eq!(
+                sent_ba, 0,
+                "converged B->A push must go quiet (round {round})"
+            );
+        }
+        // No round may move a per-key timestamp or a frontier.
+        assert_eq!(key_timestamps(&state_a).await, ts_a, "round {round}");
+        assert_eq!(key_timestamps(&state_b).await, ts_b, "round {round}");
+        assert_eq!(
+            state_a.eventual.lock().await.store().current_frontier(),
+            frontier_a
+        );
+        assert_eq!(
+            state_b.eventual.lock().await.store().current_frontier(),
+            frontier_b
+        );
+    }
+
+    // Both sides observed redundant echoes and counted them.
+    assert!(state_a.eventual.lock().await.redundant_merge_skips() > 0);
+    assert!(state_b.eventual.lock().await.redundant_merge_skips() > 0);
+}
+
+/// After a REAL change the echo is bounded: the write travels A->B (a
+/// true inflation, re-stamped on B), the echo B->A is absorbed as a
+/// no-op, and the third half-round is already empty.
+#[tokio::test]
+async fn bounded_echo_after_real_change() {
+    let state_a = test_state();
+    let state_b = test_state();
+
+    // Converge A and B via pushes (round 0 backlog + echo absorption).
+    {
+        let mut api = state_a.eventual.lock().await;
+        api.eventual_counter_inc("k").unwrap();
+    }
+    let zero = hlc(0, 0, "");
+    let mut push_frontier_ab = zero.clone();
+    let mut push_frontier_ba = zero;
+    for _ in 0..3 {
+        push_round(&state_a, &state_b, &mut push_frontier_ab).await;
+        push_round(&state_b, &state_a, &mut push_frontier_ba).await;
+    }
+    assert_eq!(
+        push_round(&state_a, &state_b, &mut push_frontier_ab).await,
+        0
+    );
+    assert_eq!(
+        push_round(&state_b, &state_a, &mut push_frontier_ba).await,
+        0
+    );
+
+    // A real write on A.
+    {
+        let mut api = state_a.eventual.lock().await;
+        api.eventual_counter_inc("k").unwrap();
+    }
+
+    // Half-round 1: the change travels A->B (B re-stamps: true inflation).
+    assert_eq!(
+        push_round(&state_a, &state_b, &mut push_frontier_ab).await,
+        1
+    );
+    // Half-round 2: B echoes its re-stamped key back once; A absorbs it.
+    assert_eq!(
+        push_round(&state_b, &state_a, &mut push_frontier_ba).await,
+        1
+    );
+    // Half-round 3: silence — the echo must not breed another echo.
+    assert_eq!(
+        push_round(&state_a, &state_b, &mut push_frontier_ab).await,
+        0
+    );
+    assert_eq!(
+        push_round(&state_b, &state_a, &mut push_frontier_ba).await,
+        0
+    );
+}
+
+/// A 3-node push cycle (A->B->C->A) must not amplify: after the write has
+/// gone around once and the origin absorbed the echo, every later cycle
+/// is empty on all three edges.
+#[tokio::test]
+async fn three_node_push_cycle_quiesces() {
+    let state_a = test_state();
+    let state_b = test_state();
+    let state_c = test_state();
+
+    {
+        let mut api = state_a.eventual.lock().await;
+        api.eventual_counter_inc("ring-key").unwrap();
+    }
+
+    let zero = hlc(0, 0, "");
+    let mut f_ab = zero.clone();
+    let mut f_bc = zero.clone();
+    let mut f_ca = zero;
+
+    // Cycle 1 carries the write around the ring; the C->A edge is the
+    // origin's echo and must be absorbed (A already dominates).
+    let cycle1 = [
+        push_round(&state_a, &state_b, &mut f_ab).await,
+        push_round(&state_b, &state_c, &mut f_bc).await,
+        push_round(&state_c, &state_a, &mut f_ca).await,
+    ];
+    assert_eq!(cycle1, [1, 1, 1]);
+
+    // Every later cycle must be empty on all edges (RED before the RR
+    // gate: each hop's re-stamp fed the next hop forever).
+    for cycle in 2..5 {
+        let sent = [
+            push_round(&state_a, &state_b, &mut f_ab).await,
+            push_round(&state_b, &state_c, &mut f_bc).await,
+            push_round(&state_c, &state_a, &mut f_ca).await,
+        ];
+        assert_eq!(sent, [0, 0, 0], "cycle {cycle} must be silent");
+    }
+
+    // All three converged on the same value.
+    for state in [&state_a, &state_b, &state_c] {
+        let api = state.eventual.lock().await;
+        match api.get_eventual("ring-key") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
+            other => panic!("expected Counter(1), got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// RR gate at the NodeRunner level (design §7(C))
+// ---------------------------------------------------------------
+
+/// AppState sharing the given eventual API (a NodeRunner and this HTTP
+/// surface serve the same store), without authority definitions — the
+/// data-plane-only shape of the digest_sync.rs runner harness.
+fn shared_state(name: &str, eventual: Arc<Mutex<EventualApi>>) -> Arc<AppState> {
+    let nid = node_id(name);
+    let namespace = Arc::new(RwLock::new(SystemNamespace::new()));
+
+    Arc::new(AppState {
+        eventual,
+        certified: Arc::new(Mutex::new(CertifiedApi::new(nid, Arc::clone(&namespace)))),
+        namespace,
+        metrics: Arc::new(RuntimeMetrics::default()),
+        peers: None,
+        peer_persist_path: None,
+        namespace_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
+        internal_token: None,
+        self_node_id: None,
+        self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: None,
+        epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
+        equivocation: Arc::new(
+            asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
+        ),
+        exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
+    })
+}
+
+/// Spawn an HTTP listener for `app`, returning its address and handle.
+async fn serve(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    // Give the listener a moment to start accepting.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+/// A NodeRunner over a SHARED eventual API, running the production sync
+/// loop (delta pull + delta/full push) at a fast interval. Digest sync
+/// is disabled so every transfer actually carries entries through
+/// `merge_remote` / `merge_remote_with_hlc` — a digest probe answering
+/// "root match" would suppress the very deliveries whose RR absorption
+/// this harness asserts. The fast GC tick only mirrors the in-memory RR
+/// skip counter into `sync_redundant_merge_skips_total` (the hour-long
+/// retention keeps actual sweeps out of the picture).
+async fn quiesce_runner(
+    name: &str,
+    eventual: Arc<Mutex<EventualApi>>,
+    peer_name: &str,
+    peer_addr: &str,
+) -> (NodeRunner, Arc<RuntimeMetrics>) {
+    let ns = Arc::new(RwLock::new(SystemNamespace::new()));
+    let certified = Arc::new(Mutex::new(CertifiedApi::new(node_id(name), ns)));
+    let registry = PeerRegistry::new(
+        node_id(name),
+        vec![PeerConfig {
+            node_id: node_id(peer_name),
+            addr: peer_addr.to_string(),
+        }],
+    )
+    .unwrap();
+    let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+
+    let config = NodeRunnerConfig {
+        certification_interval: Duration::from_millis(500),
+        cleanup_interval: Duration::from_secs(60),
+        compaction_check_interval: Duration::from_secs(60),
+        frontier_report_interval: Duration::from_secs(60),
+        sync_interval: Some(Duration::from_millis(25)),
+        ping_interval: None,
+        gc_interval: Duration::from_millis(50),
+        gc_retention: Duration::from_secs(3600),
+        digest_sync_enabled: false,
+        ..NodeRunnerConfig::default()
+    };
+
+    let metrics = Arc::new(RuntimeMetrics::default());
+    let runner = NodeRunner::with_sync(
+        node_id(name),
+        certified,
+        CompactionEngine::with_defaults(),
+        config,
+        sync_client,
+        eventual,
+        metrics.clone(),
+    )
+    .await;
+    (runner, metrics)
+}
+
+/// Snapshot a store's data as a sorted map.
+async fn snapshot_data(api: &Arc<Mutex<EventualApi>>) -> BTreeMap<String, CrdtValue> {
+    let api = api.lock().await;
+    api.store()
+        .all_entries()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Per-key timestamp snapshot over the wire, exactly as the design
+/// specifies: `GET /api/internal/keys` via the production client.
+async fn dump_timestamps(client: &SyncClient, addr: &str) -> BTreeMap<String, HlcTimestamp> {
+    client
+        .pull_all_keys(addr)
+        .await
+        .expect("GET /api/internal/keys must succeed")
+        .timestamps
+        .into_iter()
+        .collect()
+}
+
+/// Runner-level quiesce (design §7(C)): two REAL NodeRunners driving the
+/// production push/pull loop over live HTTP must go fully quiet after
+/// convergence — per-key timestamps observed via `GET /api/internal/keys`
+/// stay frozen across at least 3 further sync cycles on each runner, and
+/// the RR skip counter is exported through
+/// `sync_redundant_merge_skips_total`. This guards against the runner's
+/// push loop diverging from the handler-level `push_round` simulation
+/// used by the tests above (e.g. switching the delta baseline to the
+/// pull-advanced `peer_frontiers`, or advancing `push_frontiers` before
+/// merge success) without any test noticing.
+#[tokio::test]
+async fn two_node_push_quiesces_after_convergence() {
+    let api_a = Arc::new(Mutex::new(EventualApi::new(node_id("rr-a"))));
+    let api_b = Arc::new(Mutex::new(EventualApi::new(node_id("rr-b"))));
+    let state_a = shared_state("rr-a", api_a.clone());
+    let state_b = shared_state("rr-b", api_b.clone());
+    let (addr_a, server_a) = serve(router(state_a.clone())).await;
+    let (addr_b, server_b) = serve(router(state_b.clone())).await;
+
+    // All writes happen on A before the runners start; B converges
+    // through the real sync loop only.
+    {
+        let mut api = api_a.lock().await;
+        api.eventual_counter_inc("shared-counter").unwrap();
+        api.eventual_counter_inc("shared-counter").unwrap();
+        api.eventual_set_add("users", "alice".into()).unwrap();
+    }
+
+    let (runner_a, metrics_a) =
+        quiesce_runner("rr-a", api_a.clone(), "rr-b", &addr_b.to_string()).await;
+    let (runner_b, metrics_b) =
+        quiesce_runner("rr-b", api_b.clone(), "rr-a", &addr_a.to_string()).await;
+    let stop_a = runner_a.shutdown_handle();
+    let stop_b = runner_b.shutdown_handle();
+    let task_a = tokio::spawn(async move {
+        let mut runner = runner_a;
+        runner.run().await
+    });
+    let task_b = tokio::spawn(async move {
+        let mut runner = runner_b;
+        runner.run().await
+    });
+
+    // Phase 1: convergence. Once the two data states are equal, no
+    // further merge can inflate either side, so (with the RR gate) every
+    // per-key timestamp is frozen from this point on — the baseline
+    // snapshot below is race-free.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let a = snapshot_data(&api_a).await;
+        let b = snapshot_data(&api_b).await;
+        if a.len() == 2 && a == b {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let _ = stop_a.send(true);
+            let _ = stop_b.send(true);
+            panic!("two-node runner sync did not converge (a={a:?}, b={b:?})");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Phase 2: baseline timestamp snapshots over the wire.
+    let observer_registry = PeerRegistry::new(
+        node_id("rr-observer"),
+        vec![
+            PeerConfig {
+                node_id: node_id("rr-a"),
+                addr: addr_a.to_string(),
+            },
+            PeerConfig {
+                node_id: node_id("rr-b"),
+                addr: addr_b.to_string(),
+            },
+        ],
+    )
+    .unwrap();
+    let observer = SyncClient::new(Arc::new(Mutex::new(observer_registry)));
+    let ts_a0 = dump_timestamps(&observer, &addr_a.to_string()).await;
+    let ts_b0 = dump_timestamps(&observer, &addr_b.to_string()).await;
+    assert_eq!(ts_a0.len(), 2, "A's keys must be delta-tracked");
+    assert_eq!(ts_b0.len(), 2, "B's keys must be delta-tracked");
+
+    // Phase 3: at least 3 further REAL sync cycles on each runner.
+    // `sync_attempt_total` ticks once per peer at the START of a cycle,
+    // so waiting for base+4 guarantees >= 3 full cycles completed.
+    let base_a = metrics_a.sync_attempt_total.load(Ordering::Relaxed);
+    let base_b = metrics_b.sync_attempt_total.load(Ordering::Relaxed);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let a = metrics_a.sync_attempt_total.load(Ordering::Relaxed);
+        let b = metrics_b.sync_attempt_total.load(Ordering::Relaxed);
+        if a >= base_a + 4 && b >= base_b + 4 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let _ = stop_a.send(true);
+            let _ = stop_b.send(true);
+            panic!("sync cycles stalled (a={a}/{base_a}, b={b}/{base_b})");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The quiesce assertion: not one per-key timestamp moved. RED with
+    // the pre-M-6 unconditional re-stamp, which advanced a timestamp on
+    // every push delivery.
+    let ts_a1 = dump_timestamps(&observer, &addr_a.to_string()).await;
+    let ts_b1 = dump_timestamps(&observer, &addr_b.to_string()).await;
+    assert_eq!(
+        ts_a1, ts_a0,
+        "A's per-key timestamps must be frozen across real push cycles"
+    );
+    assert_eq!(
+        ts_b1, ts_b0,
+        "B's per-key timestamps must be frozen across real push cycles"
+    );
+
+    // Each side absorbed at least one redundant delivery (the push/pull
+    // echo of already-held state), and the GC tick exported the counter.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let a = metrics_a
+            .sync_redundant_merge_skips_total
+            .load(Ordering::Relaxed);
+        let b = metrics_b
+            .sync_redundant_merge_skips_total
+            .load(Ordering::Relaxed);
+        if a > 0 && b > 0 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            let _ = stop_a.send(true);
+            let _ = stop_b.send(true);
+            panic!("sync_redundant_merge_skips_total was never exported (a={a}, b={b})");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = stop_a.send(true);
+    let _ = stop_b.send(true);
+    let _ = task_a.await;
+    let _ = task_b.await;
+    server_a.abort();
+    server_b.abort();
 }

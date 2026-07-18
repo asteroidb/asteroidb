@@ -245,6 +245,11 @@ struct FdState {
     /// would land AFTER the garbage and turn a harmless torn write into
     /// fail-stop mid-log corruption at the next recovery.
     tainted: bool,
+    /// Test-only fault injection: the next `n` appends fail with a clean
+    /// I/O error BEFORE touching the file (a transient failure that
+    /// leaves no torn frame — e.g. an EIO surfaced by the kernel).
+    #[cfg(test)]
+    fail_next_appends: u32,
 }
 
 impl FdState {
@@ -322,6 +327,8 @@ impl WalWriter {
                     seg_bytes: SEGMENT_HEADER_LEN as u64,
                     seg_records: 0,
                     tainted: false,
+                    #[cfg(test)]
+                    fail_next_appends: 0,
                 }),
                 appended: AtomicU64::new(0),
                 durable: AtomicU64::new(0),
@@ -359,6 +366,11 @@ impl WalWriter {
 
         let pos = {
             let mut state = self.shared.state.lock().unwrap();
+            #[cfg(test)]
+            if state.fail_next_appends > 0 {
+                state.fail_next_appends -= 1;
+                return Err(io::Error::other("injected WAL append failure"));
+            }
             state.repair_if_tainted()?;
             if state.seg_records > 0
                 && state.seg_bytes + frame.len() as u64 > self.cfg.segment_max_bytes
@@ -417,6 +429,15 @@ impl WalWriter {
         self.shared
             .advance_durable(self.shared.appended.load(Ordering::Acquire));
         Ok(sealed)
+    }
+
+    /// Test hook: make the next `n` appends fail with a clean transient
+    /// I/O error (no torn frame, no taint — the file is never touched).
+    /// Used by the RR-gate tests to poison a key via a WAL data-record
+    /// append failure and verify the retry repairs it.
+    #[cfg(test)]
+    pub(crate) fn inject_append_failures(&mut self, n: u32) {
+        self.shared.state.lock().unwrap().fail_next_appends = n;
     }
 
     /// Test hook: simulate a failed append that left `garbage` bytes of a

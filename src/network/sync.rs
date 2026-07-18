@@ -145,8 +145,11 @@ pub struct DeltaSyncResponse {
     /// diverge permanently. The full-dump path (`GET /api/internal/keys`)
     /// has always compensated; this closes the same gap on the delta
     /// path. The receiver merges these without an HLC (`merge_remote`),
-    /// re-stamping them locally — which also makes them delta-visible on
-    /// the receiver from then on.
+    /// re-stamping them locally when the merge inflates its state or the
+    /// key is untracked there too — which makes a genuinely new key
+    /// delta-visible on the receiver from then on, while a redundant
+    /// echo of an already-tracked converged key is absorbed by the RR
+    /// gate (M-6) without dirtying the receiver's change log.
     ///
     /// NOTE for maintainers: bincode is positional — new fields may only
     /// be appended at the end with `#[serde(default)]` and never

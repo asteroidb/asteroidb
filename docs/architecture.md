@@ -212,6 +212,16 @@ sequenceDiagram
 - 書き込みはローカル受理後すぐにレスポンスを返却（低レイテンシ）。
 - Delta sync は定期的に実行され、失敗時は指数バックオフが適用。
 - CRDT マージは可換・結合・冪等であり、順序は問わない。
+- **no-op マージは change log を汚さない（RR: redundant relay 抑止、M-6）**:
+  受信 merge がローカル状態を厳密に inflate した時（または per-key HLC 未登録の
+  untracked キーを初めて delta 可視化する時、キーごと高々 1 回）に限り
+  ローカル HLC で再スタンプする。例外として WAL 追記失敗で poison されたキーは
+  no-op でも再スタンプ + WAL 再追記する（メモリ上の状態に対する data record が
+  WAL に欠けているため、送信側リトライを吸収すると耐久性修復が失われる）。
+  収束済みキーのエコーは受信側で吸収され、
+  書き込み静止後の再送は格子の高さで有界（旧実装は無条件再スタンプにより
+  収束済みキーがフル CRDT 状態で恒久ピンポンしていた）。スキップ件数は
+  `sync_redundant_merge_skips_total` で観測できる。
 
 ### Certified Write
 
@@ -368,8 +378,10 @@ pull 側の claims 不成立（送信側の change-log prune を含む）・デ�
 digest の材料に関する設計判断:
 
 - **`Store::timestamps`（per-key HLC）は含めない**: push 経路の merge は
-  ローカル clock で再スタンプし、prune は片側だけでエントリを消すため、
-  per-key HLC はレプリカ間で収束せず、恒常的な偽不一致を生む。
+  **状態を inflate した時のみ**ローカル clock で再スタンプし（RR、M-6。
+  no-op merge はスタンプしない）、prune は片側だけでエントリを消すため、
+  per-key HLC は依然レプリカ間で収束せず、含めると恒常的な偽不一致を生む
+  （スタンプがローカル採番である事実は RR 後も不変で、除外の結論は変わらない）。
 - **counters / compaction floor / uncovered deferred は含める（正準形、
   scheme v2）**: digest は live・counters・floor・**uncovered** deferred の
   正準形を含む。「digest 一致 ⟺ 正準状態一致（= 意味論的完全一致、SHA-256

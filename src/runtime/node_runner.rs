@@ -2925,6 +2925,7 @@ impl NodeRunner {
             allow_hole_jump,
         );
         let floor_fx = api.store_mut().take_floor_effects();
+        let redundant_merge_skips = api.redundant_merge_skips();
         drop(api);
 
         // Publish floor observability: stall gauges reflect the latest
@@ -2950,6 +2951,11 @@ impl NodeRunner {
             floor_fx.killed_by_floor + floor_fx.rejected_stale_live,
             Ordering::Relaxed,
         );
+        // Mirror the RR-gate skip counter (M-6) — a cumulative value kept
+        // by the EventualApi, so `store` (not `fetch_add`) is correct.
+        self.metrics
+            .sync_redundant_merge_skips_total
+            .store(redundant_merge_skips, Ordering::Relaxed);
 
         if stats.collected > 0 {
             tracing::info!(
@@ -3218,9 +3224,13 @@ impl NodeRunner {
         // invisible to its delta scan, yet a complete pull's adoption
         // below claims the sender's WHOLE state. Merge them BEFORE the
         // adoption so the claim is true; without an origin HLC they merge
-        // via `merge_remote` (local re-stamp — which also makes them
-        // delta-visible here from now on). A failed merge poisons the key
-        // inside merge_remote, keeping the adoption fail-closed for it.
+        // via `merge_remote`. Since the RR gate (M-6) the local re-stamp
+        // only happens when the merge inflates local state or the key is
+        // untracked HERE too — which still makes a genuinely new key
+        // delta-visible from now on, while a redundant echo of an
+        // already-tracked converged key is absorbed without dirtying the
+        // change log. A failed merge poisons the key inside merge_remote,
+        // keeping the adoption fail-closed for it.
         //
         // Skipped when no claims will be adopted (`!claims_ok`): the
         // entries only exist to make the adoption's completeness claim

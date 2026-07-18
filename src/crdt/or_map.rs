@@ -22,7 +22,7 @@ struct Dot {
 /// add/remove) with LWW-Register for values. Each key tracks its causal
 /// dots so that concurrent `set` and `delete` operations resolve correctly:
 /// a `set` that is concurrent with a `delete` will re-add the key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrMap<K, V>
 where
     K: Eq + Hash + Clone,
@@ -202,42 +202,75 @@ where
         let mut fx = MergeEffects::default();
         let floor_pre = self.compaction_floor.clone();
 
+        // `fx.changed` is set at EVERY site that mutates physical state
+        // and nowhere else (see `OrSet::merge` for the full contract):
+        // `changed == false` guarantees `pre == post` — the RR gate (M-6).
+
         for (key, (other_dots, other_reg)) in &other.entries {
-            let entry = self.entries.entry(key.clone()).or_insert_with(|| {
-                let reg = LwwRegister::new();
-                (HashSet::new(), reg)
-            });
+            if let Some(entry) = self.entries.get_mut(key) {
+                // Key exists in both — merge dots and register in place.
 
-            // Add dots from other that we haven't tombstoned and that are
-            // not stale under our pre-merge floor.
-            for dot in other_dots {
-                if self.deferred.contains(dot) || entry.0.contains(dot) {
-                    continue;
+                // Add dots from other that we haven't tombstoned and that
+                // are not stale under our pre-merge floor.
+                for dot in other_dots {
+                    if self.deferred.contains(dot) || entry.0.contains(dot) {
+                        continue;
+                    }
+                    if covered(&floor_pre, &dot.node_id, dot.counter) {
+                        fx.rejected_stale_live += 1;
+                        continue;
+                    }
+                    entry.0.insert(dot.clone());
+                    fx.changed = true;
                 }
-                if covered(&floor_pre, &dot.node_id, dot.counter) {
-                    fx.rejected_stale_live += 1;
-                    continue;
+
+                // Remove our dots that the other has tombstoned or
+                // floor-compacted away.
+                entry.0.retain(|dot| {
+                    if other.deferred.contains(dot) {
+                        fx.changed = true;
+                        return false;
+                    }
+                    if covered(&other.compaction_floor, &dot.node_id, dot.counter)
+                        && !other_dots.contains(dot)
+                    {
+                        fx.killed_by_floor += 1;
+                        fx.changed = true;
+                        return false;
+                    }
+                    true
+                });
+
+                // Merge LWW value.
+                if entry.1.merge(other_reg) {
+                    fx.changed = true;
                 }
-                entry.0.insert(dot.clone());
+            } else {
+                // Key only in other — filter the dots FIRST and adopt
+                // nothing (not even the register) when every dot is
+                // deferred/stale. The previous in-place formulation
+                // created an empty entry, merged the register into it and
+                // relied on the retain below to delete the entry again —
+                // a net no-op that a naive `changed` instrumentation
+                // would misreport as a change on every round.
+                let mut filtered: HashSet<Dot> = HashSet::new();
+                for dot in other_dots {
+                    if self.deferred.contains(dot) {
+                        continue;
+                    }
+                    if covered(&floor_pre, &dot.node_id, dot.counter) {
+                        fx.rejected_stale_live += 1;
+                        continue;
+                    }
+                    filtered.insert(dot.clone());
+                }
+                if !filtered.is_empty() {
+                    let mut reg = LwwRegister::new();
+                    reg.merge(other_reg);
+                    self.entries.insert(key.clone(), (filtered, reg));
+                    fx.changed = true;
+                }
             }
-
-            // Remove our dots that the other has tombstoned or
-            // floor-compacted away.
-            entry.0.retain(|dot| {
-                if other.deferred.contains(dot) {
-                    return false;
-                }
-                if covered(&other.compaction_floor, &dot.node_id, dot.counter)
-                    && !other_dots.contains(dot)
-                {
-                    fx.killed_by_floor += 1;
-                    return false;
-                }
-                true
-            });
-
-            // Merge LWW value.
-            entry.1.merge(other_reg);
         }
 
         // Apply other's tombstones and floor to self-only entries (keys
@@ -246,10 +279,12 @@ where
             if !other.entries.contains_key(key) {
                 dots.retain(|dot| {
                     if other.deferred.contains(dot) {
+                        fx.changed = true;
                         return false;
                     }
                     if covered(&other.compaction_floor, &dot.node_id, dot.counter) {
                         fx.killed_by_floor += 1;
+                        fx.changed = true;
                         return false;
                     }
                     true
@@ -257,25 +292,63 @@ where
             }
         }
 
-        // Remove entries with no remaining dots.
+        // Remove entries with no remaining dots. (Not a `changed` site:
+        // an entry can only become empty through a dot-dropping retain
+        // above, which already flagged.)
         self.entries.retain(|_, (dots, _)| !dots.is_empty());
 
-        // Merge counters (take max).
+        // Merge counters (take max). Only an actual raise mutates state;
+        // no ghost zero entries (see OrSet::merge).
         for (node_id, &counter) in &other.counters {
-            let our_counter = self.counters.entry(node_id.clone()).or_insert(0);
-            *our_counter = (*our_counter).max(counter);
+            match self.counters.get_mut(node_id) {
+                Some(our_counter) => {
+                    if counter > *our_counter {
+                        *our_counter = counter;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if counter > 0 {
+                        self.counters.insert(node_id.clone(), counter);
+                        fx.changed = true;
+                    }
+                }
+            }
         }
 
         // Merge the floor (pointwise max, irrevocable), then clamp
         // counters to the floor (INV-CTR).
         for (node_id, &f) in &other.compaction_floor {
-            let entry = self.compaction_floor.entry(node_id.clone()).or_insert(0);
-            *entry = (*entry).max(f);
+            match self.compaction_floor.get_mut(node_id) {
+                Some(entry) => {
+                    if f > *entry {
+                        *entry = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if f > 0 {
+                        self.compaction_floor.insert(node_id.clone(), f);
+                        fx.changed = true;
+                    }
+                }
+            }
         }
         for (node_id, &f) in &self.compaction_floor {
-            let counter = self.counters.entry(node_id.clone()).or_insert(0);
-            if *counter < f {
-                *counter = f;
+            if f == 0 {
+                continue;
+            }
+            match self.counters.get_mut(node_id) {
+                Some(counter) => {
+                    if *counter < f {
+                        *counter = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    self.counters.insert(node_id.clone(), f);
+                    fx.changed = true;
+                }
             }
         }
 
@@ -284,19 +357,27 @@ where
         // OrSet::merge).
         let floor_merged = &self.compaction_floor;
         self.deferred.retain(|d| {
-            !covered(floor_merged, &d.node_id, d.counter)
-                || covered(&floor_pre, &d.node_id, d.counter)
+            let keep = !covered(floor_merged, &d.node_id, d.counter)
+                || covered(&floor_pre, &d.node_id, d.counter);
+            if !keep {
+                fx.changed = true;
+            }
+            keep
         });
         for d in &other.deferred {
             if covered(&self.compaction_floor, &d.node_id, d.counter) {
                 if !self.deferred.contains(d) {
                     fx.rejected_covered_deferred += 1;
                 }
-            } else {
-                self.deferred.insert(d.clone());
+            } else if self.deferred.insert(d.clone()) {
+                fx.changed = true;
             }
         }
 
+        debug_assert!(
+            fx.killed_by_floor == 0 || fx.changed,
+            "a floor kill always removes a dot, so it must imply changed"
+        );
         fx
     }
 
@@ -1275,5 +1356,172 @@ mod tests {
         assert_eq!(outcome.stalled_uncandidated, 1);
         assert_eq!(map.deferred_len(), 1, "post-mark tombstone survives");
         assert_eq!(map.compaction_floor().get(&n), Some(&1));
+    }
+
+    // ---------------------------------------------------------------
+    // MergeEffects::changed ground truth (M-6, RR gate)
+    // ---------------------------------------------------------------
+
+    /// Merge `b` into `a`, asserting the changed flag equals the physical
+    /// state difference, and return the effects.
+    fn merge_ground_truth(
+        a: &mut OrMap<String, String>,
+        b: &OrMap<String, String>,
+    ) -> MergeEffects {
+        let before = a.clone();
+        let fx = a.merge(b);
+        assert_eq!(
+            fx.changed,
+            *a != before,
+            "changed flag must equal physical pre/post difference"
+        );
+        fx
+    }
+
+    #[test]
+    fn merge_changed_identical_and_subset_are_noops() {
+        let n = node("A");
+        let mut a = OrMap::new();
+        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        a.set("gone".to_string(), "g".to_string(), ts(110, 0, "A"), &n);
+        a.delete(&"gone".to_string());
+        let b = a.clone();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "identical states must merge as a no-op");
+
+        // Dominated subset: b lacks a's later entry.
+        let mut sup = b.clone();
+        sup.set("extra".to_string(), "e".to_string(), ts(200, 0, "A"), &n);
+        let mut target = sup.clone();
+        let fx = merge_ground_truth(&mut target, &b);
+        assert!(!fx.changed, "merging a dominated subset must be a no-op");
+    }
+
+    #[test]
+    fn merge_changed_register_timestamp_directions() {
+        let n = node("A");
+        let mut a = OrMap::new();
+        a.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
+        let mut newer = OrMap::new();
+        newer.set(
+            "k".to_string(),
+            "new".to_string(),
+            ts(200, 0, "B"),
+            &node("B"),
+        );
+
+        // Newer register on b: changed (dot + register both advance).
+        let fx = merge_ground_truth(&mut a, &newer);
+        assert!(fx.changed);
+        assert_eq!(a.get(&"k".to_string()), Some(&"new".to_string()));
+
+        // Older register re-offered: the stale dot is still adopted (it
+        // is a distinct live dot) — but repeating the SAME merge again
+        // must be a no-op.
+        let mut older = OrMap::new();
+        older.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
+        merge_ground_truth(&mut a, &older);
+        let fx = merge_ground_truth(&mut a, &older);
+        assert!(!fx.changed, "repeated merge of the same state is a no-op");
+    }
+
+    #[test]
+    fn merge_changed_tombstone_counter_floor_paths() {
+        let n = node("A");
+        let mut a = OrMap::new();
+        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let mut b = a.clone();
+
+        // Tombstone-only difference.
+        b.delete(&"k".to_string());
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(fx.changed, "a delete must report changed");
+
+        // Counter-only advance.
+        let counters_only: OrMap<String, String> = serde_json::from_str(
+            r#"{"entries":{},"counters":{"A":5},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+        let fx = merge_ground_truth(&mut a, &counters_only);
+        assert!(fx.changed, "a counter-only advance must report changed");
+
+        // Floor advance + floor kill on a lagging replica.
+        let mut swept = OrMap::new();
+        swept.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let mut lagging = swept.clone();
+        swept.delete(&"k".to_string());
+        swept.compact_deferred_certified(&swept.deferred_dots(), None);
+        let fx = merge_ground_truth(&mut lagging, &swept);
+        assert!(fx.changed, "a floor kill must report changed");
+        assert_eq!(fx.killed_by_floor, 1);
+    }
+
+    #[test]
+    fn merge_changed_stale_reoffers_are_noops() {
+        let n = node("A");
+        let mut a = OrMap::new();
+        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        a.delete(&"k".to_string());
+        let pre_sweep = a.clone(); // holds tombstone (A,1)
+        a.compact_deferred_certified(&a.deferred_dots(), None);
+
+        // Covered deferred re-offer: rejected, no state change.
+        let fx = merge_ground_truth(&mut a, &pre_sweep);
+        assert_eq!(fx.rejected_covered_deferred, 1);
+        assert!(
+            !fx.changed,
+            "a rejected covered tombstone must NOT report changed"
+        );
+    }
+
+    /// Regression pin for the other-only-key refactor: a key that exists
+    /// only on the other side but whose dots are ALL stale (deferred or
+    /// floor-covered) must be a full no-op — no entry created, no
+    /// register adopted, `changed == false`. The previous formulation
+    /// created an empty entry (or_insert_with), merged the register into
+    /// it and deleted the entry again in the retain — a net no-op that a
+    /// naive instrumentation would misreport as a change on EVERY round
+    /// (permanent ping-pong for lagging-peer re-offers).
+    #[test]
+    fn or_map_other_only_key_all_dots_stale_is_noop() {
+        let n = node("A");
+
+        // Case 1: all dots deferred (we deleted the key).
+        let mut sender = OrMap::new();
+        sender.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let mut a = sender.clone();
+        a.delete(&"k".to_string());
+        let fx = merge_ground_truth(&mut a, &sender);
+        assert!(!fx.changed, "all-deferred other-only key must be a no-op");
+        assert!(
+            !a.entries.contains_key("k"),
+            "no entry may be created for an all-stale other-only key"
+        );
+
+        // Case 2: all dots floor-covered (certified-removed re-offer).
+        let mut b = sender.clone();
+        b.delete(&"k".to_string());
+        b.compact_deferred_certified(&b.deferred_dots(), None);
+        assert_eq!(b.deferred_len(), 0, "tombstone folded into the floor");
+        let fx = merge_ground_truth(&mut b, &sender);
+        assert_eq!(fx.rejected_stale_live, 1);
+        assert!(!fx.changed, "floor-stale other-only key must be a no-op");
+        assert!(!b.entries.contains_key("k"));
+    }
+
+    #[test]
+    fn merge_changed_zero_counter_creates_no_ghost_entry() {
+        let n = node("A");
+        let mut a = OrMap::new();
+        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let b: OrMap<String, String> = serde_json::from_str(
+            r#"{"entries":{},"counters":{"B":0},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "a zero counter carries no information");
+        assert!(!a.counters.contains_key(&node("B")));
     }
 }

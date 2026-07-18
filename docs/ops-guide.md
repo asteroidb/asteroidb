@@ -366,6 +366,7 @@ curl -s http://localhost:3000/api/slo | jq .
 | `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
 | `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
 | `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
+| `sync_redundant_merge_skips_total` | u64 | RR ゲート（M-6）が抑止した冗長リモート merge 累計（no-op merge かつ delta 可視済みキー → 再スタンプ/変更ログ/WAL 書き込みをスキップ）。GC tick ごとに `EventualApi` の in-memory カウンタから反映（再起動でリセット）。アイドルクラスタで緩やかに増えるのは正常（収束済みキーのエコー吸収）。収束済みストアの双方向 sync 下で 0 に張り付く場合はピンポン回帰を疑う |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
 | `rebalance_keys_migrated` | u64 | リバランス移行キー累計 |

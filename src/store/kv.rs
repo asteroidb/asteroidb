@@ -66,7 +66,12 @@ struct PersistedStore {
 ///
 /// Wraps all supported CRDT types so the store can hold heterogeneous
 /// values while preserving type-safe merge semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is PHYSICAL equality (all components, including counters,
+/// floors and covered tombstones) — used by the debug no-op oracle in
+/// [`Store::merge_value`], NOT canonical/observable equality (that is the
+/// canonical digest's job).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CrdtValue {
     Counter(PnCounter),
     Set(OrSet<String>),
@@ -898,23 +903,35 @@ impl Store {
     ///
     /// If the key does not exist, the value is inserted directly.
     /// If the key exists but the CRDT types differ, returns `CrdtError::TypeMismatch`.
-    pub fn merge_value(&mut self, key: String, value: &CrdtValue) -> Result<(), CrdtError> {
-        if let Some(existing) = self.data.get_mut(&key) {
+    ///
+    /// Returns `Ok(true)` iff the merge strictly inflated local state
+    /// (including the insert of a new key); `Ok(false)` guarantees the
+    /// stored value is physically unchanged. This is the RR-gate signal
+    /// (redundant-relay suppression, M-6) consumed by
+    /// `EventualApi::merge_remote` / `merge_remote_with_hlc`.
+    pub fn merge_value(&mut self, key: String, value: &CrdtValue) -> Result<bool, CrdtError> {
+        // Debug-only no-op oracle: `changed == false` must imply
+        // `pre == post`. One-directional on purpose — non-canonical
+        // deserialized states (e.g. ghost zero counter entries persisted
+        // by older code) can make `pre != post` invisible to a merge
+        // that adopted nothing, but never the reverse.
+        #[cfg(debug_assertions)]
+        let pre = self.data.get(&key).cloned();
+
+        let changed = if let Some(existing) = self.data.get_mut(&key) {
             match (existing, value) {
-                (CrdtValue::Counter(a), CrdtValue::Counter(b)) => {
-                    a.merge(b);
-                }
+                (CrdtValue::Counter(a), CrdtValue::Counter(b)) => a.merge(b),
                 (CrdtValue::Set(a), CrdtValue::Set(b)) => {
                     let fx = a.merge(b);
                     self.floor_effects.absorb(fx);
+                    fx.changed
                 }
                 (CrdtValue::Map(a), CrdtValue::Map(b)) => {
                     let fx = a.merge(b);
                     self.floor_effects.absorb(fx);
+                    fx.changed
                 }
-                (CrdtValue::Register(a), CrdtValue::Register(b)) => {
-                    a.merge(b);
-                }
+                (CrdtValue::Register(a), CrdtValue::Register(b)) => a.merge(b),
                 (existing, incoming) => {
                     return Err(CrdtError::TypeMismatch {
                         expected: existing.type_name().to_string(),
@@ -923,9 +940,16 @@ impl Store {
                 }
             }
         } else {
-            self.data.insert(key, value.clone());
-        }
-        Ok(())
+            self.data.insert(key.clone(), value.clone());
+            true
+        };
+
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            changed || pre.as_ref() == self.data.get(&key),
+            "merge_value reported no-op but the state changed for key {key}"
+        );
+        Ok(changed)
     }
 
     /// Merge a delta CRDT value into an existing entry.

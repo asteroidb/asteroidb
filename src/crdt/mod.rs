@@ -12,9 +12,10 @@ use crate::types::NodeId;
 /// Effects of one CRDT merge that involved the per-value compaction floor
 /// (see [`or_set::OrSet::merge`] / [`or_map::OrMap::merge`]).
 ///
-/// These are diagnostics, not part of CRDT state: `merge` remains a pure
-/// join on the (elements, counters, deferred, floor) lattice. Callers that
-/// do not care may ignore the return value (deliberately not `#[must_use]`).
+/// The `rejected_*` / `killed_*` counters are diagnostics, not part of
+/// CRDT state: `merge` remains a pure join on the (elements, counters,
+/// deferred, floor) lattice. Callers that do not care may ignore the
+/// return value (deliberately not `#[must_use]`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MergeEffects {
     /// Incoming deferred (tombstone) dots that were NOT adopted because
@@ -31,14 +32,31 @@ pub struct MergeEffects {
     /// already held live here): certified-removed dots re-offered by a
     /// lagging or previously-unknown replica.
     pub rejected_stale_live: u64,
+    /// NOT a diagnostic: `true` iff this merge strictly inflated the local
+    /// physical state (`pre != post` over ALL components — elements/dots,
+    /// deferred, counters, compaction floor, register value+timestamp).
+    /// `false` GUARANTEES `pre == post`, which is what the RR gate
+    /// (redundant-relay suppression, M-6) relies on to skip re-stamping.
+    ///
+    /// Invariants: `killed_by_floor > 0 ⇒ changed` (a floor kill always
+    /// removes a dot). The `rejected_*` counters are NON-adoption events
+    /// and must NEVER imply `changed` — counting them would let a lagging
+    /// peer's stale re-offers keep the receiver permanently "dirty" and
+    /// resurrect the ping-pong this flag exists to stop.
+    pub changed: bool,
 }
 
 impl MergeEffects {
     /// Accumulate another merge's effects into this total.
+    ///
+    /// `changed` aggregates by OR: the total reads "at least one absorbed
+    /// merge inflated local state" (harmless for the diagnostics-only
+    /// consumers of the accumulated counters, e.g. `Store::floor_effects`).
     pub fn absorb(&mut self, other: MergeEffects) {
         self.rejected_covered_deferred += other.rejected_covered_deferred;
         self.killed_by_floor += other.killed_by_floor;
         self.rejected_stale_live += other.rejected_stale_live;
+        self.changed |= other.changed;
     }
 }
 

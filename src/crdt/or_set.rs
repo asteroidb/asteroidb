@@ -30,7 +30,7 @@ pub struct Dot {
 /// A causal context (`deferred` set) tracks all dots that have been removed.
 /// During merge, dots present in the remote's deferred set are discarded,
 /// ensuring that a remove on one replica propagates correctly to others.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrSet<T: Eq + Hash> {
     /// Maps each element to the set of dots that justify its presence.
     elements: HashMap<T, HashSet<Dot>>,
@@ -192,6 +192,13 @@ where
         let other_has_tombstones = !other.deferred.is_empty();
         let other_has_floor = !other.compaction_floor.is_empty();
 
+        // `fx.changed` is set at EVERY site that mutates physical state
+        // (dot adopted/dropped, counter/floor raised, tombstone
+        // adopted/dropped) and nowhere else, so `changed == false`
+        // guarantees `pre == post` — the RR-gate contract (M-6). The
+        // rejection sites (`rejected_stale_live`,
+        // `rejected_covered_deferred`) adopt nothing and must not flag.
+
         // Process elements present in the other replica.
         for (elem, other_dots) in &other.elements {
             if let Some(dots) = self.elements.get_mut(elem) {
@@ -207,18 +214,21 @@ where
                         continue;
                     }
                     dots.insert(dot.clone());
+                    fx.changed = true;
                 }
                 // Remove our dots that the other has tombstoned or
                 // floor-compacted away.
                 if other_has_tombstones || other_has_floor {
                     dots.retain(|dot| {
                         if other.deferred.contains(dot) {
+                            fx.changed = true;
                             return false;
                         }
                         if covered(&other.compaction_floor, &dot.node_id, dot.counter)
                             && !other_dots.contains(dot)
                         {
                             fx.killed_by_floor += 1;
+                            fx.changed = true;
                             return false;
                         }
                         true
@@ -239,6 +249,7 @@ where
                 }
                 if !filtered.is_empty() {
                     self.elements.insert(elem.clone(), filtered);
+                    fx.changed = true;
                 }
             }
         }
@@ -251,10 +262,12 @@ where
                 if !other.elements.contains_key(elem) {
                     dots.retain(|dot| {
                         if other.deferred.contains(dot) {
+                            fx.changed = true;
                             return false;
                         }
                         if covered(&other.compaction_floor, &dot.node_id, dot.counter) {
                             fx.killed_by_floor += 1;
+                            fx.changed = true;
                             return false;
                         }
                         true
@@ -263,27 +276,69 @@ where
             }
         }
 
-        // Remove entries with no remaining dots.
+        // Remove entries with no remaining dots. (Not a `changed` site:
+        // an entry can only become empty through a dot-dropping retain
+        // above, which already flagged.)
         self.elements.retain(|_, dots| !dots.is_empty());
 
-        // Merge counters so future dots stay globally unique.
+        // Merge counters so future dots stay globally unique. Only an
+        // actual raise mutates state; in particular an absent entry is
+        // NOT materialised for `other_counter == 0` (a ghost zero entry
+        // would be a physical change invisible to `changed`, breaking
+        // the `changed == false ⇒ pre == post` contract).
         for (node_id, &other_counter) in &other.counters {
-            let counter = self.counters.entry(node_id.clone()).or_insert(0);
-            *counter = (*counter).max(other_counter);
+            match self.counters.get_mut(node_id) {
+                Some(counter) => {
+                    if other_counter > *counter {
+                        *counter = other_counter;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if other_counter > 0 {
+                        self.counters.insert(node_id.clone(), other_counter);
+                        fx.changed = true;
+                    }
+                }
+            }
         }
 
         // Merge the compaction floor by pointwise max (irrevocable), then
         // defensively clamp counters to the floor (INV-CTR: a corrupted
         // payload with floor > counters must not let a future add reuse a
-        // fate-decided counter value).
+        // fate-decided counter value). Same no-ghost-entry discipline as
+        // the counters above.
         for (node_id, &f) in &other.compaction_floor {
-            let entry = self.compaction_floor.entry(node_id.clone()).or_insert(0);
-            *entry = (*entry).max(f);
+            match self.compaction_floor.get_mut(node_id) {
+                Some(entry) => {
+                    if f > *entry {
+                        *entry = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if f > 0 {
+                        self.compaction_floor.insert(node_id.clone(), f);
+                        fx.changed = true;
+                    }
+                }
+            }
         }
         for (node_id, &f) in &self.compaction_floor {
-            let counter = self.counters.entry(node_id.clone()).or_insert(0);
-            if *counter < f {
-                *counter = f;
+            if f == 0 {
+                continue;
+            }
+            match self.counters.get_mut(node_id) {
+                Some(counter) => {
+                    if *counter < f {
+                        *counter = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    self.counters.insert(node_id.clone(), f);
+                    fx.changed = true;
+                }
             }
         }
 
@@ -294,8 +349,12 @@ where
         // by the inherited floor (their remove is certified cluster-wide).
         let floor_merged = &self.compaction_floor;
         self.deferred.retain(|d| {
-            !covered(floor_merged, &d.node_id, d.counter)
-                || covered(&floor_pre, &d.node_id, d.counter)
+            let keep = !covered(floor_merged, &d.node_id, d.counter)
+                || covered(&floor_pre, &d.node_id, d.counter);
+            if !keep {
+                fx.changed = true;
+            }
+            keep
         });
         // Incoming tombstones covered by the merged floor are redundant
         // ("floor + absence" already encodes the remove) — never adopted.
@@ -306,11 +365,15 @@ where
                 if !self.deferred.contains(d) {
                     fx.rejected_covered_deferred += 1;
                 }
-            } else {
-                self.deferred.insert(d.clone());
+            } else if self.deferred.insert(d.clone()) {
+                fx.changed = true;
             }
         }
 
+        debug_assert!(
+            fx.killed_by_floor == 0 || fx.changed,
+            "a floor kill always removes a dot, so it must imply changed"
+        );
         fx
     }
 
@@ -1661,6 +1724,166 @@ mod tests {
             digest_of(&floored),
             digest_of(&holed),
             "a floor advance is a semantic difference and must mismatch"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // MergeEffects::changed ground truth (M-6, RR gate)
+    //
+    // Contract: `changed == (a != a_before)` over the PHYSICAL state.
+    // The bidirectional form holds for canonically-constructed states
+    // (the production debug oracle only checks the `changed == false ⇒
+    // pre == post` direction, but tests pin both).
+    // ---------------------------------------------------------------
+
+    /// Merge `b` into `a`, asserting the changed flag equals the physical
+    /// state difference, and return the effects.
+    fn merge_ground_truth(a: &mut OrSet<String>, b: &OrSet<String>) -> MergeEffects {
+        let before = a.clone();
+        let fx = a.merge(b);
+        assert_eq!(
+            fx.changed,
+            *a != before,
+            "changed flag must equal physical pre/post difference"
+        );
+        fx
+    }
+
+    #[test]
+    fn merge_changed_identical_state_is_noop() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        a.add("y".to_string(), &n);
+        a.remove(&"y".to_string());
+        let b = a.clone();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "identical states must merge as a no-op");
+    }
+
+    #[test]
+    fn merge_changed_subset_is_noop() {
+        let n = node("A");
+        let mut b = OrSet::new();
+        b.add("x".to_string(), &n);
+        let mut a = b.clone();
+        a.add("y".to_string(), &n); // a ⊋ b
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "merging a dominated subset must be a no-op");
+    }
+
+    #[test]
+    fn merge_changed_new_dot_and_tombstone() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        let mut b = a.clone();
+
+        // New dot on b.
+        b.add("x".to_string(), &n);
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(fx.changed, "a new dot must report changed");
+
+        // Tombstone-only difference.
+        let mut b2 = a.clone();
+        b2.remove(&"x".to_string());
+        let fx = merge_ground_truth(&mut a, &b2);
+        assert!(fx.changed, "a new tombstone must report changed");
+
+        // And the echo back is a no-op again.
+        let snapshot = a.clone();
+        let fx = merge_ground_truth(&mut a, &snapshot);
+        assert!(!fx.changed, "self-echo must be a no-op");
+    }
+
+    #[test]
+    fn merge_changed_counter_only_advance() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n); // counters {A:1}
+        let b: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{},"counters":{"A":3},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(fx.changed, "a counter-only advance must report changed");
+        // The advance must keep propagating: a second merge is a no-op.
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed);
+    }
+
+    #[test]
+    fn merge_changed_floor_only_advance_and_floor_kill() {
+        let n = node("A");
+        let mut swept = OrSet::new();
+        swept.add("x".to_string(), &n);
+        swept.remove(&"x".to_string());
+        swept.compact_deferred_certified(&swept.deferred_dots().clone(), None);
+        assert_eq!(swept.compaction_floor().get(&n), Some(&1));
+
+        // Floor kill: the lagging replica still holds (A,1) live.
+        let mut lagging = OrSet::new();
+        lagging.add("x".to_string(), &n);
+        let fx = merge_ground_truth(&mut lagging, &swept);
+        assert!(fx.changed, "a floor kill must report changed");
+        assert_eq!(fx.killed_by_floor, 1);
+
+        // Floor-only advance: receiver has neither the element nor the
+        // floor (counters get clamped up too — both are real changes).
+        let mut empty: OrSet<String> = OrSet::new();
+        let fx = merge_ground_truth(&mut empty, &swept);
+        assert!(fx.changed, "a floor-only advance must report changed");
+    }
+
+    #[test]
+    fn merge_changed_stale_reoffers_are_noops() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        a.remove(&"x".to_string());
+        let pre_sweep = a.clone(); // holds tombstone (A,1)
+        a.compact_deferred_certified(&a.deferred_dots().clone(), None);
+
+        // (viii) stale live re-offer: rejected, no state change.
+        let mut stale_live = OrSet::new();
+        stale_live.add("x".to_string(), &n); // reconstructs (A,1) live
+        let fx = merge_ground_truth(&mut a, &stale_live);
+        assert_eq!(fx.rejected_stale_live, 1);
+        assert!(
+            !fx.changed,
+            "a rejected stale live dot must NOT report changed (would re-dirty forever)"
+        );
+
+        // (ix) covered deferred re-offer: rejected, no state change.
+        let fx = merge_ground_truth(&mut a, &pre_sweep);
+        assert_eq!(fx.rejected_covered_deferred, 1);
+        assert!(
+            !fx.changed,
+            "a rejected covered tombstone must NOT report changed"
+        );
+    }
+
+    #[test]
+    fn merge_changed_zero_counter_creates_no_ghost_entry() {
+        let na = node("A");
+        let nb = node("B");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &na);
+        // Adversarial/legacy payload: an explicit zero counter for a node
+        // we have never seen.
+        let b: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{},"counters":{"B":0},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "a zero counter carries no information");
+        assert!(
+            !a.counters.contains_key(&nb),
+            "no ghost zero entry may be materialised (it would break the no-op oracle)"
         );
     }
 }

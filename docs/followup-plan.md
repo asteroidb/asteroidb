@@ -13,7 +13,7 @@
 1. ~~**M-8**(最優先)— tombstone GC が収束しない問題。~~ **完了**(per-value compaction floor +
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
-3. 効率系(M-6, M-7)
+3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, M-7)
 4. 検知範囲・整合(M-12, M-14, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
@@ -85,6 +85,76 @@ inbound ゲート成立時のみ legacy hole を跨ぐ。
 (5) floor は無認証(上記 (c))。(6) sweep は per-key HLC を進めないため floor 伝播は
 digest/full sync 機会依存(意図的: GC ごとの delta ストーム回避)。
 
+## M-6 クローズ記録(実装済み)
+
+**方式(RR: redundant relay 抑止)**: CRDT 4 型の merge が「厳密 inflation の有無」を返すようになった
+(`MergeEffects.changed` / `PnCounter::merge -> bool` / `LwwRegister::merge -> bool`。
+契約: `changed == false ⇒ pre == post`(物理全成分)。join-semilattice 上で merge は単調なので
+`changed == true ⟺ 厳密 inflation`)。`Store::merge_value` は `Result<bool>` でこれを中継し
+(debug ビルドでは `changed || pre == post` を検査する片方向オラクル付き)、
+`EventualApi::merge_remote` / `merge_remote_with_hlc` が RR ゲートを掛ける:
+
+```
+skip ⟺ merge が no-op(changed == false)
+       かつ store.timestamp_for(key).is_some()
+       かつ !store.merge_failed_contains(key)
+```
+
+スキップ時は再スタンプ(`record_change` / `record_change_max`)・`note_applied`・WAL 追記を行わない。
+untracked キー(per-key HLC 未登録。v1/v2 移行ストア等)は状態同一でも 1 回だけ再スタンプして
+delta 可視化する(キーごと高々 1 回 → 有界)。**poison キーはゲートを素通りする**(第三条件):
+一過性の WAL 追記失敗で poison されたキーは「マージ済みの状態がメモリにあるのに data record が
+WAL に無い」状態であり、送信側の同一値リトライを RR が飲み込むと、WAL に無いデータを ack して
+送信側 push frontier を進めてしまい、耐久性修復が「次の sync ラウンド」から「クラッシュ後の
+digest anti-entropy 待ち」に退行する。素通りさせればリトライが再スタンプ + 再追記で修復する
+(poison 集合は WAL 追記失敗が無い限り空なのでピンポンは復活しない)。`merge_remote_with_hlc` の
+`clock.update` と `note_visible` は**無条件のまま**(advisory clock 前進と「response token は
+可視状態を必ずカバー」の不変条件を保存)。poison 経路・pull_reconciled 記録条件・
+untracked 補償(node_runner)は全て不変。
+
+計装の要点: `rejected_stale_live` / `rejected_covered_deferred` は**非採用イベントであり changed を
+含意しない**(含めると lagging peer の stale 再オファーで受信側が恒久 dirty)。counters/floor の
+merge は「実際に上がった時のみ」書き込み、幽霊 0 エントリを作らない(`or_insert(0)` 廃止 —
+物理変化なのに changed=false となるオラクル破りの排除)。OrMap の other-only キー経路は
+「dot を先にフィルタし、全 stale ならエントリも register も作らない」形にリファクタ
+(旧: 空エントリ生成→retain 削除の正味 no-op が素朴計装では毎回 changed=true になる穴)。
+`killed_by_floor > 0 ⇒ changed` を debug_assert で固定。
+
+効果: 収束済み 2 ノードの双方向 push sync が完全静止(旧実装は無条件再スタンプで
+フル CRDT 状態が恒久ピンポン)。書き込み静止後の再送は格子の高さで有界。
+`changed_count` が真の変更数に縮み change-rate fallback の誤発火も減少。観測:
+`EventualApi::redundant_merge_skips`(in-memory)→ GC tick で
+`RuntimeMetrics::sync_redundant_merge_skips_total` に反映(ops-guide のメトリクス表参照)。
+テスト: CRDT 4 型の ground-truth テーブル/プロパティテスト(`changed == (pre != post)`)、
+API 単体(再スタンプ抑止・untracked 1 回スタンプ・visible 無条件前進・WAL poison キーの
+ゲート素通りと data record 修復 — 後者は WAL の test-only fault injection
+`WalWriter::inject_append_failures` を使用)、
+統合(`tests/delta_sync.rs`: `converged_key_stops_retransmitting` /
+`bounded_echo_after_real_change` / `three_node_push_cycle_quiesces` — いずれも修正前 RED —
+加えて NodeRunner レベルの `two_node_push_quiesces_after_convergence`: 実 HTTP 上の
+本番 sync ループ 2 runner が収束後、`GET /api/internal/keys` の per-key timestamp が
+3 サイクル以上完全不変で、`sync_redundant_merge_skips_total` が両ノードでエクスポートされる
+ことを検証。ハンドラ直叩きの `push_round` シミュレーションと runner 実装の乖離を防ぐ)。
+
+**却下事項(否定的知見)**:
+
+- **BP(per-key 単一 origin タグによる back-propagation 回避)は不健全で却下**: キーの現在状態は
+  複数 origin の join であり得るため、単一タグは第三者寄与を由来ピアへの push から恒久隠蔽し、
+  `push_frontiers` の C-2 不変条件と push_acked GC 契約に違反する(検証パネル 3 名が独立に反例構成)。
+  採用するなら per-delta の δ-buffer(Enes 原典形)設計が必須。
+- `SyncResponse.redundant`(ワイヤでのスキップ通知): 却下。ローカルカウンタで観測は足りる。
+
+**派生フォローアップ(未着手の独立タスク)**:
+
+- **v2 ワイヤ(SyncRequest 末尾に per-key HLC を付加し受信側で origin スタンプ採用)**:
+  per-key timestamp のレプリカ間収束により architecture.md「timestamps は digest に含めない」
+  制約緩和の道を開く。request 方向は bincode 末尾バイト無視 + 受信側二段デコードで互換成立
+  (検証済み)だが、**response 方向(新送信 ← 旧受信の legacy SyncResponse)のクライアント側
+  二段デコードが別途必須** — 無対策だとローリングアップグレード中に旧ピアへの全 push が
+  失敗扱いになる。push 受信のセッション意味論変更(note_applied→note_visible)の独立レビューも要する。
+- **送信側 RR(`delta_against` 系による真の δ 差分送信)**: 受信側 RR(本対応)は転送量自体は
+  減らさない(エコーの吸収と再送ループの停止まで)。送信量削減は別タスク。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -97,9 +167,8 @@ digest/full sync 機会依存(意図的: GC ごとの delta ストーム回避)�
   `advance_durable` を `sync_all` 成功直後(create 前)へ移動する件(rotate 失敗時に
   `durable` が過小報告される。`SyncPolicy::Off` 構成で実益。前提: `appended` の増加が
   state ロック下に限られること)は未着手の独立タスク。
-- **M-6** `src/api/eventual.rs`(merge_remote): 全受信エントリをローカル HLC で無条件再スタンプするため
-  収束済みキーがフル CRDT 状態で恒久ピンポン(BP/RR 皆無)。merge_value に no-op 判定(RR)、
-  可能なら origin タグで back-propagation 回避(BP)。
+- ~~**M-6**~~ **完了** — 下記「M-6 クローズ記録」参照(RR: no-op 判定による再スタンプ抑止。
+  BP は否定的知見として却下記録)。
 - **M-7** `src/runtime/node_runner.rs`(digest sync): サイクル毎・ピア毎・双方向にストア全体をロック保持のまま
   ディープクローン + 全キー SHA-256 再計算(O(N²))。サイクル内メモ化 + dirty バケット増分更新、
   最低限ロック外クローン/不要クローン除去。

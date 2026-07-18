@@ -12,7 +12,7 @@ use crate::types::NodeId;
 ///
 /// Merge takes the element-wise maximum of both maps, guaranteeing convergence
 /// across replicas regardless of message ordering or duplication (FR-005).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PnCounter {
     /// Positive (increment) counters per node.
     p: HashMap<NodeId, u64>,
@@ -76,21 +76,42 @@ impl PnCounter {
 
     /// Merge another PN-Counter into this one by taking the element-wise maximum
     /// of both the P and N maps.
-    pub fn merge(&mut self, other: &PnCounter) {
-        for (node_id, &count) in &other.p {
-            let entry = self.p.entry(node_id.clone()).or_insert(0);
-            *entry = (*entry).max(count);
+    ///
+    /// Returns `true` iff the merge strictly inflated local state
+    /// (`pre != post`); `false` guarantees this counter is unchanged —
+    /// the RR-gate contract (M-6). Only an actual raise mutates state:
+    /// an absent entry is NOT materialised for an incoming zero count
+    /// (a ghost zero entry would be a physical change invisible to the
+    /// return value).
+    pub fn merge(&mut self, other: &PnCounter) -> bool {
+        let mut changed = false;
+        for (map, other_map) in [(&mut self.p, &other.p), (&mut self.n, &other.n)] {
+            for (node_id, &count) in other_map {
+                match map.get_mut(node_id) {
+                    Some(entry) => {
+                        if count > *entry {
+                            *entry = count;
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        if count > 0 {
+                            map.insert(node_id.clone(), count);
+                            changed = true;
+                        }
+                    }
+                }
+            }
         }
-        for (node_id, &count) in &other.n {
-            let entry = self.n.entry(node_id.clone()).or_insert(0);
-            *entry = (*entry).max(count);
-        }
+        changed
     }
 
     /// Merge a delta into this counter.
     ///
     /// For PnCounter, `merge_delta` is identical to `merge` because the delta
     /// is the same type containing only the changed subset of node entries.
+    /// (The `changed` result is deliberately dropped: delta application
+    /// paths do not RR-gate.)
     pub fn merge_delta(&mut self, delta: &PnCounter) {
         self.merge(delta);
     }
@@ -653,5 +674,70 @@ mod tests {
         via_delta.merge_delta(&b);
 
         assert_eq!(via_merge.value(), via_delta.value());
+    }
+
+    // ---------------------------------------------------------------
+    // merge `changed` ground truth (M-6, RR gate):
+    // changed == (before != after), and no ghost zero entries.
+    // ---------------------------------------------------------------
+
+    /// Merge `b` into `a`, asserting the returned flag equals the
+    /// physical state difference.
+    fn merge_ground_truth(a: &mut PnCounter, b: &PnCounter) -> bool {
+        let before = a.clone();
+        let changed = a.merge(b);
+        assert_eq!(
+            changed,
+            *a != before,
+            "changed flag must equal physical pre/post difference"
+        );
+        changed
+    }
+
+    #[test]
+    fn merge_changed_truth_table() {
+        let na = node("A");
+        let nb = node("B");
+
+        let mut a = PnCounter::new();
+        a.increment(&na);
+        a.decrement(&na);
+
+        // Identical state: no-op.
+        let b = a.clone();
+        assert!(!merge_ground_truth(&mut a, &b));
+
+        // Dominated state (b < a): no-op.
+        let mut behind = PnCounter::new();
+        behind.increment(&na); // p[A]=1 == a's, n absent < a's
+        assert!(!merge_ground_truth(&mut a, &behind));
+
+        // New node entry (p): changed, then idempotent.
+        let mut other = PnCounter::new();
+        other.increment(&nb);
+        assert!(merge_ground_truth(&mut a, &other));
+        assert!(!merge_ground_truth(&mut a, &other));
+
+        // Raised existing entry (n): changed.
+        let mut raised = a.clone();
+        raised.decrement(&na);
+        assert!(merge_ground_truth(&mut a, &raised));
+    }
+
+    #[test]
+    fn merge_changed_zero_entry_creates_no_ghost() {
+        let na = node("A");
+        let nb = node("B");
+        let mut a = PnCounter::new();
+        a.increment(&na);
+
+        // Adversarial/legacy payload with explicit zero entries.
+        let mut zeros = PnCounter::new();
+        zeros.p.insert(nb.clone(), 0);
+        zeros.n.insert(nb.clone(), 0);
+
+        assert!(!merge_ground_truth(&mut a, &zeros));
+        assert!(!a.p.contains_key(&nb), "no ghost zero P entry");
+        assert!(!a.n.contains_key(&nb), "no ghost zero N entry");
     }
 }
