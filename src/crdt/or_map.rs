@@ -330,6 +330,48 @@ where
         });
     }
 
+    /// Snapshot the deferred (tombstone) dots as `(node_id, counter)`
+    /// pairs — the MARK phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// See [`OrSet::deferred_dots`] for semantics.
+    ///
+    /// [`OrSet::deferred_dots`]: crate::crdt::or_set::OrSet::deferred_dots
+    pub fn deferred_dots(&self) -> HashSet<(NodeId, u64)> {
+        self.deferred
+            .iter()
+            .map(|d| (d.node_id.clone(), d.counter))
+            .collect()
+    }
+
+    /// Remove tombstone dots restricted to a MARKED candidate set — the
+    /// SWEEP phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// See [`OrSet::compact_deferred_marked`] for the full safety
+    /// argument: only dots that existed at mark time (covered by the
+    /// caller's replica-synchronisation gate), are not live, and are
+    /// locally dominated are removed.
+    ///
+    /// [`OrSet::compact_deferred_marked`]: crate::crdt::or_set::OrSet::compact_deferred_marked
+    pub fn compact_deferred_marked(&mut self, candidates: &HashSet<(NodeId, u64)>) {
+        let live_dots: HashSet<&Dot> = self
+            .entries
+            .values()
+            .flat_map(|(dots, _)| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if !candidates.contains(&(d.node_id.clone(), d.counter)) {
+                return true;
+            }
+            if live_dots.contains(d) {
+                return true;
+            }
+            match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter >= max_counter,
+                None => true, // unknown node — keep to be safe
+            }
+        });
+    }
+
     /// Remove tombstone dots from `deferred` that are safe to garbage-collect
     /// according to local counter dominance or a cross-replica version floor.
     ///

@@ -86,12 +86,28 @@ pub struct NodeRunnerConfig {
     pub ping_interval: Option<Duration>,
     /// How often to check for epoch boundaries and perform key rotation.
     /// Default: 60 seconds.
+    ///
+    /// NOTE: automatic keyset ROTATION does not fire in production —
+    /// nothing calls `EpochManager::stage_keys`, so `check_and_rotate`
+    /// never finds staged keys to promote (see `check_epoch_rotation`).
+    /// Key updates today happen only via `ASTEROIDB_AUTHORITY_KEYS`
+    /// redistribution + restart. This tick still keeps the shared epoch
+    /// counter advancing (keyset expiry checks).
     pub epoch_check_interval: Duration,
     /// How often to run tombstone GC on CRDT deferred sets.
     /// Default: 60 seconds.
     pub gc_interval: Duration,
+    /// Minimum age a tombstone-GC mark must reach before its sweep may
+    /// collect (`ASTEROIDB_GC_RETENTION_SECS` in the binary).
+    /// Default: 300 seconds. See [`TombstoneGc::mark_and_sweep`].
+    pub gc_retention: Duration,
     /// Epoch configuration for key rotation (FR-008).
     /// Default: 24h epoch duration, 7 grace epochs.
+    ///
+    /// NOTE: the 24h-epoch / 7-grace-epoch rotation these parameters
+    /// describe is currently unwired in production (no `stage_keys`
+    /// caller) — see the note on
+    /// [`epoch_check_interval`](Self::epoch_check_interval).
     pub epoch_config: EpochConfig,
     /// Optional BLS key configuration. When `Some`, the node generates a BLS
     /// keypair and registers it in the keyset registry, enabling BLS
@@ -152,6 +168,7 @@ impl Default for NodeRunnerConfig {
             ping_interval: Some(Duration::from_secs(10)),
             epoch_check_interval: Duration::from_secs(60),
             gc_interval: Duration::from_secs(60),
+            gc_retention: Duration::from_secs(300),
             epoch_config: EpochConfig::default(),
             bls_config: None,
             frontier_gc_interval: Duration::from_secs(60),
@@ -207,7 +224,39 @@ pub struct NodeRunner {
     /// NOTE: this frontier also advances on successful PUSHES, so it is
     /// NOT a proof of what this node has received — see
     /// `pull_verified_frontiers` for the session-guarantee counterpart.
+    /// It also advances on successful PULLS (to the peer's own sender
+    /// frontier), so it is equally NOT a proof of what the peer has
+    /// received from us — see `push_frontiers` / `push_acked_wall_ms`
+    /// for the push-evidence counterparts (tombstone-GC gate, delta push
+    /// baseline).
     peer_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer PUSH-ONLY delta baseline: the highest HLC this node has
+    /// provably conveyed to the peer through fully-successful pushes.
+    ///
+    /// Advanced EXCLUSIVELY when a push completes with zero per-key
+    /// errors (clean delta push, clean full-state push, digest push
+    /// root-match / subset success) — NEVER by pulls. Using this (instead
+    /// of the pull-advanced `peer_frontiers`) as the `delta_entries_since`
+    /// baseline guarantees that every local entry is either at/below the
+    /// baseline (covered by an earlier successful push) or included in
+    /// the next delta push — a pull can no longer silently drop an
+    /// un-pushed local entry (e.g. a tombstone) from all future pushes
+    /// to that peer (C-2). The cost is an occasional re-push of entries a
+    /// pull already echoed back; CRDT merges are idempotent.
+    push_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer LOCAL wall-clock time (ms) of the store snapshot/scan
+    /// behind the last fully-successful push to that peer.
+    ///
+    /// This is the freshness evidence consumed by the tombstone-GC peer
+    /// gate: `push_acked_wall_ms[peer] >= mark_ms` proves the peer merged
+    /// (without per-key errors) everything this node's store held at a
+    /// scan taken AFTER the mark — including every tombstone marked at or
+    /// before it. Recorded at SNAPSHOT time (not push completion) so a
+    /// tombstone created between the scan and the ack can never be
+    /// claimed as conveyed, and measured on THIS node's clock so
+    /// peer-clock skew propagated into data HLCs cannot forge freshness
+    /// (both were possible with the previous `peer_frontiers`-based gate).
+    push_acked_wall_ms: HashMap<String, u64>,
     /// Per-peer verified received prefix for session guarantees.
     ///
     /// `pull_verified_frontiers[peer] = f` means this node has received
@@ -474,7 +523,7 @@ impl NodeRunner {
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let frontier_sync_client =
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
-        let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
+        let tombstone_gc = TombstoneGc::new(config.gc_interval, config.gc_retention);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // Initialize the accused-authorities gauge from evidence restored
         // at startup, so a restart does not reset gauge-based alerting
@@ -500,6 +549,8 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            push_frontiers: HashMap::new(),
+            push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
@@ -578,7 +629,7 @@ impl NodeRunner {
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let frontier_sync_client =
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
-        let tombstone_gc = TombstoneGc::new(config.gc_interval, Duration::from_secs(300));
+        let tombstone_gc = TombstoneGc::new(config.gc_interval, config.gc_retention);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         // Initialize the accused-authorities gauge from evidence restored
         // at startup (see `with_cluster_nodes` for rationale).
@@ -603,6 +654,8 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            push_frontiers: HashMap::new(),
+            push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
@@ -701,7 +754,11 @@ impl NodeRunner {
     /// the given peer address, which is useful for testing the
     /// delta-fail -> full-sync fallback path.
     pub fn inject_peer_frontier(&mut self, peer_addr: &str, frontier: HlcTimestamp) {
-        self.peer_frontiers.insert(peer_addr.to_string(), frontier);
+        self.peer_frontiers
+            .insert(peer_addr.to_string(), frontier.clone());
+        // Simulate "successfully pushed up to `frontier`" so the delta
+        // push path scans from it (mirrors what a real clean push sets).
+        self.push_frontiers.insert(peer_addr.to_string(), frontier);
     }
 
     /// Return a reference to the node ID.
@@ -1148,31 +1205,30 @@ impl NodeRunner {
                     .push_changed_keys(&peer.addr, entries, &self.node_id.0, DEFAULT_BATCH_SIZE)
                     .await;
 
-                let pushed_count = match &push_result {
-                    Ok(pushed) => *pushed,
-                    Err(e) => e.pushed,
+                // Mark success PER KEY, not by count: `push_changed_keys`
+                // returns an order-insensitive success count plus the exact
+                // set of failed keys. Treating the count as a positional
+                // prefix would misattribute success when an early key fails
+                // but later keys succeed, permanently skipping the failed key
+                // (silent under-replication reported as completed).
+                let failed_set: std::collections::HashSet<&str> = match &push_result {
+                    Ok(_) => std::collections::HashSet::new(),
+                    Err(e) => e.failed_keys.iter().map(|s| s.as_str()).collect(),
                 };
-
-                // Mark the first `pushed_count` entries in this group as succeeded.
-                for (group_pos, (batch_idx, _, _)) in resolved.iter().enumerate() {
-                    if group_pos < pushed_count {
+                for (batch_idx, key, _) in resolved.iter() {
+                    if failed_set.contains(key.as_str()) {
+                        failed += 1;
+                    } else {
                         succeeded[*batch_idx] = true;
+                        migrated += 1;
                     }
                 }
-
-                match push_result {
-                    Ok(pushed) => {
-                        migrated += pushed as u64;
-                    }
-                    Err(e) => {
-                        migrated += e.pushed as u64;
-                        failed += (resolved.len() - e.pushed) as u64;
-                        tracing::warn!(
-                            target_node = %target_node.0,
-                            error = %e,
-                            "rebalance push failed"
-                        );
-                    }
+                if let Err(e) = &push_result {
+                    tracing::warn!(
+                        target_node = %target_node.0,
+                        error = %e,
+                        "rebalance push failed"
+                    );
                 }
             }
 
@@ -1489,8 +1545,15 @@ impl NodeRunner {
     /// Check for epoch boundary crossings and perform key rotation.
     ///
     /// Calls `EpochManager::check_and_rotate()` with the current wall-clock
-    /// time. If a rotation event occurs, logs the transition. This enables
-    /// automatic keyset rotation at epoch boundaries per FR-008.
+    /// time. If a rotation event occurs, logs the transition.
+    ///
+    /// NOTE: in production this NEVER produces a rotation event — the
+    /// FR-008 automatic keyset rotation is unwired because nothing calls
+    /// `EpochManager::stage_keys`, so there are no staged keys for
+    /// `check_and_rotate` to promote at an epoch boundary. Operational
+    /// key updates happen exclusively via `ASTEROIDB_AUTHORITY_KEYS`
+    /// redistribution + restart (see the key-rotation runbook). The tick
+    /// is still load-bearing for the shared epoch counter below.
     fn check_epoch_rotation(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1771,7 +1834,25 @@ impl NodeRunner {
             // When the change rate is too high (changed_keys / total_keys > threshold),
             // delta sync payload approaches full-state size and loses its advantage.
             // In that case, skip delta and push the full state directly.
-            if let Some(frontier) = self.peer_frontiers.get(&peer_key) {
+            if self.peer_frontiers.contains_key(&peer_key) {
+                // The delta baseline is the PUSH-ONLY frontier: everything
+                // at/below it was covered by an earlier fully-successful
+                // push. The pull-advanced `peer_frontiers` must NOT be used
+                // here — a pull that outran an un-pushed local entry (e.g.
+                // a tombstone whose push failed) would silently drop it
+                // from every future delta push (C-2 resurrection enabler).
+                let frontier =
+                    self.push_frontiers
+                        .get(&peer_key)
+                        .cloned()
+                        .unwrap_or(HlcTimestamp {
+                            physical: 0,
+                            logical: 0,
+                            node_id: String::new(),
+                        });
+                // Wall-clock instant BEFORE the scan: recorded as the
+                // push-evidence time on success (see `push_acked_wall_ms`).
+                let scan_wall_ms = crate::hlc::wall_clock_ms();
                 let api = eventual_api.lock().await;
                 let total_keys = api.store().len();
                 // delta_entries_since returns delta-state entries sorted by
@@ -1781,7 +1862,7 @@ impl NodeRunner {
                     String,
                     crate::store::kv::CrdtValue,
                     crate::hlc::HlcTimestamp,
-                )> = api.store().delta_entries_since(frontier);
+                )> = api.store().delta_entries_since(&frontier);
                 let changed_count = entries_with_hlc.len();
 
                 // Compute change rate and decide whether to use delta or full sync.
@@ -1826,6 +1907,8 @@ impl NodeRunner {
                                 &peer_key,
                                 &peer.addr,
                                 &mut self.peer_frontiers,
+                                &mut self.push_frontiers,
+                                &mut self.push_acked_wall_ms,
                                 &mut self.digest_unsupported,
                             )
                             .await,
@@ -1840,12 +1923,18 @@ impl NodeRunner {
                             .full_sync_fallback_count
                             .fetch_add(1, Ordering::Relaxed);
 
+                        // Snapshot entries AND frontier in one lock scope:
+                        // the frontier must describe exactly the pushed
+                        // state (a post-push `current_frontier()` could
+                        // cover concurrent writes the push never carried).
+                        let snapshot_wall_ms = crate::hlc::wall_clock_ms();
                         let api = eventual_api.lock().await;
                         let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
                             .store()
                             .all_entries()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
+                        let snapshot_frontier = api.store().current_frontier();
                         drop(api);
 
                         let push_resp = sync_client
@@ -1861,14 +1950,16 @@ impl NodeRunner {
                                     "full sync push had per-key errors, not advancing frontier"
                                 );
                             } else {
-                                // After a successful full push, advance the frontier to
-                                // the local store's current frontier so the next delta
-                                // sync starts from the right point.
-                                let api = eventual_api.lock().await;
-                                if let Some(current) = api.store().current_frontier() {
-                                    self.peer_frontiers.insert(peer_key.clone(), current);
+                                // After a clean full push, advance both
+                                // frontiers to the snapshot frontier and
+                                // record the push evidence (GC peer gate).
+                                if let Some(frontier) = snapshot_frontier {
+                                    self.peer_frontiers
+                                        .insert(peer_key.clone(), frontier.clone());
+                                    self.push_frontiers.insert(peer_key.clone(), frontier);
                                 }
-                                drop(api);
+                                self.push_acked_wall_ms
+                                    .insert(peer_key.clone(), snapshot_wall_ms);
                             }
                         }
                     }
@@ -1929,6 +2020,8 @@ impl NodeRunner {
                                         &peer_key,
                                         &peer.addr,
                                         &mut self.peer_frontiers,
+                                        &mut self.push_frontiers,
+                                        &mut self.push_acked_wall_ms,
                                         &mut self.digest_unsupported,
                                     )
                                     .await,
@@ -1943,12 +2036,16 @@ impl NodeRunner {
                                     .full_sync_fallback_count
                                     .fetch_add(1, Ordering::Relaxed);
 
+                                // Snapshot entries AND frontier in one lock
+                                // scope (see the high-change-rate branch).
+                                let snapshot_wall_ms = crate::hlc::wall_clock_ms();
                                 let api = eventual_api.lock().await;
                                 let snapshot: Vec<(String, crate::store::kv::CrdtValue)> = api
                                     .store()
                                     .all_entries()
                                     .map(|(k, v)| (k.clone(), v.clone()))
                                     .collect();
+                                let snapshot_frontier = api.store().current_frontier();
                                 drop(api);
 
                                 let all_entries = tokio::task::spawn_blocking(move || {
@@ -1976,11 +2073,13 @@ impl NodeRunner {
                                             "payload overflow full push had per-key errors"
                                         );
                                     } else {
-                                        let api = eventual_api.lock().await;
-                                        if let Some(current) = api.store().current_frontier() {
-                                            self.peer_frontiers.insert(peer_key.clone(), current);
+                                        if let Some(frontier) = snapshot_frontier {
+                                            self.peer_frontiers
+                                                .insert(peer_key.clone(), frontier.clone());
+                                            self.push_frontiers.insert(peer_key.clone(), frontier);
                                         }
-                                        drop(api);
+                                        self.push_acked_wall_ms
+                                            .insert(peer_key.clone(), snapshot_wall_ms);
                                     }
                                 }
                             }
@@ -2029,14 +2128,31 @@ impl NodeRunner {
                                             }
                                         }
                                     }
-                                    // Advance peer frontier to the max HLC of the
-                                    // pushed batch — NOT current_frontier(), which
-                                    // may have advanced past unpushed concurrent
-                                    // writes.
+                                    // Advance the push frontier to the max HLC
+                                    // of the pushed batch — NOT
+                                    // current_frontier(), which may have
+                                    // advanced past unpushed concurrent
+                                    // writes. `peer_frontiers` may already sit
+                                    // higher (pull-advanced), so it only
+                                    // advances max-monotonically.
                                     if let Some(max_hlc) = hlc_vec.last() {
-                                        self.peer_frontiers
+                                        self.push_frontiers
                                             .insert(peer_key.clone(), max_hlc.clone());
+                                        if self
+                                            .peer_frontiers
+                                            .get(&peer_key)
+                                            .is_none_or(|existing| *max_hlc > *existing)
+                                        {
+                                            self.peer_frontiers
+                                                .insert(peer_key.clone(), max_hlc.clone());
+                                        }
                                     }
+                                    // Push evidence for the tombstone-GC peer
+                                    // gate: the scan (taken at scan_wall_ms)
+                                    // was fully conveyed with zero per-key
+                                    // errors (`Ok` implies no failed keys).
+                                    self.push_acked_wall_ms
+                                        .insert(peer_key.clone(), scan_wall_ms);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -2063,6 +2179,13 @@ impl NodeRunner {
                                 }
                             }
                         }
+                    } else {
+                        // Nothing above the push-only baseline: every local
+                        // entry was already conveyed by an earlier fully-
+                        // successful push, so the (empty) scan itself is
+                        // fresh push evidence for the GC peer gate.
+                        self.push_acked_wall_ms
+                            .insert(peer_key.clone(), scan_wall_ms);
                     }
                 }
             } else {
@@ -2072,12 +2195,14 @@ impl NodeRunner {
                 // data written locally would never reach a peer that starts
                 // empty, because both the delta push and delta pull paths
                 // require a known frontier.
+                let snapshot_wall_ms = crate::hlc::wall_clock_ms();
                 let api = eventual_api.lock().await;
                 let snapshot: Vec<(String, crate::store::kv::CrdtValue)> = api
                     .store()
                     .all_entries()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
+                let snapshot_frontier = api.store().current_frontier();
                 drop(api);
 
                 let all_entries = tokio::task::spawn_blocking(move || {
@@ -2100,7 +2225,16 @@ impl NodeRunner {
                         .await
                     {
                         Some(sync_resp) if sync_resp.errors.is_empty() => {
-                            // All keys merged successfully.
+                            // All keys merged successfully: seed the
+                            // push-only baseline and the push evidence
+                            // (GC peer gate) from the snapshot. The
+                            // pull-oriented `peer_frontiers` still starts
+                            // at ZERO below.
+                            if let Some(frontier) = snapshot_frontier {
+                                self.push_frontiers.insert(peer_key.clone(), frontier);
+                            }
+                            self.push_acked_wall_ms
+                                .insert(peer_key.clone(), snapshot_wall_ms);
                         }
                         Some(sync_resp) => {
                             // 2xx but per-key errors — log but still establish the
@@ -2381,6 +2515,10 @@ impl NodeRunner {
             peers.iter().map(|p| &p.addr).collect();
         self.peer_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
+        self.push_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.push_acked_wall_ms
+            .retain(|addr, _| active_addrs.contains(addr));
         self.pull_verified_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
         self.peer_backoffs
@@ -2563,25 +2701,58 @@ impl NodeRunner {
         }
     }
 
-    /// Run tombstone GC on the eventual store (if available).
+    /// Run tombstone GC on the eventual store (if available) — gated
+    /// mark-and-sweep (see [`TombstoneGc::mark_and_sweep`]).
     ///
-    /// Tombstone GC only runs when the `AckFrontierSet` confirms that all
-    /// authorities have acknowledged updates past the retention period.
+    /// Pass N snapshots (marks) the deferred dots; pass N+1, at least
+    /// `gc_retention` later, collects the MARKED dots only when a dual
+    /// replica-synchronisation gate holds against the mark time:
     ///
-    /// **P1-10 fix**: Previous code used `frontier_hlc.physical` (an HLC
-    /// millisecond timestamp) as the version floor for
-    /// `compact_deferred_with_floor()`, but that function compares against
-    /// `Dot.counter` (a small per-node monotonic integer). The units and
-    /// identity spaces don't match — HLC physical timestamps are ~10^12
-    /// while dot counters are small integers — causing tombstones to be
-    /// GC'd too aggressively and resurrecting removed entries on lagging
-    /// replicas. Additionally, per-node floors were keyed by `authority_id`
-    /// but dots are keyed by writer `node_id`, so lookups never matched.
+    /// - **Authority gate**: for every authority definition, EVERY
+    ///   authority in the definition has an ack-frontier entry for the
+    ///   current scope, the scoped minimum `frontier_hlc.physical` has
+    ///   passed the mark time, AND every scoped frontier ADVANCED (a
+    ///   strictly newer report was received) at a LOCAL wall-clock time
+    ///   past the mark. The data-time check alone is not enough:
+    ///   `frontier_hlc` is data time, which the HLC max rule pushes
+    ///   ahead of this node's wall clock under peer-clock skew, so a
+    ///   stale pre-partition frontier could read as "past the mark"
+    ///   throughout a partition. The receipt check is measured entirely
+    ///   on this node's own clock and fails for any frontier that has
+    ///   not advanced since the mark.
+    /// - **Peer gate**: every peer in the sync registry has push
+    ///   evidence (`push_acked_wall_ms`, recorded ONLY when a push
+    ///   completes with zero per-key errors, stamped with the LOCAL
+    ///   wall-clock time of the store scan behind that push) past the
+    ///   mark time — the peer provably merged everything this node held
+    ///   at a scan taken after the mark, including the marked
+    ///   tombstones. The pull-advanced `peer_frontiers` map is never
+    ///   consulted (a pull proves nothing about what the peer received),
+    ///   and no data-HLC physical is ever compared against the
+    ///   wall-clock mark (peer clock skew propagates into data HLCs and
+    ///   could otherwise forge freshness).
     ///
-    /// The fix uses `compact_deferred()` (counter-based, no external floor)
-    /// which correctly checks each dot's counter against the maximum known
-    /// counter for that writer node. GC only proceeds when all authorities
-    /// have frontier entries, ensuring all replicas have seen the tombstones.
+    /// Any missing entry fails the gate (fail-closed): a partition, a
+    /// lagging authority, or a DEAD PEER LEFT IN THE REGISTRY stalls
+    /// collection entirely — tombstones then accumulate until the
+    /// cluster heals or the peer is removed (an ops trade-off documented
+    /// in the ops guide). A single-node deployment (no authority
+    /// definitions, no peers) passes vacuously: with no other replica
+    /// there is no resurrection source.
+    ///
+    /// Residual limits (also documented): frontiers are key-range
+    /// consumption reports, not per-dot acks; replicas this node has
+    /// never heard of are outside the gate; majority-reach GC is an open
+    /// design question.
+    ///
+    /// **P1-10 note** (why the gate compares HLC *time*, never counters):
+    /// dot counters are per-CRDT/per-writer small integers and no
+    /// cross-replica protocol transports them, so `frontier_hlc` values
+    /// must NEVER be fed into `compact_deferred_with_floor` as counter
+    /// floors (units mismatch, ~10^12 vs small ints — the original
+    /// P1-10 bug). The mark-and-sweep design only ever compares
+    /// wall-clock mark times against frontier *times*; dot identity is
+    /// handled by the marked candidate sets.
     async fn run_gc(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2591,34 +2762,136 @@ impl NodeRunner {
         if !self.tombstone_gc.should_run(now_ms) {
             return;
         }
-
-        // Check that all authorities have acknowledged updates. If any
-        // authority has no frontier entry, some replicas may not have seen
-        // the tombstones yet, so GC is unsafe.
-        let all_authorities_synced = {
-            let api = self.certified_api.lock().await;
-            let frontiers = api.all_frontiers();
-            // Require at least one frontier entry to proceed. The retention
-            // period on TombstoneGc provides the additional time buffer.
-            !frontiers.is_empty()
+        let Some(eventual_api) = self.eventual_api.clone() else {
+            return;
         };
 
-        if !all_authorities_synced {
-            return;
+        // Evaluate the dual gate against the pending mark, if any (the
+        // very first pass only marks, so the verdict is irrelevant then).
+        let gates_passed = match self.tombstone_gc.pending_mark_ms() {
+            Some(mark_ms) => self.gc_gates_passed(mark_ms).await,
+            None => false,
+        };
+
+        let mut api = eventual_api.lock().await;
+        let collected = self
+            .tombstone_gc
+            .mark_and_sweep(api.store_mut(), now_ms, gates_passed);
+        drop(api);
+        if collected > 0 {
+            tracing::info!(
+                node_id = %self.node_id.0,
+                collected,
+                total = self.tombstone_gc.total_collected(),
+                "tombstone GC completed"
+            );
+        }
+    }
+
+    /// Evaluate the tombstone-GC dual gate against `mark_ms` (see
+    /// [`run_gc`](Self::run_gc)).
+    async fn gc_gates_passed(&self, mark_ms: u64) -> bool {
+        // [Authority gate] — same snapshot pattern as check_compaction
+        // Phase 1: read defs + frontier set under the certified lock,
+        // evaluate off the lock.
+        let (defs, frontier_set, policy_versions) = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
+            let defs: Vec<(KeyRange, usize)> = ns
+                .all_authority_definitions()
+                .into_iter()
+                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
+                .collect();
+            let policy_versions: Vec<PolicyVersion> = defs
+                .iter()
+                .map(|(key_range, _)| {
+                    ns.get_placement_policy(&key_range.prefix)
+                        .map(|p| p.version)
+                        .unwrap_or(crate::types::PolicyVersion(1))
+                })
+                .collect();
+            let fs = api.frontier_set().clone();
+            (defs, fs, policy_versions)
+        };
+        if !Self::gc_authority_gate_passed(&defs, &policy_versions, &frontier_set, mark_ms) {
+            return false;
         }
 
-        if let Some(ref eventual_api) = self.eventual_api {
-            let mut api = eventual_api.lock().await;
-            let collected = self.tombstone_gc.gc_tombstones(api.store_mut(), now_ms);
-            if collected > 0 {
-                tracing::info!(
-                    node_id = %self.node_id.0,
-                    collected,
-                    total = self.tombstone_gc.total_collected(),
-                    "tombstone GC completed"
-                );
+        // [Peer gate] — every registered peer must have push evidence
+        // from after the mark.
+        if let Some(sync_client) = &self.sync_client {
+            let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+            if !Self::gc_peer_gate_passed(&peers, &self.push_acked_wall_ms, mark_ms) {
+                return false;
             }
         }
+        true
+    }
+
+    /// Authority half of the tombstone-GC gate: every authority of every
+    /// definition has a frontier entry for the current scope, the scoped
+    /// minimum frontier has consumed state as of the mark time (data
+    /// time), AND every scoped frontier has ADVANCED at a local
+    /// wall-clock time at/after the mark (receipt time, this node's
+    /// clock). Vacuously true with no authority definitions (single-node
+    /// case: no other replica exists to resurrect from).
+    ///
+    /// The receipt condition closes the clock-skew hole in the data-time
+    /// condition: HLC physicals run AHEAD of this node's wall clock when
+    /// any writer's clock is skewed forward (max rule), so a frontier
+    /// whose `physical >= mark_ms` may have been received long before
+    /// the mark (stale pre-partition state). A frontier that has not
+    /// produced a strictly-newer report since the mark — including every
+    /// frontier merely restored from persistence (`advanced_at` is
+    /// volatile) — fails the gate (fail-closed).
+    fn gc_authority_gate_passed(
+        defs: &[(KeyRange, usize)],
+        policy_versions: &[PolicyVersion],
+        frontier_set: &crate::authority::ack_frontier::AckFrontierSet,
+        mark_ms: u64,
+    ) -> bool {
+        defs.iter().enumerate().all(|(i, (key_range, total))| {
+            let scoped = frontier_set.all_for_scope(key_range, &policy_versions[i]);
+            if scoped.len() < *total {
+                return false; // an authority has not reported this scope
+            }
+            frontier_set
+                .min_frontier_for_scope(key_range, &policy_versions[i])
+                .is_some_and(|min| min.physical >= mark_ms)
+                && frontier_set
+                    .min_advanced_at_for_scope(key_range, &policy_versions[i])
+                    .is_some_and(|received| received >= mark_ms)
+        })
+    }
+
+    /// Peer half of the tombstone-GC gate: every registered peer has
+    /// push evidence (`push_acked_wall_ms` — the LOCAL wall-clock time
+    /// of the store scan behind the last push that completed with zero
+    /// per-key errors) from at/after the mark time. That scan saw every
+    /// tombstone marked at or before `mark_ms`, and the push conveyed
+    /// the whole scan, so the peer can never re-offer a marked dot as
+    /// live state.
+    ///
+    /// Deliberately NOT used: `peer_frontiers` (advanced by successful
+    /// PULLS to the peer's own sender frontier — no evidence the peer
+    /// received anything from us) and frontier HLC *physical* components
+    /// (data time; peer clock skew propagates into HLCs via the max
+    /// rule, so `physical >= mark_ms` does not imply "synchronised after
+    /// the mark" on this node's clock). Both were the C-2 resurrection
+    /// holes this gate previously had.
+    ///
+    /// A peer without an entry fails the gate (fail-closed). Vacuously
+    /// true with an empty registry.
+    fn gc_peer_gate_passed(
+        peers: &[crate::network::PeerConfig],
+        push_acked_wall_ms: &HashMap<String, u64>,
+        mark_ms: u64,
+    ) -> bool {
+        peers.iter().all(|peer| {
+            push_acked_wall_ms
+                .get(&peer.addr)
+                .is_some_and(|acked| *acked >= mark_ms)
+        })
     }
 
     /// Choose the delta-pull request frontier for a peer.
@@ -2749,6 +3022,36 @@ impl NodeRunner {
             }
         }
 
+        // Untracked-key compensation (sent only on complete pulls): keys
+        // without a tracked HLC on the sender (v1/v2-migrated stores) are
+        // invisible to its delta scan, yet a complete pull's adoption
+        // below claims the sender's WHOLE state. Merge them BEFORE the
+        // adoption so the claim is true; without an origin HLC they merge
+        // via `merge_remote` (local re-stamp — which also makes them
+        // delta-visible here from now on). A failed merge poisons the key
+        // inside merge_remote, keeping the adoption fail-closed for it.
+        //
+        // Skipped when no claims will be adopted (`!claims_ok`): the
+        // entries only exist to make the adoption's completeness claim
+        // true, and merging them without it would re-stamp every key
+        // with a fresh local HLC for nothing — the guaranteed full-sync
+        // fallback transfers the same data with proper claims. This also
+        // guards against pre-fix compacted senders that shipped their
+        // whole pruned keyspace as untracked entries.
+        if claims_ok {
+            for (key, value) in &delta_resp.untracked_entries {
+                if let Err(e) = api.merge_remote(key.clone(), value) {
+                    error_count += 1;
+                    tracing::warn!(
+                        peer = %peer_id,
+                        key = %key,
+                        error = %e,
+                        "{} untracked-entry merge failed for key", label
+                    );
+                }
+            }
+        }
+
         // Frontier adoption (session guarantees): a delta entry's CRDT
         // value can embed contributions from origins other than the
         // entry's own HLC origin, so the local applied_origins alone does
@@ -2766,17 +3069,50 @@ impl NodeRunner {
         // (poison + frontier can never be separated by a crash); an append
         // failure only degrades durability of the adoption and is retried
         // by the next sync round.
-        let no_claims = HashMap::new();
-        let (adopt_applied, adopt_failed) = if claims_ok {
-            (
-                &delta_resp.applied_origins,
-                delta_resp.merge_failed_keys.clone(),
-            )
+        // Per-origin adoption soundness. A scalar `verified[peer]` watermark
+        // proves A received B's complete state up to `request_frontier` only
+        // AS OF the pull that set it — B can later back-fill a THIRD origin's
+        // write BELOW that (stale) watermark (learned from a third node after
+        // a partition heal), which an incremental delta (entries strictly
+        // above `request_frontier`) then omits. Adopting B's full
+        // applied_origins would claim that third origin's prefix without
+        // holding it — a read-your-writes lie.
+        //
+        // Two cases are sound:
+        //  * The peer's OWN origin, always: the peer's writes are monotonic,
+        //    so it cannot introduce an own-write below the request frontier
+        //    that this node has not already received.
+        //  * A COMPLETE pull (request_frontier == zero): the response is a
+        //    consistent snapshot of the peer's entire current state —
+        //    tracked entries via the delta scan plus `untracked_entries`
+        //    (keys with no per-key HLC on the sender, invisible to the
+        //    scan; merged above) — so this node genuinely holds everything
+        //    the peer holds — every origin's full prefix — and the whole
+        //    map is safe to adopt. (A mixed-version OLD sender omits
+        //    `untracked_entries`; its migrated untracked keys converge
+        //    only via full sync, as before.)
+        // On an incremental pull, third-origin coverage is re-established by
+        // the periodic complete / full sync (a false negative, never a false
+        // success).
+        let is_complete_pull = *request_frontier == zero;
+        let adopt_applied: HashMap<String, HlcTimestamp> = if !claims_ok {
+            HashMap::new()
+        } else if is_complete_pull {
+            delta_resp.applied_origins.clone()
         } else {
-            (&no_claims, Vec::new())
+            delta_resp
+                .applied_origins
+                .get(peer_id)
+                .map(|f| HashMap::from([(peer_id.to_string(), f.clone())]))
+                .unwrap_or_default()
+        };
+        let adopt_failed = if claims_ok {
+            delta_resp.merge_failed_keys.clone()
+        } else {
+            Vec::new()
         };
         if let Err(e) =
-            api.adopt_session_claims(adopt_applied, &delta_resp.visible_origins, adopt_failed)
+            api.adopt_session_claims(&adopt_applied, &delta_resp.visible_origins, adopt_failed)
         {
             tracing::warn!(
                 peer = %peer_id,
@@ -3130,6 +3466,12 @@ impl NodeRunner {
     /// (they are delta-pushed next cycle). Partial subset-push failures
     /// leave the frontier untouched (idempotent re-push next cycle),
     /// matching the delta push policy.
+    ///
+    /// Every success case (root match, peer-only mismatches, clean subset
+    /// push) proves the peer holds the whole snapshot, so it also records
+    /// push evidence for the tombstone-GC peer gate: `push_frontiers`
+    /// advances to the snapshot frontier and `push_acked_wall_ms` to the
+    /// local wall-clock time captured BEFORE the snapshot.
     #[allow(clippy::too_many_arguments)]
     async fn try_digest_push(
         sync_client: &SyncClient,
@@ -3140,12 +3482,15 @@ impl NodeRunner {
         peer_key: &str,
         peer_addr: &str,
         peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        push_frontiers: &mut HashMap<String, HlcTimestamp>,
+        push_acked_wall_ms: &mut HashMap<String, u64>,
         digest_unsupported: &mut HashMap<String, Instant>,
     ) -> DigestPushOutcome {
         metrics
             .digest_push_probe_total
             .fetch_add(1, Ordering::Relaxed);
 
+        let snapshot_wall_ms = crate::hlc::wall_clock_ms();
         let (digest, data, snapshot_frontier) = Self::snapshot_store_digest(eventual_api).await;
         let request = DigestSyncRequest::from_digest(node_id, &digest, false);
 
@@ -3161,8 +3506,10 @@ impl NodeRunner {
                         "digest push probe: peer already matches, skipping full push"
                     );
                     if let Some(frontier) = snapshot_frontier {
-                        peer_frontiers.insert(peer_key.to_string(), frontier);
+                        peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                        push_frontiers.insert(peer_key.to_string(), frontier);
                     }
+                    push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                     return DigestPushOutcome::Handled;
                 }
 
@@ -3184,8 +3531,10 @@ impl NodeRunner {
                         "digest push probe: mismatches are peer-only data, nothing to push"
                     );
                     if let Some(frontier) = snapshot_frontier {
-                        peer_frontiers.insert(peer_key.to_string(), frontier);
+                        peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                        push_frontiers.insert(peer_key.to_string(), frontier);
                     }
+                    push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                     return DigestPushOutcome::Handled;
                 }
 
@@ -3205,8 +3554,10 @@ impl NodeRunner {
                             "digest push: pushed mismatched buckets instead of full state"
                         );
                         if let Some(frontier) = snapshot_frontier {
-                            peer_frontiers.insert(peer_key.to_string(), frontier);
+                            peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                            push_frontiers.insert(peer_key.to_string(), frontier);
                         }
+                        push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                         DigestPushOutcome::Handled
                     }
                     Err(e) => {
@@ -5503,9 +5854,12 @@ mod tests {
         }
     }
 
-    /// A delta response's applied_origins is adopted when the request
-    /// frontier is at or above the sender's pruned floor (or the sender
-    /// never pruned).
+    /// An INCREMENTAL delta response (non-zero request frontier) with
+    /// sound coverage adopts ONLY the sender's OWN origin from its
+    /// applied_origins: a scalar verified watermark cannot rule out the
+    /// sender having back-filled a THIRD origin's write below the (stale)
+    /// watermark after the pull that set it, so third-origin claims from
+    /// an incremental delta would be read-your-writes lies.
     #[tokio::test]
     async fn apply_delta_response_adopts_applied_origins_when_floor_ok() {
         let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
@@ -5514,8 +5868,12 @@ mod tests {
         let mut counter = crate::crdt::pn_counter::PnCounter::new();
         counter.increment(&node_id("origin-a"));
         let mut applied_origins = HashMap::new();
-        // The sender has applied origin-a up to 300 (the entry's value
-        // embeds contributions the entry HLC alone would not cover).
+        // The sender claims its OWN origin (adoptable on an incremental
+        // pull: its writes are monotone, so it cannot introduce an
+        // own-write below the request frontier this node lacks) and a
+        // THIRD origin (NOT adoptable — possible back-fill below the
+        // stale watermark).
+        applied_origins.insert("peer-1".to_string(), hlc_ts(200, 0, "peer-1"));
         applied_origins.insert("origin-a".to_string(), hlc_ts(300, 0, "origin-a"));
         let delta_resp = crate::network::sync::DeltaSyncResponse {
             entries: vec![crate::network::sync::DeltaEntry {
@@ -5528,6 +5886,7 @@ mod tests {
             merge_failed_keys: vec!["poisoned-on-sender".into()],
             pruned_floor: Some(hlc_ts(100, 0, "origin-a")),
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         // Coverage: everything up to 150 was previously received via pulls.
@@ -5535,7 +5894,7 @@ mod tests {
         pull_verified.insert("peer-1:8000".to_string(), hlc_ts(150, 0, "origin-b"));
 
         // Request frontier (150) >= pruned floor (100) and <= verified
-        // coverage (150): claims and adoption are sound.
+        // coverage (150): claims are sound for the sender's own origin.
         let outcome = NodeRunner::apply_delta_response(
             &mut peer_frontiers,
             &mut pull_verified,
@@ -5552,9 +5911,18 @@ mod tests {
 
         let api = eventual_api.lock().await;
         assert_eq!(
-            api.store().applied_origin("origin-a"),
-            Some(&hlc_ts(300, 0, "origin-a")),
-            "sender applied_origins must be adopted"
+            api.store().applied_origin("peer-1"),
+            Some(&hlc_ts(200, 0, "peer-1")),
+            "the sender's OWN origin claim must be adopted"
+        );
+        // Regression (third-origin claim unsoundness on incremental
+        // pulls): the sender may have back-filled origin-a's writes below
+        // the stale verified watermark; an incremental delta omits them,
+        // so adopting origin-a's frontier would claim writes this node
+        // does not hold.
+        assert!(
+            api.store().applied_origin("origin-a").is_none(),
+            "third-origin claims must not be adopted from an incremental delta"
         );
         // Regression (per-entry claim unsoundness): the entry's own HLC
         // origin must NOT be claimed — sender completeness only proves
@@ -5598,6 +5966,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: Some(hlc_ts(200, 0, "origin-a")),
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         // Coverage would allow claims (request 50 <= verified 60), but the
@@ -5660,6 +6029,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         // Verified coverage is 100, but the request frontier is 200
@@ -5747,16 +6117,21 @@ mod tests {
     /// End-to-end ratchet recovery at the apply level: after a push
     /// advanced peer_frontiers, the next pull (requested from the
     /// verified prefix) makes claims again and re-synchronises both maps
-    /// with the sender frontier — applied_origins keeps advancing.
+    /// with the sender frontier. A COMPLETE (zero-frontier) pull adopts
+    /// the whole applied_origins map; subsequent INCREMENTAL pulls keep
+    /// advancing the sender's OWN origin (third origins wait for the
+    /// next complete transfer).
     #[tokio::test]
     async fn claims_recover_after_push_advances_peer_frontier() {
         let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
         let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
         let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
 
-        // Cycle 1: initial claimed pull at frontier zero.
+        // Cycle 1: initial claimed pull at frontier zero — a COMPLETE
+        // pull, so even third-origin claims are adopted.
         let mut applied = HashMap::new();
         applied.insert("origin-a".to_string(), hlc_ts(100, 0, "origin-a"));
+        applied.insert("peer-1".to_string(), hlc_ts(90, 0, "peer-1"));
         let resp1 = crate::network::sync::DeltaSyncResponse {
             entries: vec![],
             sender_frontier: Some(hlc_ts(100, 0, "origin-a")),
@@ -5764,6 +6139,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
         let outcome = NodeRunner::apply_delta_response(
             &mut peer_frontiers,
@@ -5777,6 +6153,14 @@ mod tests {
         )
         .await;
         assert!(outcome.claims_ok);
+        {
+            let api = eventual_api.lock().await;
+            assert_eq!(
+                api.store().applied_origin("origin-a"),
+                Some(&hlc_ts(100, 0, "origin-a")),
+                "a complete pull adopts third-origin claims"
+            );
+        }
 
         // Cycle 2: a successful push advanced peer_frontiers past the
         // verified prefix (this is what run_sync does after a delta push).
@@ -5790,14 +6174,16 @@ mod tests {
         assert_eq!(request, hlc_ts(100, 0, "origin-a"));
 
         let mut applied = HashMap::new();
+        applied.insert("peer-1".to_string(), hlc_ts(1_000, 0, "peer-1"));
         applied.insert("origin-a".to_string(), hlc_ts(1_000, 0, "origin-a"));
         let resp2 = crate::network::sync::DeltaSyncResponse {
             entries: vec![],
-            sender_frontier: Some(hlc_ts(1_000, 0, "origin-a")),
+            sender_frontier: Some(hlc_ts(1_000, 0, "peer-1")),
             applied_origins: applied,
             merge_failed_keys: vec![],
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
         let outcome = NodeRunner::apply_delta_response(
             &mut peer_frontiers,
@@ -5817,14 +6203,272 @@ mod tests {
 
         let api = eventual_api.lock().await;
         assert_eq!(
+            api.store().applied_origin("peer-1"),
+            Some(&hlc_ts(1_000, 0, "peer-1")),
+            "incremental adoption must keep advancing the sender's own origin"
+        );
+        // The third origin stays at its complete-pull value: an
+        // incremental delta cannot prove origin-a's (1_000 > 100) writes
+        // were transferred (possible back-fill below the watermark).
+        assert_eq!(
             api.store().applied_origin("origin-a"),
-            Some(&hlc_ts(1_000, 0, "origin-a")),
-            "adoption must keep advancing applied_origins"
+            Some(&hlc_ts(100, 0, "origin-a")),
+            "third-origin claims must wait for the next complete transfer"
         );
         drop(api);
         assert_eq!(
             pull_verified.get("peer-1:8000"),
-            Some(&hlc_ts(1_000, 0, "origin-a"))
+            Some(&hlc_ts(1_000, 0, "peer-1"))
+        );
+    }
+
+    /// M-2 regression: a COMPLETE (zero-frontier) pull from a
+    /// v1/v2-migrated sender includes its timestamp-less keys as
+    /// `untracked_entries`; the receiver must merge them BEFORE adopting
+    /// the sender's whole applied_origins map. Without the compensation
+    /// the receiver would adopt the claim while the data never arrives
+    /// through the pull path — a read-your-writes false success plus
+    /// permanent divergence.
+    #[tokio::test]
+    async fn complete_pull_merges_untracked_entries_before_adoption() {
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("receiver"))));
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+        let mut pull_verified: HashMap<String, HlcTimestamp> = HashMap::new();
+
+        // The sender's tracked entry rides the delta scan; the migrated
+        // key has no per-key HLC and rides untracked_entries.
+        let mut tracked_counter = crate::crdt::pn_counter::PnCounter::new();
+        tracked_counter.increment(&node_id("peer-1"));
+        let mut migrated_counter = crate::crdt::pn_counter::PnCounter::new();
+        migrated_counter.increment(&node_id("peer-1"));
+        migrated_counter.increment(&node_id("peer-1"));
+
+        let mut applied = HashMap::new();
+        applied.insert("peer-1".to_string(), hlc_ts(100, 0, "peer-1"));
+        let mut untracked = HashMap::new();
+        untracked.insert(
+            "migrated-key".to_string(),
+            CrdtValue::Counter(migrated_counter),
+        );
+        let delta_resp = crate::network::sync::DeltaSyncResponse {
+            entries: vec![crate::network::sync::DeltaEntry {
+                key: "tracked-key".into(),
+                value: CrdtValue::Counter(tracked_counter),
+                hlc: hlc_ts(100, 0, "peer-1"),
+            }],
+            sender_frontier: Some(hlc_ts(100, 0, "peer-1")),
+            applied_origins: applied,
+            merge_failed_keys: vec![],
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+            untracked_entries: untracked,
+        };
+
+        let outcome = NodeRunner::apply_delta_response(
+            &mut peer_frontiers,
+            &mut pull_verified,
+            &delta_resp,
+            "peer-1",
+            "peer-1:8000",
+            &eventual_api,
+            &hlc_ts(0, 0, ""),
+            "test",
+        )
+        .await;
+        assert_eq!(outcome.merge_errors, 0);
+        assert!(outcome.claims_ok, "zero-frontier pull is complete");
+
+        let api = eventual_api.lock().await;
+        // The adopted claim is TRUE: the untracked data arrived with it.
+        match api.get_eventual("migrated-key") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected migrated Counter, got {other:?}"),
+        }
+        assert_eq!(
+            api.store().applied_origin("peer-1"),
+            Some(&hlc_ts(100, 0, "peer-1")),
+            "complete-pull adoption still applies"
+        );
+        // The compensated key is re-stamped locally: it is now tracked
+        // and therefore delta-visible onward from this node.
+        assert!(
+            api.store().timestamp_for("migrated-key").is_some(),
+            "untracked entries must become tracked on the receiver"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Tombstone GC gates (C-2)
+    // ---------------------------------------------------------------
+
+    fn ack_frontier(
+        authority: &str,
+        prefix: &str,
+        version: u64,
+        physical: u64,
+    ) -> crate::authority::ack_frontier::AckFrontier {
+        crate::authority::ack_frontier::AckFrontier {
+            authority_id: node_id(authority),
+            frontier_hlc: hlc_ts(physical, 0, authority),
+            key_range: KeyRange {
+                prefix: prefix.into(),
+            },
+            policy_version: PolicyVersion(version),
+            digest_hash: "d".into(),
+        }
+    }
+
+    /// The authority half of the GC gate: EVERY authority of EVERY
+    /// definition must have reported the current scope, and the scoped
+    /// minimum frontier must have consumed state as of the mark time.
+    /// The old guard (`!frontiers.is_empty()`) passed off this node's
+    /// own self-report — a partitioned authority could still resurrect
+    /// GC'd removes after healing.
+    #[test]
+    fn gc_authority_gate_requires_all_authorities_past_mark() {
+        let defs = vec![(
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            2usize,
+        )];
+        let versions = vec![PolicyVersion(1)];
+        let mark_ms = 8_000;
+
+        // No reports at all: fail-closed (the old `!frontiers.is_empty()`
+        // guard is exactly what this replaces).
+        let set = crate::authority::ack_frontier::AckFrontierSet::new();
+        assert!(!NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // Only one of two authorities reported: fail.
+        let mut set = crate::authority::ack_frontier::AckFrontierSet::new();
+        set.update(ack_frontier("auth-1", "user/", 1, 10_000));
+        assert!(!NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // Both reported but one is still BEHIND the mark: fail (that
+        // authority may not have consumed the tombstoned state yet).
+        set.update(ack_frontier("auth-2", "user/", 1, 5_000));
+        assert!(!NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // Both past the mark: pass.
+        set.update(ack_frontier("auth-2", "user/", 1, 9_000));
+        assert!(NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // No authority definitions (single-node deployment): vacuously
+        // true — there is no other replica to resurrect from.
+        assert!(NodeRunner::gc_authority_gate_passed(
+            &[],
+            &[],
+            &crate::authority::ack_frontier::AckFrontierSet::new(),
+            mark_ms
+        ));
+    }
+
+    /// Clock-skew regression (re-review): the authority gate must not
+    /// pass off a frontier whose DATA time (`frontier_hlc.physical`,
+    /// which the HLC max rule inflates under peer-clock skew) is past
+    /// the mark when the report was RECEIVED (local wall clock) before
+    /// the mark — a stale pre-partition frontier must stall collection
+    /// for the whole partition.
+    #[test]
+    fn gc_authority_gate_requires_fresh_local_receipts() {
+        let defs = vec![(
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            1usize,
+        )];
+        let versions = vec![PolicyVersion(1)];
+        let mark_ms = 8_000;
+
+        // Skew-inflated data time (10_000 >= mark) but a receipt from
+        // BEFORE the mark (7_000): fail.
+        let mut set = crate::authority::ack_frontier::AckFrontierSet::new();
+        set.update_at(ack_frontier("auth-1", "user/", 1, 10_000), 7_000);
+        assert!(
+            !NodeRunner::gc_authority_gate_passed(&defs, &versions, &set, mark_ms),
+            "a stale receipt must fail the gate regardless of the frontier's data time"
+        );
+
+        // A strictly newer report received at/after the mark: pass.
+        set.update_at(ack_frontier("auth-1", "user/", 1, 10_001), 8_500);
+        assert!(NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // A frontier restored from persistence never advanced in this
+        // process: the (volatile) receipt map is empty after a JSON
+        // round-trip, so the gate stays fail-closed.
+        let json = serde_json::to_string(&set).expect("serialize frontier set");
+        let restored: crate::authority::ack_frontier::AckFrontierSet =
+            serde_json::from_str(&json).expect("deserialize frontier set");
+        assert!(
+            !NodeRunner::gc_authority_gate_passed(&defs, &versions, &restored, mark_ms),
+            "persisted frontiers without fresh receipts must fail the gate"
+        );
+    }
+
+    /// The peer half of the GC gate: every registered peer must have
+    /// push evidence (local wall-clock time of the scan behind the last
+    /// error-free push) at/after the mark — a peer with NO entry (never
+    /// successfully pushed to, e.g. partitioned since before the mark)
+    /// fails the gate rather than being ignored.
+    #[test]
+    fn gc_peer_gate_requires_all_registered_peers_past_mark() {
+        let peer = |name: &str, addr: &str| crate::network::PeerConfig {
+            node_id: node_id(name),
+            addr: addr.into(),
+        };
+        let mark_ms = 8_000;
+        let mut acked: HashMap<String, u64> = HashMap::new();
+
+        // Empty registry (no peers): vacuously true.
+        assert!(NodeRunner::gc_peer_gate_passed(&[], &acked, mark_ms));
+
+        // A registered peer with no push evidence at all: fail-closed.
+        let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
+        acked.insert("p1:9000".into(), 9_000);
+        assert!(!NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
+
+        // Push evidence from BEFORE the mark: fail.
+        acked.insert("p2:9000".into(), 7_999);
+        assert!(!NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
+
+        // All peers pushed at/after the mark: pass.
+        acked.insert("p2:9000".into(), 8_000);
+        assert!(NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
+    }
+
+    /// C-2 regression (re-review): a successful PULL must NOT count as
+    /// push evidence for the GC peer gate. Under the old design
+    /// `peer_frontiers` (advanced to the peer's own sender frontier on
+    /// every pull) fed the gate, so a peer that kept writing while our
+    /// pushes to it failed would pass the gate and the swept tombstone
+    /// could resurrect from its stale state.
+    #[test]
+    fn gc_peer_gate_ignores_pull_advanced_frontiers() {
+        let peers = vec![crate::network::PeerConfig {
+            node_id: node_id("p1"),
+            addr: "p1:9000".into(),
+        }];
+        let mark_ms = 8_000;
+
+        // Simulate what a pull does: peer_frontiers advances, but the
+        // push-evidence map stays empty. The gate must fail.
+        let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
+        peer_frontiers.insert("p1:9000".into(), hlc_ts(9_999, 0, "p1"));
+        let push_acked: HashMap<String, u64> = HashMap::new();
+        assert!(
+            !NodeRunner::gc_peer_gate_passed(&peers, &push_acked, mark_ms),
+            "a pull-advanced peer frontier must not open the GC gate"
         );
     }
 }

@@ -288,6 +288,49 @@ where
         });
     }
 
+    /// Snapshot the deferred (tombstone) dots as `(node_id, counter)`
+    /// pairs — the MARK phase of the gated mark-and-sweep tombstone GC
+    /// (see [`crate::crdt::gc::TombstoneGc`]).
+    pub fn deferred_dots(&self) -> HashSet<(NodeId, u64)> {
+        self.deferred
+            .iter()
+            .map(|d| (d.node_id.clone(), d.counter))
+            .collect()
+    }
+
+    /// Remove tombstone dots restricted to a MARKED candidate set — the
+    /// SWEEP phase of the gated mark-and-sweep tombstone GC.
+    ///
+    /// A dot is removed only when ALL of:
+    /// 1. it is in `candidates` (it existed at mark time, so the caller's
+    ///    replica-synchronisation gate covers it — every known replica
+    ///    has merged the post-remove state from after the mark);
+    /// 2. it is not referenced by any live element;
+    /// 3. it is locally dominated (`counter < max_counter` for its node,
+    ///    the same criterion as [`compact_deferred`](Self::compact_deferred)).
+    ///
+    /// Dots added AFTER the mark are never touched: they wait for the
+    /// next mark/sweep cycle, whose gate will cover them.
+    pub fn compact_deferred_marked(&mut self, candidates: &HashSet<(NodeId, u64)>) {
+        let live_dots: HashSet<&Dot> = self
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .collect();
+        self.deferred.retain(|d| {
+            if !candidates.contains(&(d.node_id.clone(), d.counter)) {
+                return true;
+            }
+            if live_dots.contains(d) {
+                return true;
+            }
+            match self.counters.get(&d.node_id) {
+                Some(&max_counter) => d.counter >= max_counter,
+                None => true, // unknown node — keep to be safe
+            }
+        });
+    }
+
     /// Remove tombstone dots from `deferred` that are safe to garbage-collect
     /// according to local counter dominance or a cross-replica version floor.
     ///

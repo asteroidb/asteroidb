@@ -3,7 +3,7 @@
 //! Covers:
 //! - CompactionEngine: record_op, should_checkpoint, create_checkpoint,
 //!   is_compactable, run_compaction
-//! - TombstoneGc: gc_tombstones at various store sizes
+//! - TombstoneGc: mark_and_sweep at various store sizes
 //! - AdaptiveCompactionConfig: tune cycle
 
 use std::time::Duration;
@@ -303,10 +303,13 @@ fn bench_gc_tombstones(c: &mut Criterion) {
                         set.add(format!("elem-{i}-new"), &nid);
                         store.put(format!("set-{i:04}"), CrdtValue::Set(set));
                     }
+                    let mut gc = gc;
+                    // Take the mark in setup; the measured pass is the sweep.
+                    gc.mark_and_sweep(&mut store, 0, true);
                     (gc, store)
                 },
                 |(mut gc, mut store)| {
-                    let collected = gc.gc_tombstones(&mut store, 1_000);
+                    let collected = gc.mark_and_sweep(&mut store, 1_000, true);
                     std::hint::black_box(collected);
                 },
                 criterion::BatchSize::SmallInput,
@@ -340,10 +343,13 @@ fn bench_gc_mixed_store(c: &mut Criterion) {
                     store.put(format!("cnt-{i:04}"), CrdtValue::Counter(counter));
                 }
 
+                let mut gc = gc;
+                // Take the mark in setup; the measured pass is the sweep.
+                gc.mark_and_sweep(&mut store, 0, true);
                 (gc, store)
             },
             |(mut gc, mut store)| {
-                let collected = gc.gc_tombstones(&mut store, 1_000);
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true);
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,
@@ -351,11 +357,11 @@ fn bench_gc_mixed_store(c: &mut Criterion) {
     });
 }
 
-fn bench_gc_with_version_floor(c: &mut Criterion) {
-    c.bench_function("gc/with_version_floor_50", |b| {
+fn bench_gc_full_cycle(c: &mut Criterion) {
+    c.bench_function("gc/mark_and_sweep_cycle_50", |b| {
         b.iter_batched(
             || {
-                let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
+                let gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(0));
                 let mut store = Store::new();
 
                 // Create 50 OrSets with tombstones from different nodes.
@@ -366,14 +372,14 @@ fn bench_gc_with_version_floor(c: &mut Criterion) {
                     set.remove(&format!("elem-{i}"));
                     set.add(format!("elem-{i}-new"), &nid);
                     store.put(format!("set-{i:04}"), CrdtValue::Set(set));
-                    // Set version floor for each node.
-                    gc.set_floor(&nid, 2);
                 }
 
                 (gc, store)
             },
             |(mut gc, mut store)| {
-                let collected = gc.gc_tombstones(&mut store, 1_000);
+                // Full cycle: mark pass + gated sweep pass.
+                gc.mark_and_sweep(&mut store, 0, true);
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true);
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,
@@ -392,6 +398,6 @@ criterion_group!(
     bench_write_rate_tracker,
     bench_gc_tombstones,
     bench_gc_mixed_store,
-    bench_gc_with_version_floor,
+    bench_gc_full_cycle,
 );
 criterion_main!(benches);

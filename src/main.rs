@@ -757,6 +757,17 @@ async fn main() {
         })
         .unwrap_or(false);
 
+    // Minimum age a tombstone-GC mark must reach before its sweep may
+    // collect (see NodeRunner::run_gc). Collection additionally requires
+    // every authority frontier and every registered peer's push frontier
+    // to have passed the mark time, so raising this only adds slack.
+    let gc_retention = std::time::Duration::from_secs(
+        std::env::var("ASTEROIDB_GC_RETENTION_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(300),
+    );
+
     let runner_config = NodeRunnerConfig {
         bls_config,
         node_signer,
@@ -765,6 +776,7 @@ async fn main() {
         current_epoch: Some(Arc::clone(&current_epoch)),
         equivocation: Some(Arc::clone(&equivocation)),
         digest_sync_enabled,
+        gc_retention,
         ..NodeRunnerConfig::default()
     };
 

@@ -95,6 +95,22 @@ pub struct AckFrontierSet {
     /// Used by GC to enforce a grace period before removing fenced entries.
     #[serde(default, with = "fenced_at_serde")]
     fenced_at: HashMap<FencedVersion, u64>,
+    /// LOCAL wall-clock time (ms since epoch, THIS node's clock) when each
+    /// scope's frontier last ADVANCED (a strictly newer `frontier_hlc` was
+    /// accepted by [`update`](Self::update)).
+    ///
+    /// This is the freshness evidence consumed by the tombstone-GC
+    /// authority gate: `frontier_hlc.physical` is DATA time — under
+    /// peer-clock skew the HLC max rule pushes it ahead of this node's
+    /// wall clock, so `frontier_hlc.physical >= mark_ms` does not imply
+    /// the authority synchronised after the mark. A receipt stamped on
+    /// this node's own clock does.
+    ///
+    /// `#[serde(skip)]`: volatile by design (also keeps every serialized
+    /// format byte-identical). After a restart the map is empty, so the
+    /// GC authority gate stays fail-closed until fresh reports arrive.
+    #[serde(skip)]
+    advanced_at_ms: HashMap<FrontierScope, u64>,
 }
 
 /// Custom serde for `HashMap<FrontierScope, AckFrontier>`.
@@ -161,6 +177,7 @@ impl AckFrontierSet {
             frontiers: HashMap::new(),
             fenced_versions: HashSet::new(),
             fenced_at: HashMap::new(),
+            advanced_at_ms: HashMap::new(),
         }
     }
 
@@ -169,10 +186,18 @@ impl AckFrontierSet {
     /// The scope key `{key_range, policy_version, authority_id}` is derived
     /// from the frontier itself. Only advances the frontier forward within
     /// its scope; an older `frontier_hlc` is ignored to prevent regression.
+    /// An accepted advancement is stamped with the current LOCAL wall-clock
+    /// time (see [`advanced_at_for_scope`](Self::advanced_at_for_scope)).
     ///
     /// Returns `true` if the frontier was actually advanced (inserted or
     /// updated), `false` if the update was stale or duplicate.
     pub fn update(&mut self, frontier: AckFrontier) -> bool {
+        self.update_at(frontier, crate::hlc::wall_clock_ms())
+    }
+
+    /// [`update`](Self::update) with an explicit local wall-clock receipt
+    /// time (ms). Exposed for deterministic tests.
+    pub fn update_at(&mut self, frontier: AckFrontier, now_ms: u64) -> bool {
         // Reject updates targeting a fenced (key_range, policy_version) pair.
         if self.is_version_fenced(&frontier.key_range, &frontier.policy_version) {
             return false;
@@ -185,10 +210,48 @@ impl AckFrontierSet {
                 false
             }
             _ => {
-                self.frontiers.insert(scope, frontier);
+                self.frontiers.insert(scope.clone(), frontier);
+                // Max-monotone so an out-of-order test clock can never
+                // regress a previously recorded receipt.
+                let stamp = self.advanced_at_ms.entry(scope).or_insert(now_ms);
+                *stamp = (*stamp).max(now_ms);
                 true
             }
         }
+    }
+
+    /// LOCAL wall-clock time (ms) when this scope's frontier last
+    /// advanced, if it advanced during this process's lifetime.
+    pub fn advanced_at_for_scope(&self, scope: &FrontierScope) -> Option<u64> {
+        self.advanced_at_ms.get(scope).copied()
+    }
+
+    /// The OLDEST advancement receipt across all authorities of a
+    /// `(key_range, policy_version)` scope, on this node's wall clock.
+    ///
+    /// Returns `None` (fail-closed) when the scope has no frontiers at
+    /// all, or when ANY scoped frontier has never advanced during this
+    /// process's lifetime (e.g. it was restored from persistence).
+    pub fn min_advanced_at_for_scope(
+        &self,
+        key_range: &KeyRange,
+        policy_version: &PolicyVersion,
+    ) -> Option<u64> {
+        let scoped: Vec<&FrontierScope> = self
+            .frontiers
+            .keys()
+            .filter(|scope| {
+                &scope.key_range == key_range && &scope.policy_version == policy_version
+            })
+            .collect();
+        if scoped.is_empty() {
+            return None;
+        }
+        scoped
+            .into_iter()
+            .map(|scope| self.advanced_at_ms.get(scope).copied())
+            .collect::<Option<Vec<u64>>>()
+            .and_then(|stamps| stamps.into_iter().min())
     }
 
     /// Fence a (key_range, policy_version) pair.
@@ -521,6 +584,7 @@ impl AckFrontierSet {
         let count = to_remove.len();
         for scope in &to_remove {
             self.frontiers.remove(scope);
+            self.advanced_at_ms.remove(scope);
         }
 
         // Also clean up fenced_versions and fenced_at entries for scopes
