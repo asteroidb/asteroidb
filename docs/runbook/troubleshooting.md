@@ -116,14 +116,19 @@
    cost**: if exclusion drops a scope below majority, certificate
    production for that scope stalls until the authority set is fixed.
 
-4. Permanent removal: update the authority set through control-plane
-   consensus (majority approval required):
+4. Permanent removal: update the authority set through the control-plane
+   Raft consensus. Send the request to the **current Raft leader** — any
+   other node answers `503 NOT_LEADER` with leader hint headers
+   (`x-asteroidb-leader-id` / `x-asteroidb-leader-addr`); retry against the
+   hinted leader. The deprecated `approvals` field is ignored.
 
    ```bash
-   curl -X PUT http://node:3000/api/control-plane/authorities \
+   # Find the leader
+   curl -s http://node:3000/api/control-plane/raft/status | jq '{role, leader_id, leader_addr}'
+
+   curl -X PUT http://<leader-addr>/api/control-plane/authorities \
      -H 'Content-Type: application/json' \
-     -d '{"key_range_prefix":"", "authority_nodes":["auth-1","auth-2"],
-          "approvals":["auth-1","auth-2"]}'
+     -d '{"key_range_prefix":"", "authority_nodes":["auth-1","auth-2"]}'
    ```
 
 5. If the cause is key compromise rather than malice, rotate the affected

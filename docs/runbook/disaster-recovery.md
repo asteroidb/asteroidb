@@ -11,9 +11,24 @@ be affected if the node was an Authority.
 
 **Recovery**:
 
-1. Restart the node with a clean data directory.
+> **WARNING**: Starting "with a clean data directory" is only acceptable
+> when the disk itself was lost (nothing salvageable remains). If only part
+> of the data directory is corrupted, **never move aside or delete the
+> whole directory**. Only the *eventual* store can be rebuilt from peers;
+> the certified store has no anti-entropy rebuild path (discarding it is
+> permanent loss), wiping `raft/` re-introduces double-voting risk in an
+> already-voted term, and discarding `equivocation_evidence.json` destroys
+> evidence permanently. For partial corruption, follow the crash-recovery
+> runbook in `docs/ops-guide.md` §13.6 and move aside only the damaged
+> store's files.
+
+1. Restart the node (with a clean data directory only if the disk itself was
+   lost; otherwise follow ops-guide §13.6 and preserve `raft/`,
+   `equivocation_evidence.json`, and the certified snapshot/WAL).
 2. The node will re-join the cluster via fan-out join.
-3. Anti-entropy sync will automatically replicate all data from peers.
+3. Anti-entropy sync will automatically replicate all *eventual* data from
+   peers. Certified data and Raft state have no peer-rebuild path — restore
+   them from backup if they were lost.
 4. Monitor convergence:
 
    ```bash
@@ -53,19 +68,28 @@ normally.
    fastest recovery path.
 
 2. If nodes cannot be restored, update the Authority definition to include
-   new replacement nodes:
+   new replacement nodes. The update is committed through the control-plane
+   Raft log, so it must be sent to the **current Raft leader** (any other
+   node answers `503 NOT_LEADER` with `x-asteroidb-leader-id` /
+   `x-asteroidb-leader-addr` hint headers — retry against the leader):
 
    ```bash
-   curl -X PUT http://seed:3000/api/control-plane/authorities \
+   # Find the leader
+   curl -s http://seed:3000/api/control-plane/raft/status | jq '{role, leader_id, leader_addr}'
+
+   curl -X PUT http://<leader-addr>/api/control-plane/authorities \
      -H 'Content-Type: application/json' \
      -d '{
        "key_range_prefix": "",
-       "authority_nodes": ["auth-1", "auth-new-2", "auth-new-3"],
-       "approvals": ["auth-1"]
+       "authority_nodes": ["auth-1", "auth-new-2", "auth-new-3"]
      }'
    ```
 
-   Note: This requires at least one surviving Authority node for approval.
+   Note: This requires a majority of the control-plane Raft voter set
+   (`ASTEROIDB_CONTROL_PLANE_NODES`) to be up and reachable — Raft cannot
+   commit without a quorum. The deprecated `approvals` field is accepted
+   but ignored. If the Raft quorum itself is lost, see
+   `docs/ops-guide.md` §14 before proceeding.
 
 3. If ALL Authority nodes are lost, manual intervention is required:
    - Stop all remaining nodes.

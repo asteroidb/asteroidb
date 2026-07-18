@@ -326,7 +326,15 @@ curl http://localhost:3000/api/certified/sensor/temp
 
 ### 3.3 System Namespace でポリシー設定
 
-System Namespace は HTTP API または Rust API 経由で設定します。すべての更新には Authority ノード群の過半数承認 (`approvals`) が必要です (FR-009)。
+System Namespace は HTTP API または Rust API 経由で設定します。すべての更新は
+**内蔵の control-plane Raft コンセンサス**で合意されます (FR-009): 現在の Raft
+リーダーだけが書き込みリクエストを受理し、更新はリーダーのログに追記され、
+投票者集合（`ASTEROIDB_CONTROL_PLANE_NODES`）の過半数で commit されてから
+応答が返ります。単一ノード（`ASTEROIDB_CONTROL_PLANE_NODES` 未設定）では
+自ノードが即座にリーダーとなるため、開発時はそのまま `localhost` に送れます。
+
+> 旧バージョンで必須だった `approvals`（過半数承認）フィールドは
+> **deprecated** で、送っても無視されます。
 
 #### HTTP API での設定
 
@@ -337,8 +345,7 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "sensor/",
-    "authority_nodes": ["auth-1", "auth-2", "auth-3"],
-    "approvals": ["auth-1", "auth-2"]
+    "authority_nodes": ["auth-1", "auth-2", "auth-3"]
   }'
 # => {"key_range_prefix":"sensor/","authority_nodes":["auth-1","auth-2","auth-3"]}
 ```
@@ -352,61 +359,63 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
     "key_range_prefix": "sensor/",
     "replica_count": 3,
     "required_tags": ["region:us-east"],
-    "certified": true,
-    "approvals": ["auth-1", "auth-2"]
+    "certified": true
   }'
 # => {"key_range_prefix":"sensor/","version":3,"replica_count":3,...}
 ```
 
-承認が過半数に達しない場合は `403 POLICY_DENIED` が返されます:
+マルチノードクラスタでリーダー以外のノードに送ると `503 NOT_LEADER` が
+返されます。応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` の
+ヒント先へ再送してください:
 
 ```bash
 curl -X PUT http://localhost:3000/api/control-plane/policies \
   -H "Content-Type: application/json" \
-  -d '{
-    "key_range_prefix": "sensor/",
-    "replica_count": 3,
-    "approvals": ["auth-1"]
-  }'
-# => 403 {"error_code":"POLICY_DENIED","message":"insufficient approvals for policy update"}
+  -d '{"key_range_prefix": "sensor/", "replica_count": 3}'
+# => 503 {"error_code":"NOT_LEADER","message":"this node is not the control-plane
+#         leader; retry against the leader (leader_id: node-2, leader_addr: ...)"}
+
+# リーダーの確認
+curl -s http://localhost:3000/api/control-plane/raft/status | jq '{role, leader_id, leader_addr}'
 ```
 
 #### Rust API での設定
 
+`ControlPlaneConsensus` は Raft ノードへの Clone 可能なファサードです。
+提案は async で、commit + apply 後に適用結果が返ります:
+
 ```rust
-use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
-use asteroidb_poc::placement::PlacementPolicy;
-use asteroidb_poc::types::{KeyRange, NodeId, PolicyVersion};
+use asteroidb_poc::control_plane::raft::types::{AuthoritySpec, PolicySpec};
+use asteroidb_poc::types::NodeId;
 
-// Authority ノードのリストで ControlPlaneConsensus を作成
-let authority_nodes = vec![
-    NodeId("auth-1".into()),
-    NodeId("auth-2".into()),
-    NodeId("auth-3".into()),
-];
-let mut consensus = ControlPlaneConsensus::new(authority_nodes);
+// 本番配線では ControlPlaneConsensus::with_raft(raft_node) で構築される。
+// consensus: ControlPlaneConsensus（リーダーのノード上のハンドル）
 
-// Authority 定義の更新を提案 (過半数の承認が必要)
-let def = AuthorityDefinition {
-    key_range: KeyRange { prefix: "sensor/".into() },
+// Authority 定義の更新を提案（Raft ログで合意）
+let spec = AuthoritySpec {
+    prefix: "sensor/".into(),
     authority_nodes: vec![
         NodeId("auth-1".into()),
         NodeId("auth-2".into()),
         NodeId("auth-3".into()),
     ],
 };
-let approvals = [NodeId("auth-1".into()), NodeId("auth-2".into())];
-consensus.propose_authority_update(def, &approvals).unwrap();
+let def = consensus.propose_authority_update(spec).await?;
 
-// 配置ポリシーの更新を提案
-let policy = PlacementPolicy::new(
-    PolicyVersion(2),
-    KeyRange { prefix: "sensor/".into() },
-    5,  // レプリカ数を 5 に変更
-);
-let result = consensus.propose_policy_update(policy, &approvals);
-// majority (2/3) に達していれば Ok(())
+// 配置ポリシーの更新を提案。バージョンは commit 順から採番されて返る
+let spec = PolicySpec {
+    prefix: "sensor/".into(),
+    replica_count: 5,
+    required_tags: Default::default(),
+    forbidden_tags: Default::default(),
+    allow_local_write_on_partition: false,
+    certified: true,
+    max_read_latency_ms: None,
+    preferred_cost_tier: None,
+};
+let policy = consensus.propose_policy_update(spec).await?;
+// リーダーでないノード上では Err(CrdtError::NotLeader { .. }) が返る
 ```
 
 ## 4. テスト実行

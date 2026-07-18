@@ -534,13 +534,25 @@ curl -s "http://localhost:3002/api/eventual/page-views?session_token=$TOKEN&wait
 # => {"key":"page-views","value":{"type":"counter","value":1},"session_token":"v1:..."}
 ```
 
+同一セッションで**複数回書き込む**場合は、write にも直前のトークンを
+`?session_token=` で渡して累積させます（特に書き込み先ノードが毎回異なる
+場合に必須 — 最後の write の応答トークンだけでは先行 write の位置が
+含まれません）:
+
+```bash
+TOKEN=$(curl -s -X POST "http://localhost:3003/api/eventual/write?session_token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"counter_inc","key":"page-views"}' | jq -r .session_token)
+```
+
 #### monotonic reads: 応答トークンを持ち回る
 
 read 応答の `session_token` は「このセッションが観測した位置」を表します。
 これを次の read に添付し続ける限り、どのレプリカに切り替えても読み取りは
 巻き戻りません（追いついていないレプリカは 412 を返します）。ただしトークンの
 エントリ数には上限（64 origin）があり、書き込み origin がそれを超えるクラスタ
-では古い origin から間引かれ、間引かれた origin については保証が弱まります
+では古い HLC のエントリから機械的に間引かれます。間引かれた origin の
+書き込みについては read が誤って成功し**読み取りが巻き戻る可能性**があります
 （詳細は API リファレンスの「保証の限界」参照）。
 
 ```bash
@@ -581,7 +593,7 @@ asteroidb-cli --host 127.0.0.1:3002 get greeting --session
   周期（デフォルト 2 秒）で回復します（pull は検証済み受信位置から要求される
   ため）。412 が返るのは「まだ追いついていない」区間だけです
 - 書き込み origin が 64 を超えるクラスタでは応答トークンが間引かれ、間引かれた
-  origin については monotonic reads が弱まります（上記参照）
+  origin の書き込みについては読み取りが巻き戻り得ます（上記参照）
 - 保証されるのは可視性の順序です。耐久性は WAL の fsync モードに従属します
   （既定の `always` では ack 済み書き込みは再起動を生き延びます）。詳細な
   保証内容と限界は [API リファレンスのセッショントークン節](api-reference.md#セッショントークン)
@@ -766,18 +778,22 @@ AsteroidDB は固定のトポロジー階層（Region > DC > Rack）を持たず
 
 ### 5.1 基本的な配置ポリシー
 
-配置ポリシーの設定には、Control Plane API を使用します。**設定の変更には Authority ノードの過半数承認が必要です。**
+配置ポリシーの設定には、Control Plane API を使用します。**設定の変更は内蔵
+Raft コンセンサスで合意され、現在の Raft リーダーだけが書き込みリクエストを
+受理します。** リーダー以外のノードに送ると `503` + `error_code: NOT_LEADER`
+が返り、応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` に
+リーダーのヒントが入るので、ヒント先へ再送してください（リーダーは
+`GET /api/control-plane/raft/status` でも確認できます）。
 
 ```bash
-# "sensor/" プレフィックスのキーに対する配置ポリシーを設定
+# "sensor/" プレフィックスのキーに対する配置ポリシーを設定（Raft リーダー宛て）
 curl -s -X PUT http://localhost:3001/api/control-plane/policies \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "sensor/",
     "replica_count": 3,
     "required_tags": ["tier:primary"],
-    "certified": true,
-    "approvals": ["node-1", "node-2"]
+    "certified": true
   }' | jq .
 ```
 
@@ -790,7 +806,7 @@ curl -s -X PUT http://localhost:3001/api/control-plane/policies \
 | `required_tags` | string[] | ノードに必須のタグ |
 | `forbidden_tags` | string[] | このタグを持つノードを除外 |
 | `certified` | boolean | Certified 機能を有効にするか |
-| `approvals` | string[] | ポリシー変更を承認する Authority ノード ID |
+| `approvals` | string[] | **Deprecated**。旧・承認カウント合意の名残で、受理されるが無視されます（合意は Raft が担う） |
 
 #### ポリシーの確認
 
@@ -807,15 +823,15 @@ curl -s http://localhost:3001/api/control-plane/versions | jq .
 
 ### 5.2 Authority 定義の設定
 
-特定のキー範囲に対して、Certified 機能の合意を行う Authority ノード群を定義します:
+特定のキー範囲に対して、Certified 機能の合意を行う Authority ノード群を定義します
+（配置ポリシーと同じく Raft リーダー宛て）:
 
 ```bash
 curl -s -X PUT http://localhost:3001/api/control-plane/authorities \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "account/",
-    "authority_nodes": ["node-1", "node-2", "node-3"],
-    "approvals": ["node-1", "node-2"]
+    "authority_nodes": ["node-1", "node-2", "node-3"]
   }' | jq .
 ```
 
@@ -843,8 +859,7 @@ curl -s -X PUT http://localhost:3001/api/control-plane/policies \
     "replica_count": 3,
     "required_tags": ["region:ap-northeast-1"],
     "forbidden_tags": ["decommissioning"],
-    "certified": true,
-    "approvals": ["node-1", "node-2"]
+    "certified": true
   }' | jq .
 ```
 
@@ -859,8 +874,7 @@ curl -s -X PUT http://localhost:3001/api/control-plane/policies \
     "key_range_prefix": "telemetry/",
     "replica_count": 2,
     "required_tags": ["tier:primary"],
-    "certified": false,
-    "approvals": ["node-1", "node-2"]
+    "certified": false
   }' | jq .
 ```
 
@@ -876,8 +890,7 @@ curl -s -X PUT http://localhost:3001/api/control-plane/policies \
     "replica_count": 3,
     "required_tags": ["tier:primary"],
     "forbidden_tags": ["decommissioning", "maintenance"],
-    "certified": true,
-    "approvals": ["node-1", "node-2"]
+    "certified": true
   }' | jq .
 ```
 
@@ -1047,30 +1060,34 @@ curl -s http://localhost:3001/api/eventual/my-key | jq '.value.type'
 
 キーごとに CRDT 型は固定されるため、別の型が必要な場合は別のキーを使用してください。
 
-**Q: `POLICY_DENIED` エラーが返される**
+**Q: `NOT_LEADER` エラー（503）が返される**
 
-A: 配置ポリシーや Authority 定義の更新には、過半数の Authority ノードの承認（`approvals`）が必要です。3 ノード構成の場合、最低 2 ノードの承認が必要です:
+A: 配置ポリシーや Authority 定義の更新は内蔵 Raft コンセンサスで合意され、
+**現在の Raft リーダーだけが書き込みを受理**します。リーダー以外のノードに
+送ると `503` + `error_code: NOT_LEADER` が返ります（`Retry-After: 1` 付き）。
+応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` に入っている
+リーダーのヒント先へ再送してください（サーバー側での転送は行われません）:
 
 ```bash
-# 正しい例（2/3 の承認）
-curl -s -X PUT http://localhost:3001/api/control-plane/policies \
-  -H "Content-Type: application/json" \
-  -d '{
-    "key_range_prefix": "data/",
-    "replica_count": 3,
-    "approvals": ["node-1", "node-2"]
-  }'
+# リーダーの確認
+curl -s http://localhost:3001/api/control-plane/raft/status | jq '{role, leader_id, leader_addr}'
 
-# エラーになる例（1/3 の承認では不足）
-curl -s -X PUT http://localhost:3001/api/control-plane/policies \
+# リーダー宛てに再送
+curl -s -X PUT http://<leader-addr>/api/control-plane/policies \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "data/",
-    "replica_count": 3,
-    "approvals": ["node-1"]
+    "replica_count": 3
   }'
-# => 403 {"error_code":"POLICY_DENIED","message":"insufficient approvals for policy update"}
 ```
+
+リーダー選出中（`role: "candidate"`）はヒントが空のことがあります。少し
+待ってからリトライしてください。
+
+なお、旧バージョンで必要だった `approvals` フィールド（過半数承認）は
+deprecated で、送っても**無視**されます。承認数不足による
+`403 POLICY_DENIED` は発生しなくなりました（`POLICY_DENIED` が返るのは、
+そのノードに control-plane コンセンサスが構成されていない場合です）。
 
 **Q: `KEY_NOT_FOUND` エラーが返される**
 

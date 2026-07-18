@@ -45,7 +45,7 @@ API は大きく3つのカテゴリに分かれる:
 |----------|-------------------|------|------|
 | Public API | `/api/eventual/*`, `/api/certified/*`, `/api/status/*` | 不要 | クライアントからのデータ読み書き |
 | Internal API | `/api/internal/*` | Bearer Token (設定時) | ノード間通信 (sync, membership) |
-| Control Plane (書き込み) | `PUT /api/control-plane/*`, `DELETE /api/control-plane/*` | Bearer Token (設定時) | Authority 定義・配置ポリシーの変更 |
+| Control Plane (書き込み) | `PUT /api/control-plane/*`, `DELETE /api/control-plane/*` | Bearer Token (設定時) | Authority 定義・配置ポリシーの変更（Raft リーダーのみ受理 — 下記参照） |
 
 Control Plane の読み取りエンドポイント (`GET`) は認証不要で誰でもアクセス可能。
 
@@ -231,6 +231,12 @@ CRDT 操作をローカルの eventual ストアに適用する。
 - **Content-Type**: `application/json`
 - **レスポンス**: `200 OK`
 
+**クエリパラメータ:**
+
+| パラメータ | 型 | 必須 | 説明 |
+|-----------|-----|------|------|
+| `session_token` | string | いいえ | クライアントが保持している直前のセッショントークン。指定すると、この書き込みの HLC 位置を**提示トークンにマージ（折り畳み）した累積トークン**が応答で返る。複数コーディネータに跨って書き込むセッションが read-your-writes を維持するにはこの持ち回りが必須（トークンは不透明であり、クライアント側で複数トークンをマージすることはできない）。空文字列は「トークン無し」と同義。不正な形式・制限超過・サーバ時計 + 60 秒を超えるトークンは `400` で拒否され、**書き込み自体も適用されない** |
+
 **リクエストボディ** (tagged union 形式):
 
 操作の種別は `type` フィールドで指定する。以下の操作をサポート:
@@ -315,9 +321,15 @@ CRDT 操作をローカルの eventual ストアに適用する。
 }
 ```
 
-`session_token` はこの書き込みの HLC 位置を表す（常に返却される）。次の
-`GET /api/eventual/{key}?session_token=...` に添付すると read-your-writes が保証される。
-詳細は [セッショントークン](#セッショントークン) を参照。
+`session_token` は常に返却される。`session_token` クエリパラメータ無しの
+リクエストでは**この書き込みの HLC 位置のみ**を表し、提示ありのリクエスト
+では**提示トークンにこの書き込みの位置をマージした累積トークン**を表す。
+次の `GET /api/eventual/{key}?session_token=...` に添付すると
+read-your-writes が保証される。同一セッションで複数回書き込む場合
+（特にコーディネータを跨ぐ場合）は、**毎回の write に直前の応答トークンを
+渡して累積させる**こと — 最後の write の応答トークンだけを read に添付する
+方式では、先行 write の origin 位置がトークンに含まれず read-your-writes が
+保証されない。詳細は [セッショントークン](#セッショントークン) を参照。
 
 **curl 例:**
 
@@ -437,12 +449,17 @@ entry   := physical-hex "." logical-hex "." nodeid-hex
   返さない（fail-closed。詳細は ops-guide の耐久性保証表を参照）
 - トークンは eventual ストア専用。certified read に流用しても充足しない
   （412 になるだけで害はない）
-- 応答トークンはエントリ数上限 64・全長 8192 バイトで間引かれ得る（古い HLC
-  のエントリから削除。直前に読んだキーの変更位置はリクエスト由来として優先
-  保持される）。間引き後は記載されている origin についてのみ monotonic reads
-  を保証する（保証の弱化であり嘘ではない）。書き込み origin が 64 を超える
-  クラスタでは、間引かれた origin の書き込みについて読み取りが巻き戻る可能性
-  がある — 完全な monotonic reads が必要な場合は origin 数を 64 以下に保つこと
+- 応答トークンはエントリ数上限 64・全長 8192 バイトに収めるため間引かれ得る。
+  間引きは HLC の新しい順にソートして**古いエントリから機械的に切り捨てる**
+  だけであり、リクエスト由来のエントリや直前に読んだキーの変更位置を優先
+  保持する仕組みは**ない**（当該エントリが最古ならそれが落ちる）。落ちた
+  origin は以後の判定から消えるため、間引きは単なる偽陰性（保証の弱化）では
+  **済まない**: 間引かれた origin の書き込みを持たないレプリカでの次の read
+  が誤って成功し、**観測済みの値より古い値が返り得る**（monotonic reads の
+  巻き戻り）。ノード ID が長い場合はバイト上限により origin 数が 64 以下でも
+  間引きが起き得る。完全な monotonic reads が必要な場合は、書き込み origin
+  数を 64 以下に保ち、かつトークンが 8192 バイトに収まるようノード ID を
+  短く保つこと
 - 応答トークンは applied claim 済みの origin だけでなく**可視状態全体**
   （unclaimed マージで見えるようになった寄与を含む）を被覆する。観測した値を
   被覆しないトークンを発行すると、別レプリカでの巻き戻り（monotonic reads の
@@ -474,13 +491,19 @@ TOKEN=$(curl -s -X POST http://node-a:3000/api/eventual/write \
   -H "Content-Type: application/json" \
   -d '{"type":"register_set","key":"greeting","value":"hello"}' | jq -r .session_token)
 
-# 2. 別ノードでトークン付き read（追いついていなければ 412）
+# 2. 続けて書き込む場合（別コーディネータでも可）: 直前のトークンを
+#    write に渡して累積させる（渡さないと先行 write の位置が失われる）
+TOKEN=$(curl -s -X POST "http://node-c:3000/api/eventual/write?session_token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"register_set","key":"farewell","value":"bye"}' | jq -r .session_token)
+
+# 3. 別ノードでトークン付き read（追いついていなければ 412）
 curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN"
 
-# 3. 412 の場合: wait_ms 付きでリトライ（複製が届き次第 200）
+# 4. 412 の場合: wait_ms 付きでリトライ（複製が届き次第 200）
 curl "http://node-b:3000/api/eventual/greeting?session_token=$TOKEN&wait_ms=3000"
 
-# 4. 応答の session_token を次の read に持ち回る（monotonic reads）
+# 5. 応答の session_token を次の read に持ち回る（monotonic reads）
 ```
 
 ---
@@ -863,6 +886,48 @@ curl http://localhost:3000/api/control-plane/versions
 
 ---
 
+#### GET /api/control-plane/raft/status
+
+Control plane Raft コンセンサスの状態を返す（`/api/metrics` と同じく認証
+不要の読み取り専用観測エンドポイント）。書き込み前のリーダー特定や、
+`NOT_LEADER` 受信後のリトライ先の確認に使う。
+
+- **レスポンス**: `200 OK`
+
+```json
+{
+  "node_id": "node-1",
+  "role": "leader",
+  "term": 3,
+  "leader_id": "node-1",
+  "leader_addr": null,
+  "commit_index": 12,
+  "last_applied": 12,
+  "last_log_index": 12,
+  "voters": ["node-1", "node-2", "node-3"]
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `node_id` | string | このノードの ID |
+| `role` | string | `"leader"` / `"follower"` / `"candidate"` / `"detached"`（Raft 未構成） |
+| `term` | u64 | 現在の Raft term |
+| `leader_id` | string \| null | 既知のリーダーのヒント |
+| `leader_addr` | string \| null | リーダーの解決済みアドレス（既知の場合） |
+| `commit_index` | u64 | commit 済みログの最大 index |
+| `last_applied` | u64 | 状態機械へ適用済みの最大 index |
+| `last_log_index` | u64 | ローカルログの末尾 index |
+| `voters` | string[] | 静的投票者集合（`ASTEROIDB_CONTROL_PLANE_NODES`） |
+
+**curl 例:**
+
+```bash
+curl http://localhost:3000/api/control-plane/raft/status
+```
+
+---
+
 ### Metrics / SLO / Topology
 
 #### GET /api/metrics
@@ -901,9 +966,9 @@ curl http://localhost:3000/api/control-plane/versions
   "rebalance_keys_failed": 0,
   "rebalance_complete_total": 3,
   "rebalance_duration_sum_us": 5000000,
-  "key_rotation_total": 2,
-  "key_rotation_last_version": 3,
-  "key_rotation_last_time_ms": 1700000000000,
+  "key_rotation_total": 0,
+  "key_rotation_last_version": 0,
+  "key_rotation_last_time_ms": 0,
   "write_ops_total": 25000,
   "delta_sync_count": 8000
 }
@@ -925,9 +990,9 @@ curl http://localhost:3000/api/control-plane/versions
 | `rebalance_keys_failed` | u64 | 累計リバランス失敗キー数 |
 | `rebalance_complete_total` | u64 | 累計リバランス完了回数 |
 | `rebalance_duration_sum_us` | u64 | リバランス所要時間合計 (マイクロ秒) |
-| `key_rotation_total` | u64 | 累計鍵ローテーション回数 |
-| `key_rotation_last_version` | u64 | 最新 keyset バージョン |
-| `key_rotation_last_time_ms` | u64 | 最新ローテーション時刻 (ミリ秒) |
+| `key_rotation_total` | u64 | 累計鍵ローテーション回数。**自動ローテーション未配線のため現状は常に 0**（`docs/runbook/key-rotation.md` 参照） |
+| `key_rotation_last_version` | u64 | 最後にローテーションで適用された keyset バージョン。**自動ローテーション未配線のため現状は常に 0**（メトリクスの初期値。keyset レジストリの初期バージョン 1 とは別物であり、0 は鍵レジストリの初期化不良を意味しない） |
+| `key_rotation_last_time_ms` | u64 | 最新ローテーション時刻 (ミリ秒)。**現状は常に 0** |
 | `write_ops_total` | u64 | 累計書き込みオペレーション数 |
 | `delta_sync_count` | u64 | 累計デルタ同期回数 |
 | `full_sync_fallback_count` | u64 | 累計フルシンクフォールバック回数 |
@@ -1600,7 +1665,30 @@ curl -X POST http://localhost:3000/api/internal/ping \
 
 ## Control Plane API (書き込み)
 
-以下のエンドポイントは全て、Authority ノードの過半数承認 (FR-009) と Bearer Token 認証（設定時）が必要。
+以下のエンドポイントは全て、**control-plane Raft ログでの合意 (FR-009)** と
+Bearer Token 認証（設定時）が必要。リクエストを受理できるのは**現在の Raft
+リーダーのみ**で、更新はリーダーのログに追記され、静的投票者集合
+（`ASTEROIDB_CONTROL_PLANE_NODES`）の過半数で commit されてから応答が返る。
+
+リーダー以外のノードに送ると `503 Service Unavailable` + `error_code:
+NOT_LEADER` が返る（`Retry-After: 1` 付き）。応答ヘッダ
+`x-asteroidb-leader-id` / `x-asteroidb-leader-addr` にリーダーのヒントが
+入るので、クライアントはヒント先へ再送すること（サーバー側転送は行わない）。
+リーダーが不明な場合は `GET /api/control-plane/raft/status` で確認できる。
+
+```json
+// HTTP 503 Service Unavailable（Retry-After: 1、
+// x-asteroidb-leader-id / x-asteroidb-leader-addr ヘッダ付き）
+{
+  "error_code": "NOT_LEADER",
+  "message": "this node is not the control-plane leader; retry against the leader (leader_id: node-2, leader_addr: 10.0.0.2:3000)"
+}
+```
+
+> **`approvals` フィールドは deprecated**: pre-Raft の承認カウント合意で
+> 使われていた自己申告の承認リスト。旧クライアントとのワイヤ互換のため
+> 受理はされるが**完全に無視**される — 合意は Raft ログ複製が担う。
+> 新規クライアントは送らないこと。
 
 ### PUT /api/control-plane/authorities
 
@@ -1608,14 +1696,14 @@ Authority 定義を設定する。
 
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
 ```json
 {
   "key_range_prefix": "user/",
-  "authority_nodes": ["auth-1", "auth-2", "auth-3"],
-  "approvals": ["auth-1", "auth-2"]
+  "authority_nodes": ["auth-1", "auth-2", "auth-3"]
 }
 ```
 
@@ -1623,7 +1711,7 @@ Authority 定義を設定する。
 |-----------|-----|------|
 | `key_range_prefix` | string | 対象キー範囲プレフィックス |
 | `authority_nodes` | string[] | Authority ノード ID のリスト |
-| `approvals` | string[] | この更新を承認したノード ID（過半数必要） |
+| `approvals` | string[] | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
 
 **レスポンスボディ:**
 
@@ -1637,13 +1725,12 @@ Authority 定義を設定する。
 **curl 例:**
 
 ```bash
-curl -X PUT http://localhost:3000/api/control-plane/authorities \
+curl -X PUT http://<leader-addr>/api/control-plane/authorities \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{
     "key_range_prefix": "user/",
-    "authority_nodes": ["auth-1", "auth-2", "auth-3"],
-    "approvals": ["auth-1", "auth-2"]
+    "authority_nodes": ["auth-1", "auth-2", "auth-3"]
   }'
 ```
 
@@ -1651,10 +1738,13 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 
 ### PUT /api/control-plane/policies
 
-配置ポリシーを設定する。バージョンは自動的にインクリメントされる。
+配置ポリシーを設定する。バージョンは commit 済みエントリの**適用時**に
+複製されたバージョンカウンタから採番される（commit 順が全ノードで同一の
+バージョンを決める）。
 
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
@@ -1665,8 +1755,7 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
   "required_tags": ["region:ap-northeast-1"],
   "forbidden_tags": ["decommissioned"],
   "allow_local_write_on_partition": true,
-  "certified": true,
-  "approvals": ["auth-1", "auth-2"]
+  "certified": true
 }
 ```
 
@@ -1678,7 +1767,7 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 | `forbidden_tags` | string[] | いいえ | `[]` | 禁止タグ |
 | `allow_local_write_on_partition` | bool | いいえ | `false` | ネットワーク分断時のローカル書き込み許可 |
 | `certified` | bool | いいえ | `false` | 認証が必要なキー範囲かどうか |
-| `approvals` | string[] | はい | - | 承認ノード ID（過半数必要） |
+| `approvals` | string[] | いいえ | `[]` | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
 
 **レスポンスボディ:**
 
@@ -1698,10 +1787,10 @@ curl -X PUT http://localhost:3000/api/control-plane/authorities \
 
 ```bash
 # replica_count が 0 の場合
-curl -X PUT http://localhost:3000/api/control-plane/policies \
+curl -X PUT http://<leader-addr>/api/control-plane/policies \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
-  -d '{"key_range_prefix":"","replica_count":0,"approvals":["auth-1","auth-2"]}'
+  -d '{"key_range_prefix":"","replica_count":0}'
 ```
 
 ```json
@@ -1715,7 +1804,7 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 **curl 例:**
 
 ```bash
-curl -X PUT http://localhost:3000/api/control-plane/policies \
+curl -X PUT http://<leader-addr>/api/control-plane/policies \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1724,8 +1813,7 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
     "required_tags": [],
     "forbidden_tags": [],
     "allow_local_write_on_partition": false,
-    "certified": false,
-    "approvals": ["auth-1", "auth-2"]
+    "certified": false
   }'
 ```
 
@@ -1738,14 +1826,15 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 - **認証**: Bearer Token (設定時)
 - **Content-Type**: `application/json`
 - **パスパラメータ**: `prefix` - 削除対象のキー範囲プレフィックス
+- **受理**: Raft リーダーのみ（それ以外は `503 NOT_LEADER`）
 
 **リクエストボディ:**
 
 ```json
-{
-  "approvals": ["auth-1", "auth-2"]
-}
+{}
 ```
+
+（`approvals` フィールドは deprecated — 受理されるが無視される）
 
 **レスポンスボディ:**
 
@@ -1768,10 +1857,10 @@ curl -X PUT http://localhost:3000/api/control-plane/policies \
 **curl 例:**
 
 ```bash
-curl -X DELETE http://localhost:3000/api/control-plane/policies/user%2F \
+curl -X DELETE http://<leader-addr>/api/control-plane/policies/user%2F \
   -H "Authorization: Bearer my-token" \
   -H "Content-Type: application/json" \
-  -d '{"approvals":["auth-1","auth-2"]}'
+  -d '{}'
 ```
 
 ---
@@ -1788,6 +1877,8 @@ curl -X DELETE http://localhost:3000/api/control-plane/policies/user%2F \
 | `POLICY_DENIED` | 403 Forbidden | 配置ポリシーによる拒否 | 対象キー範囲の配置ポリシーを確認する |
 | `TIMEOUT` | 504 Gateway Timeout | Authority 合意がタイムアウト | Authority ノードの稼働状況を確認する。`on_timeout=pending` で再試行可能 |
 | `SESSION_NOT_SATISFIED` | 412 Precondition Failed | セッショントークンの示す書き込みまでローカルレプリカが追いついていない | `Retry-After` に従いリトライ、`wait_ms` を増やす、または別レプリカに問い合わせる |
+| `NOT_LEADER` | 503 Service Unavailable | Control plane 書き込みを Raft リーダー以外のノードが受信した | 応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` のヒント先へ再送する（`Retry-After: 1` 付き）。リーダー不明なら `GET /api/control-plane/raft/status` で確認 |
+| `STORAGE_UNAVAILABLE` | 503 Service Unavailable | 書き込みの WAL 追記に失敗し耐久性を確立できない（例: ディスクフル） | ディスク容量・I/O 状態を確認してリトライする。読み取りは継続可能 |
 | `INCOMPATIBLE_VERSION` | 500 Internal Server Error | データバージョンとコードバージョンの不整合 | AsteroidDB を最新版に更新するか、データマイグレーションを実行する |
 | `MIGRATION_FAILED` | 500 Internal Server Error | データマイグレーション失敗 | ログを確認し、データの整合性を検証する |
 | `INTERNAL` | 500 Internal Server Error | 内部エラー | サーバーログを確認する |

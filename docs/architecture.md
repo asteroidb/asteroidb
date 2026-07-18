@@ -48,7 +48,7 @@ Certified 整合性を提供します。
 | Attestation Pool | `src/authority/attestation_pool.rs` | 検証済み attestation をスコープ × チェックポイント単位で収集し majority certificate を組み立て |
 | Certificate | `src/authority/certificate.rs` | デュアルモード（Ed25519 / BLS）majority certificate の構築 |
 | BLS Signatures | `src/authority/bls.rs` | `blst` クレート経由の BLS12-381 aggregate signatures と Proof-of-Possession（PoP、`POP_` DST での鍵所有証明） |
-| Epoch Manager | `src/authority/certificate.rs` | 24 時間 epoch、7 epoch 猶予期間付き鍵ローテーション |
+| Epoch Manager | `src/authority/certificate.rs` | epoch 追跡と keyset バージョン管理の基盤（**自動ローテーションは未配線** — `stage_keys` を呼ぶ production 経路が無く `check_and_rotate` は常に no-op。鍵更新は `ASTEROIDB_AUTHORITY_KEYS` 再配布 + 再起動のみ。`docs/runbook/key-rotation.md` 参照） |
 
 frontier 報告の署名対象は 1 秒単位に床丸めした「チェックポイント HLC」であり、
 全 Authority が同一メッセージバイト列に署名する。これにより Ed25519 の
@@ -83,6 +83,9 @@ BLS 鍵の登録時（`KeysetRegistry::register_bls_keys`——`KeysetEntry.bls_
   Ed25519 署名と個別 BLS 署名検証を要求するため署名能力の昇格にはならない（受容済みの性質）。
 - PoP はバイナリの起動ログに配布用エントリとして出力され、鍵ローテーション時にはバージョンごとに
   再登録・再検証される（`rotate_keyset` は新バージョンを空の BLS 鍵で作る）。
+  ※自動ローテーションが未配線のため、現状この経路（`rotate_keyset` による新バージョン作成と
+  BLS 鍵の再登録）はテストでのみ実行される。運用上の鍵更新は `ASTEROIDB_AUTHORITY_KEYS`
+  再配布 + 再起動で、キーセットは初期バージョンとして再構築される。
 
 ### Control Plane
 
