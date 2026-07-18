@@ -18,11 +18,24 @@ use crate::store::migration;
 
 /// Current persistence format version written by this code.
 ///
+/// v4: added an end-to-end CRC32 checksum to both snapshot encodings
+/// (bincode: a 4-byte LE checksum between the version prefix and the
+/// payload; JSON: a `crc32` envelope field over the canonical `store`
+/// JSON) and the `recovery_gaps` fence field to [`Store`]. The WAL has
+/// protected every frame with a CRC32 since its introduction; without a
+/// snapshot checksum the SAME data became unprotected the moment a
+/// checkpoint copied it out of the log — a silent bit flip that still
+/// bincode-decodes (e.g. a bumped counter contribution or a future HLC)
+/// would then poison every peer via anti-entropy max-merges. Load-time
+/// verification is fail-stop, the same discipline as the WAL.
+///
 /// v3: added the session-guarantee fields (`applied_origins`,
 /// `merge_failed_keys`, `pruned_floor`, `visible_origins`) to [`Store`].
+/// v3 snapshots carry no checksum and are decoded via [`StoreV3Layout`]
+/// (bincode is positional — the v3 struct layout is frozen there).
 /// v1/v2 snapshots contain only `data` + `timestamps` and are migrated on
 /// load (JSON via the migration registry, bincode via [`StoreV2Layout`]).
-pub const CURRENT_FORMAT_VERSION: u32 = 3;
+pub const CURRENT_FORMAT_VERSION: u32 = 4;
 
 /// Versioned envelope for persisted store data.
 ///
@@ -31,6 +44,13 @@ pub const CURRENT_FORMAT_VERSION: u32 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedStore {
     format_version: u32,
+    /// CRC32 over the canonical JSON serialization of `store`
+    /// (`serde_json::to_string` of the `store` value — deterministic:
+    /// object keys are BTreeMap-ordered). `None` only in pre-v4
+    /// snapshots; v4+ snapshots always carry it and it is verified
+    /// fail-stop on load.
+    #[serde(default)]
+    crc32: Option<u32>,
     store: serde_json::Value,
 }
 
@@ -175,6 +195,43 @@ pub struct Store {
     /// monotonic-reads lie). Never consulted by `is_satisfied`.
     #[serde(default)]
     visible_origins: HashMap<String, HlcTimestamp>,
+    /// Recovery gap fences (session guarantees, v4 field).
+    ///
+    /// A durability-lossy crash recovery (WAL sync `interval`/`off`,
+    /// persistence disabled, or an explicit `RECOVER_TRUNCATE`) can lose
+    /// an ACKED suffix of an origin's writes while `applied_origins`
+    /// still records the pre-loss frontier. The next LOCAL write then
+    /// max-merges `applied_origins[self]` PAST the hole (its HLC is
+    /// wall-clock-derived and larger than every lost timestamp), and a
+    /// session token for a lost write would wrongly pass evidence path A.
+    /// Each gap `(floor, ceiling]` for `node_id` marks such a hole:
+    /// `applied_origin_covers` refuses path A for entries inside it.
+    ///
+    /// Healing happens EXCLUSIVELY in [`merge_applied_origins`]
+    /// (anti-entropy adoption — the only path that proves a complete
+    /// transfer re-covered the range); [`note_applied`] (local writes)
+    /// deliberately never heals a gap.
+    ///
+    /// [`merge_applied_origins`]: Self::merge_applied_origins
+    /// [`note_applied`]: Self::note_applied
+    #[serde(default)]
+    recovery_gaps: Vec<RecoveryGap>,
+}
+
+/// One recovery gap fence: evidence path A is disabled for `node_id`
+/// entries with `floor < entry <= ceiling` (see
+/// [`Store::recovery_gaps`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryGap {
+    /// Origin node whose write prefix may have a hole.
+    pub node_id: String,
+    /// Exclusive lower bound: the origin's applied frontier as recovered
+    /// (everything at or below it was provably applied pre-loss).
+    pub floor: HlcTimestamp,
+    /// Inclusive upper bound: an HLC issued at recovery time — every
+    /// post-restart write is strictly above it, every lost write at or
+    /// below it (modulo wall-clock regression across the reboot).
+    pub ceiling: HlcTimestamp,
 }
 
 /// Structural layout of `Store` persisted by format versions 1 and 2
@@ -197,6 +254,42 @@ impl From<StoreV2Layout> for Store {
             merge_failed_keys: HashSet::new(),
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            recovery_gaps: Vec::new(),
+        };
+        store.rebuild_visible_origins();
+        store
+    }
+}
+
+/// Structural layout of `Store` persisted by format version 3 (frozen —
+/// v4 appended `recovery_gaps`, and bincode cannot default a missing
+/// trailing field, so v3 snapshots must be decoded with exactly this
+/// layout).
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreV3Layout {
+    data: BTreeMap<String, CrdtValue>,
+    #[serde(default)]
+    timestamps: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    applied_origins: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    merge_failed_keys: HashSet<String>,
+    #[serde(default)]
+    pruned_floor: Option<HlcTimestamp>,
+    #[serde(default)]
+    visible_origins: HashMap<String, HlcTimestamp>,
+}
+
+impl From<StoreV3Layout> for Store {
+    fn from(old: StoreV3Layout) -> Self {
+        let mut store = Store {
+            data: old.data,
+            timestamps: old.timestamps,
+            applied_origins: old.applied_origins,
+            merge_failed_keys: old.merge_failed_keys,
+            pruned_floor: old.pruned_floor,
+            visible_origins: old.visible_origins,
+            recovery_gaps: Vec::new(),
         };
         store.rebuild_visible_origins();
         store
@@ -251,6 +344,7 @@ impl Store {
             merge_failed_keys: HashSet::new(),
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            recovery_gaps: Vec::new(),
         }
     }
 
@@ -361,6 +455,28 @@ impl Store {
             .filter_map(|(k, v)| self.timestamps.get(k).map(|ts| (k, v, ts)))
     }
 
+    /// Return entries with NO tracked change timestamp: stores migrated
+    /// from format v1/v2 (whose snapshots predate the timestamps map)
+    /// AND keys whose timestamps were removed by compaction
+    /// ([`prune_timestamps_before`](Self::prune_timestamps_before) drops
+    /// the timestamp while keeping the data).
+    ///
+    /// These keys are invisible to [`entries_since`](Self::entries_since)
+    /// / [`delta_entries_since`](Self::delta_entries_since): any transfer
+    /// that must be COMPLETE relative to this store (full dumps,
+    /// zero-frontier delta pulls) has to include them explicitly or it
+    /// silently under-transfers. NOTE for callers on the delta path: a
+    /// compacted store (`pruned_floor` set) matches its ENTIRE pruned
+    /// keyspace here — a full-dump-sized set. Since a compacted sender's
+    /// zero-frontier claims are rejected by the receiver's floor gate
+    /// anyway, `internal_delta_sync` only ships these when `pruned_floor`
+    /// is `None` (see the comment there).
+    pub fn untracked_entries(&self) -> impl Iterator<Item = (&String, &CrdtValue)> {
+        self.data
+            .iter()
+            .filter(|(k, _)| !self.timestamps.contains_key(*k))
+    }
+
     /// Save the store as a versioned JSON snapshot to the given path.
     ///
     /// Uses a [`FileBackend`] internally for atomic write (write to `.tmp`
@@ -375,11 +491,18 @@ impl Store {
     }
 
     /// Save the store to an arbitrary [`StorageBackend`].
+    ///
+    /// The envelope carries a CRC32 over the canonical JSON serialization
+    /// of the store value (end-to-end integrity, same discipline as the
+    /// WAL frame CRC — see [`CURRENT_FORMAT_VERSION`]).
     pub fn save_to_backend(&self, backend: &dyn StorageBackend) -> io::Result<()> {
         let store_value = serde_json::to_value(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let store_json = serde_json::to_string(&store_value)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let envelope = PersistedStore {
             format_version: CURRENT_FORMAT_VERSION,
+            crc32: Some(crc32fast::hash(store_json.as_bytes())),
             store: store_value,
         };
         let json = serde_json::to_string(&envelope)
@@ -391,7 +514,9 @@ impl Store {
     ///
     /// Uses bincode for faster serialization compared to JSON (~2-4x speedup).
     /// The snapshot includes a 4-byte format version prefix for forward
-    /// compatibility detection.
+    /// compatibility detection and a 4-byte CRC32 over the payload
+    /// (verified fail-stop on load — see
+    /// [`save_to_backend_bincode`](Self::save_to_backend_bincode)).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save_snapshot_bincode(&self, path: &Path) -> io::Result<()> {
         let backend = FileBackend::new(path);
@@ -399,12 +524,21 @@ impl Store {
     }
 
     /// Save the store to an arbitrary [`StorageBackend`] using bincode.
+    ///
+    /// v4 layout: `[format_version: u32 LE][crc32: u32 LE][payload]`
+    /// where `crc32` covers the bincode payload. The checksum closes the
+    /// WAL/snapshot asymmetry: WAL frames have been CRC32-protected since
+    /// their introduction, but the same data became unprotected the
+    /// moment a checkpoint copied it into a snapshot — a silent bit flip
+    /// that still decodes would then out-merge every peer's correct value
+    /// via anti-entropy. Verification on load is fail-stop.
     pub fn save_to_backend_bincode(&self, backend: &dyn StorageBackend) -> io::Result<()> {
-        let mut buf = Vec::new();
-        // Write format version as a 4-byte LE prefix.
-        buf.extend_from_slice(&CURRENT_FORMAT_VERSION.to_le_bytes());
         let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut buf = Vec::with_capacity(8 + encoded.len());
+        // Format version as a 4-byte LE prefix, then the payload CRC32.
+        buf.extend_from_slice(&CURRENT_FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&crc32fast::hash(&encoded).to_le_bytes());
         buf.extend_from_slice(&encoded);
         backend.save(&buf)
     }
@@ -454,20 +588,56 @@ impl Store {
         // `#[serde(default)]` cannot rescue fields missing from an old
         // snapshot. Every persisted format version whose STRUCT LAYOUT
         // differs from the current one needs its own versioned decode type
-        // below (see `StoreV2Layout` for v1/v2). When you add a field to
-        // `Store`, bump `CURRENT_FORMAT_VERSION` and add a decode arm here.
+        // below (see `StoreV2Layout` for v1/v2 and `StoreV3Layout` for
+        // v3). When you add a field to `Store`, bump
+        // `CURRENT_FORMAT_VERSION`, freeze the previous layout in a new
+        // decode type, and add a decode arm here.
         let mut store: Self = match version {
             // v1 and v2 share the {data, timestamps} layout; the session
-            // fields introduced in v3 are filled with defaults.
+            // fields introduced in v3 are filled with defaults. No
+            // checksum in these formats (read compatibility only — every
+            // snapshot written by this code is v4 and checksummed).
             1 | 2 => {
                 let (old, _len): (StoreV2Layout, _) =
                     bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 old.into()
             }
-            _ => {
-                let (store, _len): (Self, _) =
+            // v3 added the session-guarantee fields but no checksum.
+            3 => {
+                let (old, _len): (StoreV3Layout, _) =
                     bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                old.into()
+            }
+            // v4+: `[version][crc32][payload]` — verify the payload CRC
+            // BEFORE decoding. Fail-stop on mismatch: a damaged snapshot
+            // must never be loaded (a bit flip that still decodes would
+            // poison every peer via anti-entropy max-merges), same
+            // discipline as a corrupt WAL frame.
+            _ => {
+                if bytes.len() < 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bincode snapshot too short for v4 header (version + crc32)",
+                    ));
+                }
+                let expected_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                let payload = &bytes[8..];
+                let actual_crc = crc32fast::hash(payload);
+                if actual_crc != expected_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "bincode snapshot checksum mismatch (expected {expected_crc:#010x}, \
+                             got {actual_crc:#010x}): the snapshot is damaged and must not be \
+                             loaded. Restore it from a backup — or, for the eventual store only, \
+                             re-fill from peers via anti-entropy (see docs/ops-guide.md)"
+                        ),
+                    ));
+                }
+                let (store, _len): (Self, _) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 store
             }
@@ -518,6 +688,35 @@ impl Store {
                     code_version: CURRENT_FORMAT_VERSION,
                 },
             ));
+        }
+
+        // Verify the envelope checksum when present (v4+ snapshots always
+        // carry one; pre-v4 snapshots are accepted without — read
+        // compatibility only). The CRC covers the canonical JSON of the
+        // `store` value; re-serializing the parsed value reproduces the
+        // exact bytes hashed at save time (object keys are
+        // BTreeMap-ordered, so `Value → String` is deterministic).
+        if let Some(expected_crc) = parsed.get("crc32").and_then(|v| v.as_u64()) {
+            let store_field = parsed.get("store").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot envelope has a crc32 but no store field",
+                )
+            })?;
+            let store_json = serde_json::to_string(store_field)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let actual_crc = u64::from(crc32fast::hash(store_json.as_bytes()));
+            if actual_crc != expected_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "JSON snapshot checksum mismatch (expected {expected_crc:#010x}, got \
+                         {actual_crc:#010x}): the snapshot is damaged and must not be loaded. \
+                         Restore it from a backup — or, for the eventual store only, re-fill \
+                         from peers via anti-entropy (see docs/ops-guide.md)"
+                    ),
+                ));
+            }
         }
 
         // Extract the store data from the envelope.
@@ -832,6 +1031,57 @@ impl Store {
         self.applied_origins.get(node_id)
     }
 
+    /// Session evidence path A with recovery-gap fencing: does the
+    /// applied frontier PROVABLY cover origin `node_id`'s write at `ts`?
+    ///
+    /// True when `applied_origins[node_id] >= ts` AND `ts` does not fall
+    /// inside any recovery gap `(floor, ceiling]` for that origin. The
+    /// gap check closes the leapfrog hole: after a durability-lossy
+    /// recovery, the first post-restart local write advances
+    /// `applied_origins[self]` past a LOST acked suffix, so the raw
+    /// frontier comparison alone would answer a false success for lost
+    /// tokens (see [`Store::recovery_gaps`]).
+    pub fn applied_origin_covers(&self, node_id: &str, ts: &HlcTimestamp) -> bool {
+        let frontier_ok = self
+            .applied_origins
+            .get(node_id)
+            .is_some_and(|applied| applied >= ts);
+        if !frontier_ok {
+            return false;
+        }
+        !self
+            .recovery_gaps
+            .iter()
+            .any(|gap| gap.node_id == node_id && gap.floor < *ts && *ts <= gap.ceiling)
+    }
+
+    /// Install a recovery gap fence for `node_id` over `(floor, ceiling]`
+    /// (see [`Store::recovery_gaps`]). A no-op when the range is empty.
+    ///
+    /// Called by crash recovery when the WAL could not guarantee that
+    /// every acked write survived (sync policy `interval`/`off`,
+    /// persistence disabled, or a truncating corruption recovery).
+    pub fn add_recovery_gap(
+        &mut self,
+        node_id: String,
+        floor: HlcTimestamp,
+        ceiling: HlcTimestamp,
+    ) {
+        if floor >= ceiling {
+            return;
+        }
+        self.recovery_gaps.push(RecoveryGap {
+            node_id,
+            floor,
+            ceiling,
+        });
+    }
+
+    /// Return the active recovery gap fences.
+    pub fn recovery_gaps(&self) -> &[RecoveryGap] {
+        &self.recovery_gaps
+    }
+
     /// Max-merge a remote applied-origins snapshot into the local map
     /// (frontier adoption).
     ///
@@ -839,10 +1089,31 @@ impl Store {
     /// a full dump was applied (unconditionally complete), or a delta was
     /// requested from a frontier at or above the sender's
     /// [`pruned_floor`](Self::pruned_floor).
+    ///
+    /// Adoption is ALSO the exclusive healer of recovery gaps: an adopted
+    /// value `v` for an origin proves this store now holds that origin's
+    /// full write prefix up to `v` (the completeness condition above), so
+    /// any gap floor for the origin rises to `min(v, ceiling)`; a gap
+    /// whose floor reaches its ceiling is closed. Local writes
+    /// ([`note_applied`](Self::note_applied)) never heal a gap — they
+    /// prove nothing about the lost range.
     pub fn merge_applied_origins(&mut self, remote: &HashMap<String, HlcTimestamp>) {
         for hlc in remote.values() {
             self.note_applied(hlc);
+            if hlc.node_id.is_empty() {
+                continue;
+            }
+            for gap in &mut self.recovery_gaps {
+                if gap.node_id == hlc.node_id && *hlc > gap.floor {
+                    gap.floor = if *hlc < gap.ceiling {
+                        hlc.clone()
+                    } else {
+                        gap.ceiling.clone()
+                    };
+                }
+            }
         }
+        self.recovery_gaps.retain(|gap| gap.floor < gap.ceiling);
     }
 
     /// Mark a key as poisoned by a failed remote merge (type mismatch).
@@ -2371,6 +2642,231 @@ mod tests {
             err.to_string().contains("incompatible"),
             "error message must mention 'incompatible'; got: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Snapshot checksums (C-1): end-to-end CRC32, fail-stop on damage
+    // ---------------------------------------------------------------
+
+    /// A flipped bit in the bincode snapshot payload must fail the load
+    /// with a checksum error — NEVER decode successfully. Without the
+    /// CRC a bit flip that still decodes (e.g. a bumped counter
+    /// contribution or a future HLC) would silently out-merge every
+    /// peer's correct value via anti-entropy max-merges.
+    #[test]
+    fn bincode_snapshot_bit_flip_is_fail_stop() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut store = Store::new();
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        store.put("hits".into(), CrdtValue::Counter(counter));
+        store.record_change("hits", ts(100, 0, "A"));
+
+        let backend = MemoryBackend::new();
+        store.save_to_backend_bincode(&backend).unwrap();
+        let clean = backend.load().unwrap();
+        assert!(Store::load_from_backend_bincode(&backend).is_ok());
+
+        // Flip one bit in every payload byte position in turn: each
+        // damaged variant must be rejected (either by the CRC or, at
+        // worst, by a decode failure) — none may load "successfully".
+        for i in 8..clean.len() {
+            let mut damaged = clean.clone();
+            damaged[i] ^= 0x01;
+            let corrupt_backend = MemoryBackend::new();
+            corrupt_backend.save(&damaged).unwrap();
+            let err = Store::load_from_backend_bincode(&corrupt_backend)
+                .err()
+                .unwrap_or_else(|| panic!("bit flip at byte {i} must fail the load"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        // A damaged CRC field itself is also fail-stop.
+        let mut damaged = clean.clone();
+        damaged[4] ^= 0xFF;
+        let corrupt_backend = MemoryBackend::new();
+        corrupt_backend.save(&damaged).unwrap();
+        let err = Store::load_from_backend_bincode(&corrupt_backend)
+            .expect_err("damaged CRC field must fail the load");
+        assert!(
+            err.to_string().contains("checksum"),
+            "expected a checksum error, got: {err}"
+        );
+    }
+
+    /// Serialisable mirror of the exact struct layout persisted by
+    /// format version 3 (no checksum, no `recovery_gaps`), used to craft
+    /// genuine v3 snapshots in tests.
+    #[derive(serde::Serialize)]
+    struct OldStoreLayoutV3 {
+        data: BTreeMap<String, CrdtValue>,
+        timestamps: HashMap<String, HlcTimestamp>,
+        applied_origins: HashMap<String, HlcTimestamp>,
+        merge_failed_keys: HashSet<String>,
+        pruned_floor: Option<HlcTimestamp>,
+        visible_origins: HashMap<String, HlcTimestamp>,
+    }
+
+    /// v3 bincode snapshots (no checksum, no recovery_gaps) must keep
+    /// loading: the version prefix dispatches to the frozen v3 layout.
+    #[test]
+    fn bincode_v3_snapshot_loads_without_checksum() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut counter = PnCounter::new();
+        counter.increment(&node("A"));
+        let mut data = BTreeMap::new();
+        data.insert("hits".to_string(), CrdtValue::Counter(counter));
+        let mut timestamps = HashMap::new();
+        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
+        let mut applied = HashMap::new();
+        applied.insert("A".to_string(), ts(42, 0, "A"));
+        let old = OldStoreLayoutV3 {
+            data,
+            timestamps,
+            applied_origins: applied,
+            merge_failed_keys: HashSet::from(["bad".to_string()]),
+            pruned_floor: Some(ts(10, 0, "A")),
+            visible_origins: HashMap::new(),
+        };
+        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap();
+        let mut bytes = 3u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let backend = MemoryBackend::new();
+        backend.save(&bytes).unwrap();
+        let loaded = Store::load_from_backend_bincode(&backend)
+            .expect("v3 snapshot must load via the frozen layout");
+
+        assert_eq!(loaded.applied_origin("A"), Some(&ts(42, 0, "A")));
+        assert!(loaded.merge_failed_contains("bad"));
+        assert_eq!(loaded.pruned_floor(), Some(&ts(10, 0, "A")));
+        assert!(loaded.recovery_gaps().is_empty());
+        // visible_origins is rebuilt to keep the superset invariant.
+        assert_eq!(loaded.visible_origins().get("A"), Some(&ts(42, 0, "A")));
+    }
+
+    /// The JSON snapshot envelope carries a CRC over the canonical store
+    /// JSON: a mutation that still parses as valid JSON must be rejected
+    /// by the checksum, and pre-v4 envelopes without a CRC keep loading.
+    #[test]
+    fn json_snapshot_checksum_detects_value_mutation() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut store = Store::new();
+        store.put("k".into(), CrdtValue::Counter(PnCounter::new()));
+        store.record_change("k", ts(42, 0, "A"));
+
+        let backend = MemoryBackend::new();
+        store.save_to_backend(&backend).unwrap();
+        let clean = String::from_utf8(backend.load().unwrap()).unwrap();
+        assert!(Store::load_from_backend(&backend).is_ok());
+
+        // Silently change a persisted number: still valid JSON, still
+        // decodes into a Store — only the checksum can catch it.
+        let mutated = clean.replace("\"physical\":42", "\"physical\":43");
+        assert_ne!(clean, mutated, "test setup: mutation must apply");
+        let corrupt_backend = MemoryBackend::new();
+        corrupt_backend.save(mutated.as_bytes()).unwrap();
+        let err = Store::load_from_backend(&corrupt_backend)
+            .expect_err("mutated JSON snapshot must fail the checksum");
+        assert!(
+            err.to_string().contains("checksum"),
+            "expected a checksum error, got: {err}"
+        );
+
+        // Pre-v4 envelope without a crc32 field: read compatibility.
+        let store_value = serde_json::to_value(&store).unwrap();
+        let legacy = serde_json::json!({
+            "format_version": 3,
+            "store": store_value,
+        });
+        let legacy_backend = MemoryBackend::new();
+        legacy_backend
+            .save(serde_json::to_string(&legacy).unwrap().as_bytes())
+            .unwrap();
+        let loaded = Store::load_from_backend(&legacy_backend)
+            .expect("pre-v4 JSON snapshot without crc must load");
+        assert!(loaded.contains_key("k"));
+    }
+
+    // ---------------------------------------------------------------
+    // Recovery gap fence (M-3)
+    // ---------------------------------------------------------------
+
+    /// A local write after a durability-lossy recovery leapfrogs the
+    /// applied frontier past the lost range; the gap fence must keep
+    /// path-A coverage FALSE inside the gap until anti-entropy adoption
+    /// (merge_applied_origins) proves the range re-covered. note_applied
+    /// (local writes) must never heal the gap.
+    #[test]
+    fn recovery_gap_fences_applied_coverage_until_adoption() {
+        let mut store = Store::new();
+        // Recovered state: applied[self] = 100, acked writes (100, 500]
+        // lost. Recovery fences the hole.
+        store.note_applied(&ts(100, 0, "self"));
+        store.add_recovery_gap("self".to_string(), ts(100, 0, "self"), ts(500, 0, "self"));
+
+        // First post-restart local write leapfrogs the frontier.
+        store.note_applied(&ts(600, 0, "self"));
+        assert_eq!(store.applied_origin("self"), Some(&ts(600, 0, "self")));
+
+        // Pre-gap and post-gap positions are covered; the hole is not.
+        assert!(store.applied_origin_covers("self", &ts(80, 0, "self")));
+        assert!(store.applied_origin_covers("self", &ts(100, 0, "self")));
+        assert!(!store.applied_origin_covers("self", &ts(300, 0, "self")));
+        assert!(!store.applied_origin_covers("self", &ts(500, 0, "self")));
+        assert!(store.applied_origin_covers("self", &ts(600, 0, "self")));
+        // Other origins are unaffected by the gap.
+        store.note_applied(&ts(300, 0, "other"));
+        assert!(store.applied_origin_covers("other", &ts(300, 0, "other")));
+
+        // note_applied (local write) must NOT heal the gap.
+        store.note_applied(&ts(700, 0, "self"));
+        assert!(!store.applied_origin_covers("self", &ts(300, 0, "self")));
+
+        // Partial adoption raises the floor: positions at or below the
+        // adopted value become covered, the rest stays fenced.
+        let mut remote = HashMap::new();
+        remote.insert("self".to_string(), ts(400, 0, "self"));
+        store.merge_applied_origins(&remote);
+        assert!(store.applied_origin_covers("self", &ts(300, 0, "self")));
+        assert!(!store.applied_origin_covers("self", &ts(450, 0, "self")));
+
+        // Full adoption past the ceiling closes the gap.
+        let mut remote = HashMap::new();
+        remote.insert("self".to_string(), ts(500, 0, "self"));
+        store.merge_applied_origins(&remote);
+        assert!(store.recovery_gaps().is_empty(), "gap must close");
+        assert!(store.applied_origin_covers("self", &ts(450, 0, "self")));
+    }
+
+    /// Recovery gaps are part of the persisted v4 state: a checkpoint
+    /// between recovery and healing must not lose the fence.
+    #[test]
+    fn recovery_gaps_survive_bincode_round_trip() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut store = Store::new();
+        store.note_applied(&ts(600, 0, "self"));
+        store.add_recovery_gap("self".to_string(), ts(100, 0, "self"), ts(500, 0, "self"));
+
+        let backend = MemoryBackend::new();
+        store.save_to_backend_bincode(&backend).unwrap();
+        let loaded = Store::load_from_backend_bincode(&backend).unwrap();
+
+        assert_eq!(loaded.recovery_gaps(), store.recovery_gaps());
+        assert!(!loaded.applied_origin_covers("self", &ts(300, 0, "self")));
+    }
+
+    /// Degenerate gaps (empty range) are not installed.
+    #[test]
+    fn empty_recovery_gap_is_not_installed() {
+        let mut store = Store::new();
+        store.add_recovery_gap("self".to_string(), ts(500, 0, "self"), ts(500, 0, "self"));
+        store.add_recovery_gap("self".to_string(), ts(600, 0, "self"), ts(500, 0, "self"));
+        assert!(store.recovery_gaps().is_empty());
     }
 
     // ---------------------------------------------------------------

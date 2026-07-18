@@ -3,12 +3,12 @@
 //! Scope note: the write-ahead log (`store::wal`) is an INDEPENDENT format
 //! with its own magic + `WAL_FORMAT_VERSION` header and is NOT managed by
 //! this registry. WAL records are idempotent redo records, so recovery
-//! needs no snapshot watermark and the `Store` layout (v3) is untouched by
+//! needs no snapshot watermark and the `Store` layout (v4) is untouched by
 //! the WAL. If a future change embeds WAL metadata into the snapshot (or
-//! adds any `Store` field), it must bump `CURRENT_FORMAT_VERSION` to 4,
-//! add a bincode decode arm (see `StoreV2Layout`), AND register a `V3ToV4`
-//! migration here — bincode is positional, `#[serde(default)]` cannot
-//! rescue old snapshots.
+//! adds any `Store` field), it must bump `CURRENT_FORMAT_VERSION`, freeze
+//! the previous layout in a bincode decode type (see `StoreV3Layout`),
+//! AND register the next migration here — bincode is positional,
+//! `#[serde(default)]` cannot rescue old snapshots.
 
 use crate::error::CrdtError;
 
@@ -153,11 +153,37 @@ impl Migration for V2ToV3 {
     }
 }
 
+/// Migration from v3 to v4: an envelope-level CRC32 checksum (verified
+/// before this registry runs) and the `recovery_gaps` fence field were
+/// added.
+///
+/// A JSON no-op: `recovery_gaps` carries `#[serde(default)]` and old
+/// snapshots simply omit it; the checksum lives in the envelope, not the
+/// store value. (The bincode path uses the frozen `StoreV3Layout` decode
+/// type instead — see `Store::load_from_backend_bincode`.)
+pub struct V3ToV4;
+
+impl Migration for V3ToV4 {
+    fn source_version(&self) -> u32 {
+        3
+    }
+
+    fn target_version(&self) -> u32 {
+        4
+    }
+
+    fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+        // No-op for JSON: added fields default via serde.
+        Ok(data)
+    }
+}
+
 /// Build the default migration registry with all known migrations.
 pub fn default_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
     registry.register(Box::new(V1ToV2));
     registry.register(Box::new(V2ToV3));
+    registry.register(Box::new(V3ToV4));
     registry
 }
 
