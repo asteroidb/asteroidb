@@ -4,7 +4,7 @@
 //! scope and checkpoint, and assembles them into majority certificates once
 //! enough distinct authorities have signed the same checkpoint message.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::authority::certificate::{
     AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate,
@@ -39,6 +39,32 @@ const MAX_CHECKPOINTS_PER_SCOPE: usize = 128;
 /// the clock share a single skew policy.
 pub const MAX_CHECKPOINT_FUTURE_SKEW_MS: u64 = 60_000;
 
+/// Hard cap on tracked scopes. Same value as
+/// [`equivocation::MAX_TRACKED_SCOPES`](crate::authority::equivocation::MAX_TRACKED_SCOPES)
+/// — the two files share the system-wide scale assumption; raise both
+/// together when deploying more ranges. Legitimate concurrent scopes =
+/// (defined ranges R) x (<= LAG+LEAD+1 = 4 policy versions admitted by the
+/// `CertifiedApi` version window), so R <= 256 is unaffected. Memory
+/// ceiling: 1024 scopes x 128 checkpoints x A authorities x O(hundreds of
+/// bytes)/attestation.
+///
+/// Unlike the equivocation detector (which evicts LRU scopes because a
+/// missed detection is lost forever), the pool REJECTS the incoming scope
+/// when the cap is hit: resident attestations must never be flushed by a
+/// flood (see [`MAX_CHECKPOINTS_PER_SCOPE`] rationale), and evicted past
+/// checkpoints could never be re-collected — `FrontierReporter` only
+/// generates current-time frontiers.
+pub const MAX_POOL_SCOPES: usize = 1024;
+
+/// Per-authority cap on scopes containing that authority's attestations.
+/// Same value as
+/// [`equivocation::MAX_TRACKED_SCOPES_PER_AUTHORITY`](crate::authority::equivocation::MAX_TRACKED_SCOPES_PER_AUTHORITY).
+/// Legitimate presence = (ranges the authority belongs to) x <= 4 versions,
+/// so <= 16 ranges per authority is unaffected. NOTE: presence is counted at
+/// scope granularity and only returned when the scope itself is removed
+/// (over-approximation, errs on the strict side).
+pub const MAX_POOL_SCOPES_PER_AUTHORITY: usize = 64;
+
 /// Scope key for attestation grouping.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PoolScope {
@@ -46,14 +72,52 @@ struct PoolScope {
     policy_version: PolicyVersion,
 }
 
+/// Outcome of [`AttestationPool::insert`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The attestation was recorded.
+    Inserted,
+    /// Rejected: checkpoint further than [`MAX_CHECKPOINT_FUTURE_SKEW_MS`]
+    /// in the future.
+    RejectedFutureSkew,
+    /// Rejected: the pool already tracks [`MAX_POOL_SCOPES`] scopes and the
+    /// attestation would create a new one (residents are never evicted).
+    RejectedScopeCap,
+    /// Rejected: the authority already has attestations in
+    /// [`MAX_POOL_SCOPES_PER_AUTHORITY`] scopes and the attestation would
+    /// create a new one.
+    RejectedAuthorityCap,
+}
+
 /// Collects verified attestations and assembles majority certificates.
 ///
 /// Non-persistent: the pool only holds recent checkpoints, and certificates
 /// can always be rebuilt from fresh frontier reports.
+///
+/// # Invariants (`authority_scopes` presence index)
+///
+/// 1. Every scope referenced by `authority_scopes` exists in `entries`
+///    (no dangling references — otherwise fenced/GC'd versions would
+///    permanently occupy per-authority slots).
+/// 2. If any checkpoint bucket of `entries[S]` holds an entry for authority
+///    `a`, then `S ∈ authority_scopes[a]`. The reverse may over-approximate
+///    at bucket granularity: presence is only released when the *scope* is
+///    removed (per-bucket pruning does not decrement), which errs on the
+///    strict side of the per-authority cap.
 #[derive(Debug, Default)]
 pub struct AttestationPool {
     /// scope -> checkpoint physical (ms) -> authority -> attestation.
     entries: HashMap<PoolScope, BTreeMap<u64, HashMap<NodeId, VerifiedAttestation>>>,
+    /// authority -> scopes that contain (or contained) its attestations.
+    /// Added on insert; removed only when a scope is removed (`gc_scope` /
+    /// `retain_scopes` / `purge_authority`). See the invariants above.
+    authority_scopes: HashMap<NodeId, HashSet<PoolScope>>,
+    /// Cumulative inserts rejected by the global scope cap.
+    rejected_scope_cap_total: u64,
+    /// Cumulative inserts rejected by the per-authority scope cap.
+    rejected_authority_cap_total: u64,
+    /// Cumulative attestations removed by [`Self::purge_authority`].
+    purged_attestations_total: u64,
 }
 
 impl AttestationPool {
@@ -72,15 +136,22 @@ impl AttestationPool {
     /// `now_ms` is the local wall clock: attestations whose checkpoint is
     /// more than [`MAX_CHECKPOINT_FUTURE_SKEW_MS`] in the future are rejected
     /// so a skewed or malicious authority cannot flood the checkpoint window
-    /// with future buckets and evict honest attestations. Returns whether the
-    /// attestation was recorded.
+    /// with future buckets and evict honest attestations.
+    ///
+    /// Capacity: inserting into an *existing* scope is always admitted (a
+    /// signer joining an in-progress quorum must never be blocked), but an
+    /// insert that would create a new scope is rejected when the authority's
+    /// presence cap ([`MAX_POOL_SCOPES_PER_AUTHORITY`], checked first so an
+    /// over-cap authority cannot trip the global rejection for everyone
+    /// else) or the global scope cap ([`MAX_POOL_SCOPES`]) is reached.
+    /// Residents are never evicted to make room.
     pub fn insert(
         &mut self,
         key_range: &KeyRange,
         policy_version: PolicyVersion,
         attestation: VerifiedAttestation,
         now_ms: u64,
-    ) -> bool {
+    ) -> InsertOutcome {
         if attestation.checkpoint_hlc.physical
             > now_ms.saturating_add(MAX_CHECKPOINT_FUTURE_SKEW_MS)
         {
@@ -90,12 +161,33 @@ impl AttestationPool {
                 now_ms,
                 "rejecting attestation with far-future checkpoint (clock skew)"
             );
-            return false;
+            return InsertOutcome::RejectedFutureSkew;
         }
         let scope = PoolScope {
             key_range: key_range.clone(),
             policy_version,
         };
+        if !self.entries.contains_key(&scope) {
+            // New scope: enforce the per-authority cap before the global cap
+            // (same order as equivocation::make_room_for_scope — an authority
+            // beyond its fairness share must not consume the global budget).
+            let own_scopes = self
+                .authority_scopes
+                .get(&attestation.authority_id)
+                .map_or(0, HashSet::len);
+            if own_scopes >= MAX_POOL_SCOPES_PER_AUTHORITY {
+                self.rejected_authority_cap_total += 1;
+                return InsertOutcome::RejectedAuthorityCap;
+            }
+            if self.entries.len() >= MAX_POOL_SCOPES {
+                self.rejected_scope_cap_total += 1;
+                return InsertOutcome::RejectedScopeCap;
+            }
+        }
+        self.authority_scopes
+            .entry(attestation.authority_id.clone())
+            .or_default()
+            .insert(scope.clone());
         let checkpoints = self.entries.entry(scope).or_default();
         checkpoints
             .entry(attestation.checkpoint_hlc.physical)
@@ -105,7 +197,77 @@ impl AttestationPool {
         while checkpoints.len() > MAX_CHECKPOINTS_PER_SCOPE {
             checkpoints.pop_first();
         }
-        true
+        InsertOutcome::Inserted
+    }
+
+    /// Remove `scope` from every authority's presence set.
+    ///
+    /// Must be called whenever a scope is removed from `entries`, so that
+    /// per-authority slots are returned (invariant 1 above).
+    fn detach_scope_from_authorities(&mut self, scope: &PoolScope) {
+        self.authority_scopes.retain(|_, scopes| {
+            scopes.remove(scope);
+            !scopes.is_empty()
+        });
+    }
+
+    /// Remove every attestation of `authority` from the pool (m-7: an
+    /// accused authority's pooled attestations must not be consumed by later
+    /// certificate assembly).
+    ///
+    /// Surgical: co-signers in shared scopes are untouched. Scopes and
+    /// checkpoint buckets left empty are dropped, and every removed scope is
+    /// detached from all presence sets. The authority's own presence entry
+    /// is removed entirely — attestations re-inserted after the purge count
+    /// as fresh presence. Idempotent. Returns the number of attestations
+    /// removed.
+    pub fn purge_authority(&mut self, authority: &NodeId) -> usize {
+        let Some(scopes) = self.authority_scopes.remove(authority) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        let mut emptied: Vec<PoolScope> = Vec::new();
+        for scope in &scopes {
+            let Some(checkpoints) = self.entries.get_mut(scope) else {
+                continue;
+            };
+            checkpoints.retain(|_, atts| {
+                if atts.remove(authority).is_some() {
+                    removed += 1;
+                }
+                !atts.is_empty()
+            });
+            if checkpoints.is_empty() {
+                emptied.push(scope.clone());
+            }
+        }
+        for scope in &emptied {
+            self.entries.remove(scope);
+            self.detach_scope_from_authorities(scope);
+        }
+        self.purged_attestations_total += removed as u64;
+        removed
+    }
+
+    /// Drop every scope for which `keep` returns `false`, returning the
+    /// number of scopes removed.
+    ///
+    /// Used as the cap-pressure fallback: when an insert is rejected by a
+    /// capacity cap, the caller sweeps out scopes that can no longer be
+    /// consumed by certificate assembly (fenced / stale policy versions,
+    /// removed ranges) and retries.
+    pub fn retain_scopes<F: Fn(&KeyRange, PolicyVersion) -> bool>(&mut self, keep: F) -> usize {
+        let victims: Vec<PoolScope> = self
+            .entries
+            .keys()
+            .filter(|s| !keep(&s.key_range, s.policy_version))
+            .cloned()
+            .collect();
+        for scope in &victims {
+            self.entries.remove(scope);
+            self.detach_scope_from_authorities(scope);
+        }
+        victims.len()
     }
 
     /// Whether any attestations are recorded for a scope.
@@ -260,16 +422,39 @@ impl AttestationPool {
     }
 
     /// Drop all attestations for a scope (fence / GC hook, FR-009).
+    ///
+    /// Also returns the scope's per-authority presence slots: without this,
+    /// fenced versions would permanently occupy slots and long-running
+    /// honest authorities would eventually hit
+    /// [`MAX_POOL_SCOPES_PER_AUTHORITY`] through organic version churn.
     pub fn gc_scope(&mut self, key_range: &KeyRange, policy_version: &PolicyVersion) {
-        self.entries.remove(&PoolScope {
+        let scope = PoolScope {
             key_range: key_range.clone(),
             policy_version: *policy_version,
-        });
+        };
+        if self.entries.remove(&scope).is_some() {
+            self.detach_scope_from_authorities(&scope);
+        }
     }
 
     /// Return the number of tracked scopes (for tests and diagnostics).
     pub fn scope_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Cumulative inserts rejected by the global scope cap.
+    pub fn rejected_scope_cap_total(&self) -> u64 {
+        self.rejected_scope_cap_total
+    }
+
+    /// Cumulative inserts rejected by the per-authority scope cap.
+    pub fn rejected_authority_cap_total(&self) -> u64 {
+        self.rejected_authority_cap_total
+    }
+
+    /// Cumulative attestations removed by [`Self::purge_authority`].
+    pub fn purged_attestations_total(&self) -> u64 {
+        self.purged_attestations_total
     }
 }
 
@@ -541,21 +726,27 @@ mod tests {
 
         // Just inside the skew allowance: accepted.
         let inside = TEST_NOW + MAX_CHECKPOINT_FUTURE_SKEW_MS;
-        assert!(pool.insert(
-            &kr("user/"),
-            PolicyVersion(1),
-            attest(&s1, inside),
-            TEST_NOW
-        ));
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&s1, inside),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
 
         // Beyond the allowance: rejected, and no bucket is created.
         let outside = TEST_NOW + MAX_CHECKPOINT_FUTURE_SKEW_MS + CHECKPOINT_INTERVAL_MS;
-        assert!(!pool.insert(
-            &kr("user/"),
-            PolicyVersion(1),
-            attest(&s1, outside),
-            TEST_NOW
-        ));
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&s1, outside),
+                TEST_NOW
+            ),
+            InsertOutcome::RejectedFutureSkew
+        );
         let scope = PoolScope {
             key_range: kr("user/"),
             policy_version: PolicyVersion(1),
@@ -585,18 +776,24 @@ mod tests {
         }
 
         // Two honest authorities attest the current checkpoint.
-        assert!(pool.insert(
-            &kr("user/"),
-            PolicyVersion(1),
-            attest(&s2, TEST_NOW),
-            TEST_NOW
-        ));
-        assert!(pool.insert(
-            &kr("user/"),
-            PolicyVersion(1),
-            attest(&s3, TEST_NOW),
-            TEST_NOW
-        ));
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&s2, TEST_NOW),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&s3, TEST_NOW),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
 
         let (checkpoint, cert, _) = pool
             .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(TEST_NOW - 500))
@@ -745,5 +942,345 @@ mod tests {
             .unwrap();
         assert!(cert.has_majority(3));
         assert!(bls_cert.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Capacity caps (M-4) and accusation purge (m-7)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn purge_authority_removes_across_scopes_and_checkpoints() {
+        let s1 = make_signer("auth-1", 40, false);
+        let s2 = make_signer("auth-2", 41, false);
+        let mut pool = AttestationPool::new();
+
+        // auth-1 in two scopes x two checkpoint buckets; auth-2 co-signs one
+        // bucket of the first scope only.
+        for phys in [10_500, 12_500] {
+            pool.insert(&kr("user/"), PolicyVersion(1), attest(&s1, phys), TEST_NOW);
+            pool.insert(&kr("order/"), PolicyVersion(2), attest(&s1, phys), TEST_NOW);
+        }
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s2, 10_500),
+            TEST_NOW,
+        );
+        assert_eq!(pool.scope_count(), 2);
+
+        let removed = pool.purge_authority(&node("auth-1"));
+        assert_eq!(removed, 4, "both scopes and both buckets must be purged");
+        assert_eq!(pool.purged_attestations_total(), 4);
+
+        // The scope auth-1 occupied alone is dropped entirely; the shared
+        // scope survives with only auth-2's bucket.
+        assert_eq!(pool.scope_count(), 1);
+        assert!(pool.has_attestations(&kr("user/"), &PolicyVersion(1)));
+        assert!(!pool.has_attestations(&kr("order/"), &PolicyVersion(2)));
+
+        // The purged signer never appears in later certificate assembly.
+        let (_, cert, _) = pool
+            .build_certificates(&kr("user/"), PolicyVersion(1), 1, &write_ts(9_000))
+            .expect("auth-2 alone reaches the 1-of-1 threshold");
+        assert!(!cert.signers().into_iter().any(|n| *n == node("auth-1")));
+
+        // Idempotent.
+        assert_eq!(pool.purge_authority(&node("auth-1")), 0);
+        assert_eq!(pool.purged_attestations_total(), 4);
+
+        // Re-insert after purge is fresh presence, not a stale slot.
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&s1, 12_500),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn purge_is_surgical_in_shared_scope() {
+        let s1 = make_signer("auth-1", 42, false);
+        let s2 = make_signer("auth-2", 43, false);
+        let s3 = make_signer("auth-3", 44, false);
+        let mut pool = AttestationPool::new();
+        for s in [&s1, &s2, &s3] {
+            pool.insert(&kr("user/"), PolicyVersion(1), attest(s, 10_500), TEST_NOW);
+        }
+
+        assert_eq!(pool.purge_authority(&node("auth-1")), 1);
+
+        // The honest co-signers' quorum survives and still certifies.
+        let (_, cert, _) = pool
+            .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
+            .expect("honest 2-of-3 majority must survive the purge");
+        assert!(cert.has_majority(3));
+        assert!(!cert.signers().into_iter().any(|n| *n == node("auth-1")));
+    }
+
+    #[test]
+    fn global_cap_rejects_new_scope_keeps_residents() {
+        let honest1 = make_signer("auth-h1", 45, false);
+        let honest2 = make_signer("auth-h2", 46, false);
+        let mut pool = AttestationPool::new();
+
+        // Resident quorum in one scope.
+        for s in [&honest1, &honest2] {
+            assert_eq!(
+                pool.insert(&kr("user/"), PolicyVersion(1), attest(s, 10_500), TEST_NOW),
+                InsertOutcome::Inserted
+            );
+        }
+
+        // Fill the pool to the global cap with distinct scopes from enough
+        // authorities that no per-authority cap bites first.
+        let fillers: Vec<NodeSigner> = (0..17)
+            .map(|i| make_signer(&format!("filler-{i}"), 100 + i as u8, false))
+            .collect();
+        'fill: for (i, filler) in fillers.iter().enumerate() {
+            let att = attest(filler, 10_500);
+            for j in 0..MAX_POOL_SCOPES_PER_AUTHORITY {
+                if pool.scope_count() >= MAX_POOL_SCOPES {
+                    break 'fill;
+                }
+                assert_eq!(
+                    pool.insert(
+                        &kr(&format!("flood-{i}-{j}/")),
+                        PolicyVersion(1),
+                        att.clone(),
+                        TEST_NOW
+                    ),
+                    InsertOutcome::Inserted
+                );
+            }
+        }
+        assert_eq!(pool.scope_count(), MAX_POOL_SCOPES);
+
+        // One more NEW scope (from a fresh authority) is rejected...
+        let fresh = make_signer("auth-fresh", 90, false);
+        assert_eq!(
+            pool.insert(
+                &kr("one-more/"),
+                PolicyVersion(1),
+                attest(&fresh, 10_500),
+                TEST_NOW
+            ),
+            InsertOutcome::RejectedScopeCap
+        );
+        assert_eq!(pool.rejected_scope_cap_total(), 1);
+        assert_eq!(pool.scope_count(), MAX_POOL_SCOPES);
+
+        // ...but joining an EXISTING scope is always admitted, and the
+        // resident quorum still certifies.
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&fresh, 10_500),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+        let (_, cert, _) = pool
+            .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(9_000))
+            .expect("residents must never be evicted by cap pressure");
+        assert!(cert.has_majority(3));
+    }
+
+    #[test]
+    fn per_authority_cap_rejects_only_offender() {
+        let attacker = make_signer("auth-bad", 47, false);
+        let honest = make_signer("auth-good", 48, false);
+        let mut pool = AttestationPool::new();
+
+        // The honest authority creates one scope first.
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(&honest, 10_500),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+
+        let att = attest(&attacker, 10_500);
+        for i in 0..MAX_POOL_SCOPES_PER_AUTHORITY {
+            assert_eq!(
+                pool.insert(
+                    &kr(&format!("flood-{i}/")),
+                    PolicyVersion(1),
+                    att.clone(),
+                    TEST_NOW
+                ),
+                InsertOutcome::Inserted
+            );
+        }
+        // 65th new scope: rejected by the per-authority cap (not the global
+        // one — the pool is nowhere near MAX_POOL_SCOPES).
+        assert_eq!(
+            pool.insert(
+                &kr("flood-overflow/"),
+                PolicyVersion(1),
+                att.clone(),
+                TEST_NOW
+            ),
+            InsertOutcome::RejectedAuthorityCap
+        );
+        assert_eq!(pool.rejected_authority_cap_total(), 1);
+
+        // Other authorities are unaffected...
+        assert_eq!(
+            pool.insert(
+                &kr("other/"),
+                PolicyVersion(1),
+                attest(&honest, 10_500),
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+        // ...and the capped authority can still JOIN existing scopes.
+        assert_eq!(
+            pool.insert(&kr("user/"), PolicyVersion(1), att, TEST_NOW),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn cap_flood_does_not_flush_resident_quorum() {
+        // A single authority floods the pool with distinct new scopes while
+        // an honest quorum keeps assembling in a resident scope. Analogue of
+        // future_bucket_flood_cannot_evict_current_majority at the scope
+        // (rather than checkpoint-bucket) level.
+        let attacker = make_signer("auth-bad", 49, false);
+        let s2 = make_signer("auth-2", 50, false);
+        let s3 = make_signer("auth-3", 51, false);
+        let mut pool = AttestationPool::new();
+
+        for s in [&s2, &s3] {
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(1),
+                attest(s, TEST_NOW),
+                TEST_NOW,
+            );
+        }
+
+        let att = attest(&attacker, TEST_NOW);
+        for i in 0..(4 * MAX_POOL_SCOPES_PER_AUTHORITY) {
+            let _ = pool.insert(
+                &kr(&format!("flood-{i}/")),
+                PolicyVersion(i as u64 + 2),
+                att.clone(),
+                TEST_NOW,
+            );
+        }
+
+        // The flood is confined to the attacker's fairness share.
+        assert!(pool.scope_count() <= 1 + MAX_POOL_SCOPES_PER_AUTHORITY);
+        assert!(pool.rejected_authority_cap_total() > 0);
+
+        // The honest quorum still certifies.
+        let (_, cert, _) = pool
+            .build_certificates(&kr("user/"), PolicyVersion(1), 3, &write_ts(TEST_NOW - 500))
+            .expect("honest majority must certify despite the scope flood");
+        assert!(cert.has_majority(3));
+    }
+
+    #[test]
+    fn retain_scopes_returns_capacity() {
+        let s1 = make_signer("auth-1", 52, false);
+        let mut pool = AttestationPool::new();
+
+        let att = attest(&s1, 10_500);
+        for i in 0..MAX_POOL_SCOPES_PER_AUTHORITY {
+            assert_eq!(
+                pool.insert(
+                    &kr("user/"),
+                    PolicyVersion(i as u64 + 1),
+                    att.clone(),
+                    TEST_NOW
+                ),
+                InsertOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(MAX_POOL_SCOPES_PER_AUTHORITY as u64 + 1),
+                att.clone(),
+                TEST_NOW
+            ),
+            InsertOutcome::RejectedAuthorityCap
+        );
+
+        // Sweep out all but the two newest versions (stale-version cleanup).
+        let removed = pool.retain_scopes(|_, pv| pv.0 > MAX_POOL_SCOPES_PER_AUTHORITY as u64 - 2);
+        assert_eq!(removed, MAX_POOL_SCOPES_PER_AUTHORITY - 2);
+        assert_eq!(pool.scope_count(), 2);
+
+        // Capacity is returned: the previously rejected insert now succeeds.
+        assert_eq!(
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(MAX_POOL_SCOPES_PER_AUTHORITY as u64 + 1),
+                att,
+                TEST_NOW
+            ),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn gc_scope_returns_authority_slots() {
+        let s1 = make_signer("auth-1", 53, false);
+        let mut pool = AttestationPool::new();
+
+        let att = attest(&s1, 10_500);
+        for i in 0..MAX_POOL_SCOPES_PER_AUTHORITY {
+            pool.insert(
+                &kr("user/"),
+                PolicyVersion(i as u64 + 1),
+                att.clone(),
+                TEST_NOW,
+            );
+        }
+        assert_eq!(
+            pool.insert(&kr("user/"), PolicyVersion(999), att.clone(), TEST_NOW),
+            InsertOutcome::RejectedAuthorityCap
+        );
+
+        // A fence GC of one of the authority's scopes frees a slot.
+        pool.gc_scope(&kr("user/"), &PolicyVersion(1));
+        assert_eq!(
+            pool.insert(&kr("user/"), PolicyVersion(999), att, TEST_NOW),
+            InsertOutcome::Inserted
+        );
+    }
+
+    #[test]
+    fn scope_flood_is_memory_bounded_even_without_admission_checks() {
+        // Pool-level backstop for M-4: even if the CertifiedApi admission
+        // layer were bypassed entirely, 100k distinct scopes from a handful
+        // of authorities cannot grow the pool past MAX_POOL_SCOPES.
+        let signers: Vec<NodeSigner> = (0..20)
+            .map(|i| make_signer(&format!("auth-{i}"), 150 + i as u8, false))
+            .collect();
+        let atts: Vec<VerifiedAttestation> = signers.iter().map(|s| attest(s, 10_500)).collect();
+        let mut pool = AttestationPool::new();
+        for i in 0..100_000u64 {
+            let att = atts[(i % atts.len() as u64) as usize].clone();
+            let _ = pool.insert(&kr(&format!("scope-{i}/")), PolicyVersion(1), att, TEST_NOW);
+        }
+        assert!(
+            pool.scope_count() <= MAX_POOL_SCOPES,
+            "pool must stay hard-bounded under a distinct-scope flood"
+        );
+        assert!(
+            pool.rejected_scope_cap_total() + pool.rejected_authority_cap_total() > 0,
+            "cap counters must record the flood"
+        );
     }
 }

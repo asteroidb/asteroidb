@@ -526,6 +526,11 @@ pub async fn post_internal_frontiers(
     // Set when new equivocation evidence was recorded, so the evidence store
     // is re-persisted after all sync guards are released.
     let mut evidence_dirty = false;
+    // Authorities newly accused during THIS request (deduplicated). When
+    // exclusion is enabled, their previously pooled attestations are purged
+    // after the apply loop (m-7) — attestations pooled before the accusation
+    // must not feed later certificate assembly.
+    let mut newly_accused: Vec<NodeId> = Vec::new();
 
     // Verify signatures BEFORE taking the certified lock — signature
     // verification is CPU-heavy and must not serialize with other handlers.
@@ -539,8 +544,11 @@ pub async fn post_internal_frontiers(
         // Authority-set membership gate (FR-008): the sender must be one of
         // the authorities defined for the frontier's key range. Signature
         // verification only proves *who* signed, not that the signer owns
-        // the range. Ranges without an authority definition cannot certify
-        // writes anyway, so they are accepted for backwards compatibility.
+        // the range. Ranges without an authority definition pass this gate
+        // (longest-prefix match, lenient) but are dropped by the certified
+        // API's admission check (M-4): frontier tracking and the
+        // attestation pool only accept scopes that exactly match a defined
+        // range with a placement policy.
         let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
         let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
             match ns.get_authorities_for_key(&frontier.key_range.prefix) {
@@ -615,6 +623,11 @@ pub async fn post_internal_frontiers(
                                         state.equivocation.accused_count(),
                                     );
                                     evidence_dirty = true;
+                                    if state.exclude_accused_authorities
+                                        && !newly_accused.contains(&ev.authority_id)
+                                    {
+                                        newly_accused.push(ev.authority_id.clone());
+                                    }
                                 }
                                 // Optional exclusion from certificate assembly
                                 // (detect-only by default): the frontier value
@@ -695,6 +708,11 @@ pub async fn post_internal_frontiers(
                                     .metrics
                                     .set_accused_authorities(state.equivocation.accused_count());
                                 evidence_dirty = true;
+                                if state.exclude_accused_authorities
+                                    && !newly_accused.contains(&ev.authority_id)
+                                {
+                                    newly_accused.push(ev.authority_id.clone());
+                                }
                             }
                         }
                         Err(e) => {
@@ -720,10 +738,45 @@ pub async fn post_internal_frontiers(
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for (frontier, attestation) in to_apply {
+        // Re-check the accusation set at APPLY time (m-7): an attestation
+        // batched ahead of the equivocating pair in this request — or
+        // applied concurrently with an accusation from another request —
+        // passed the verification-time gate before the accusation landed.
+        // The frontier itself still advances (monotone max, low-poison).
+        let attestation = if state.exclude_accused_authorities
+            && attestation.is_some()
+            && state.equivocation.is_accused(&frontier.authority_id)
+        {
+            None
+        } else {
+            attestation
+        };
         if api.update_frontier_verified(frontier, attestation) {
             accepted += 1;
         }
     }
+    // Purge AFTER the apply loop, in the same critical section: nothing of
+    // an accused authority applied above can survive, and a concurrent
+    // request cannot interleave an accused attestation between the apply
+    // and the purge. Gated on the exclusion flag — the detect-only default
+    // must not enforce anything.
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
+    let stats = api.attestation_stats();
+    state.metrics.set_attestation_pool_stats(
+        stats.scopes,
+        stats.rejected_unknown_range_total,
+        stats.rejected_version_window_total,
+        stats.rejected_scope_cap_total,
+        stats.rejected_authority_cap_total,
+        stats.purged_total,
+    );
     let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
     internal_response(&resp, accept)
 }

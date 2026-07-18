@@ -4,9 +4,9 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 
 use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
-use crate::authority::attestation_pool::AttestationPool;
+use crate::authority::attestation_pool::{AttestationPool, InsertOutcome};
 use crate::authority::certificate::{DualModeCertificate, MajorityCertificate};
-use crate::authority::frontier_sig::VerifiedAttestation;
+use crate::authority::frontier_sig::{CHECKPOINT_INTERVAL_MS, VerifiedAttestation};
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp};
@@ -150,6 +150,103 @@ pub struct CertifiedCacheEntry {
 /// Maximum number of entries in the certified proof cache before eviction.
 const MAX_CERTIFIED_CACHE: usize = 10_000;
 
+/// Policy-version admission window (lag side): attestations up to this many
+/// versions BEHIND the range's current placement-policy version are admitted
+/// to the attestation pool.
+///
+/// Must equal `NodeRunnerConfig::frontier_gc_max_retained_versions`' default
+/// (2): the pool has to accept every version the frontier GC still retains
+/// (`cur - 2 ..= cur`, see `AckFrontierSet::gc_stale_entries`), or lagging
+/// reporters whose frontiers the GC deliberately keeps would have their
+/// attestations rejected here.
+const ATTESTATION_VERSION_LAG: u64 = 2;
+
+/// Policy-version admission window (lead side): accept one version ahead —
+/// a leading reporter may attest under `N + 1` before this node's namespace
+/// catches up (control-plane propagation race).
+const ATTESTATION_VERSION_LEAD: u64 = 1;
+
+/// Why a frontier report was refused admission (M-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionReject {
+    /// No authority definition exists for the exact key-range prefix.
+    /// Unknown ranges can never certify a write (`resolve_scope` fails with
+    /// `PolicyDenied`), so rejecting them loses nothing legitimate.
+    UnknownRange,
+    /// The signer is not a member of the range's authority set (defence in
+    /// depth: the HTTP receive path also gates on membership).
+    NotRangeAuthority,
+    /// The range has a definition but no placement policy; without a
+    /// current version there is nothing to certify against.
+    NoPolicy,
+    /// The attested policy version is outside
+    /// `current - ATTESTATION_VERSION_LAG ..= current + ATTESTATION_VERSION_LEAD`.
+    VersionOutOfWindow { current: u64 },
+}
+
+/// Validate one frontier report against the namespace before tracking it
+/// (M-4).
+///
+/// This is the primary defence that collapses the scope key space of BOTH
+/// resource sinks fed by `update_frontier_verified` — the frontier set
+/// (`AckFrontierSet`, an otherwise uncapped map that grows one entry per
+/// distinct `(key_range, policy_version, authority)` triple) and the
+/// attestation pool — to a finite, namespace-derived set: a registered
+/// authority rotating `policy_version` / `key_range` values can no longer
+/// mint unbounded scopes in either structure. Nothing legitimate is lost:
+/// certification (`resolve_scope`) requires the same exact definition and
+/// placement policy this gate checks, so a rejected scope can never certify
+/// a write. The pool's own caps remain as a backstop.
+fn attestation_admissible(
+    ns: &SystemNamespace,
+    key_range: &KeyRange,
+    policy_version: PolicyVersion,
+    authority: &NodeId,
+) -> Result<(), AdmissionReject> {
+    // Exact-prefix lookup: a pending write's key_range always equals some
+    // authority definition's key_range verbatim (resolve_scope), so an
+    // attestation that does not match a definition exactly can never be
+    // consumed by certificate assembly.
+    let Some(def) = ns.get_authority_definition(&key_range.prefix) else {
+        return Err(AdmissionReject::UnknownRange);
+    };
+    if !def.authority_nodes.contains(authority) {
+        return Err(AdmissionReject::NotRangeAuthority);
+    }
+    let Some(policy) = ns.get_placement_policy(&key_range.prefix) else {
+        return Err(AdmissionReject::NoPolicy);
+    };
+    let current = policy.version.0;
+    let pv = policy_version.0;
+    if pv < current.saturating_sub(ATTESTATION_VERSION_LAG)
+        || pv > current.saturating_add(ATTESTATION_VERSION_LEAD)
+    {
+        return Err(AdmissionReject::VersionOutOfWindow { current });
+    }
+    Ok(())
+}
+
+/// Point-in-time attestation pool statistics (admission + capacity + purge)
+/// for the metrics pipeline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttestationPoolStats {
+    /// Number of scopes currently tracked by the pool (gauge).
+    pub scopes: u64,
+    /// Frontier reports rejected at admission (neither tracked nor pooled):
+    /// unknown range, non-member signer, or missing placement policy.
+    pub rejected_unknown_range_total: u64,
+    /// Frontier reports rejected at admission (neither tracked nor pooled):
+    /// policy version outside the accepted window around the current
+    /// version.
+    pub rejected_version_window_total: u64,
+    /// Attestation inserts rejected by the pool's global scope cap.
+    pub rejected_scope_cap_total: u64,
+    /// Attestation inserts rejected by the pool's per-authority scope cap.
+    pub rejected_authority_cap_total: u64,
+    /// Attestations removed by accused-authority purges (m-7).
+    pub purged_total: u64,
+}
+
 /// Certified consistency API (FR-002, FR-004).
 ///
 /// Provides `get_certified` and `certified_write` operations that integrate
@@ -178,6 +275,15 @@ pub struct CertifiedApi {
     /// Keys promoted to `Certified` before a certificate could be assembled.
     /// Later certification ticks retry certificate assembly for these keys.
     cert_pending_keys: HashSet<String>,
+    /// Cumulative attestations rejected at admission for a non-window
+    /// reason (unknown range / non-member signer / missing policy).
+    attestation_rejected_unknown_range_total: u64,
+    /// Cumulative attestations rejected at admission for a policy version
+    /// outside the accepted window.
+    attestation_rejected_version_window_total: u64,
+    /// Wall-clock ms of the last cap-pressure stale-scope sweep, used to
+    /// throttle sweeps to at most one per checkpoint interval.
+    last_stale_prune_ms: u64,
     /// Write-ahead log appender; `None` = persistence disabled.
     ///
     /// The certified store is NOT covered by anti-entropy sync, so a crash
@@ -211,6 +317,9 @@ impl CertifiedApi {
             certified_cache: HashMap::new(),
             attestations: AttestationPool::new(),
             cert_pending_keys: HashSet::new(),
+            attestation_rejected_unknown_range_total: 0,
+            attestation_rejected_version_window_total: 0,
+            last_stale_prune_ms: 0,
             #[cfg(not(target_arch = "wasm32"))]
             wal: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -247,6 +356,9 @@ impl CertifiedApi {
             certified_cache: HashMap::new(),
             attestations: AttestationPool::new(),
             cert_pending_keys: HashSet::new(),
+            attestation_rejected_unknown_range_total: 0,
+            attestation_rejected_version_window_total: 0,
+            last_stale_prune_ms: 0,
             wal,
             last_wal_pos: None,
         };
@@ -325,6 +437,9 @@ impl CertifiedApi {
             certified_cache: HashMap::new(),
             attestations: AttestationPool::new(),
             cert_pending_keys: HashSet::new(),
+            attestation_rejected_unknown_range_total: 0,
+            attestation_rejected_version_window_total: 0,
+            last_stale_prune_ms: 0,
             #[cfg(not(target_arch = "wasm32"))]
             wal: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -739,9 +854,21 @@ impl CertifiedApi {
 
     /// Update an Authority's ack frontier, recording a verified attestation.
     ///
-    /// The frontier itself goes through `AckFrontierSet::update()` unchanged
-    /// (monotonicity, deduplication, fencing). When `verified` is present and
-    /// the scope is not fenced, the attestation is recorded in the pool
+    /// The report is first validated against the namespace
+    /// ([`attestation_admissible`], M-4). An inadmissible report — unknown
+    /// range, non-member signer, missing placement policy, or a policy
+    /// version outside the admission window — is dropped ENTIRELY: it
+    /// advances neither the frontier set nor the pool. Gating the frontier
+    /// set as well is deliberate: `AckFrontierSet` grows one uncapped,
+    /// persisted entry per distinct scope triple, so admitting inadmissible
+    /// frontiers would leave the M-4 memory-exhaustion vector open there
+    /// even with the pool protected. A scope this gate rejects can never
+    /// certify a write (`resolve_scope` requires the same definition and
+    /// policy), so no legitimate certification is lost.
+    ///
+    /// Admissible reports go through `AckFrontierSet::update()` unchanged
+    /// (monotonicity, deduplication, fencing). When `verified` is present
+    /// and the scope is not fenced, the attestation is recorded in the pool
     /// **even if the frontier update itself was stale** — a late-arriving
     /// signature for an already-known checkpoint still contributes to
     /// certificate assembly. Returns whether the frontier advanced.
@@ -750,19 +877,185 @@ impl CertifiedApi {
         frontier: AckFrontier,
         verified: Option<VerifiedAttestation>,
     ) -> bool {
+        let key_range = frontier.key_range.clone();
+        let policy_version = frontier.policy_version;
+        let authority_id = frontier.authority_id.clone();
+        let admissible = {
+            let ns = self.namespace.read().unwrap();
+            attestation_admissible(&ns, &key_range, policy_version, &authority_id)
+        };
+        if let Err(reject) = admissible {
+            self.note_admission_rejection(&key_range, policy_version, &authority_id, reject);
+            return false;
+        }
         let fenced = self
             .frontiers
             .is_version_fenced(&frontier.key_range, &frontier.policy_version);
-        let key_range = frontier.key_range.clone();
-        let policy_version = frontier.policy_version;
         let advanced = self.frontiers.update(frontier);
         if let Some(att) = verified
             && !fenced
         {
-            self.attestations
-                .insert(&key_range, policy_version, att, crate::hlc::wall_clock_ms());
+            self.record_attestation(
+                &key_range,
+                policy_version,
+                &authority_id,
+                att,
+                crate::hlc::wall_clock_ms(),
+            );
         }
         advanced
+    }
+
+    /// Count and log one admission rejection (M-4).
+    ///
+    /// The log volume is bounded by the receive path's
+    /// `MAX_FRONTIERS_PER_REQUEST` (256) per request and is zero under
+    /// honest load.
+    fn note_admission_rejection(
+        &mut self,
+        key_range: &KeyRange,
+        policy_version: PolicyVersion,
+        authority: &NodeId,
+        reject: AdmissionReject,
+    ) {
+        match reject {
+            AdmissionReject::VersionOutOfWindow { current } => {
+                self.attestation_rejected_version_window_total += 1;
+                tracing::warn!(
+                    authority = %authority.0,
+                    key_range = %key_range.prefix,
+                    policy_version = policy_version.0,
+                    current,
+                    "rejecting frontier report: policy version outside the admission window"
+                );
+            }
+            reason => {
+                self.attestation_rejected_unknown_range_total += 1;
+                tracing::warn!(
+                    authority = %authority.0,
+                    key_range = %key_range.prefix,
+                    policy_version = policy_version.0,
+                    ?reason,
+                    "rejecting frontier report: scope not admissible for certification"
+                );
+            }
+        }
+    }
+
+    /// Record an already-admitted attestation in the pool (M-4).
+    ///
+    /// Admission ([`attestation_admissible`]) runs in
+    /// `update_frontier_verified` before this point. When the pool rejects
+    /// the insert for capacity, a throttled sweep (at most one per
+    /// [`CHECKPOINT_INTERVAL_MS`]) drops scopes that can no longer be
+    /// consumed by certificate assembly — the current-version snapshot is
+    /// taken under a single `namespace.read()` so a sweep never mixes
+    /// versions from different namespace states — and the insert is retried
+    /// once.
+    fn record_attestation(
+        &mut self,
+        key_range: &KeyRange,
+        policy_version: PolicyVersion,
+        authority: &NodeId,
+        att: VerifiedAttestation,
+        now_ms: u64,
+    ) {
+        let outcome = self
+            .attestations
+            .insert(key_range, policy_version, att.clone(), now_ms);
+        if !matches!(
+            outcome,
+            InsertOutcome::RejectedScopeCap | InsertOutcome::RejectedAuthorityCap
+        ) {
+            return;
+        }
+
+        // Cap pressure: sweep stale scopes and retry, at most once per
+        // checkpoint interval (namespace snapshot + full-scope walk). A
+        // backward wall-clock step (NTP correction, VM migration) counts as
+        // throttle expiry: with `now_ms < last_stale_prune_ms` a plain
+        // saturating_sub would return 0 and suppress the sweep until the
+        // clock re-passes the old timestamp, leaving cap-pressure inserts
+        // rejected for the whole regression window (cf. commit f86c6da for
+        // the same class of bug on the http-writer path).
+        if self.last_stale_prune_ms != 0
+            && now_ms >= self.last_stale_prune_ms
+            && now_ms - self.last_stale_prune_ms < CHECKPOINT_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_stale_prune_ms = now_ms;
+
+        let current_versions: HashMap<String, u64> = {
+            let ns = self.namespace.read().unwrap();
+            ns.all_authority_definitions()
+                .into_iter()
+                .filter_map(|def| {
+                    let prefix = def.key_range.prefix.clone();
+                    ns.get_placement_policy(&prefix)
+                        .map(|p| (prefix, p.version.0))
+                })
+                .collect()
+        };
+        let removed = self.attestations.retain_scopes(|kr, pv| {
+            current_versions.get(&kr.prefix).is_some_and(|current| {
+                pv.0 >= current.saturating_sub(ATTESTATION_VERSION_LAG)
+                    && pv.0 <= current.saturating_add(ATTESTATION_VERSION_LEAD)
+            })
+        });
+        let retry = self
+            .attestations
+            .insert(key_range, policy_version, att, now_ms);
+        if matches!(
+            retry,
+            InsertOutcome::RejectedScopeCap | InsertOutcome::RejectedAuthorityCap
+        ) {
+            tracing::warn!(
+                authority = %authority.0,
+                key_range = %key_range.prefix,
+                policy_version = policy_version.0,
+                swept = removed,
+                "attestation pool caps reached even after sweeping stale scopes; \
+                 the number of concurrently live scopes exceeds the configured \
+                 bounds — an operating-scale problem, consider raising \
+                 MAX_POOL_SCOPES / MAX_POOL_SCOPES_PER_AUTHORITY"
+            );
+        }
+    }
+
+    /// Remove pooled attestations of accused authorities (m-7).
+    ///
+    /// Called when an equivocation accusation lands while
+    /// `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` is enabled: attestations the
+    /// accused authority pooled *before* the accusation (up to 128
+    /// checkpoints per scope) must not be consumed by later certificate
+    /// assembly. Returns the number of attestations removed.
+    pub fn purge_accused_attestations(&mut self, accused: &[NodeId]) -> usize {
+        let mut total = 0;
+        for authority in accused {
+            let removed = self.attestations.purge_authority(authority);
+            if removed > 0 {
+                tracing::warn!(
+                    authority = %authority.0,
+                    removed,
+                    "purged pooled attestations of accused authority"
+                );
+            }
+            total += removed;
+        }
+        total
+    }
+
+    /// Attestation pool statistics for the metrics pipeline.
+    pub fn attestation_stats(&self) -> AttestationPoolStats {
+        AttestationPoolStats {
+            scopes: self.attestations.scope_count() as u64,
+            rejected_unknown_range_total: self.attestation_rejected_unknown_range_total,
+            rejected_version_window_total: self.attestation_rejected_version_window_total,
+            rejected_scope_cap_total: self.attestations.rejected_scope_cap_total(),
+            rejected_authority_cap_total: self.attestations.rejected_authority_cap_total(),
+            purged_total: self.attestations.purged_attestations_total(),
+        }
     }
 
     /// Re-evaluate all pending writes against the current frontiers.
@@ -2770,5 +3063,523 @@ mod tests {
             0,
         );
         assert!(result.valid, "BLS certificate must verify: {result:?}");
+    }
+
+    // ---------------------------------------------------------------
+    // Attestation admission (M-4) and accused purge (m-7)
+    // ---------------------------------------------------------------
+
+    /// Signed frontier + attestation with an explicit policy version.
+    fn make_signed_frontier_v(
+        signer: &NodeSigner,
+        physical: u64,
+        prefix: &str,
+        version: u64,
+    ) -> (AckFrontier, VerifiedAttestation) {
+        let frontier = make_frontier_v(signer.node_id().0.as_str(), physical, 0, prefix, version);
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        let att = signer.self_verified(&frontier, &sig);
+        (frontier, att)
+    }
+
+    fn namespace_with_version(
+        prefix: &str,
+        authorities: &[&str],
+        version: u64,
+    ) -> Arc<RwLock<SystemNamespace>> {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(prefix),
+            authority_nodes: authorities.iter().map(|a| node(a)).collect(),
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(version),
+            kr(prefix),
+            authorities.len(),
+        ))
+        .unwrap();
+        wrap_ns(ns)
+    }
+
+    #[test]
+    fn attestation_version_window_boundaries() {
+        // Current policy version 5: accept cur-2 ..= cur+1, reject outside.
+        let mut api = CertifiedApi::new(
+            node("node-1"),
+            namespace_with_version("", &["auth-1", "auth-2", "auth-3"], 5),
+        );
+        let signer = make_signer("auth-1", 20);
+
+        for (pv, admitted) in [
+            (2u64, false),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, false),
+        ] {
+            let (f, a) = make_signed_frontier_v(&signer, 10_500, "", pv);
+            // Admission gates the frontier set as well as the pool (M-4):
+            // an in-window report advances (first report for its scope), an
+            // out-of-window report is dropped entirely.
+            assert_eq!(
+                api.update_frontier_verified(f, Some(a)),
+                admitted,
+                "frontier advance must follow admission (pv={pv})"
+            );
+        }
+
+        let stats = api.attestation_stats();
+        assert_eq!(stats.scopes, 4, "cur-2 ..= cur+1 must be pooled");
+        assert_eq!(stats.rejected_version_window_total, 2);
+        assert_eq!(stats.rejected_unknown_range_total, 0);
+        assert_eq!(
+            api.frontier_count(),
+            4,
+            "out-of-window reports must not enter the frontier set either"
+        );
+    }
+
+    #[test]
+    fn attestation_admission_rejects_unknown_scopes() {
+        let ns = default_namespace();
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+
+        // Unknown range: no authority definition for the exact prefix.
+        let signer = make_signer("auth-1", 21);
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "ghost/", 1);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+
+        // Non-member signer for a defined range.
+        let outsider = make_signer("auth-9", 22);
+        let (f, a) = make_signed_frontier_v(&outsider, 10_500, "", 1);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+
+        // Defined range without a placement policy.
+        ns.write()
+            .unwrap()
+            .set_authority_definition(AuthorityDefinition {
+                key_range: kr("nopolicy/"),
+                authority_nodes: vec![node("auth-1")],
+                auto_generated: false,
+            });
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "nopolicy/", 1);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+
+        let stats = api.attestation_stats();
+        assert_eq!(stats.scopes, 0, "no inadmissible attestation may pool");
+        assert_eq!(stats.rejected_unknown_range_total, 3);
+        assert_eq!(stats.rejected_version_window_total, 0);
+        assert_eq!(
+            api.frontier_count(),
+            0,
+            "no inadmissible report may enter the frontier set"
+        );
+    }
+
+    #[test]
+    fn fence_takes_precedence_over_admission() {
+        // A fenced scope stays fenced even when the version window would
+        // admit it: no insert, no admission-rejection counter movement.
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.fence_version(&kr(""), PolicyVersion(1));
+
+        let signer = make_signer("auth-1", 23);
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "", 1);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+
+        let stats = api.attestation_stats();
+        assert_eq!(stats.scopes, 0);
+        assert_eq!(stats.rejected_unknown_range_total, 0);
+        assert_eq!(stats.rejected_version_window_total, 0);
+    }
+
+    #[test]
+    fn version_transition_admits_lag_and_lead_until_fence() {
+        let ns = default_namespace(); // current version 1
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+        let s1 = make_signer("auth-1", 24);
+        let s2 = make_signer("auth-2", 25);
+
+        // Leading reporter: v2 admitted while current is still 1.
+        let (f, a) = make_signed_frontier_v(&s1, 10_500, "", 2);
+        api.update_frontier_verified(f, Some(a));
+        // Current version: admitted.
+        let (f, a) = make_signed_frontier_v(&s1, 10_500, "", 1);
+        api.update_frontier_verified(f, Some(a));
+        assert_eq!(api.attestation_stats().scopes, 2);
+
+        // Bump to v2: a lagging reporter still attests v1 and is admitted.
+        ns.write()
+            .unwrap()
+            .set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr(""), 3))
+            .unwrap();
+        let (f, a) = make_signed_frontier_v(&s2, 10_600, "", 1);
+        api.update_frontier_verified(f, Some(a));
+        assert_eq!(api.attestation_stats().scopes, 2);
+
+        // Fencing v1 drops its scope and blocks later v1 attestations even
+        // though the window still covers v1.
+        api.fence_version(&kr(""), PolicyVersion(1));
+        let (f, a) = make_signed_frontier_v(&s2, 10_700, "", 1);
+        api.update_frontier_verified(f, Some(a));
+        let stats = api.attestation_stats();
+        assert_eq!(stats.scopes, 1, "only the v2 scope may remain");
+        assert_eq!(stats.rejected_version_window_total, 0);
+
+        // v2 keeps pooling after the bump.
+        let (f, a) = make_signed_frontier_v(&s2, 10_800, "", 2);
+        api.update_frontier_verified(f, Some(a));
+        assert_eq!(api.attestation_stats().scopes, 1);
+    }
+
+    #[test]
+    fn unfenced_reassigned_version_is_admitted_again() {
+        // The replicated version counter can re-assign a version this node
+        // already fenced (node_runner lifts the fence via unfence_version).
+        // After the lift, attestations under the re-assigned CURRENT version
+        // must pool again.
+        let ns = default_namespace();
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+        api.fence_version(&kr(""), PolicyVersion(2));
+
+        ns.write()
+            .unwrap()
+            .set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr(""), 3))
+            .unwrap();
+        assert!(api.unfence_version(&kr(""), PolicyVersion(2)));
+
+        let signer = make_signer("auth-1", 26);
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "", 2);
+        api.update_frontier_verified(f, Some(a));
+        assert_eq!(api.attestation_stats().scopes, 1);
+    }
+
+    #[test]
+    fn cap_pressure_sweeps_stale_scopes_and_is_throttled() {
+        use crate::authority::attestation_pool::MAX_POOL_SCOPES_PER_AUTHORITY;
+
+        // 16 prefixes, all with auth-1 as the only authority, current
+        // version 4 → 16 x 4 in-window versions = 64 admissible scopes,
+        // exactly the per-authority cap.
+        let mut ns = SystemNamespace::new();
+        for i in 0..16 {
+            let prefix = format!("p{i}/");
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr(&prefix),
+                authority_nodes: vec![node("auth-1")],
+                auto_generated: false,
+            });
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(4), kr(&prefix), 1))
+                .unwrap();
+        }
+        let ns = wrap_ns(ns);
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+        let signer = make_signer("auth-1", 27);
+
+        let fill = |api: &mut CertifiedApi, versions: [u64; 4], now_ms: u64| {
+            for i in 0..16 {
+                for pv in versions {
+                    let (f, a) = make_signed_frontier_v(&signer, 9_500, &format!("p{i}/"), pv);
+                    api.record_attestation(
+                        &f.key_range,
+                        f.policy_version,
+                        &f.authority_id,
+                        a,
+                        now_ms,
+                    );
+                }
+            }
+        };
+        let bump_all = |ns: &Arc<RwLock<SystemNamespace>>, version: u64| {
+            let mut ns = ns.write().unwrap();
+            for i in 0..16 {
+                ns.set_placement_policy(PlacementPolicy::new(
+                    PolicyVersion(version),
+                    kr(&format!("p{i}/")),
+                    1,
+                ))
+                .unwrap();
+            }
+        };
+
+        fill(&mut api, [2, 3, 4, 5], 10_000);
+        assert_eq!(
+            api.attestation_stats().scopes,
+            MAX_POOL_SCOPES_PER_AUTHORITY as u64
+        );
+
+        // Bump every prefix far ahead: all pooled scopes become stale. The
+        // next admissible insert hits the cap, sweeps them, and succeeds.
+        bump_all(&ns, 100);
+        let (f, a) = make_signed_frontier_v(&signer, 9_500, "p0/", 100);
+        api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 10_000);
+        let stats = api.attestation_stats();
+        assert_eq!(stats.scopes, 1, "sweep must evict stale scopes and admit");
+        assert_eq!(stats.rejected_authority_cap_total, 1);
+
+        // Refill to the cap under the new current version, then bump again:
+        // a rejection within the throttle interval must NOT sweep...
+        fill(&mut api, [98, 99, 100, 101], 10_100);
+        assert_eq!(
+            api.attestation_stats().scopes,
+            MAX_POOL_SCOPES_PER_AUTHORITY as u64
+        );
+        bump_all(&ns, 200);
+        let (f, a) = make_signed_frontier_v(&signer, 9_500, "p0/", 200);
+        api.record_attestation(
+            &f.key_range,
+            f.policy_version,
+            &f.authority_id,
+            a.clone(),
+            10_500,
+        );
+        assert_eq!(
+            api.attestation_stats().scopes,
+            MAX_POOL_SCOPES_PER_AUTHORITY as u64,
+            "within the throttle interval the sweep must not run"
+        );
+
+        // ...but one interval later the sweep runs and the insert lands.
+        api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 11_000);
+        assert_eq!(api.attestation_stats().scopes, 1);
+    }
+
+    /// M-4 DoS regression: a single REGISTERED authority rotating
+    /// policy_version and key_range values through legitimately signed
+    /// frontier reports must not grow the attestation pool OR the frontier
+    /// set beyond the namespace-derived scope set — the admission layer
+    /// alone stops the attack (the pool caps are never even reached, and
+    /// the uncapped `AckFrontierSet` never sees a rotated scope).
+    #[test]
+    fn scope_rotation_flood_is_stopped_by_admission() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        let signer = make_signer("auth-1", 28);
+
+        for i in 0..10_000u64 {
+            let (f, a) = if i % 2 == 0 {
+                // Rotating far-future policy versions on the real range.
+                make_signed_frontier_v(&signer, 10_500 + i, "", 10 + i)
+            } else {
+                // Rotating fictional prefixes.
+                make_signed_frontier_v(&signer, 10_500 + i, &format!("junk-{i}/"), 1)
+            };
+            api.update_frontier_verified(f, Some(a));
+        }
+
+        let stats = api.attestation_stats();
+        assert_eq!(
+            stats.scopes, 0,
+            "no rotated scope may enter the pool (admission stops the flood)"
+        );
+        assert_eq!(stats.rejected_version_window_total, 5_000);
+        assert_eq!(stats.rejected_unknown_range_total, 5_000);
+        assert_eq!(stats.rejected_scope_cap_total, 0, "caps never reached");
+        assert_eq!(stats.rejected_authority_cap_total, 0);
+        assert_eq!(
+            api.frontier_count(),
+            0,
+            "no rotated scope may enter the frontier set (M-4: it is \
+             uncapped and persisted, so admission must gate it too)"
+        );
+
+        // Honest traffic is unaffected during and after the flood.
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "", 1);
+        api.update_frontier_verified(f, Some(a));
+        assert_eq!(api.attestation_stats().scopes, 1);
+        assert_eq!(api.frontier_count(), 1);
+    }
+
+    /// The cap-pressure sweep throttle must treat a BACKWARD wall-clock
+    /// step as expiry: after `last_stale_prune_ms` is set at time T, a
+    /// rejection observed at `now < T` must still be allowed to sweep —
+    /// otherwise an NTP step back would suppress all sweeps until the
+    /// clock re-passes T, rejecting every new-scope insert meanwhile.
+    #[test]
+    fn cap_sweep_throttle_survives_backward_clock_step() {
+        use crate::authority::attestation_pool::MAX_POOL_SCOPES_PER_AUTHORITY;
+
+        let mut ns = SystemNamespace::new();
+        for i in 0..16 {
+            let prefix = format!("p{i}/");
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr(&prefix),
+                authority_nodes: vec![node("auth-1")],
+                auto_generated: false,
+            });
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(4), kr(&prefix), 1))
+                .unwrap();
+        }
+        let ns = wrap_ns(ns);
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+        let signer = make_signer("auth-1", 33);
+
+        // Fill to the per-authority cap and run one sweep at wall time
+        // 600_000 to arm the throttle far in the "future".
+        for i in 0..16 {
+            for pv in [2u64, 3, 4, 5] {
+                let (f, a) = make_signed_frontier_v(&signer, 9_500, &format!("p{i}/"), pv);
+                api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 10_000);
+            }
+        }
+        assert_eq!(
+            api.attestation_stats().scopes,
+            MAX_POOL_SCOPES_PER_AUTHORITY as u64
+        );
+        {
+            let mut guard = ns.write().unwrap();
+            for i in 0..16 {
+                guard
+                    .set_placement_policy(PlacementPolicy::new(
+                        PolicyVersion(100),
+                        kr(&format!("p{i}/")),
+                        1,
+                    ))
+                    .unwrap();
+            }
+        }
+        let (f, a) = make_signed_frontier_v(&signer, 9_500, "p0/", 100);
+        api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 600_000);
+        assert_eq!(api.attestation_stats().scopes, 1, "sweep ran at T=600_000");
+
+        // Refill to the cap, then make everything stale again.
+        for i in 0..16 {
+            for pv in [98u64, 99, 100, 101] {
+                let (f, a) = make_signed_frontier_v(&signer, 9_500, &format!("p{i}/"), pv);
+                api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 600_100);
+            }
+        }
+        assert_eq!(
+            api.attestation_stats().scopes,
+            MAX_POOL_SCOPES_PER_AUTHORITY as u64
+        );
+        {
+            let mut guard = ns.write().unwrap();
+            for i in 0..16 {
+                guard
+                    .set_placement_policy(PlacementPolicy::new(
+                        PolicyVersion(200),
+                        kr(&format!("p{i}/")),
+                        1,
+                    ))
+                    .unwrap();
+            }
+        }
+
+        // The wall clock steps back 10 minutes (now < last_stale_prune_ms):
+        // the sweep must still run and the insert must land.
+        let (f, a) = make_signed_frontier_v(&signer, 9_500, "p0/", 200);
+        api.record_attestation(&f.key_range, f.policy_version, &f.authority_id, a, 10_000);
+        assert_eq!(
+            api.attestation_stats().scopes,
+            1,
+            "a backward clock step must count as throttle expiry, not \
+             suppress the sweep"
+        );
+    }
+
+    #[test]
+    fn purge_accused_attestations_removes_pooled_entries() {
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        let s1 = make_signer("auth-1", 29);
+        let s2 = make_signer("auth-2", 30);
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        for signer in [&s1, &s2] {
+            let (f, a) = make_signed_frontier(signer, report_ts, "");
+            api.update_frontier_verified(f, Some(a));
+        }
+
+        // auth-1 gets accused: purge its pooled attestation. auth-2 alone is
+        // 1 of 3 — certification still happens via frontier majority, but no
+        // certificate can be assembled and no purged signer may appear.
+        let purged = api.purge_accused_attestations(&[node("auth-1")]);
+        assert_eq!(purged, 1);
+        assert_eq!(api.attestation_stats().purged_total, 1);
+
+        api.process_certifications();
+        let read = api.get_certified("key1");
+        assert_eq!(read.status, CertificationStatus::Certified);
+        let proof = read.proof.expect("certified read carries a proof");
+        assert!(
+            proof.certificate.is_none(),
+            "1 of 3 attestations after the purge must not certify"
+        );
+
+        // Idempotent.
+        assert_eq!(api.purge_accused_attestations(&[node("auth-1")]), 0);
+    }
+
+    /// Version-transition liveness: attestations arriving under the OLD
+    /// version after a policy bump (lagging reporters) still certify a
+    /// write issued under that version, and attestations arriving one
+    /// version AHEAD (leading reporters) are pooled before the local bump.
+    #[test]
+    fn lag_and_lead_attestations_around_bump_still_certify() {
+        let ns = default_namespace();
+        let mut api = CertifiedApi::new(node("node-1"), Arc::clone(&ns));
+
+        // Write under v1.
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write_ts = api.pending_writes()[0].timestamp.physical;
+
+        // Policy bumps to v2 BEFORE any attestation for the write arrived.
+        ns.write()
+            .unwrap()
+            .set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr(""), 3))
+            .unwrap();
+
+        // Lagging reporters still attest v1 — admitted by the lag window,
+        // and the v1 write still receives its certificate.
+        let s1 = make_signer("auth-1", 31);
+        let s2 = make_signer("auth-2", 32);
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        for signer in [&s1, &s2] {
+            let (f, a) = make_signed_frontier(signer, report_ts, ""); // v1
+            api.update_frontier_verified(f, Some(a));
+        }
+        api.process_certifications();
+        let read = api.get_certified("key1");
+        assert_eq!(read.status, CertificationStatus::Certified);
+        assert!(
+            read.proof.unwrap().certificate.is_some(),
+            "lagging v1 attestations must still certify the v1 write"
+        );
+
+        // Leading reporters: v3 attestations are pooled while current is 2.
+        for (signer, ts) in [(&s1, report_ts + 2_000), (&s2, report_ts + 2_000)] {
+            let (f, a) = make_signed_frontier_v(signer, ts, "", 3);
+            api.update_frontier_verified(f, Some(a));
+        }
+        // After the local bump to v3, a write under v3 certifies against
+        // the pre-bump attestations.
+        ns.write()
+            .unwrap()
+            .set_placement_policy(PlacementPolicy::new(PolicyVersion(3), kr(""), 3))
+            .unwrap();
+        api.certified_write("key2".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let write2_ts = api.pending_writes()[1].timestamp.physical;
+        // Ensure the pooled checkpoints cover the new write; if the clock
+        // advanced past them, top up with fresh v3 attestations.
+        if (report_ts + 2_000) < write2_ts {
+            let late_ts = (write2_ts / 1000 + 1) * 1000 + 100;
+            for signer in [&s1, &s2] {
+                let (f, a) = make_signed_frontier_v(signer, late_ts, "", 3);
+                api.update_frontier_verified(f, Some(a));
+            }
+        }
+        api.process_certifications();
+        let read = api.get_certified("key2");
+        assert_eq!(read.status, CertificationStatus::Certified);
+        assert!(
+            read.proof.unwrap().certificate.is_some(),
+            "leading attestations must be available once the bump lands"
+        );
     }
 }

@@ -145,6 +145,10 @@ async fn spawn_node(name: &str, opts: NodeOpts) -> (Arc<AppState>, SocketAddr, J
 }
 
 fn make_frontier(authority: &str, physical: u64, digest: &str) -> AckFrontier {
+    make_frontier_v(authority, physical, digest, 1)
+}
+
+fn make_frontier_v(authority: &str, physical: u64, digest: &str, version: u64) -> AckFrontier {
     AckFrontier {
         authority_id: node_id(authority),
         frontier_hlc: HlcTimestamp {
@@ -155,7 +159,7 @@ fn make_frontier(authority: &str, physical: u64, digest: &str) -> AckFrontier {
         key_range: KeyRange {
             prefix: String::new(),
         },
-        policy_version: PolicyVersion(1),
+        policy_version: PolicyVersion(version),
         digest_hash: digest.into(),
     }
 }
@@ -816,6 +820,272 @@ async fn exclusion_flag_drops_accused_attestations_from_certificates() {
         !has_certificate,
         "excluded attestation must not contribute to certificate assembly"
     );
+}
+
+/// Reversed-order exclusion scenario (m-7): the accused authority's NORMAL
+/// attestation is pooled FIRST, and only afterwards does the equivocation
+/// arrive. Without the accusation-time purge, the pre-pooled attestation
+/// (up to 128 checkpoints of history) would still be consumed by
+/// certificate assembly despite the exclusion flag.
+async fn run_pre_pooled_exclusion_scenario(exclude: bool) -> (CertificationStatus, bool) {
+    let s1 = make_signer("auth-1", 54);
+    let s2 = make_signer("auth-2", 55);
+    let s3 = make_signer("auth-3", 56);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1, &s2, &s3])),
+            exclude_accused: exclude,
+            persist_path: None,
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // A pending certified write.
+    let write_ts = {
+        let mut api = state.certified.lock().await;
+        let mut counter = PnCounter::new();
+        counter.increment(&node_id("writer"));
+        api.certified_write(
+            "user/dave".into(),
+            CrdtValue::Counter(counter),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        api.pending_writes()[0].timestamp.physical
+    };
+
+    // BOTH authorities report past the write's checkpoint first: auth-1's
+    // attestation is now pooled (it is not accused yet).
+    let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+    for signer in [&s1, &s2] {
+        let f = make_frontier(&signer.node_id().0, report_ts, "digest-ok");
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(signer, &f))],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Only NOW does auth-1 equivocate (at an old checkpoint).
+    let old_hlc = (write_ts / 1000) * 1000 - 5_000;
+    for digest in ["digest-a", "digest-b"] {
+        let f = make_frontier("auth-1", old_hlc, digest);
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(&s1, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+
+    let (status, has_certificate) = {
+        let mut api = state.certified.lock().await;
+        api.process_certifications();
+        let read = api.get_certified("user/dave");
+        let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
+        (read.status, has_cert)
+    };
+    handle.abort();
+    (status, has_certificate)
+}
+
+#[tokio::test]
+async fn accusation_purges_pre_pooled_attestations_from_certificates() {
+    // exclude=1: the attestation auth-1 pooled BEFORE its accusation must
+    // be purged at accusation time, leaving 1 of 3 attestations — no
+    // certificate. The write still certifies via frontier majority.
+    let (status, has_certificate) = run_pre_pooled_exclusion_scenario(true).await;
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        !has_certificate,
+        "attestations pooled before the accusation must not feed certificates"
+    );
+}
+
+#[tokio::test]
+async fn detect_only_default_keeps_pre_pooled_attestations() {
+    // exclude=0 (default): detection never enforces — the pre-pooled
+    // attestation still contributes and the certificate assembles.
+    let (status, has_certificate) = run_pre_pooled_exclusion_scenario(false).await;
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        has_certificate,
+        "detect-only default must not purge pooled attestations"
+    );
+}
+
+/// Same-batch race (m-7): a request carries the accused authority's normal
+/// attestation BEFORE the equivocating pair. The verification-time gate
+/// sees an unaccused authority; the apply-time re-check and the post-apply
+/// purge must still keep every attestation of the (now accused) authority
+/// out of the pool.
+#[tokio::test]
+async fn same_batch_equivocation_excludes_earlier_attestations() {
+    let s1 = make_signer("auth-1", 57);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1])),
+            exclude_accused: true,
+            persist_path: None,
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    let base = wall_ms();
+    let normal = make_frontier("auth-1", base, "digest-ok");
+    let f_a = make_frontier("auth-1", base - 5_000, "digest-a");
+    let f_b = make_frontier("auth-1", base - 5_000, "digest-b");
+    let signatures = vec![
+        Some(sign(&s1, &normal)),
+        Some(sign(&s1, &f_a)),
+        Some(sign(&s1, &f_b)),
+    ];
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![normal.clone(), f_a, f_b],
+            signatures,
+        )
+        .await
+        .unwrap();
+
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let api = state.certified.lock().await;
+    let stats = api.attestation_stats();
+    assert_eq!(
+        stats.scopes, 0,
+        "no attestation of the in-batch accused authority may survive"
+    );
+    // The frontier itself still advanced (detection never blocks it).
+    assert!(!api.all_frontiers().is_empty());
+    drop(api);
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------
+// M-4: version-rotation flood via HTTP stays memory-bounded
+// ---------------------------------------------------------------
+
+/// A single registered authority pushes full-size requests that rotate
+/// `policy_version` on every frontier. The admission window must reject
+/// them all (bounded pool, counters moving) while honest certification
+/// keeps working throughout.
+#[tokio::test]
+async fn version_rotation_flood_is_bounded_and_certification_survives() {
+    let s1 = make_signer("auth-1", 58);
+    let s2 = make_signer("auth-2", 59);
+    let s3 = make_signer("auth-3", 60);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts::with_registry(full_registry(&[&s1, &s2, &s3])),
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // A pending certified write issued before the flood.
+    let write_ts = {
+        let mut api = state.certified.lock().await;
+        let mut counter = PnCounter::new();
+        counter.increment(&node_id("writer"));
+        api.certified_write(
+            "user/erin".into(),
+            CrdtValue::Counter(counter),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        api.pending_writes()[0].timestamp.physical
+    };
+
+    // Flood: batched requests of validly signed frontiers rotating the
+    // policy version far outside the admission window. 64 per request keeps
+    // the per-request Ed25519 verification time well inside the client
+    // timeout on unoptimized builds; the handler-side per-request cap
+    // (MAX_FRONTIERS_PER_REQUEST) is exercised by dedicated tests.
+    let base = wall_ms();
+    let mut rotation = 0u64;
+    for _ in 0..4 {
+        let mut frontiers = Vec::with_capacity(64);
+        let mut signatures = Vec::with_capacity(64);
+        for _ in 0..64 {
+            rotation += 1;
+            let f = make_frontier_v(
+                "auth-1",
+                base - rotation, // distinct HLCs, all in the past
+                &format!("rot-{rotation}"),
+                1_000 + rotation, // far outside cur(1) - 2 ..= cur(1) + 1
+            );
+            signatures.push(Some(sign(&s1, &f)));
+            frontiers.push(f);
+        }
+        client
+            .push_signed_frontiers(&addr.to_string(), frontiers, signatures)
+            .await
+            .expect("flood requests are processed, not refused");
+    }
+
+    // The pool stayed bounded: nothing rotated was pooled, and the
+    // admission counter recorded the whole flood.
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(
+        metrics["attestation_rejected_version_window_total"]
+            .as_u64()
+            .unwrap(),
+        rotation
+    );
+    assert!(
+        metrics["attestation_pool_scopes"].as_u64().unwrap() <= 4,
+        "pool scopes must stay within the namespace-derived set"
+    );
+    // The frontier set stayed bounded too (M-4): it is uncapped and
+    // persisted, so admission must stop rotated scopes from ever being
+    // tracked — not merely from being pooled.
+    {
+        let api = state.certified.lock().await;
+        assert!(
+            api.frontier_count() <= 4,
+            "frontier scopes must stay within the namespace-derived set, got {}",
+            api.frontier_count()
+        );
+    }
+
+    // Honest majority certification (with a certificate) still works.
+    let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+    for signer in [&s1, &s2] {
+        let f = make_frontier(&signer.node_id().0, report_ts, "digest-ok");
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(signer, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    let (status, has_certificate) = {
+        let mut api = state.certified.lock().await;
+        api.process_certifications();
+        let read = api.get_certified("user/erin");
+        let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
+        (read.status, has_cert)
+    };
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        has_certificate,
+        "honest 2-of-3 must still assemble a certificate during/after the flood"
+    );
+
+    handle.abort();
 }
 
 // ---------------------------------------------------------------

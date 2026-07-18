@@ -167,6 +167,14 @@ pub struct NodeRunnerConfig {
     /// path rides this runner's gossip (and self-signed reports feed the
     /// same index).
     pub equivocation: Option<Arc<EquivocationDetector>>,
+    /// When `true`, this node's OWN attestations are excluded from
+    /// certificate assembly while the node is accused of equivocation, and
+    /// its previously pooled attestations are purged (m-7). Must mirror
+    /// `AppState.exclude_accused_authorities`
+    /// (`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES`) — without this wiring the
+    /// self-report path re-inserts what the HTTP path excludes. Default:
+    /// `false` (detect-only).
+    pub exclude_accused_authorities: bool,
 }
 
 impl Default for NodeRunnerConfig {
@@ -194,6 +202,7 @@ impl Default for NodeRunnerConfig {
             internal_token: None,
             current_epoch: None,
             equivocation: None,
+            exclude_accused_authorities: false,
         }
     }
 }
@@ -1683,9 +1692,33 @@ impl NodeRunner {
 
                     {
                         let mut api = self.certified_api.lock().await;
+                        // Self-report exclusion (m-7): when exclusion is
+                        // enabled and THIS node is accused (compromised key
+                        // or duplicate process), its own attestations must
+                        // not feed certificate assembly either — the HTTP
+                        // receive path already excludes them, and without
+                        // this gate the self-report lane would re-insert
+                        // them locally. The frontier itself still advances.
+                        //
+                        // The accusation state is read UNDER the certified
+                        // lock, mirroring the HTTP path's apply-time
+                        // re-check: a concurrent handler that accuses this
+                        // node purges its pooled attestations inside the
+                        // same lock, so either that purge already ran (we
+                        // read accused=true here and skip the inserts) or
+                        // it is serialized after us and removes whatever we
+                        // insert below. Reading the flag before the lock
+                        // would reopen a window in which a fresh
+                        // self-attestation slips in right after the purge
+                        // and can be consumed by a certification tick.
+                        let self_excluded = self.config.exclude_accused_authorities
+                            && self
+                                .equivocation
+                                .as_ref()
+                                .is_some_and(|d| d.is_accused(&self.node_id));
                         for (f, sig) in frontiers.iter().zip(signatures.iter()) {
                             match (&self.node_signer, sig) {
-                                (Some(signer), Some(sig)) => {
+                                (Some(signer), Some(sig)) if !self_excluded => {
                                     // Own signature: no re-verification needed.
                                     let att = signer.self_verified(f, sig);
                                     api.update_frontier_verified(f.clone(), Some(att));
@@ -1695,6 +1728,24 @@ impl NodeRunner {
                                 }
                             }
                         }
+                        // Purge attestations pooled BEFORE the accusation
+                        // (m-7). Gated on the accusation state rather than
+                        // on a detection in this very tick, so an
+                        // accusation that lands via the shared detector
+                        // between ticks is also enforced; after the first
+                        // purge this is O(1) per tick.
+                        if self_excluded {
+                            api.purge_accused_attestations(std::slice::from_ref(&self.node_id));
+                        }
+                        let stats = api.attestation_stats();
+                        self.metrics.set_attestation_pool_stats(
+                            stats.scopes,
+                            stats.rejected_unknown_range_total,
+                            stats.rejected_version_window_total,
+                            stats.rejected_scope_cap_total,
+                            stats.rejected_authority_cap_total,
+                            stats.purged_total,
+                        );
                     }
 
                     // Attach the split-view gossip sample (evidence pairs
@@ -4465,6 +4516,9 @@ mod tests {
             authority_nodes: vec![node_id("auth-1")],
             auto_generated: false,
         });
+        // Admission (M-4) only tracks scopes with a placement policy.
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1))
+            .unwrap();
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
 
@@ -5034,6 +5088,14 @@ mod tests {
         let mut ns = SystemNamespace::new();
         ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(5), kr("user/"), 3))
             .unwrap();
+        // Manual authority definition (survives recalculation): admission
+        // (M-4) only accepts frontier reports from members of the exact
+        // range definition.
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
         let shared_ns = wrap_ns(ns);
         let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
 
@@ -5796,6 +5858,136 @@ mod tests {
             "accusation must survive a restart"
         );
         assert!(!restored.evidence().is_empty());
+    }
+
+    /// Accuse `authority` in `detector` with a forged conflicting pair at a
+    /// fixed old HLC (observe() never verifies — documented precondition).
+    fn accuse_via_forged_pair(
+        detector: &crate::authority::equivocation::EquivocationDetector,
+        signer: &NodeSigner,
+        authority: &str,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for digest in ["forged-a", "forged-b"] {
+            let frontier = AckFrontier {
+                authority_id: node_id(authority),
+                frontier_hlc: HlcTimestamp {
+                    physical: now_ms.saturating_sub(30_000),
+                    logical: 0,
+                    node_id: authority.into(),
+                },
+                key_range: kr(""),
+                policy_version: PolicyVersion(1),
+                digest_hash: digest.into(),
+            };
+            let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+            detector.observe(&frontier, &sig, now_ms);
+        }
+        assert!(detector.is_accused(&node_id(authority)));
+    }
+
+    /// m-7 self-report lane: with exclusion enabled, an accused node's own
+    /// attestations are dropped from the pool AND attestations pooled
+    /// before the accusation are purged; frontier advancement continues.
+    #[tokio::test]
+    async fn self_report_exclusion_drops_and_purges_own_attestations() {
+        let signer = make_signer("auth-1", 48);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let metrics = default_metrics();
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            exclude_accused_authorities: true,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            Arc::clone(&metrics),
+        )
+        .await;
+
+        // Not yet accused: the self-report pools an attestation.
+        runner.report_frontiers().await;
+        {
+            let api = shared_api.lock().await;
+            assert_eq!(api.attestation_stats().scopes, 1);
+        }
+
+        // The accusation lands (e.g. relayed evidence via the shared
+        // detector). The next report tick must purge the pre-accusation
+        // attestation and stop pooling new ones — while the frontier
+        // itself keeps advancing.
+        accuse_via_forged_pair(&detector, &signer, "auth-1");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        let stats = api.attestation_stats();
+        assert_eq!(
+            stats.scopes, 0,
+            "pre-accusation attestations must be purged from the pool"
+        );
+        assert!(stats.purged_total >= 1);
+        assert!(
+            !api.all_frontiers().is_empty(),
+            "frontier advancement is never blocked by an accusation"
+        );
+
+        // Event-driven metrics sync ran on the report tick.
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_pool_scopes, 0);
+        assert!(snap.attestation_purged_total >= 1);
+    }
+
+    /// Detect-only default: without the exclusion flag, an accusation does
+    /// not change self-report behaviour (no exclusion, no purge).
+    #[tokio::test]
+    async fn self_report_detect_only_keeps_attestations_without_flag() {
+        let signer = make_signer("auth-1", 49);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            // exclude_accused_authorities: false (default)
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+
+        accuse_via_forged_pair(&detector, &signer, "auth-1");
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        let stats = api.attestation_stats();
+        assert_eq!(
+            stats.scopes, 1,
+            "detect-only default must keep pooling own attestations"
+        );
+        assert_eq!(stats.purged_total, 0);
     }
 
     #[tokio::test]

@@ -404,6 +404,26 @@ pub struct RuntimeMetrics {
     /// via the split-view gossip lane.
     pub split_view_observations_total: AtomicU64,
 
+    /// Attestations rejected at pool admission: unknown range, non-member
+    /// signer, or missing placement policy (zero under honest load).
+    pub attestation_rejected_unknown_range_total: AtomicU64,
+
+    /// Attestations rejected at pool admission: policy version outside the
+    /// accepted window around the current version (zero under honest load).
+    pub attestation_rejected_version_window_total: AtomicU64,
+
+    /// Attestation inserts rejected by the pool's global scope cap.
+    pub attestation_rejected_scope_cap_total: AtomicU64,
+
+    /// Attestation inserts rejected by the pool's per-authority scope cap.
+    pub attestation_rejected_authority_cap_total: AtomicU64,
+
+    /// Gauge: number of scopes currently tracked by the attestation pool.
+    pub attestation_pool_scopes: AtomicU64,
+
+    /// Cumulative attestations removed by accused-authority purges (m-7).
+    pub attestation_purged_total: AtomicU64,
+
     /// Per-key write operation counts for accurate per-range compaction tracking.
     ///
     /// Maps written keys to their cumulative op count since last drain.
@@ -461,6 +481,12 @@ impl Default for RuntimeMetrics {
             equivocation_last_detected_ms: AtomicU64::default(),
             equivocation_accused_authorities: AtomicU64::default(),
             split_view_observations_total: AtomicU64::default(),
+            attestation_rejected_unknown_range_total: AtomicU64::default(),
+            attestation_rejected_version_window_total: AtomicU64::default(),
+            attestation_rejected_scope_cap_total: AtomicU64::default(),
+            attestation_rejected_authority_cap_total: AtomicU64::default(),
+            attestation_pool_scopes: AtomicU64::default(),
+            attestation_purged_total: AtomicU64::default(),
             write_ops_by_key: Mutex::new(HashMap::new()),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
@@ -648,6 +674,35 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Sync the attestation pool gauges/counters from a
+    /// `CertifiedApi::attestation_stats()` snapshot (event-driven: called
+    /// after frontier applies and self-reports). The stats are owned by the
+    /// `CertifiedApi` (they survive inside its lock), so the metrics side
+    /// stores absolute values rather than deltas.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_attestation_pool_stats(
+        &self,
+        scopes: u64,
+        rejected_unknown_range: u64,
+        rejected_version_window: u64,
+        rejected_scope_cap: u64,
+        rejected_authority_cap: u64,
+        purged: u64,
+    ) {
+        self.attestation_pool_scopes
+            .store(scopes, Ordering::Relaxed);
+        self.attestation_rejected_unknown_range_total
+            .store(rejected_unknown_range, Ordering::Relaxed);
+        self.attestation_rejected_version_window_total
+            .store(rejected_version_window, Ordering::Relaxed);
+        self.attestation_rejected_scope_cap_total
+            .store(rejected_scope_cap, Ordering::Relaxed);
+        self.attestation_rejected_authority_cap_total
+            .store(rejected_authority_cap, Ordering::Relaxed);
+        self.attestation_purged_total
+            .store(purged, Ordering::Relaxed);
+    }
+
     /// Record the completion of a rebalance operation.
     pub fn record_rebalance_complete(&self, _key_range: &str, duration: Duration) {
         self.rebalance_complete_total
@@ -716,6 +771,20 @@ impl RuntimeMetrics {
             split_view_observations_total: self
                 .split_view_observations_total
                 .load(Ordering::Relaxed),
+            attestation_rejected_unknown_range_total: self
+                .attestation_rejected_unknown_range_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_version_window_total: self
+                .attestation_rejected_version_window_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_scope_cap_total: self
+                .attestation_rejected_scope_cap_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_authority_cap_total: self
+                .attestation_rejected_authority_cap_total
+                .load(Ordering::Relaxed),
+            attestation_pool_scopes: self.attestation_pool_scopes.load(Ordering::Relaxed),
+            attestation_purged_total: self.attestation_purged_total.load(Ordering::Relaxed),
             delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
             full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
             full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
@@ -820,6 +889,21 @@ pub struct MetricsSnapshot {
     pub equivocation_accused_authorities: u64,
     /// Cumulative relayed attestations processed via the split-view gossip lane.
     pub split_view_observations_total: u64,
+    /// Attestations rejected at pool admission (unknown range / non-member
+    /// signer / missing policy). Zero under honest load; growth signals a
+    /// flood or a misconfigured authority.
+    pub attestation_rejected_unknown_range_total: u64,
+    /// Attestations rejected at pool admission (policy version outside the
+    /// accepted window). Zero under honest load.
+    pub attestation_rejected_version_window_total: u64,
+    /// Attestation inserts rejected by the pool's global scope cap.
+    pub attestation_rejected_scope_cap_total: u64,
+    /// Attestation inserts rejected by the pool's per-authority scope cap.
+    pub attestation_rejected_authority_cap_total: u64,
+    /// Gauge: scopes currently tracked by the attestation pool.
+    pub attestation_pool_scopes: u64,
+    /// Cumulative attestations removed by accused-authority purges.
+    pub attestation_purged_total: u64,
     /// Cumulative number of delta syncs performed (push phase).
     pub delta_sync_count: u64,
     /// Cumulative number of full sync fallbacks triggered by high change rate.
@@ -883,6 +967,37 @@ mod tests {
         assert_eq!(snap.equivocation_last_detected_ms, 5_678);
         assert_eq!(snap.equivocation_accused_authorities, 2);
         assert_eq!(snap.split_view_observations_total, 1);
+    }
+
+    #[test]
+    fn attestation_pool_metrics_default_zero_and_set() {
+        let metrics = RuntimeMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_rejected_unknown_range_total, 0);
+        assert_eq!(snap.attestation_rejected_version_window_total, 0);
+        assert_eq!(snap.attestation_rejected_scope_cap_total, 0);
+        assert_eq!(snap.attestation_rejected_authority_cap_total, 0);
+        assert_eq!(snap.attestation_pool_scopes, 0);
+        assert_eq!(snap.attestation_purged_total, 0);
+
+        metrics.set_attestation_pool_stats(4, 1, 2, 3, 5, 6);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_pool_scopes, 4);
+        assert_eq!(snap.attestation_rejected_unknown_range_total, 1);
+        assert_eq!(snap.attestation_rejected_version_window_total, 2);
+        assert_eq!(snap.attestation_rejected_scope_cap_total, 3);
+        assert_eq!(snap.attestation_rejected_authority_cap_total, 5);
+        assert_eq!(snap.attestation_purged_total, 6);
+
+        // Absolute-value semantics: a later sync overwrites, never adds.
+        metrics.set_attestation_pool_stats(1, 1, 2, 3, 5, 6);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_pool_scopes, 1);
+
+        // Snapshot serialization carries the new fields.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["attestation_pool_scopes"], 1);
+        assert_eq!(json["attestation_purged_total"], 6);
     }
 
     #[test]

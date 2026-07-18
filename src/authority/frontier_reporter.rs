@@ -2,7 +2,7 @@ use crate::authority::ack_frontier::{AckFrontier, FrontierScope};
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::HlcError;
 use crate::hlc::{Hlc, HlcTimestamp};
-use crate::types::{NodeId, PolicyVersion};
+use crate::types::NodeId;
 
 /// Generates frontier reports for authority scopes managed by this node.
 ///
@@ -18,6 +18,13 @@ pub struct FrontierReporter {
     node_id: NodeId,
     /// Scopes this node is authority for (derived from SystemNamespace).
     authority_scopes: Vec<FrontierScope>,
+    /// Whether this node is a member of at least one authority definition,
+    /// including definitions whose range has no placement policy yet.
+    /// Kept separate from `authority_scopes` (which only contains
+    /// reportable scopes) so that a node seeded into a definition before
+    /// any policy exists still registers as an authority — and starts
+    /// reporting as soon as `refresh_scopes` sees the first policy.
+    is_definition_member: bool,
 }
 
 impl FrontierReporter {
@@ -26,10 +33,11 @@ impl FrontierReporter {
     /// Discovers which authority scopes this node is responsible for by
     /// scanning all authority definitions in the system namespace.
     pub fn new(node_id: NodeId, namespace: &SystemNamespace) -> Self {
-        let authority_scopes = Self::discover_scopes(&node_id, namespace);
+        let (authority_scopes, is_definition_member) = Self::discover_scopes(&node_id, namespace);
         Self {
             node_id,
             authority_scopes,
+            is_definition_member,
         }
     }
 
@@ -38,9 +46,10 @@ impl FrontierReporter {
         &self.authority_scopes
     }
 
-    /// Return true if this node is an authority for at least one scope.
+    /// Return true if this node is a member of at least one authority
+    /// definition (whether or not the range has a placement policy yet).
     pub fn is_authority(&self) -> bool {
-        !self.authority_scopes.is_empty()
+        self.is_definition_member
     }
 
     /// Return a reference to the node ID.
@@ -84,27 +93,42 @@ impl FrontierReporter {
     /// Call this when the namespace changes (e.g., policy version bump or
     /// authority set reconfiguration).
     pub fn refresh_scopes(&mut self, namespace: &SystemNamespace) {
-        self.authority_scopes = Self::discover_scopes(&self.node_id, namespace);
+        let (scopes, is_member) = Self::discover_scopes(&self.node_id, namespace);
+        self.authority_scopes = scopes;
+        self.is_definition_member = is_member;
     }
 
-    /// Discover which scopes this node is authority for.
-    fn discover_scopes(node_id: &NodeId, namespace: &SystemNamespace) -> Vec<FrontierScope> {
+    /// Discover which scopes this node is authority for, and whether it is
+    /// a member of any authority definition at all.
+    ///
+    /// Definitions WITHOUT a placement policy are membership-relevant but
+    /// never reported: a range without a policy cannot certify any write
+    /// (`resolve_scope` requires both), and every receiving node would
+    /// reject the report at admission (`NoPolicy`) — notably the
+    /// auto-seeded catch-all `""` definition on signed deployments would
+    /// otherwise produce a WARN per authority per checkpoint tick, forever,
+    /// while permanently ratcheting the flood-signal rejection counter.
+    fn discover_scopes(
+        node_id: &NodeId,
+        namespace: &SystemNamespace,
+    ) -> (Vec<FrontierScope>, bool) {
         let mut scopes = Vec::new();
+        let mut is_member = false;
         for def in namespace.all_authority_definitions() {
-            if def.authority_nodes.contains(node_id) {
-                let policy_version = namespace
-                    .get_placement_policy(&def.key_range.prefix)
-                    .map(|p| p.version)
-                    .unwrap_or(PolicyVersion(1));
-
-                scopes.push(FrontierScope::new(
-                    def.key_range.clone(),
-                    policy_version,
-                    node_id.clone(),
-                ));
+            if !def.authority_nodes.contains(node_id) {
+                continue;
             }
+            is_member = true;
+            let Some(policy) = namespace.get_placement_policy(&def.key_range.prefix) else {
+                continue;
+            };
+            scopes.push(FrontierScope::new(
+                def.key_range.clone(),
+                policy.version,
+                node_id.clone(),
+            ));
         }
-        scopes
+        (scopes, is_member)
     }
 }
 
@@ -114,7 +138,7 @@ mod tests {
     use crate::authority::ack_frontier::AckFrontierSet;
     use crate::control_plane::system_namespace::AuthorityDefinition;
     use crate::placement::PlacementPolicy;
-    use crate::types::KeyRange;
+    use crate::types::{KeyRange, PolicyVersion};
 
     fn node(name: &str) -> NodeId {
         NodeId(name.into())
@@ -128,12 +152,24 @@ mod tests {
 
     fn make_namespace(prefix: &str, authorities: &[&str]) -> SystemNamespace {
         let mut ns = SystemNamespace::new();
+        add_scope(&mut ns, prefix, authorities);
+        ns
+    }
+
+    /// Add an authority definition WITH a placement policy (v1): only
+    /// ranges with a policy are reportable.
+    fn add_scope(ns: &mut SystemNamespace, prefix: &str, authorities: &[&str]) {
         ns.set_authority_definition(AuthorityDefinition {
             key_range: kr(prefix),
             authority_nodes: authorities.iter().map(|a| node(a)).collect(),
             auto_generated: false,
         });
-        ns
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            kr(prefix),
+            authorities.len(),
+        ))
+        .unwrap();
     }
 
     fn make_ts(physical: u64, logical: u32, node_id: &str) -> HlcTimestamp {
@@ -174,16 +210,8 @@ mod tests {
     #[test]
     fn discovers_multiple_scopes() {
         let mut ns = SystemNamespace::new();
-        ns.set_authority_definition(AuthorityDefinition {
-            key_range: kr("user/"),
-            authority_nodes: vec![node("auth-1"), node("auth-2")],
-            auto_generated: false,
-        });
-        ns.set_authority_definition(AuthorityDefinition {
-            key_range: kr("order/"),
-            authority_nodes: vec![node("auth-1"), node("auth-3")],
-            auto_generated: false,
-        });
+        add_scope(&mut ns, "user/", &["auth-1", "auth-2"]);
+        add_scope(&mut ns, "order/", &["auth-1", "auth-3"]);
 
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         assert_eq!(reporter.authority_scopes().len(), 2);
@@ -331,21 +359,13 @@ mod tests {
     #[test]
     fn refresh_scopes_detects_new_authority() {
         let mut ns = SystemNamespace::new();
-        ns.set_authority_definition(AuthorityDefinition {
-            key_range: kr("user/"),
-            authority_nodes: vec![node("auth-1")],
-            auto_generated: false,
-        });
+        add_scope(&mut ns, "user/", &["auth-1"]);
 
         let mut reporter = FrontierReporter::new(node("auth-1"), &ns);
         assert_eq!(reporter.authority_scopes().len(), 1);
 
         // Add a new authority definition that includes auth-1.
-        ns.set_authority_definition(AuthorityDefinition {
-            key_range: kr("order/"),
-            authority_nodes: vec![node("auth-1"), node("auth-2")],
-            auto_generated: false,
-        });
+        add_scope(&mut ns, "order/", &["auth-1", "auth-2"]);
 
         reporter.refresh_scopes(&ns);
         assert_eq!(reporter.authority_scopes().len(), 2);
@@ -354,11 +374,7 @@ mod tests {
     #[test]
     fn refresh_scopes_removes_revoked_authority() {
         let mut ns = SystemNamespace::new();
-        ns.set_authority_definition(AuthorityDefinition {
-            key_range: kr("user/"),
-            authority_nodes: vec![node("auth-1"), node("auth-2")],
-            auto_generated: false,
-        });
+        add_scope(&mut ns, "user/", &["auth-1", "auth-2"]);
 
         let mut reporter = FrontierReporter::new(node("auth-1"), &ns);
         assert_eq!(reporter.authority_scopes().len(), 1);
@@ -372,6 +388,47 @@ mod tests {
 
         reporter.refresh_scopes(&ns);
         assert!(!reporter.is_authority());
+        assert!(reporter.authority_scopes().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Definitions without a placement policy are never reported
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn definition_without_policy_is_member_but_not_reported() {
+        // The auto-seeded catch-all "" definition has no placement policy:
+        // it must count for authority membership (the node keeps its
+        // reporter and starts reporting once a policy appears) but must not
+        // generate frontier reports — every receiver would reject them at
+        // admission (NoPolicy), warn once per tick per authority forever,
+        // and ratchet the flood-signal rejection counter.
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
+        });
+
+        let mut reporter = FrontierReporter::new(node("auth-1"), &ns);
+        assert!(
+            reporter.is_authority(),
+            "definition membership must hold even without a policy"
+        );
+        assert!(
+            reporter.authority_scopes().is_empty(),
+            "a range without a placement policy must not be reported"
+        );
+
+        // Once the operator creates a policy, the scope becomes reportable.
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr(""), 3))
+            .unwrap();
+        reporter.refresh_scopes(&ns);
+        assert_eq!(reporter.authority_scopes().len(), 1);
+        assert_eq!(
+            reporter.authority_scopes()[0].policy_version,
+            PolicyVersion(7)
+        );
     }
 
     // ---------------------------------------------------------------

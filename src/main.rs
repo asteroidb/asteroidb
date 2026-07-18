@@ -786,6 +786,10 @@ async fn main() {
         internal_token: internal_token.clone(),
         current_epoch: Some(Arc::clone(&current_epoch)),
         equivocation: Some(Arc::clone(&equivocation)),
+        // Same flag as AppState: without this, the self-report path would
+        // keep pooling this node's own attestations while the HTTP path
+        // excludes them (m-7).
+        exclude_accused_authorities,
         digest_sync_enabled,
         gc_retention,
         gc_hole_jump_enabled,

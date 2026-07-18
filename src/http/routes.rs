@@ -1913,26 +1913,29 @@ mod tests {
         use crate::network::frontier_sync::FrontierPushResponse;
 
         let state = test_state();
+        let pv = current_pv(&state).0;
         let app = router(state);
 
-        let frontier_json = r#"{
+        let frontier_json = format!(
+            r#"{{
             "frontiers": [
-                {
+                {{
                     "authority_id": "auth-1",
-                    "frontier_hlc": {"physical": 100, "logical": 0, "node_id": "auth-1"},
-                    "key_range": {"prefix": ""},
-                    "policy_version": 1,
+                    "frontier_hlc": {{"physical": 100, "logical": 0, "node_id": "auth-1"}},
+                    "key_range": {{"prefix": ""}},
+                    "policy_version": {pv},
                     "digest_hash": "h1"
-                }
+                }}
             ]
-        }"#;
+        }}"#
+        );
 
         // First push: frontier is new, accepted should be 1.
         let req = Request::builder()
             .method("POST")
             .uri("/api/internal/frontiers")
             .header("content-type", "application/json")
-            .body(Body::from(frontier_json))
+            .body(Body::from(frontier_json.clone()))
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1961,17 +1964,19 @@ mod tests {
         );
 
         // Third push: newer frontier, accepted should be 1.
-        let newer_json = r#"{
+        let newer_json = format!(
+            r#"{{
             "frontiers": [
-                {
+                {{
                     "authority_id": "auth-1",
-                    "frontier_hlc": {"physical": 200, "logical": 0, "node_id": "auth-1"},
-                    "key_range": {"prefix": ""},
-                    "policy_version": 1,
+                    "frontier_hlc": {{"physical": 200, "logical": 0, "node_id": "auth-1"}},
+                    "key_range": {{"prefix": ""}},
+                    "policy_version": {pv},
                     "digest_hash": "h2"
-                }
+                }}
             ]
-        }"#;
+        }}"#
+        );
 
         let req = Request::builder()
             .method("POST")
@@ -2512,6 +2517,22 @@ mod tests {
         registry
     }
 
+    /// Current placement-policy version of the catch-all "" range.
+    ///
+    /// The single-node Raft bootstrap re-proposes seeded policies and
+    /// re-assigns their versions in commit order, so tests must report
+    /// frontiers under the LIVE version — admission (M-4) rejects reports
+    /// outside the current version's window.
+    fn current_pv(state: &Arc<AppState>) -> PolicyVersion {
+        state
+            .namespace
+            .read()
+            .unwrap()
+            .get_placement_policy("")
+            .expect("test namespace seeds a catch-all policy")
+            .version
+    }
+
     fn signed_push_body(signers: &[&NodeSigner], physical: u64) -> FrontierPushRequest {
         signed_push_body_with_pv(signers, physical, PolicyVersion(1))
     }
@@ -2565,9 +2586,10 @@ mod tests {
         let s1 = signing_test_signer("auth-1", 61);
         let s2 = signing_test_signer("auth-2", 62);
         let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let pv = current_pv(&state);
         let app = router(state);
 
-        let body = signed_push_body(&[&s1, &s2], 10_500);
+        let body = signed_push_body_with_pv(&[&s1, &s2], 10_500, pv);
         let result = push_frontiers(&app, &body).await;
         assert_eq!(
             result.accepted, 2,
@@ -2609,8 +2631,9 @@ mod tests {
 
         // Lenient (default): unsigned frontiers are accepted.
         let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let pv = current_pv(&state);
         let app = router(state);
-        let mut body = signed_push_body(&[&s1], 10_500);
+        let mut body = signed_push_body_with_pv(&[&s1], 10_500, pv);
         body.signatures = vec![None];
         let result = push_frontiers(&app, &body).await;
         assert_eq!(
@@ -2631,8 +2654,9 @@ mod tests {
         // payloads carrying (unverifiable) signatures.
         let s1 = signing_test_signer("auth-1", 67);
         let state = test_state_signing(None, false);
+        let pv = current_pv(&state);
         let app = router(state);
-        let body = signed_push_body(&[&s1], 10_500);
+        let body = signed_push_body_with_pv(&[&s1], 10_500, pv);
         let result = push_frontiers(&app, &body).await;
         assert_eq!(result.accepted, 1);
     }
@@ -2686,7 +2710,7 @@ mod tests {
         }
         let app = router(Arc::clone(&state));
 
-        let make_body = |prefix: &str| {
+        let make_body = |prefix: &str, pv: PolicyVersion| {
             let frontier = crate::authority::ack_frontier::AckFrontier {
                 authority_id: s1.node_id().clone(),
                 frontier_hlc: HlcTimestamp {
@@ -2697,7 +2721,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: prefix.into(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: pv,
                 digest_hash: format!("{}-10500", s1.node_id().0),
             };
             let sig = s1.sign_frontier(&frontier, KeysetVersion(1));
@@ -2710,14 +2734,14 @@ mod tests {
 
         // Frontier for order/ (owned by auth-b1..b3): rejected despite the
         // valid signature.
-        let result = push_frontiers(&app, &make_body("order/")).await;
+        let result = push_frontiers(&app, &make_body("order/", PolicyVersion(1))).await;
         assert_eq!(
             result.accepted, 0,
             "registered authority outside the range's authority set must be rejected"
         );
 
         // Frontier for the catch-all range (auth-1 IS a member): accepted.
-        let result = push_frontiers(&app, &make_body("")).await;
+        let result = push_frontiers(&app, &make_body("", current_pv(&state))).await;
         assert_eq!(result.accepted, 1);
     }
 

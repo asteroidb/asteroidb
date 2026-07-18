@@ -178,7 +178,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と（`native-crypto` ビルドでは）BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する。`native-crypto` 無効ビルドでは Ed25519 のみで署名する |
 | `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
-| `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in |
+| `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。除外は 3 点で強制される: (1) HTTP 受信経路での検証時＋**apply 時の再チェック**（同一リクエスト内で告発が後続しても前方の attestation がすり抜けない）、(2) **告発時の attestation pool purge**（告発前にプール済みの最大 128 checkpoint 分の attestation を除去。`attestation_purged_total` で観測可能）、(3) **自己報告経路**（自ノードが告発された場合、自身の attestation も pool へ入れず、既存分を purge する）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in。**`0`（既定）では purge は発動せず、告発済み Authority の attestation は detect-only 契約どおり証明書に混入し続ける**。なお、告発**前**に組み立て済み・キャッシュ済みの証明書の遡及失効は行わない（証明書失効プロトコルは将来課題、`docs/followup-plan.md` 参照） |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
@@ -281,6 +281,14 @@ frame を含む可能性があるため自動では削除・切り詰めされ�
 
 > **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
 
+### Frontier 追跡と attestation pool の資源上限（M-4）
+
+frontier 追跡（`AckFrontierSet`——scope ごとに 1 エントリで固有の上限を持たず、スナップショットにも載る）と、署名検証済み attestation を保持する pool（証明書組み立ての材料置き場、非永続）は、登録済み Authority 1 台が `policy_version` / `key_range` を回転させるだけでメモリを増やせないよう、二層で防御される:
+
+- **入口検証（一次防衛）**: frontier 報告は「定義済み range と完全一致 ∧ 報告者がその range の authority set メンバー ∧ placement policy が存在 ∧ `policy_version` が現行版の `-2..=+1` ウィンドウ内」の場合のみ受理される。拒否された報告は **frontier 追跡にも attestation pool にも一切入らず**、`attestation_rejected_unknown_range_total` / `attestation_rejected_version_window_total` に計上される。拒否される scope は certification（`resolve_scope`）が要求するのと同じ「定義＋policy」条件を満たさないため、いかなる write の証明にも使われ得ない——正当損失ゼロ。ウィンドウ幅は frontier GC の保持幅（`frontier_gc_max_retained_versions` 既定 2）＋先行 1 版に一致し、ラグ中／先行中の正当な報告者を落とさない。なお placement policy を持たない range（自動シードされる catch-all `""` 定義など）は報告側（`FrontierReporter`）がそもそも報告対象にしない——受信側全ノードで admission 拒否になるだけの報告を毎 tick 生成して、警告ログと flood 信号カウンタを恒常汚染しないため。policy を後から作成すれば、次の policy 変更検知で自動的に報告対象へ昇格する。
+- **pool 内ハード上限（バックストップ）**: グローバル 1024 scope・Authority あたり 64 scope（いずれも `equivocation` 検知器の上限と同値。スケール前提を変える場合は両方を同時に引き上げる）。上限到達時は**新規 scope の作成を拒否**する（既存 scope への参加は常に受理——組み立て進行中の定足数を絶対に妨げない。resident の追い出しも行わない——過去 checkpoint の attestation は再取得不能なため）。拒否時は 1 秒間隔にスロットルされた stale scope 掃除（現行版ウィンドウ外の scope を一括除去）が走り 1 回だけ再試行する。
+- 正常運用では拒否カウンタは全てゼロが期待値。`attestation_rejected_scope_cap_total` / `attestation_rejected_authority_cap_total` の増加は「同時有効 scope 数が運用規模の想定（range 数 × 4 版）を超えた」ことを意味し、定数（`MAX_POOL_SCOPES` / `MAX_POOL_SCOPES_PER_AUTHORITY`）の引き上げ検討シグナルとなる。
+
 ### Equivocation / split-view 検知
 
 同一 Authority が矛盾する frontier 報告を（同一ピアまたは別ピアへ）署名付きで送った場合、受信ノードはこれをローカルで検知し、否認不能な証拠を保存する。
@@ -371,6 +379,12 @@ curl -s http://localhost:3000/api/slo | jq .
 | `equivocation_last_detected_ms` | u64 | 最終 equivocation 検知時刻 (ms、0=なし) |
 | `equivocation_accused_authorities` | u64 | 証拠が存在する Authority 数（ゲージ） |
 | `split_view_observations_total` | u64 | gossip 経由で検証・照合した観測数累計 |
+| `attestation_pool_scopes` | u64 | attestation pool が追跡中の scope 数（ゲージ。正常時は「定義 range 数 × 高々 4 バージョン」以下） |
+| `attestation_rejected_unknown_range_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：未定義 range・authority set 非メンバー報告者・placement policy なし。**正常時ゼロ**、増加は flood または設定不整合の一次信号 |
+| `attestation_rejected_version_window_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：policy_version が現行版の `-2..=+1` ウィンドウ外。**正常時ゼロ** |
+| `attestation_rejected_scope_cap_total` | u64 | pool のグローバル scope 上限（1024）による insert 拒否累計。**正常時ゼロ** |
+| `attestation_rejected_authority_cap_total` | u64 | pool の per-authority scope 上限（64）による insert 拒否累計。**正常時ゼロ** |
+| `attestation_purged_total` | u64 | 告発された Authority の pool 済み attestation の purge 除去累計（`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1` 時のみ増加し得る） |
 | `peer_sync` | map | ピアごとの同期統計（60 秒スライディングウィンドウ） |
 | `certification_latency_window` | object | 証明レイテンシウィンドウ統計（60 秒） |
 
