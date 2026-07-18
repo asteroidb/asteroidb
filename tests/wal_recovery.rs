@@ -687,13 +687,34 @@ fn certified_write_recovery_matches_acked_state() {
             OnTimeout::Pending,
         )
         .unwrap();
+        // A REGRESSING counter write (3 after 10) is unrepresentable on
+        // the certified path (merge takes the per-node max, so the
+        // acked-value/live-state divergence would be silent): it must be
+        // rejected loudly instead of acked as success.
         let mut c2 = PnCounter::new();
         for _ in 0..3 {
             c2.increment(&node("http-writer"));
         }
+        let err = api
+            .certified_write(
+                "orders/1".into(),
+                CrdtValue::Counter(c2),
+                OnTimeout::Pending,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CrdtError::InvalidArgument(_)),
+            "regressing certified counter write must be rejected, got {err:?}"
+        );
+        // An ADVANCING write (13 after 10) merges to exactly the
+        // requested value and is accepted.
+        let mut c3 = PnCounter::new();
+        for _ in 0..13 {
+            c3.increment(&node("http-writer"));
+        }
         api.certified_write(
             "orders/1".into(),
-            CrdtValue::Counter(c2),
+            CrdtValue::Counter(c3),
             OnTimeout::Pending,
         )
         .unwrap();

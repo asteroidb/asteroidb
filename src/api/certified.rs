@@ -236,7 +236,7 @@ impl CertifiedApi {
         if let Some(max) = store.max_known_hlc() {
             clock.seed_recovered(&max);
         }
-        Self {
+        let mut api = Self {
             store,
             clock,
             frontiers: AckFrontierSet::new(),
@@ -249,6 +249,44 @@ impl CertifiedApi {
             cert_pending_keys: HashSet::new(),
             wal,
             last_wal_pos: None,
+        };
+        api.rebuild_pending_from_store();
+        api
+    }
+
+    /// Re-enqueue every recovered store entry as a pending certification.
+    ///
+    /// Without this, a write acked `"pending"` before a crash is dropped from
+    /// certification tracking on restart: `process_certifications` only scans
+    /// `pending_writes`, so the write would report `Pending` / `proof: null`
+    /// forever even after the cluster certifies it (clients polling the
+    /// documented contract hang indefinitely). Frontiers start empty on
+    /// recovery, so every entry is re-tracked as `Pending` and promoted as
+    /// attestations are re-collected. Keys without an authority definition
+    /// cannot certify and are skipped.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rebuild_pending_from_store(&mut self) {
+        let keys: Vec<String> = self.store.keys().into_iter().cloned().collect();
+        for key in keys {
+            let (Some(value), Some(timestamp)) = (
+                self.store.get(&key).cloned(),
+                self.store.timestamp_for(&key).cloned(),
+            ) else {
+                continue;
+            };
+            let Ok((key_range, policy_version, total_authorities)) = self.resolve_scope(&key)
+            else {
+                continue;
+            };
+            self.pending_writes.push(PendingWrite {
+                key,
+                value,
+                timestamp,
+                status: CertificationStatus::Pending,
+                key_range,
+                policy_version,
+                total_authorities,
+            });
         }
     }
 
@@ -565,6 +603,30 @@ impl CertifiedApi {
         // divergence would be permanent. A type-changing write is rejected
         // here (TypeMismatch) instead of installing state that replay
         // could not reconstruct.
+        // A counter write carries an absolute value, but the merge above takes
+        // the per-node max — so setting a counter to 3 after 5 is a silent
+        // no-op that would still be acked as success. Detect an
+        // unrepresentable counter write and fail loudly *before* mutating the
+        // store (so an error leaves it untouched), instead of lying to the
+        // client. Registers/sets/maps legitimately produce a merged post-state
+        // that differs from the request, so this check is counter-only.
+        if let CrdtValue::Counter(requested) = &value
+            && let Some(CrdtValue::Counter(existing)) = self.store.get(&key)
+        {
+            let mut merged = existing.clone();
+            merged.merge(requested);
+            if merged.value() != requested.value() {
+                return Err(CrdtError::InvalidArgument(format!(
+                    "certified counter write to key {key} is unrepresentable: \
+                     merging with existing state yields {} (requested {}); the \
+                     certified path merges rather than replaces for WAL-replay \
+                     soundness, so a counter can only advance, never regress",
+                    merged.value(),
+                    requested.value(),
+                )));
+            }
+        }
+
         self.store.merge_value(key.clone(), &value)?;
         self.store.record_change(&key, timestamp.clone());
 
