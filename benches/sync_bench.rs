@@ -66,6 +66,7 @@ fn build_delta_response(n: usize) -> DeltaSyncResponse {
         merge_failed_keys: vec![],
         pruned_floor: None,
         visible_origins: std::collections::HashMap::new(),
+        untracked_entries: std::collections::HashMap::new(),
     }
 }
 

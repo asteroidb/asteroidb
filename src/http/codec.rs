@@ -255,6 +255,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         let (bytes, _) = serialize_internal(&resp, Some(CONTENT_TYPE_BINCODE)).unwrap();

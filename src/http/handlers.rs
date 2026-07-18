@@ -1499,6 +1499,35 @@ pub async fn internal_delta_sync(
     let pruned_floor = store.pruned_floor().cloned();
     let visible_origins = store.visible_origins().clone();
 
+    // Untracked-key compensation for COMPLETE pulls. A zero request
+    // frontier means "send me everything" and the receiver treats the
+    // response as a complete transfer (adopting the whole applied_origins
+    // map) — but `delta_entries_since` scans only the timestamps map, so
+    // keys without a tracked HLC (v1/v2-migrated stores) would be
+    // silently omitted: the receiver would claim writes it never got and
+    // the pull path would never converge on those keys. The full-dump
+    // handler (`internal_keys`) has always compensated; do the same here.
+    //
+    // Skipped entirely once this store has COMPACTED (`pruned_floor`
+    // set): `untracked_entries()` then matches every compaction-pruned
+    // key too (pruning removes timestamps while keeping data), which
+    // would put a full-dump-sized payload on the delta path — for
+    // nothing, because the receiver's floor gate (`request_frontier >=
+    // pruned_floor`, i.e. `zero >= floor`) is guaranteed to reject the
+    // claims of a zero-frontier pull against a compacted sender and
+    // fall back to full sync anyway. The fallback (digest sync or full
+    // dump) is the designed convergence path for those keys.
+    let is_complete_request = req.frontier.physical == 0 && req.frontier.logical == 0;
+    let untracked_entries: std::collections::HashMap<String, crate::store::kv::CrdtValue> =
+        if is_complete_request && pruned_floor.is_none() {
+            store
+                .untracked_entries()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let resp = DeltaSyncResponse {
         entries,
         sender_frontier,
@@ -1506,6 +1535,7 @@ pub async fn internal_delta_sync(
         merge_failed_keys,
         pruned_floor,
         visible_origins,
+        untracked_entries,
     };
     internal_response(&resp, accept)
 }

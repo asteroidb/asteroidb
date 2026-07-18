@@ -132,6 +132,29 @@ pub struct DeltaSyncResponse {
     /// (false negatives); it never fabricates an applied claim.
     #[serde(default)]
     pub visible_origins: HashMap<String, HlcTimestamp>,
+    /// Entries with NO tracked per-key HLC on the responder (possible in
+    /// stores migrated from format v1/v2), populated only for COMPLETE
+    /// (zero-frontier) pulls.
+    ///
+    /// `delta_entries_since` scans the timestamps map, so untracked keys
+    /// are invisible to it — without this compensation a zero-frontier
+    /// pull would be treated as a complete transfer (adopting the whole
+    /// `applied_origins` map) while silently omitting these keys: the
+    /// receiver would claim writes it never received (read-your-writes
+    /// false success) and, since the pull path never re-requests them,
+    /// diverge permanently. The full-dump path (`GET /api/internal/keys`)
+    /// has always compensated; this closes the same gap on the delta
+    /// path. The receiver merges these without an HLC (`merge_remote`),
+    /// re-stamping them locally — which also makes them delta-visible on
+    /// the receiver from then on.
+    ///
+    /// NOTE for maintainers: bincode is positional — new fields may only
+    /// be appended at the end with `#[serde(default)]` and never
+    /// `skip_serializing_if` (same rule as `KeyDumpResponse`). Old
+    /// senders omit this field (JSON retry path defaults it to empty);
+    /// their migrated untracked keys still converge only via full sync.
+    #[serde(default)]
+    pub untracked_entries: HashMap<String, CrdtValue>,
 }
 
 // ---------------------------------------------------------------
@@ -275,7 +298,18 @@ pub enum DigestSyncResult {
 #[derive(Debug, Clone)]
 pub struct SyncPushError {
     /// Number of entries that were successfully pushed before the failure.
+    ///
+    /// NOTE: this is an order-insensitive *count*, not a positional prefix
+    /// length. Callers that need to know *which* keys failed (e.g. rebalance
+    /// marking per-key migration success) must use [`failed_keys`] — treating
+    /// `pushed` as "the first N keys succeeded" silently misattributes
+    /// success when an early key fails but later keys succeed.
+    ///
+    /// [`failed_keys`]: Self::failed_keys
     pub pushed: usize,
+    /// The exact keys that were not successfully pushed: remote merge errors
+    /// plus keys in the aborted batch and every un-attempted later batch.
+    pub failed_keys: Vec<String>,
     /// Human-readable reason for the failure.
     pub reason: String,
 }
@@ -831,9 +865,13 @@ impl SyncClient {
         };
 
         let mut total_pushed = 0usize;
-        let mut merge_error_total = 0usize;
+        // The exact keys that failed, so the caller can mark per-key success
+        // rather than treating `total_pushed` as a positional prefix length.
+        let mut failed_keys: Vec<String> = Vec::new();
 
-        for chunk in changed_entries.chunks(effective_batch_size) {
+        let chunks: Vec<&[(String, CrdtValue)]> =
+            changed_entries.chunks(effective_batch_size).collect();
+        for (ci, chunk) in chunks.iter().enumerate() {
             let entries: HashMap<String, CrdtValue> = chunk.iter().cloned().collect();
             let request = SyncRequest {
                 sender: sender_id.to_string(),
@@ -848,13 +886,13 @@ impl SyncClient {
                         // errors. Only count entries that were actually merged.
                         let sync_resp: Option<SyncResponse> =
                             Self::decode_response(resp).await.ok();
-                        let error_count = sync_resp.as_ref().map(|r| r.errors.len()).unwrap_or(0);
+                        let error_keys: Vec<String> = sync_resp
+                            .as_ref()
+                            .map(|r| r.errors.iter().map(|e| e.key.clone()).collect())
+                            .unwrap_or_default();
+                        let error_count = error_keys.len();
                         let actually_pushed = chunk.len().saturating_sub(error_count);
                         if error_count > 0 {
-                            let error_keys: Vec<&str> = sync_resp
-                                .as_ref()
-                                .map(|r| r.errors.iter().map(|e| e.key.as_str()).collect())
-                                .unwrap_or_default();
                             tracing::warn!(
                                 peer_addr = %peer_addr,
                                 error_count = error_count,
@@ -867,7 +905,7 @@ impl SyncClient {
                             // remaining batches without helping the failed
                             // ones. Keep pushing and report the accumulated
                             // failures once all batches were attempted.
-                            merge_error_total += error_count;
+                            failed_keys.extend(error_keys);
                         }
                         total_pushed += actually_pushed;
                         tracing::debug!(
@@ -881,8 +919,13 @@ impl SyncClient {
                             status = %resp.status(),
                             "delta push batch received non-success status"
                         );
+                        // This batch and every un-attempted later batch failed.
+                        for rem in &chunks[ci..] {
+                            failed_keys.extend(rem.iter().map(|(k, _)| k.clone()));
+                        }
                         return Err(SyncPushError {
                             pushed: total_pushed,
+                            failed_keys,
                             reason: format!("HTTP {}", resp.status()),
                         });
                     }
@@ -893,20 +936,25 @@ impl SyncClient {
                         error = %e,
                         "delta push batch failed"
                     );
+                    for rem in &chunks[ci..] {
+                        failed_keys.extend(rem.iter().map(|(k, _)| k.clone()));
+                    }
                     return Err(SyncPushError {
                         pushed: total_pushed,
+                        failed_keys,
                         reason: e.to_string(),
                     });
                 }
             }
         }
 
-        if merge_error_total > 0 {
+        if !failed_keys.is_empty() {
             // Partial success: return an error so the caller does not
             // advance its frontier past the failed keys.
             return Err(SyncPushError {
                 pushed: total_pushed,
-                reason: format!("{merge_error_total} keys failed to merge on remote"),
+                reason: format!("{} keys failed to merge on remote", failed_keys.len()),
+                failed_keys,
             });
         }
 
@@ -1420,6 +1468,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: Some(hlc(100, 0, "node-1")),
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -1443,6 +1492,7 @@ mod tests {
             merge_failed_keys: vec![],
             pruned_floor: None,
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -1463,6 +1513,7 @@ mod tests {
         assert!(back.applied_origins.is_empty());
         assert!(back.merge_failed_keys.is_empty());
         assert!(back.pruned_floor.is_none());
+        assert!(back.untracked_entries.is_empty());
     }
 
     /// The new session-guarantee fields must round-trip through bincode
@@ -1478,6 +1529,7 @@ mod tests {
             merge_failed_keys: vec!["poisoned".into()],
             pruned_floor: Some(hlc(10, 0, "origin-a")),
             visible_origins: HashMap::new(),
+            untracked_entries: HashMap::new(),
         };
         let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
         let (back, _): (DeltaSyncResponse, _) =
@@ -1624,6 +1676,7 @@ mod tests {
     fn sync_push_error_display() {
         let err = SyncPushError {
             pushed: 5,
+            failed_keys: vec![],
             reason: "timeout".into(),
         };
         let msg = format!("{err}");

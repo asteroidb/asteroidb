@@ -96,6 +96,7 @@ fn main() {
         merge_failed_keys: vec![],
         pruned_floor: None,
         visible_origins: HashMap::new(),
+        untracked_entries: HashMap::new(),
     };
 
     let start = Instant::now();
