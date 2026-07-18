@@ -2221,6 +2221,22 @@ fn validate_peer_address(addr: &str) -> Result<(), String> {
 /// already prevents CPU-based DoS.
 const MAX_COUNTER_MAGNITUDE: i64 = 1_000_000_000;
 
+/// Process-wide monotonic clock for the `http-writer` pseudo-node.
+///
+/// LWW register and OR-map timestamps must be strictly increasing across HTTP
+/// writes: a *fresh* `Hlc` per call resets the logical counter to 0, so two
+/// writes in the same wall-clock millisecond produce equal timestamps and
+/// `LwwRegister::merge` tie-breaks by value order — silently dropping the
+/// later write. A single reused clock guarantees each `now()` strictly
+/// exceeds the previous one, so ordering reflects write order.
+static HTTP_WRITER_CLOCK: std::sync::Mutex<Option<crate::hlc::Hlc>> = std::sync::Mutex::new(None);
+
+fn http_writer_now() -> Result<crate::hlc::HlcTimestamp, CrdtError> {
+    let mut guard = HTTP_WRITER_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let clock = guard.get_or_insert_with(|| crate::hlc::Hlc::new("http-writer".into()));
+    Ok(clock.now()?)
+}
+
 /// Convert a JSON CRDT value representation into an internal `CrdtValue`.
 ///
 /// For Counter, creates a PnCounter with the specified value using O(1)
@@ -2230,7 +2246,6 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
     use crate::crdt::lww_register::LwwRegister;
     use crate::crdt::or_map::OrMap;
     use crate::crdt::or_set::OrSet;
-    use crate::hlc::Hlc;
     use crate::types::NodeId;
 
     let writer = NodeId("http-writer".into());
@@ -2255,9 +2270,8 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
         }
         CrdtValueJson::Map { entries } => {
             let mut map = OrMap::new();
-            let mut clock = Hlc::new("http-writer".into());
             for (k, v) in entries {
-                let ts = clock.now()?;
+                let ts = http_writer_now()?;
                 map.set(k.clone(), v.clone(), ts, &writer);
             }
             Ok(CrdtValue::Map(map))
@@ -2265,8 +2279,7 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
         CrdtValueJson::Register { value } => {
             let mut reg = LwwRegister::new();
             if let Some(v) = value {
-                let mut clock = Hlc::new("http-writer".into());
-                let ts = clock.now()?;
+                let ts = http_writer_now()?;
                 reg.set(v.clone(), ts);
             }
             Ok(CrdtValue::Register(reg))
