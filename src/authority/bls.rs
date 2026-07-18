@@ -200,15 +200,24 @@ impl BlsPublicKey {
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
+    // Operate on the raw bytes rather than string slices: slicing `&hex[i..i+2]`
+    // panics when the offset lands inside a multi-byte UTF-8 code point, and this
+    // runs on peer-supplied hex during Deserialize (remote-triggerable).
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| format!("invalid hex character: {e}"))
-        })
+    fn nibble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("invalid hex character".to_string()),
+        }
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }
 

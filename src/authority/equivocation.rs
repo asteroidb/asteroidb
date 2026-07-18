@@ -43,10 +43,41 @@ use crate::authority::frontier_sig::FrontierSignature;
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
 
-/// Maximum observed attestations retained per scope. Matches the
-/// `AttestationPool` checkpoint cap so the detection window is roughly the
-/// same (~2 minutes at the 1s report interval); older heads are evicted.
+/// Maximum observed attestations retained per scope (hard memory bound).
+/// In normal operation heads leave the window by wall-clock age
+/// ([`OBSERVED_RETENTION_MS`]); this cap is the backstop that only bites
+/// under an abnormal flood of distinct heads. Crucially, when the cap is hit
+/// the *incoming* head is kept out of the main window rather than a resident
+/// head evicted — a resident head can only leave by aging out, never by
+/// being displaced by newer heads. Otherwise a compromised authority could
+/// flush a specific head it plans to contradict by flooding the scope with
+/// fresh signed heads, defeating split-view detection (see
+/// `flush_resistant_eviction` test). The kept-out head is NOT dropped: it is
+/// recorded in the bounded overflow FIFO ([`MAX_OVERFLOW_PER_SCOPE`]) so
+/// heads arriving during saturation still detect conflicts.
 pub const MAX_OBSERVED_PER_SCOPE: usize = 128;
+
+/// Wall-clock retention for observed heads. This — not the count cap — is
+/// what slides the detection window for a long-running honest scope; heads
+/// older than this are dropped on the next observation. Roughly matches the
+/// historical ~2-minute window (128 heads at the 1s report interval).
+pub const OBSERVED_RETENTION_MS: u64 = 120_000;
+
+/// Capacity of the per-scope OVERFLOW window: a bounded FIFO holding heads
+/// that arrived while the main window was saturated. Refusing such heads
+/// outright (the previous design) protected residents from flush floods
+/// but opened the symmetric *pre-saturation blinding* attack: an authority
+/// could flood 128 junk heads FIRST and then sign two conflicting heads
+/// `(H, D1)` / `(H, D2)` — both would be refused unrecorded, so no
+/// evidence could ever form. Overflowed heads are conflict-checked, count
+/// toward [`is_known_exact`](EquivocationDetector::is_known_exact), and
+/// ride the gossip lane, so the conflicting pair is still caught (locally
+/// or cross-detected via gossip). Residual: a sustained flood can cycle a
+/// head out of this FIFO between the two conflicting deliveries — the
+/// attack cost rises from a one-shot pre-flood to continuous interleaved
+/// flooding that must also outrun gossip; `heads_saturated_total` keeps
+/// flagging either shape.
+pub const MAX_OVERFLOW_PER_SCOPE: usize = 32;
 
 /// Maximum number of distinct `(authority, key_range, policy_version)`
 /// scopes tracked in the observation index (memory DoS bound). When the
@@ -76,6 +107,13 @@ pub const MAX_FUTURE_SKEW_MS: u64 = 60_000;
 /// Each relayed observation may cost two Ed25519 verifications, so this is
 /// deliberately conservative (CPU DoS bound).
 pub const MAX_OBSERVED_PER_REQUEST: usize = 64;
+
+/// Per-request cap on primary frontiers processed by the receive path. Each
+/// signed frontier costs a full Ed25519 verification held under the namespace
+/// and keyset-registry read locks, so an uncapped list lets a single request
+/// starve the worker (CPU DoS bound). A legitimate push batches far fewer than
+/// this; senders with more split across requests.
+pub const MAX_FRONTIERS_PER_REQUEST: usize = 256;
 
 /// Maximum observations attached to an outgoing frontier push (gossip lane).
 pub const GOSSIP_SAMPLE_MAX: usize = 64;
@@ -127,6 +165,14 @@ pub enum ObserveOutcome {
     Equivocation(Box<EquivocationEvidence>),
     /// Not recorded: future-skew guard.
     Skipped,
+    /// The scope's main head window is saturated with still-live
+    /// observations: the incoming head is kept out of the main window to
+    /// protect resident heads from being flushed by a flood of fresh
+    /// signed heads, but it IS recorded in the bounded per-scope overflow
+    /// FIFO ([`MAX_OVERFLOW_PER_SCOPE`]) so that a conflicting head at
+    /// the same HLC arriving during saturation still produces evidence
+    /// (and the head still gossips / answers `is_known_exact`).
+    Saturated,
 }
 
 /// Observation index scope: one authority within one attestation scope.
@@ -155,11 +201,24 @@ struct PersistedEvidence {
     accused: Vec<NodeId>,
 }
 
+/// One observed attestation plus the wall-clock time it was first seen,
+/// used for time-based retention of the observation window.
+#[derive(Clone)]
+struct HeadEntry {
+    att: ObservedAttestation,
+    seen_ms: u64,
+}
+
 /// Per-scope observation window plus an LRU stamp for scope eviction.
 #[derive(Default)]
 struct ScopeState {
     /// Observed attestations indexed by exact frontier HLC.
-    heads: BTreeMap<HlcTimestamp, ObservedAttestation>,
+    heads: BTreeMap<HlcTimestamp, HeadEntry>,
+    /// Bounded FIFO of heads that arrived while `heads` was saturated
+    /// (see [`MAX_OVERFLOW_PER_SCOPE`]). Participates in conflict
+    /// detection, `is_known_exact` and gossip; never displaces a `heads`
+    /// resident (flush resistance is preserved).
+    overflow: std::collections::VecDeque<HeadEntry>,
     /// Monotonic touch stamp (from `DetectorState::touch_counter`), bumped
     /// on every observation for this scope. Least-recently-touched scopes
     /// are evicted first when a capacity bound is hit.
@@ -175,6 +234,11 @@ struct DetectorState {
     accused: HashSet<NodeId>,
     /// Conflicts detected beyond `MAX_EVIDENCE_PER_AUTHORITY` (not stored).
     evidence_overflow_total: u64,
+    /// Observations diverted to a scope's overflow FIFO because the main
+    /// head window was saturated with still-live heads — a signal of an
+    /// abnormal head flood (flush or blinding attempt). Never advances
+    /// under honest load.
+    heads_saturated_total: u64,
     /// Monotonic counter feeding `ScopeState::last_touch`.
     touch_counter: u64,
     /// Rotating start position for the evidence share of the gossip sample,
@@ -190,6 +254,7 @@ impl DetectorState {
             evidence: HashMap::new(),
             accused: HashSet::new(),
             evidence_overflow_total: 0,
+            heads_saturated_total: 0,
             touch_counter: 0,
             gossip_evidence_cursor: 0,
         }
@@ -249,6 +314,42 @@ impl DetectorState {
             );
             self.observed.remove(&victim);
         }
+    }
+
+    /// Record a fresh conflict between a previously observed head
+    /// (`first` — from the main window OR the overflow FIFO) and the
+    /// incoming attestation: accuse the authority, store the evidence
+    /// (bounded per authority, overflow counted), and return the pair.
+    fn record_conflict(
+        &mut self,
+        first: ObservedAttestation,
+        frontier: &AckFrontier,
+        sig: &FrontierSignature,
+        now_ms: u64,
+    ) -> EquivocationEvidence {
+        let evidence = EquivocationEvidence {
+            authority_id: frontier.authority_id.clone(),
+            key_range: frontier.key_range.clone(),
+            policy_version: frontier.policy_version,
+            frontier_hlc: frontier.frontier_hlc.clone(),
+            first,
+            second: ObservedAttestation {
+                frontier: frontier.clone(),
+                signature: sig.clone(),
+            },
+            detected_at_ms: now_ms,
+        };
+        self.accused.insert(frontier.authority_id.clone());
+        let entries = self
+            .evidence
+            .entry(frontier.authority_id.clone())
+            .or_default();
+        if entries.len() < MAX_EVIDENCE_PER_AUTHORITY {
+            entries.push(evidence.clone());
+        } else {
+            self.evidence_overflow_total += 1;
+        }
+        evidence
     }
 }
 
@@ -357,30 +458,90 @@ impl EquivocationDetector {
         let touch = state.touch_counter;
 
         // Cloned lookup keeps the borrow short; the clone is needed for the
-        // evidence pair anyway when a conflict is found.
-        let existing = {
+        // evidence pair anyway when a conflict is found. Age out heads older
+        // than the retention window first (wall-clock time, from this node's
+        // clock, is not attacker-controllable) — this is what slides the
+        // window under honest load, so the count cap below only bites under
+        // an abnormal flood. The overflow FIFO ages by the same rule.
+        let cutoff = now_ms.saturating_sub(OBSERVED_RETENTION_MS);
+        let (existing, overflow_hit) = {
             let entry = state.observed.entry(scope.clone()).or_default();
             entry.last_touch = touch;
-            entry.heads.get(&frontier.frontier_hlc).cloned()
+            entry.heads.retain(|_, h| h.seen_ms >= cutoff);
+            entry.overflow.retain(|h| h.seen_ms >= cutoff);
+            let existing = entry
+                .heads
+                .get(&frontier.frontier_hlc)
+                .map(|h| h.att.clone());
+            // Only consulted when the HLC is not resident in the main
+            // window: a head refused during saturation may live here.
+            let overflow_hit = if existing.is_none() {
+                entry
+                    .overflow
+                    .iter()
+                    .find(|h| h.att.frontier.frontier_hlc == frontier.frontier_hlc)
+                    .map(|h| h.att.clone())
+            } else {
+                None
+            };
+            (existing, overflow_hit)
         };
         match existing {
             None => {
-                let entry = state
-                    .observed
-                    .get_mut(&scope)
-                    .expect("scope entry inserted above");
-                entry.heads.insert(
-                    frontier.frontier_hlc.clone(),
-                    ObservedAttestation {
-                        frontier: frontier.clone(),
-                        signature: sig.clone(),
-                    },
-                );
-                // Evict the oldest head once over capacity; conflicts older
-                // than this window can no longer be detected locally (the
-                // documented ~2 minute detection window).
-                while entry.heads.len() > MAX_OBSERVED_PER_SCOPE {
-                    entry.heads.pop_first();
+                // Blinding resistance: a head that was refused by the
+                // saturated main window is still conflict-checked here —
+                // without this, an authority could flood the scope FIRST
+                // and then split-view at a fresh HLC with both halves
+                // refused unrecorded (no evidence, ever).
+                if let Some(prior) = overflow_hit {
+                    if prior.frontier.digest_hash == frontier.digest_hash {
+                        return ObserveOutcome::Consistent;
+                    }
+                    if state.evidence_digest_recorded(
+                        &scope,
+                        &frontier.frontier_hlc,
+                        &frontier.digest_hash,
+                    ) {
+                        return ObserveOutcome::Consistent;
+                    }
+                    let evidence = state.record_conflict(prior, frontier, sig, now_ms);
+                    return ObserveOutcome::Equivocation(Box::new(evidence));
+                }
+                let saturated = {
+                    let entry = state
+                        .observed
+                        .get_mut(&scope)
+                        .expect("scope entry inserted above");
+                    let head = HeadEntry {
+                        att: ObservedAttestation {
+                            frontier: frontier.clone(),
+                            signature: sig.clone(),
+                        },
+                        seen_ms: now_ms,
+                    };
+                    // Keep the newcomer out of the MAIN window when it is
+                    // saturated with still-live heads: evicting a resident
+                    // by HLC/recency would let an authority flush a head it
+                    // plans to contradict by flooding the scope with fresh
+                    // signed heads. A resident head can only leave by aging
+                    // out above, never by displacement. The newcomer goes
+                    // to the bounded overflow FIFO instead, so it still
+                    // detects conflicts, gossips and answers
+                    // `is_known_exact` (see MAX_OVERFLOW_PER_SCOPE).
+                    if entry.heads.len() >= MAX_OBSERVED_PER_SCOPE {
+                        if entry.overflow.len() >= MAX_OVERFLOW_PER_SCOPE {
+                            entry.overflow.pop_front();
+                        }
+                        entry.overflow.push_back(head);
+                        true
+                    } else {
+                        entry.heads.insert(frontier.frontier_hlc.clone(), head);
+                        false
+                    }
+                };
+                if saturated {
+                    state.heads_saturated_total += 1;
+                    return ObserveOutcome::Saturated;
                 }
                 ObserveOutcome::FirstSeen
             }
@@ -400,28 +561,7 @@ impl EquivocationDetector {
                     // Already recorded — a gossip echo of a known conflict.
                     return ObserveOutcome::Consistent;
                 }
-                let evidence = EquivocationEvidence {
-                    authority_id: frontier.authority_id.clone(),
-                    key_range: frontier.key_range.clone(),
-                    policy_version: frontier.policy_version,
-                    frontier_hlc: frontier.frontier_hlc.clone(),
-                    first: existing,
-                    second: ObservedAttestation {
-                        frontier: frontier.clone(),
-                        signature: sig.clone(),
-                    },
-                    detected_at_ms: now_ms,
-                };
-                state.accused.insert(frontier.authority_id.clone());
-                let entries = state
-                    .evidence
-                    .entry(frontier.authority_id.clone())
-                    .or_default();
-                if entries.len() < MAX_EVIDENCE_PER_AUTHORITY {
-                    entries.push(evidence.clone());
-                } else {
-                    state.evidence_overflow_total += 1;
-                }
+                let evidence = state.record_conflict(existing, frontier, sig, now_ms);
                 ObserveOutcome::Equivocation(Box::new(evidence))
             }
         }
@@ -436,11 +576,16 @@ impl EquivocationDetector {
     pub fn is_known_exact(&self, frontier: &AckFrontier) -> bool {
         let scope = ObsScope::of(frontier);
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .observed
-            .get(&scope)
+        let scope_state = state.observed.get(&scope);
+        scope_state
             .and_then(|m| m.heads.get(&frontier.frontier_hlc))
-            .is_some_and(|obs| obs.frontier.digest_hash == frontier.digest_hash)
+            .is_some_and(|obs| obs.att.frontier.digest_hash == frontier.digest_hash)
+            || scope_state.is_some_and(|m| {
+                m.overflow.iter().any(|h| {
+                    h.att.frontier.frontier_hlc == frontier.frontier_hlc
+                        && h.att.frontier.digest_hash == frontier.digest_hash
+                })
+            })
             || state.evidence_digest_recorded(&scope, &frontier.frontier_hlc, &frontier.digest_hash)
     }
 
@@ -480,6 +625,15 @@ impl EquivocationDetector {
     pub fn evidence_overflow_total(&self) -> u64 {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.evidence_overflow_total
+    }
+
+    /// Number of observations diverted to an overflow FIFO because a scope's
+    /// main head window was saturated with still-live heads. Stays at zero
+    /// under honest load; a rising value indicates an abnormal head flood
+    /// (possible flush or blinding attempt).
+    pub fn heads_saturated_total(&self) -> u64 {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.heads_saturated_total
     }
 
     /// Build the split-view gossip sample attached to outgoing frontier
@@ -552,11 +706,15 @@ impl EquivocationDetector {
             state.gossip_evidence_cursor = (start + used) % evidence.len();
         }
 
-        // (b) Round-robin across scopes, newest observation first.
+        // (b) Round-robin across scopes, newest observation first. The
+        // overflow FIFO trails the main window (newest first as well):
+        // heads refused during a saturation flood must still propagate,
+        // or a split view delivered under saturation could never be
+        // cross-detected by peers.
         let mut cursors: Vec<_> = state
             .observed
             .values()
-            .map(|m| m.heads.values().rev())
+            .map(|m| m.heads.values().rev().chain(m.overflow.iter().rev()))
             .collect();
         while out.len() < max {
             let mut progressed = false;
@@ -565,7 +723,7 @@ impl EquivocationDetector {
                     break;
                 }
                 if let Some(obs) = cursor.next() {
-                    push(obs, &mut out);
+                    push(&obs.att, &mut out);
                     progressed = true;
                 }
             }
@@ -848,8 +1006,8 @@ mod tests {
         let signer = make_signer("auth-1", 5);
         let det = EquivocationDetector::new(None);
 
-        // Fill one scope beyond capacity: oldest HLC gets evicted.
-        for i in 0..(MAX_OBSERVED_PER_SCOPE as u64 + 1) {
+        // Fill one scope exactly to capacity — all heads live (same NOW_MS).
+        for i in 0..(MAX_OBSERVED_PER_SCOPE as u64) {
             let f = make_frontier("auth-1", "user/", 1, 1_000 + i, 0, &format!("d{i}"));
             let (f, s) = signed(&signer, &f);
             assert!(matches!(
@@ -857,9 +1015,23 @@ mod tests {
                 ObserveOutcome::FirstSeen
             ));
         }
-        // The evicted (oldest) head re-observes as FirstSeen, not Consistent.
+        // One more distinct head while saturated with live heads is kept out
+        // of the MAIN window, NOT admitted by evicting a resident head —
+        // this is the flush-resistance property. The counter records it.
+        let overflow = make_frontier("auth-1", "user/", 1, 5_000, 0, "dN");
+        let (of, os) = signed(&signer, &overflow);
+        assert!(matches!(
+            det.observe(&of, &os, NOW_MS),
+            ObserveOutcome::Saturated
+        ));
+        assert_eq!(det.heads_saturated_total(), 1);
+        // The oldest resident head is retained (not flushed by the flood)...
         let oldest = make_frontier("auth-1", "user/", 1, 1_000, 0, "d0");
-        assert!(!det.is_known_exact(&oldest));
+        assert!(det.is_known_exact(&oldest));
+        // ...and the kept-out newcomer is STILL tracked (overflow window):
+        // dropping it unrecorded would open the pre-saturation blinding
+        // attack (both halves of a split view refused, no evidence ever).
+        assert!(det.is_known_exact(&overflow));
 
         // Future-skew guard.
         let future = make_frontier(
@@ -925,6 +1097,135 @@ mod tests {
                 .iter()
                 .any(|ev| ev.frontier_hlc.physical == 3_000)
         );
+    }
+
+    #[test]
+    fn flush_resistant_eviction() {
+        // A compromised authority must not be able to flush a specific head
+        // it plans to contradict by flooding the scope with fresh signed
+        // heads. Concretely: observe (H, D1); flood MAX_OBSERVED_PER_SCOPE
+        // distinct newer heads (all live); then present the conflicting
+        // (H, D2). The conflict must still be detected.
+        let signer = make_signer("auth-1", 9);
+        let det = EquivocationDetector::new(None);
+
+        let victim1 = make_frontier("auth-1", "user/", 1, 1_000, 0, "D1");
+        let (vf, vs) = signed(&signer, &victim1);
+        assert!(matches!(
+            det.observe(&vf, &vs, NOW_MS),
+            ObserveOutcome::FirstSeen
+        ));
+
+        // Flood with fresh heads at higher HLCs, all within the retention
+        // window (same NOW_MS). Under the old pop_first() eviction these
+        // would flush the victim head; now they are refused once the window
+        // saturates, leaving the victim resident.
+        for i in 0..(MAX_OBSERVED_PER_SCOPE as u64 * 2) {
+            let f = make_frontier("auth-1", "user/", 1, 2_000 + i, 0, &format!("flood{i}"));
+            let (f, s) = signed(&signer, &f);
+            let _ = det.observe(&f, &s, NOW_MS);
+        }
+        assert!(det.heads_saturated_total() > 0, "flood should saturate");
+        assert!(
+            det.is_known_exact(&victim1),
+            "victim head must survive the flood"
+        );
+
+        // The conflicting digest at the same HLC is still caught as evidence.
+        let victim2 = make_frontier("auth-1", "user/", 1, 1_000, 0, "D2");
+        let (v2f, v2s) = signed(&signer, &victim2);
+        assert!(matches!(
+            det.observe(&v2f, &v2s, NOW_MS),
+            ObserveOutcome::Equivocation(_)
+        ));
+        assert!(det.is_accused(&node("auth-1")));
+    }
+
+    /// Pre-saturation blinding regression (re-review): a compromised
+    /// authority floods the scope's main window with junk heads FIRST,
+    /// then signs two conflicting heads at a fresh HLC. Under the old
+    /// refusal design both halves were dropped unrecorded — is_known_exact
+    /// stayed false and no evidence could ever form. The overflow FIFO
+    /// must record the first refused half so the second one is caught.
+    #[test]
+    fn saturation_blinding_attack_still_detected() {
+        let signer = make_signer("auth-1", 20);
+        let det = EquivocationDetector::new(None);
+
+        // Saturate the main window with junk (all live at NOW_MS).
+        for i in 0..(MAX_OBSERVED_PER_SCOPE as u64) {
+            let f = make_frontier("auth-1", "user/", 1, 1_000 + i, 0, &format!("junk{i}"));
+            let (f, s) = signed(&signer, &f);
+            assert!(matches!(
+                det.observe(&f, &s, NOW_MS),
+                ObserveOutcome::FirstSeen
+            ));
+        }
+
+        // First half of the split view arrives while saturated: diverted
+        // to the overflow FIFO (Saturated), but still tracked.
+        let h_d1 = make_frontier("auth-1", "user/", 1, 4_000, 0, "D1");
+        let (f1, s1) = signed(&signer, &h_d1);
+        assert!(matches!(
+            det.observe(&f1, &s1, NOW_MS),
+            ObserveOutcome::Saturated
+        ));
+        assert!(det.is_known_exact(&h_d1), "refused head must be recorded");
+
+        // An echo of the recorded overflow head is consistent, not a
+        // second refusal.
+        assert!(matches!(
+            det.observe(&f1, &s1, NOW_MS),
+            ObserveOutcome::Consistent
+        ));
+
+        // The overflow head rides the gossip lane so a peer that saw the
+        // OTHER half can cross-detect the split view.
+        let gossiped = det.gossip_summaries(1_000);
+        assert!(
+            gossiped.iter().any(|o| o.frontier.digest_hash == "D1"),
+            "overflow heads must gossip"
+        );
+
+        // Second, conflicting half at the exact same HLC: evidence.
+        let h_d2 = make_frontier("auth-1", "user/", 1, 4_000, 0, "D2");
+        let (f2, s2) = signed(&signer, &h_d2);
+        let ObserveOutcome::Equivocation(ev) = det.observe(&f2, &s2, NOW_MS) else {
+            panic!("a conflicting head during saturation must be detected");
+        };
+        assert_eq!(ev.first.frontier.digest_hash, "D1");
+        assert_eq!(ev.second.frontier.digest_hash, "D2");
+        assert!(det.is_accused(&node("auth-1")));
+    }
+
+    #[test]
+    fn retention_window_slides_by_wall_clock() {
+        // Heads older than the retention window are dropped by wall clock,
+        // so a long-running honest scope keeps admitting new heads without
+        // ever hitting the saturation cap.
+        let signer = make_signer("auth-1", 10);
+        let det = EquivocationDetector::new(None);
+
+        // An old head observed at t0.
+        let old = make_frontier("auth-1", "user/", 1, 1_000, 0, "old");
+        let (of, os) = signed(&signer, &old);
+        let t0 = 1_000_000u64;
+        assert!(matches!(
+            det.observe(&of, &os, t0),
+            ObserveOutcome::FirstSeen
+        ));
+
+        // A new head observed well past the retention window ages out the old
+        // one, so it is no longer known locally (documented window expiry).
+        let new = make_frontier("auth-1", "user/", 1, 2_000, 0, "new");
+        let (nf, ns) = signed(&signer, &new);
+        let t1 = t0 + OBSERVED_RETENTION_MS + 1;
+        assert!(matches!(
+            det.observe(&nf, &ns, t1),
+            ObserveOutcome::FirstSeen
+        ));
+        assert!(!det.is_known_exact(&old), "old head should have aged out");
+        assert!(det.is_known_exact(&new));
     }
 
     #[test]

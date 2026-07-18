@@ -19,7 +19,7 @@ use crate::authority::bls::{BlsPublicKey, BlsSignature};
 use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{EpochConfig, KeysetRegistry};
 use crate::authority::equivocation::{
-    EquivocationDetector, MAX_OBSERVED_PER_REQUEST, ObserveOutcome,
+    EquivocationDetector, MAX_FRONTIERS_PER_REQUEST, MAX_OBSERVED_PER_REQUEST, ObserveOutcome,
 };
 use crate::control_plane::consensus::ControlPlaneConsensus;
 use crate::control_plane::raft::types::{AuthoritySpec, PolicySpec};
@@ -554,7 +554,7 @@ pub async fn post_internal_frontiers(
                 // Without a registry, relayed observations cannot be
                 // verified — and unverifiable pairs must never become
                 // evidence (they could frame an honest authority).
-                for frontier in frontiers {
+                for frontier in frontiers.into_iter().take(MAX_FRONTIERS_PER_REQUEST) {
                     if state.require_signed_frontiers {
                         // Strict mode without a registry must fail closed:
                         // there is no key material to verify any signature,
@@ -583,7 +583,7 @@ pub async fn post_internal_frontiers(
                 let current_epoch = state
                     .current_epoch
                     .load(std::sync::atomic::Ordering::Relaxed);
-                for frontier in frontiers {
+                for frontier in frontiers.into_iter().take(MAX_FRONTIERS_PER_REQUEST) {
                     let signature = signatures.next().flatten();
                     if !is_range_authority(&frontier) {
                         tracing::warn!(
