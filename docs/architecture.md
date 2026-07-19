@@ -432,6 +432,64 @@ digest の材料に関する設計判断:
 `apply_complete_state` を共用し、意味論の分岐を構造的に防ぐ）。
 digest 交換が失敗した場合は何も採用しない（fail-closed、false success なし）。
 
+#### 増分 digest キャッシュ（M-7）
+
+M-7 以前は digest 交換のたびに（発信側 pull/push、応答側とも）ストア全体を
+ロック保持のままディープクローンし、全キーを SHA-256 再計算していた
+（サイクル毎・ピア毎・双方向で O(N)、クラスタ全体では実質 O(N²) 級）。
+現在は `Store` が増分 digest キャッシュ（`store::digest::DigestCache`、
+`#[serde(skip)]` なので永続化形式・wire 形式は不変）を内蔵する:
+
+- **dirty 追跡（INV-1）**: `data` を変異させ得る Store メソッド全 6 個
+  （`get_mut` / `put` / `put_with_timestamp` / `delete` / `merge_value` /
+  `merge_delta_value`）が同一呼び出し内で `note_dirty` を呼ぶ。
+  `merge_value` の `Ok(false)`（no-op マージ）だけは「物理不変」契約に
+  基づき dirty にしない — M-6 の RR ゲート（収束済みキーは再スタンプ
+  されない）と合わせて、**収束済み定常状態の digest 交換はクラスタ全体で
+  クローン 0・ハッシュ 0** になる。GC sweep の floor 前進（scheme v2 の
+  digest 対象）も `get_mut` 経由で一点被覆される。
+- **増分 refresh**: `Store::digest()` は dirty キーの値だけを再ハッシュし、
+  影響バケットをキャッシュ済み per-key digest（32B）から再結合して root を
+  再計算する。結果は常に `compute_store_digest` とビット同一（debug ビルド
+  は毎 refresh でアサート、golden テストはキャッシュ経由でも凍結値を検証）。
+- **mutation generation（INV-2/INV-5）**: すべての `note_dirty` は世代
+  カウンタを無条件にインクリメントする。「ロック下で読んだ世代が後の
+  ロック下でも不変」⟺「その間 data は物理不変」。ロック外で計算した
+  結果は「キー単位の全か無か」で採用する: 世代一致なら全採用、不一致でも
+  capture window（取得時に開き、以降に変異した**全キー**を invalid 中も
+  追跡する窓）が完全なら取得時点の結果を採用して窓内キーだけを dirty の
+  まま残す（非 dirty キーの meta は常に最新 = 偽一致ゼロは不変）。窓が
+  溢れた場合（`DIRTY_COLLAPSE_MAX` 超の churn）や別 capture に置換された
+  場合は**全破棄**。push の不一致バケット抽出の証拠前進は従来どおり
+  世代完全一致のみ。
+- **warm-up プロトコル**: デシリアライズ直後（キャッシュ invalid）や
+  inline 予算（`REFRESH_INLINE_MAX = 512` dirty キー）超過時は、sync
+  サイクル冒頭の `ensure_digest_warm` がロック外 `spawn_blocking` で
+  ハッシュし上記の窓検証付きで採用する（最大 2 試行）。継続書き込み下の
+  大ストア再起動でも窓採用により通常 1 試行で warm 化し、捨てフルクローン
+  +フルハッシュを毎サイクル払い続けることはない。失敗時（極端な churn
+  のみ）は従来どおりのスナップショット経路にフォールバック — 挙動・
+  digest 値とも M-7 以前と同一。
+- **push 再ロック時の cold ガード**: probe RTT 窓中に inline 予算超の
+  書き込みバーストが入った場合、push の再ロック `digest()` はロック内
+  大量ハッシュになり得るため実行せず、そのサイクルの subset push を
+  スキップする（cold 化は世代移動を含意するので証拠はどのみち進められ
+  ない — 安全方向、次サイクルの warm-up 後に再試行）。
+- **push 証拠の意味論**: probe は T0 digest を比較するため、
+  `push_frontiers` / `push_acked_wall_ms`（tombstone GC のピアゲート証拠）
+  は「送った内容が T0 そのものだと証明できた場合」のみ (frontier_T0,
+  wall0) に前進する。warm 経路で probe と抽出の間に書き込みが入った場合、
+  新しいデータは送る（CRDT マージは常に無害）が証拠は据え置く（安全方向:
+  GC ゲートが遅れるだけで、静穏後の root 一致 probe が前進させる）。
+- **応答側**: handler も warm なら単一ロックスコープで応答し、root 一致は
+  O(1)（クローン 0・timestamps 構築 0）、不一致は該当バケットのみ
+  `clone_bucket_entries` で抽出する。cold（再起動直後など）は従来経路の
+  ままで応答はビット同一。
+
+常駐コストは per-key メタ（キー 1 重複製 + 33B/キー）。効果の実測は
+`benches/digest_bench.rs`（legacy クローン+全ハッシュ vs cached d=0 /
+d∈{1,64,1024}）を参照。
+
 #### ローリングアップグレード安全性
 
 旧ノードは `/api/internal/sync/digest` に 404 を返す。要求側はこれを

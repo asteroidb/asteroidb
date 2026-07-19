@@ -106,3 +106,7 @@ harness = false
 [[bench]]
 name = "compaction_bench"
 harness = false
+
+[[bench]]
+name = "digest_bench"
+harness = false

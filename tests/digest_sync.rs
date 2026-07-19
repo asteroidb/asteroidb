@@ -1917,3 +1917,274 @@ async fn legacy_full_sync_records_pull_reconciliation_evidence() {
         "a clean legacy full-dump pull must record inbound reconciliation evidence"
     );
 }
+
+// ===========================================================================
+// M-7: incremental digest cache — push-evidence semantics and
+// cold/warm handler equivalence
+// ===========================================================================
+
+/// Push side, root match (M-7 T21): the probe advances the T0-coupled
+/// push evidence (`push_acked_wall_ms`) without any relock, stamped no
+/// earlier than the pre-probe wall clock.
+#[tokio::test]
+async fn runner_digest_push_root_match_records_push_evidence() {
+    let server = test_state("server");
+    let (addr, server_handle) = serve(router(server.clone())).await;
+
+    let mut harness = runner_against(&addr.to_string(), true).await;
+    {
+        let mut api = harness.local_api.lock().await;
+        for i in 0..10 {
+            api.eventual_counter_inc(&format!("k-{i}")).unwrap();
+        }
+    }
+    mirror_api(&harness.local_api, &server.eventual).await;
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(0, 0, ""));
+
+    let before_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let metrics_check = harness.metrics.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let m = metrics_check.clone();
+        async move { m.digest_push_match_total.load(Ordering::Relaxed) > 0 }
+    })
+    .await;
+    server_handle.abort();
+
+    let acked = runner
+        .push_acked_for(&addr.to_string())
+        .expect("a probe root match must record push evidence");
+    assert!(
+        acked >= before_ms,
+        "push evidence must be stamped at probe start ({acked} >= {before_ms})"
+    );
+}
+
+/// Push side, mismatch with a stable generation (M-7 T22): the warm-path
+/// extraction proves the store still IS the probed T0 state, sends
+/// exactly the mismatched buckets, and advances the push evidence.
+#[tokio::test]
+async fn runner_digest_push_subset_stable_generation_advances_push_evidence() {
+    let server = test_state("server");
+    let (addr, server_handle) = serve(router(server.clone())).await;
+
+    let mut harness = runner_against(&addr.to_string(), true).await;
+    {
+        let mut api = harness.local_api.lock().await;
+        for i in 0..15 {
+            api.eventual_counter_inc(&format!("shared-{i}")).unwrap();
+        }
+    }
+    mirror_api(&harness.local_api, &server.eventual).await;
+    {
+        let mut api = harness.local_api.lock().await;
+        for i in 0..5 {
+            api.eventual_register_set(&format!("localonly-{i}"), format!("v{i}"))
+                .unwrap();
+        }
+    }
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(0, 0, ""));
+
+    let metrics_check = harness.metrics.clone();
+    let server_check = server.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let m = metrics_check.clone();
+        let srv = server_check.clone();
+        async move {
+            let api = srv.eventual.lock().await;
+            m.digest_push_keys_pushed_total.load(Ordering::Relaxed) > 0
+                && (0..5).all(|i| api.get_eventual(&format!("localonly-{i}")).is_some())
+        }
+    })
+    .await;
+    server_handle.abort();
+
+    assert!(
+        runner.push_acked_for(&addr.to_string()).is_some(),
+        "a clean subset push at an unchanged generation must record push evidence"
+    );
+}
+
+/// Router whose digest route FIRST injects a write into `victim` (the
+/// prober's own store) and then answers with the real handler — a
+/// deterministic mutation in the probe→extraction window.
+fn write_injecting_router(state: Arc<AppState>, victim: Arc<Mutex<EventualApi>>) -> axum::Router {
+    use asteroidb_poc::http::handlers::{internal_digest_sync, internal_sync};
+    use axum::extract::State;
+    use axum::routing::post;
+    let inject_state = state.clone();
+    axum::Router::new()
+        .route("/api/internal/sync", post(internal_sync))
+        .route(
+            "/api/internal/sync/digest",
+            post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let victim = victim.clone();
+                    let state = inject_state.clone();
+                    async move {
+                        {
+                            let mut api = victim.lock().await;
+                            api.eventual_counter_inc("concurrent-write").unwrap();
+                        }
+                        internal_digest_sync(State(state), headers, body).await
+                    }
+                },
+            ),
+        )
+        .with_state(state)
+}
+
+/// Push side, mismatch with a MOVED generation (M-7 T23, the F2
+/// regression): a local write lands between the probe and the
+/// extraction. The (fresher) data is still pushed — a CRDT merge of
+/// newer state is always safe — but the T0-coupled push evidence is
+/// withheld, because what was sent is no longer provably the probed
+/// snapshot.
+#[tokio::test]
+async fn runner_digest_push_concurrent_local_write_withholds_push_evidence() {
+    let server = test_state("server");
+    let mut harness_placeholder = None;
+
+    // Build the runner first so the injecting router can capture its
+    // local store.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = runner_against(&addr.to_string(), true).await;
+    let app = write_injecting_router(server.clone(), harness.local_api.clone());
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness_placeholder.replace(harness);
+    let mut harness = harness_placeholder.take().unwrap();
+
+    {
+        let mut api = harness.local_api.lock().await;
+        for i in 0..10 {
+            api.eventual_register_set(&format!("localonly-{i}"), format!("v{i}"))
+                .unwrap();
+        }
+    }
+    harness
+        .runner
+        .inject_peer_frontier(&addr.to_string(), hlc(0, 0, ""));
+
+    let metrics_check = harness.metrics.clone();
+    let server_check = server.clone();
+    let runner = run_until_owned(harness.runner, move || {
+        let m = metrics_check.clone();
+        let srv = server_check.clone();
+        async move {
+            let api = srv.eventual.lock().await;
+            m.digest_push_keys_pushed_total.load(Ordering::Relaxed) > 0
+                && api.get_eventual("localonly-0").is_some()
+        }
+    })
+    .await;
+    server_handle.abort();
+
+    // Data flowed (convergence unharmed) …
+    {
+        let api = server.eventual.lock().await;
+        assert!(api.get_eventual("localonly-0").is_some());
+    }
+    // … but the evidence stayed put: every probe raced with the
+    // injected write, so no (frontier_T0, wall0) pair was provable.
+    assert!(
+        runner.push_acked_for(&addr.to_string()).is_none(),
+        "a generation race must withhold push evidence (F2 regression)"
+    );
+}
+
+/// M-7 T26–T28: the handler's warm (cached) and cold (legacy snapshot)
+/// paths must answer FIELD-IDENTICALLY for the same store state — for a
+/// root match, and for a mismatch with a bucket-subset transfer.
+#[tokio::test]
+async fn digest_endpoint_cold_and_warm_paths_answer_identically() {
+    // Warm server: state built through the write API (cache warm).
+    let warm = test_state("server");
+    {
+        let mut api = warm.eventual.lock().await;
+        for i in 0..20 {
+            api.eventual_counter_inc(&format!("key-{i}")).unwrap();
+        }
+        api.eventual_set_add("team", "alice".into()).unwrap();
+        api.eventual_set_remove("team", "alice").unwrap();
+        assert!(!api.store().digest_is_cold(), "warm server must be warm");
+    }
+
+    // Cold twin: byte-identical store state, but round-tripped through
+    // serde so the digest cache starts invalid (the pre-warm-up state
+    // after a restart).
+    let cold = test_state("server");
+    {
+        let json = {
+            let api = warm.eventual.lock().await;
+            serde_json::to_string(api.store()).unwrap()
+        };
+        let mut api = cold.eventual.lock().await;
+        *api.store_mut() = serde_json::from_str(&json).unwrap();
+        assert!(api.store().digest_is_cold(), "cold twin must be cold");
+    }
+
+    let warm_app = router(warm.clone());
+    let cold_app = router(cold.clone());
+
+    // (a) Mismatch + transfer: requester holds a subset.
+    let requester = test_state("requester");
+    {
+        let warm_api = warm.eventual.lock().await;
+        let mut req_api = requester.eventual.lock().await;
+        for (k, v) in warm_api.store().all_entries().take(10) {
+            req_api.merge_remote(k.clone(), v).unwrap();
+        }
+    }
+    let digest = compute_store_digest(&snapshot_data(&requester).await);
+    let req = DigestSyncRequest::from_digest("requester", &digest, true);
+
+    let (_, warm_resp) = post_digest_request(&warm_app, &req).await;
+    let (_, cold_resp) = post_digest_request(&cold_app, &req).await;
+    let (warm_resp, cold_resp) = (warm_resp.unwrap(), cold_resp.unwrap());
+
+    assert!(warm_resp.scheme_ok && cold_resp.scheme_ok);
+    assert_eq!(warm_resp.root_matched, cold_resp.root_matched);
+    assert!(!warm_resp.root_matched);
+    assert_eq!(warm_resp.mismatched_buckets, cold_resp.mismatched_buckets);
+    assert_eq!(warm_resp.entries, cold_resp.entries);
+    assert_eq!(warm_resp.timestamps, cold_resp.timestamps);
+    assert_eq!(warm_resp.frontier, cold_resp.frontier);
+    assert_eq!(warm_resp.applied_origins, cold_resp.applied_origins);
+    assert_eq!(warm_resp.visible_origins, cold_resp.visible_origins);
+    {
+        let mut w = warm_resp.merge_failed_keys.clone();
+        let mut c = cold_resp.merge_failed_keys.clone();
+        w.sort();
+        c.sort();
+        assert_eq!(w, c);
+    }
+    assert_eq!(warm_resp.total_keys, cold_resp.total_keys);
+    assert!(!warm_resp.entries.is_empty(), "subset transfer expected");
+
+    // (b) Root match: requester mirrors the full state.
+    let mirror = test_state("mirror");
+    mirror_state(&warm, &mirror.eventual).await;
+    let digest = compute_store_digest(&snapshot_data(&mirror).await);
+    let req = DigestSyncRequest::from_digest("mirror", &digest, true);
+
+    let (_, warm_resp) = post_digest_request(&warm_app, &req).await;
+    let (_, cold_resp) = post_digest_request(&cold_app, &req).await;
+    let (warm_resp, cold_resp) = (warm_resp.unwrap(), cold_resp.unwrap());
+    assert!(warm_resp.root_matched, "identical states must root-match");
+    assert!(cold_resp.root_matched, "cold path must root-match too");
+    assert!(warm_resp.entries.is_empty() && cold_resp.entries.is_empty());
+    assert_eq!(warm_resp.frontier, cold_resp.frontier);
+    assert_eq!(warm_resp.applied_origins, cold_resp.applied_origins);
+    assert_eq!(warm_resp.total_keys, cold_resp.total_keys);
+}

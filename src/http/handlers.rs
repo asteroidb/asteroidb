@@ -1639,8 +1639,91 @@ pub async fn internal_digest_sync(
         return internal_response(&DigestSyncResponse::default(), accept);
     }
 
-    // Single-lock-scope snapshot: digest material, entries, frontier and
-    // session claims must all describe exactly the same state T0.
+    // Warm path (M-7): the store's incremental digest cache answers in
+    // ONE lock scope with no data clone, no timestamps rebuild and no
+    // O(N) hashing — a root match is O(1). The single-lock-scope
+    // invariant is preserved verbatim: digest, frontier, session claims
+    // (and, on mismatch, the transferred bucket entries) all describe
+    // exactly the same state T0, which is what makes the requester's
+    // adoption of `applied_origins` sound.
+    {
+        let mut api = state.eventual.lock().await;
+        if !api.store().digest_is_cold() {
+            let local = api.store_mut().digest();
+            let store = api.store();
+            let total_keys = local.total_keys;
+            let frontier = store.current_frontier();
+            let applied_origins = store.applied_origins().clone();
+            let merge_failed_keys: Vec<String> =
+                store.merge_failed_keys().iter().cloned().collect();
+            let visible_origins = store.visible_origins().clone();
+
+            if req.root.as_slice() == local.root {
+                drop(api);
+                return internal_response(
+                    &DigestSyncResponse {
+                        scheme_ok: true,
+                        root_matched: true,
+                        frontier,
+                        applied_origins,
+                        visible_origins,
+                        merge_failed_keys,
+                        total_keys,
+                        ..DigestSyncResponse::default()
+                    },
+                    accept,
+                );
+            }
+
+            let remote: Vec<(u16, [u8; DIGEST_LEN])> = req
+                .buckets
+                .iter()
+                .map(|b| {
+                    let mut digest = [0u8; DIGEST_LEN];
+                    digest.copy_from_slice(&b.digest);
+                    (b.index, digest)
+                })
+                .collect();
+            let mismatched = mismatched_buckets(&local, &remote);
+
+            let (entries, timestamps) = if req.include_entries {
+                let mismatched_set: std::collections::HashSet<u16> =
+                    mismatched.iter().copied().collect();
+                // Bucket-subset clone via the cache's bucket index (the
+                // cache is clean right after `digest()` above): only the
+                // transferred keys are cloned, no key is re-hashed.
+                store.clone_bucket_entries(&mismatched_set)
+            } else {
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            };
+            drop(api);
+
+            return internal_response(
+                &DigestSyncResponse {
+                    scheme_ok: true,
+                    root_matched: false,
+                    mismatched_buckets: mismatched,
+                    entries,
+                    timestamps,
+                    frontier,
+                    applied_origins,
+                    visible_origins,
+                    merge_failed_keys,
+                    total_keys,
+                },
+                accept,
+            );
+        }
+    }
+
+    // Cold cache (fresh deserialize before the first sync-cycle warm-up,
+    // or a dirty burst beyond the inline budget): the pre-M-7 legacy
+    // path, bit-identical responses. Single-lock-scope snapshot: digest
+    // material, entries, frontier and session claims must all describe
+    // exactly the same state T0.
     let api = state.eventual.lock().await;
     let store = api.store();
     let data: std::collections::BTreeMap<String, CrdtValue> = store

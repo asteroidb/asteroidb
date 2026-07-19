@@ -13,7 +13,7 @@
 1. ~~**M-8**(最優先)— tombstone GC が収束しない問題。~~ **完了**(per-value compaction floor +
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
-3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, M-7)
+3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
 4. 検知範囲・整合(M-12, M-14, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
@@ -155,6 +155,51 @@ API 単体(再スタンプ抑止・untracked 1 回スタンプ・visible 無条�
 - **送信側 RR(`delta_against` 系による真の δ 差分送信)**: 受信側 RR(本対応)は転送量自体は
   減らさない(エコーの吸収と再送ループの停止まで)。送信量削減は別タスク。
 
+## M-7 クローズ記録(実装済み)
+
+**方式(Store 内蔵 dirty バケット増分 DigestCache + generation 検証)**: `Store` に
+`#[serde(skip)]` の `DigestCache`(`src/store/digest.rs`: per-key digest+bucket メタ、dirty 集合、
+mutation generation、invalid フラグ)を内蔵。`data` を変異させ得る全 6 メソッド
+(`get_mut`(Some 時)/ `put` / `put_with_timestamp` / `delete` / `merge_value` /
+`merge_delta_value`)が同一呼び出し内で `note_dirty`(dirty 挿入 + generation 無条件 ++)。
+`merge_value Ok(false)` のみ非 dirty(「物理不変」契約 + debug オラクル + M-6 RR とのシナジー:
+収束済み定常はクラスタ全体でクローン 0・ハッシュ 0)。`Store::digest()` は dirty キーのみ
+再ハッシュ → 影響バケットをキャッシュ済み 32B per-key digest から再結合 → root 再計算し、
+常に `compute_store_digest` とビット同一(debug ビルドは毎 refresh でアサート、golden 3 本
+無修正パス + キャッシュ経由 golden を追加)。ロック外作業(cold リビルド / warm 経路の
+不一致バケット抽出)は「取得時 generation == 適用時 generation」の全か無か検証のみで正当化
+(部分採用 API 不存在 — 設計時に致命指摘された seed_from_full 系の stale meta 汚染を構造的に排除)。
+warm-up は `api::digest_warmup::ensure_digest_warm`(run_sync 冒頭、最大 2 試行、
+`spawn_blocking`、失敗時は従来のスナップショット経路へフォールバックで挙動不変)。
+呼び出し側: `try_digest_pull` は warm 時クローン全廃(`pull_reconciled_wall_ms` 記録条件は不変)、
+`try_digest_push` は root 一致/peer-only 判定を T0 digest の key_counts で再ロックなしに行い、
+不一致時の抽出は generation 一致なら T0 証明済みで証拠前進、不一致なら**データは送るが
+証拠(push_frontiers/push_acked_wall_ms)は据え置き**(安全方向: GC ゲートが待つだけ、
+静穏後の root 一致で自己治癒 — 旧設計の「T1 選別の単調性依存」を撤廃)。handler
+(`internal_digest_sync`)は warm 時に単一ロックスコープで応答(root 一致 O(1)、不一致は
+`clone_bucket_entries` でバケット部分クローンのみ)、cold は従来コードを温存し応答フィールド同一
+(cold/warm 等価性テストで固定)。永続化・wire 形式・スキームバージョンは全て不変。
+
+テスト: kv.rs に無効化条件の全列挙(put/put_with_timestamp/delete 存在・不在/get_mut Some・None/
+merge inflating/no-op/型不一致 Err/merge_delta/メタデータ非 dirty/既 dirty でも generation 前進/
+GC floor 前進)+ ランダム op 列の等価性 + Clone/serde/bincode/WAL replay/migration 経由の
+整合性。digest.rs に digest_pass sink 検証 + キャッシュ経由 golden。digest_warmup.rs に
+採用/全破棄(F1 回帰)/dirty バースト。tests/digest_sync.rs に push 証拠意味論
+(root 一致で前進・安定 generation subset push で前進・並行書き込み時は送るが据え置き(F2 回帰))+
+handler cold/warm フィールド同一性。既存 digest 関連テスト(golden 3 本、digest_sync 27 本、
+delta_sync、GC ライブロック回帰)は全て無修正パス。ベンチ: `benches/digest_bench.rs`
+(N∈{1k,10k,100k} × legacy クローン+全ハッシュ / full hash のみ / cached d=0 / d∈{1,64,1024})。
+
+**派生フォローアップ(未着手の独立タスク)**:
+
+- **M-7-f1** `apply_complete_state`(node_runner.rs)のロック保持 merge ループ — 残る最大の
+  ロック保持区間。store 変異ゆえロック外化不可、チャンク化は完全性転送の原子性意味論に触れるため別タスク。
+- **M-7-f2** legacy full push fallback(digest 経路正常時は不達)のフルクローンは未最適化のまま。
+- **M-7-f3** key_meta の per-bucket 索引化(refresh の O(N) メタ走査と `clone_bucket_entries` の
+  O(N) 走査を O(bucket) に)— ベンチが必要性を示した場合のみ。
+- **M-7-f4** key_meta 常駐メモリ(キー 1 重複製 + 33B/キー)の長大キー × 大 N 環境での監視/上限
+  ドキュメント。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -169,9 +214,8 @@ API 単体(再スタンプ抑止・untracked 1 回スタンプ・visible 無条�
   state ロック下に限られること)は未着手の独立タスク。
 - ~~**M-6**~~ **完了** — 下記「M-6 クローズ記録」参照(RR: no-op 判定による再スタンプ抑止。
   BP は否定的知見として却下記録)。
-- **M-7** `src/runtime/node_runner.rs`(digest sync): サイクル毎・ピア毎・双方向にストア全体をロック保持のまま
-  ディープクローン + 全キー SHA-256 再計算(O(N²))。サイクル内メモ化 + dirty バケット増分更新、
-  最低限ロック外クローン/不要クローン除去。
+- ~~**M-7**~~ **完了** — 下記「M-7 クローズ記録」参照(Store 内蔵 dirty バケット増分 DigestCache +
+  generation 検証)。
 - **M-12** `src/authority/frontier_reporter.rs`: frontier の `digest_hash` が (node_id, HLC) のプレースホルダのため
   データ内容の split-view は原理的に検知不能。将来 store digest(D(k) 集約)へ置換。
   (限界は docs 明記済み。コードは次期対応)

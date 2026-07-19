@@ -33,7 +33,7 @@ use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
 };
 use crate::placement::topology::TopologyView;
-use crate::store::digest::{StoreDigest, bucket_of, compute_store_digest};
+use crate::store::digest::{StoreDigest, digest_pass};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
 /// How long a peer stays cached as digest-unsupported (e.g. an old node
@@ -453,6 +453,48 @@ enum DigestPullOutcome {
     Fallback,
 }
 
+/// Where the local digest for one digest exchange came from (see
+/// [`NodeRunner::local_digest`]). Both variants describe exactly one
+/// store state T0 (digest and frontier from a single lock scope).
+enum LocalDigestSource {
+    /// Read from the store's incremental digest cache: no data clone.
+    /// `generation` is the mutation epoch at T0 — an unchanged reading
+    /// under a later lock proves the store still IS T0, which is what
+    /// lets the push path extract mismatched buckets from the live store
+    /// and still advance T0-coupled evidence (all-or-nothing, M-7).
+    Warm {
+        digest: StoreDigest,
+        frontier: Option<HlcTimestamp>,
+        generation: u64,
+    },
+    /// Legacy cold fallback: full snapshot cloned under the lock, hashed
+    /// off the lock; `buckets[i]` is the bucket of the i-th key of
+    /// `data` in iteration order (captured in the same digest pass, so
+    /// mismatched-bucket filtering needs no per-key re-hash).
+    Snapshot {
+        digest: StoreDigest,
+        frontier: Option<HlcTimestamp>,
+        data: std::collections::BTreeMap<String, crate::store::kv::CrdtValue>,
+        buckets: Vec<u8>,
+    },
+}
+
+impl LocalDigestSource {
+    fn digest(&self) -> &StoreDigest {
+        match self {
+            LocalDigestSource::Warm { digest, .. } => digest,
+            LocalDigestSource::Snapshot { digest, .. } => digest,
+        }
+    }
+
+    fn frontier(&self) -> Option<HlcTimestamp> {
+        match self {
+            LocalDigestSource::Warm { frontier, .. } => frontier.clone(),
+            LocalDigestSource::Snapshot { frontier, .. } => frontier.clone(),
+        }
+    }
+}
+
 /// Outcome of a digest-based push probe (see [`NodeRunner::try_digest_push`]).
 enum DigestPushOutcome {
     /// The probe ran: either the peer already matched (nothing pushed) or
@@ -806,6 +848,19 @@ impl NodeRunner {
     /// `pull_reconciled_wall_ms`).
     pub fn pull_reconciled_for(&self, peer_addr: &str) -> Option<u64> {
         self.pull_reconciled_wall_ms.get(peer_addr).copied()
+    }
+
+    /// Outbound push evidence recorded for a peer, if any (test
+    /// observability for the tombstone-GC peer gate — see
+    /// `push_acked_wall_ms`).
+    pub fn push_acked_for(&self, peer_addr: &str) -> Option<u64> {
+        self.push_acked_wall_ms.get(peer_addr).copied()
+    }
+
+    /// Push frontier recorded for a peer, if any (test observability —
+    /// see `push_frontiers`).
+    pub fn push_frontier_for(&self, peer_addr: &str) -> Option<&HlcTimestamp> {
+        self.push_frontiers.get(peer_addr)
     }
 
     /// Return a reference to the node ID.
@@ -1894,6 +1949,14 @@ impl NodeRunner {
         let Some(eventual_api) = &self.eventual_api else {
             return;
         };
+
+        // Best-effort digest cache warm-up (M-7): move any pending O(N)
+        // digest rebuild OFF the store lock before the per-peer digest
+        // exchanges. Failure is safe — cold exchanges fall back to the
+        // legacy snapshot path and the next cycle retries.
+        if self.config.digest_sync_enabled {
+            let _ = crate::api::digest_warmup::ensure_digest_warm(eventual_api).await;
+        }
 
         let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
@@ -3383,21 +3446,38 @@ impl NodeRunner {
         }
     }
 
-    /// Snapshot the eventual store's data and frontier in ONE lock scope,
-    /// then compute the two-level key-range digest OFF the lock.
+    /// Obtain the local store digest + frontier for one digest exchange.
     ///
-    /// The digest describes exactly the returned `data`/frontier (that
-    /// coupling is what makes the push-side frontier advancement and the
-    /// pull-side claims adoption sound). Hashing is O(total CRDT state
-    /// size), so it runs in `spawn_blocking`; the lock is held only for
-    /// the clone, matching the existing full-push snapshot pattern.
-    async fn snapshot_store_digest(
-        eventual_api: &Arc<Mutex<EventualApi>>,
-    ) -> (
-        StoreDigest,
-        std::collections::BTreeMap<String, crate::store::kv::CrdtValue>,
-        Option<HlcTimestamp>,
-    ) {
+    /// Warm cache (the steady state, thanks to the `run_sync` warm-up and
+    /// the M-6 RR gate): a single lock scope reads the incrementally
+    /// maintained digest, the frontier and the mutation generation —
+    /// ZERO data cloning and (with an empty dirty set) zero hashing.
+    ///
+    /// Cold cache (fresh deserialize before the first warm-up succeeds,
+    /// or a warm-up that lost two generation races): the pre-M-7 legacy
+    /// path, bit-identical digests — snapshot under the lock, hash off
+    /// the lock in `spawn_blocking` — with a per-key bucket index
+    /// captured in the same pass so the push path never re-hashes keys
+    /// for bucket filtering. The cache is left untouched.
+    ///
+    /// Either way the digest and frontier describe exactly ONE state T0
+    /// (that coupling is what makes the push-side evidence advancement
+    /// and the pull-side claims adoption sound).
+    async fn local_digest(eventual_api: &Arc<Mutex<EventualApi>>) -> LocalDigestSource {
+        {
+            let mut api = eventual_api.lock().await;
+            if !api.store().digest_is_cold() {
+                let generation = api.store().digest_generation();
+                let digest = api.store_mut().digest();
+                let frontier = api.store().current_frontier();
+                return LocalDigestSource::Warm {
+                    digest,
+                    frontier,
+                    generation,
+                };
+            }
+        }
+
         let api = eventual_api.lock().await;
         let data: std::collections::BTreeMap<String, crate::store::kv::CrdtValue> = api
             .store()
@@ -3407,14 +3487,51 @@ impl NodeRunner {
         let frontier = api.store().current_frontier();
         drop(api);
 
-        let (digest, data) = tokio::task::spawn_blocking(move || {
-            let digest = compute_store_digest(&data);
-            (digest, data)
+        let (digest, data, buckets) = tokio::task::spawn_blocking(move || {
+            let mut buckets = Vec::with_capacity(data.len());
+            let digest = digest_pass(&data, |_, bucket, _| buckets.push(bucket));
+            (digest, data, buckets)
         })
         .await
         .expect("spawn_blocking panicked");
 
-        (digest, data, frontier)
+        LocalDigestSource::Snapshot {
+            digest,
+            frontier,
+            data,
+            buckets,
+        }
+    }
+
+    /// Extract from a [`LocalDigestSource::Snapshot`] the entries living
+    /// in `mismatched` buckets.
+    ///
+    /// `buckets[i]` MUST be the bucket of the i-th key of `data` in
+    /// iteration order (the positional pairing captured by
+    /// [`local_digest`]'s digest pass) — that is what makes this
+    /// equivalent to the legacy per-key `bucket_of(key)` filter without
+    /// re-hashing any key. Push evidence advanced after sending this
+    /// extract relies on it being exactly the T0 content of those
+    /// buckets, so the pairing is pinned by unit tests and a length
+    /// assert.
+    fn snapshot_bucket_extract(
+        data: std::collections::BTreeMap<String, crate::store::kv::CrdtValue>,
+        buckets: Vec<u8>,
+        mismatched: &std::collections::HashSet<u16>,
+    ) -> Vec<(String, crate::store::kv::CrdtValue)> {
+        assert_eq!(
+            data.len(),
+            buckets.len(),
+            "positional bucket index must cover the snapshot exactly"
+        );
+        data.into_iter()
+            .zip(buckets)
+            .filter_map(|((key, value), bucket)| {
+                mismatched
+                    .contains(&(bucket as u16))
+                    .then_some((key, value))
+            })
+            .collect()
     }
 
     /// Apply a COMPLETE state transfer received from a peer.
@@ -3566,8 +3683,12 @@ impl NodeRunner {
         // (`pull_reconciled_wall_ms`) can never overstate freshness.
         let request_start_wall_ms = crate::hlc::wall_clock_ms();
 
-        let (digest, _data, _frontier) = Self::snapshot_store_digest(eventual_api).await;
-        let request = DigestSyncRequest::from_digest(node_id, &digest, true);
+        // Only the digest is needed here (the peer answers with ITS
+        // entries); the warm path makes this a zero-clone lock scope.
+        let request = {
+            let source = Self::local_digest(eventual_api).await;
+            DigestSyncRequest::from_digest(node_id, source.digest(), true)
+        };
 
         match sync_client.digest_sync(peer_addr, &request).await {
             DigestSyncResult::Ok(resp) if resp.scheme_ok => {
@@ -3712,12 +3833,13 @@ impl NodeRunner {
             .fetch_add(1, Ordering::Relaxed);
 
         let snapshot_wall_ms = crate::hlc::wall_clock_ms();
-        let (digest, data, snapshot_frontier) = Self::snapshot_store_digest(eventual_api).await;
-        let request = DigestSyncRequest::from_digest(node_id, &digest, false);
+        let source = Self::local_digest(eventual_api).await;
+        let request = DigestSyncRequest::from_digest(node_id, source.digest(), false);
 
         match sync_client.digest_sync(peer_addr, &request).await {
             DigestSyncResult::Ok(resp) if resp.scheme_ok => {
                 digest_unsupported.remove(peer_key);
+                let snapshot_frontier = source.frontier();
                 if resp.root_matched {
                     metrics
                         .digest_push_match_total
@@ -3736,17 +3858,22 @@ impl NodeRunner {
 
                 let mismatched: std::collections::HashSet<u16> =
                     resp.mismatched_buckets.iter().copied().collect();
-                let changed: Vec<(String, crate::store::kv::CrdtValue)> = data
-                    .into_iter()
-                    .filter(|(key, _)| mismatched.contains(&(bucket_of(key) as u16)))
-                    .collect();
 
-                if changed.is_empty() {
+                // Decide the peer-only case straight from the T0 digest's
+                // per-bucket key counts — no relock, no data walk.
+                let local_has_keys = mismatched.iter().any(|&bucket| {
+                    source
+                        .digest()
+                        .key_counts
+                        .get(bucket as usize)
+                        .is_some_and(|&count| count > 0)
+                });
+                if !local_has_keys {
                     // Every mismatched bucket is empty on OUR side: the
                     // peer holds data we lack, but everything we hold it
-                    // already has — the snapshot state is fully conveyed,
-                    // so the snapshot frontier may advance. The pull
-                    // phase fetches the peer-only data.
+                    // already has — the T0 state is fully conveyed, so
+                    // the T0 frontier may advance. The pull phase
+                    // fetches the peer-only data.
                     tracing::debug!(
                         peer = %peer_id,
                         "digest push probe: mismatches are peer-only data, nothing to push"
@@ -3756,6 +3883,72 @@ impl NodeRunner {
                         push_frontiers.insert(peer_key.to_string(), frontier);
                     }
                     push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
+                    return DigestPushOutcome::Handled;
+                }
+
+                // Extract the local entries of the mismatched buckets.
+                //
+                // `evidence_valid` is the all-or-nothing guard for the
+                // T0-coupled push evidence: the probe compared the T0
+                // digest, so `push_frontiers` / `push_acked_wall_ms` may
+                // only advance to (frontier_T0, wall0) if what we now
+                // send provably IS the T0 content of those buckets.
+                // - Snapshot source: the extract comes from the T0
+                //   snapshot itself — always valid.
+                // - Warm source: valid iff the mutation generation is
+                //   unchanged (the store still IS T0). Otherwise the
+                //   fresher extract is still sent — a CRDT merge of
+                //   newer state is always safe — but the evidence stays
+                //   put, in the fail-safe direction (the tombstone-GC
+                //   peer gate merely waits; the next quiet probe's root
+                //   match advances it).
+                let (changed, evidence_valid): (Vec<(String, crate::store::kv::CrdtValue)>, bool) =
+                    match source {
+                        LocalDigestSource::Snapshot { data, buckets, .. } => (
+                            Self::snapshot_bucket_extract(data, buckets, &mismatched),
+                            true,
+                        ),
+                        LocalDigestSource::Warm { generation, .. } => {
+                            let mut api = eventual_api.lock().await;
+                            if api.store().digest_is_cold() {
+                                // A write burst larger than the inline
+                                // refresh budget landed during the probe
+                                // RTT: refreshing here would hash O(dirty)
+                                // values — or fully rebuild after a
+                                // collapse — UNDER the lock, stalling all
+                                // reads/writes/syncs. The burst also moved
+                                // the generation, so push evidence could
+                                // not advance anyway: skip this subset
+                                // push; the next cycle re-probes after the
+                                // off-lock warm-up.
+                                drop(api);
+                                tracing::debug!(
+                                    peer = %peer_id,
+                                    "digest push: cache went cold during the probe RTT; \
+                                     skipping subset push this cycle"
+                                );
+                                return DigestPushOutcome::Handled;
+                            }
+                            // Refresh so the bucket index is clean (O(d),
+                            // bounded by the inline budget just checked),
+                            // then check whether anything mutated since T0.
+                            let _ = api.store_mut().digest();
+                            let stable = api.store().digest_generation() == generation;
+                            let (entries, _timestamps) =
+                                api.store().clone_bucket_entries(&mismatched);
+                            drop(api);
+                            (entries.into_iter().collect(), stable)
+                        }
+                    };
+
+                if changed.is_empty() {
+                    // Only reachable when a warm extract raced with
+                    // concurrent mutations that emptied the buckets;
+                    // nothing to send and nothing to prove.
+                    tracing::debug!(
+                        peer = %peer_id,
+                        "digest push: mismatched buckets emptied concurrently, nothing to push"
+                    );
                     return DigestPushOutcome::Handled;
                 }
 
@@ -3774,11 +3967,20 @@ impl NodeRunner {
                             mismatched_buckets = resp.mismatched_buckets.len(),
                             "digest push: pushed mismatched buckets instead of full state"
                         );
-                        if let Some(frontier) = snapshot_frontier {
-                            peer_frontiers.insert(peer_key.to_string(), frontier.clone());
-                            push_frontiers.insert(peer_key.to_string(), frontier);
+                        if evidence_valid {
+                            if let Some(frontier) = snapshot_frontier {
+                                peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                                push_frontiers.insert(peer_key.to_string(), frontier);
+                            }
+                            push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
+                        } else {
+                            tracing::debug!(
+                                peer = %peer_id,
+                                "digest push: store mutated between probe and extraction; \
+                                 data pushed but push evidence withheld (self-healing: a \
+                                 later quiet probe's root match advances it)"
+                            );
                         }
-                        push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                         DigestPushOutcome::Handled
                     }
                     Err(e) => {
@@ -4020,6 +4222,112 @@ mod tests {
         assert!(
             !NodeRunner::digest_sync_allowed(&cache, true, "peer:1"),
             "peer must stay suppressed while the TTL has not elapsed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // local_digest cold fallback (LocalDigestSource::Snapshot) and the
+    // positional bucket extraction used by the push path
+    // -----------------------------------------------------------------
+
+    /// Build an eventual API whose digest cache is COLD at exchange time
+    /// (serde round-trip of the store yields the invalid `serde(skip)`
+    /// default), i.e. the state of a freshly restarted node before its
+    /// first warm-up.
+    fn cold_eventual_api(keys: usize) -> Arc<Mutex<EventualApi>> {
+        let mut api = EventualApi::new(NodeId("cold-node".into()));
+        for i in 0..keys {
+            api.eventual_counter_inc(&format!("cold-key-{i:03}"))
+                .unwrap();
+        }
+        let json = serde_json::to_string(api.store()).unwrap();
+        *api.store_mut() = serde_json::from_str(&json).unwrap();
+        assert!(
+            api.store().digest_is_cold(),
+            "round-trip must leave a cold cache"
+        );
+        Arc::new(Mutex::new(api))
+    }
+
+    /// The runner-side cold fallback must (a) produce the exact
+    /// from-scratch digest and (b) capture a positional bucket index
+    /// aligned with the snapshot's iteration order — the coupling the
+    /// push extraction and its T0 evidence semantics stand on.
+    #[tokio::test]
+    async fn local_digest_cold_snapshot_matches_recompute_and_bucket_index() {
+        let api = cold_eventual_api(64);
+
+        let source = NodeRunner::local_digest(&api).await;
+        let LocalDigestSource::Snapshot {
+            digest,
+            data,
+            buckets,
+            ..
+        } = source
+        else {
+            panic!("a cold cache must take the snapshot fallback");
+        };
+
+        assert_eq!(
+            digest,
+            crate::store::digest::compute_store_digest(&data),
+            "cold-path digest must equal the from-scratch recompute"
+        );
+        assert_eq!(data.len(), buckets.len());
+        for ((key, _), bucket) in data.iter().zip(&buckets) {
+            assert_eq!(
+                *bucket as usize,
+                crate::store::digest::bucket_of(key),
+                "positional bucket index must match bucket_of({key})"
+            );
+        }
+        // The legacy path must leave the cache untouched.
+        assert!(api.lock().await.store().digest_is_cold());
+    }
+
+    /// The zip-based extraction must be equivalent to the legacy
+    /// per-key `bucket_of(key)` filter for an arbitrary mismatched
+    /// bucket set — a regression here would silently push the WRONG
+    /// keys while still advancing T0 push evidence.
+    #[tokio::test]
+    async fn snapshot_bucket_extract_equals_legacy_bucket_of_filter() {
+        let api = cold_eventual_api(64);
+        let LocalDigestSource::Snapshot { data, buckets, .. } =
+            NodeRunner::local_digest(&api).await
+        else {
+            panic!("a cold cache must take the snapshot fallback");
+        };
+
+        // Mismatch the buckets of every third key, plus one bucket that
+        // is guaranteed empty locally (peer-only data).
+        let mut mismatched: std::collections::HashSet<u16> = data
+            .keys()
+            .step_by(3)
+            .map(|key| crate::store::digest::bucket_of(key) as u16)
+            .collect();
+        let occupied: std::collections::HashSet<u16> = data
+            .keys()
+            .map(|key| crate::store::digest::bucket_of(key) as u16)
+            .collect();
+        let empty_bucket = (0..crate::store::digest::DIGEST_BUCKET_COUNT as u16)
+            .find(|bucket| !occupied.contains(bucket))
+            .expect("64 keys cannot fill all 256 buckets");
+        mismatched.insert(empty_bucket);
+
+        let expected: Vec<(String, CrdtValue)> = data
+            .iter()
+            .filter(|(key, _)| mismatched.contains(&(crate::store::digest::bucket_of(key) as u16)))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert!(
+            !expected.is_empty() && expected.len() < data.len(),
+            "the mismatched set must select a proper non-empty subset"
+        );
+
+        let extracted = NodeRunner::snapshot_bucket_extract(data, buckets, &mismatched);
+        assert_eq!(
+            extracted, expected,
+            "positional extraction must equal the legacy bucket_of filter"
         );
     }
 
