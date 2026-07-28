@@ -2219,6 +2219,8 @@ impl NodeRunner {
                 stats.scopes,
                 stats.rejected_unknown_range_total,
                 stats.rejected_version_window_total,
+                stats.stale_version_total,
+                stats.rejected_fenced_total,
                 stats.rejected_scope_cap_total,
                 stats.rejected_authority_cap_total,
                 stats.purged_total,

@@ -197,12 +197,16 @@ enum AdmissionReject {
 /// certification (`resolve_scope`) requires the same exact definition and
 /// placement policy this gate checks, so a rejected scope can never certify
 /// a write. The pool's own caps remain as a backstop.
+///
+/// Returns the range's CURRENT policy version on success, so the caller can
+/// detect stale-but-admissible reports (M-17 observability) without a
+/// second namespace read.
 fn attestation_admissible(
     ns: &SystemNamespace,
     key_range: &KeyRange,
     policy_version: PolicyVersion,
     authority: &NodeId,
-) -> Result<(), AdmissionReject> {
+) -> Result<u64, AdmissionReject> {
     // Exact-prefix lookup: a pending write's key_range always equals some
     // authority definition's key_range verbatim (resolve_scope), so an
     // attestation that does not match a definition exactly can never be
@@ -223,7 +227,7 @@ fn attestation_admissible(
     {
         return Err(AdmissionReject::VersionOutOfWindow { current });
     }
-    Ok(())
+    Ok(current)
 }
 
 /// Point-in-time attestation pool statistics (admission + capacity + purge)
@@ -239,6 +243,17 @@ pub struct AttestationPoolStats {
     /// policy version outside the accepted window around the current
     /// version.
     pub rejected_version_window_total: u64,
+    /// Frontier reports ADMITTED with a policy version behind the range's
+    /// current version (M-17). The earliest visible symptom of a lagging
+    /// authority — an observer with a stale namespace, or a voter on the
+    /// minority side of a partition — fires from the FIRST policy bump,
+    /// before fencing or the admission window drop anything.
+    pub stale_version_total: u64,
+    /// Frontier reports whose (range, version) scope was FENCED: the
+    /// frontier no longer advances and no attestation is pooled, so the
+    /// signer contributes nothing to certification for that scope (M-17;
+    /// previously fully silent).
+    pub rejected_fenced_total: u64,
     /// Attestation inserts rejected by the pool's global scope cap.
     pub rejected_scope_cap_total: u64,
     /// Attestation inserts rejected by the pool's per-authority scope cap.
@@ -281,6 +296,18 @@ pub struct CertifiedApi {
     /// Cumulative attestations rejected at admission for a policy version
     /// outside the accepted window.
     attestation_rejected_version_window_total: u64,
+    /// Cumulative frontier reports admitted with a policy version behind
+    /// the current one (M-17: stale-but-admissible, the first symptom of a
+    /// lagging authority namespace).
+    attestation_stale_version_total: u64,
+    /// Cumulative frontier reports dropped because their scope was fenced
+    /// (M-17: previously a fully silent drop).
+    attestation_rejected_fenced_total: u64,
+    /// Per-(range, authority) wall-clock ms of the last stale-version WARN,
+    /// throttling the log line (not the counter) to ~1/minute per scope.
+    /// Bounded: admission collapses the key space to namespace-defined
+    /// (range, authority) pairs.
+    stale_version_warned_ms: HashMap<(String, String), u64>,
     /// Wall-clock ms of the last cap-pressure stale-scope sweep, used to
     /// throttle sweeps to at most one per checkpoint interval.
     last_stale_prune_ms: u64,
@@ -319,6 +346,9 @@ impl CertifiedApi {
             cert_pending_keys: HashSet::new(),
             attestation_rejected_unknown_range_total: 0,
             attestation_rejected_version_window_total: 0,
+            attestation_stale_version_total: 0,
+            attestation_rejected_fenced_total: 0,
+            stale_version_warned_ms: HashMap::new(),
             last_stale_prune_ms: 0,
             #[cfg(not(target_arch = "wasm32"))]
             wal: None,
@@ -358,6 +388,9 @@ impl CertifiedApi {
             cert_pending_keys: HashSet::new(),
             attestation_rejected_unknown_range_total: 0,
             attestation_rejected_version_window_total: 0,
+            attestation_stale_version_total: 0,
+            attestation_rejected_fenced_total: 0,
+            stale_version_warned_ms: HashMap::new(),
             last_stale_prune_ms: 0,
             wal,
             last_wal_pos: None,
@@ -439,6 +472,9 @@ impl CertifiedApi {
             cert_pending_keys: HashSet::new(),
             attestation_rejected_unknown_range_total: 0,
             attestation_rejected_version_window_total: 0,
+            attestation_stale_version_total: 0,
+            attestation_rejected_fenced_total: 0,
+            stale_version_warned_ms: HashMap::new(),
             last_stale_prune_ms: 0,
             #[cfg(not(target_arch = "wasm32"))]
             wal: None,
@@ -884,13 +920,59 @@ impl CertifiedApi {
             let ns = self.namespace.read().unwrap();
             attestation_admissible(&ns, &key_range, policy_version, &authority_id)
         };
-        if let Err(reject) = admissible {
-            self.note_admission_rejection(&key_range, policy_version, &authority_id, reject);
-            return false;
+        let current = match admissible {
+            Ok(current) => current,
+            Err(reject) => {
+                self.note_admission_rejection(&key_range, policy_version, &authority_id, reject);
+                return false;
+            }
+        };
+        // Stale-but-admissible (M-17): the report is inside the admission
+        // window but behind the current version — the FIRST bump after an
+        // authority's namespace freezes (frozen observer, minority-side
+        // voter) lands here, before fencing or the window reject anything.
+        // The counter always increments; the WARN is throttled per
+        // (range, authority) since a lagging reporter re-reports every tick.
+        if policy_version.0 < current {
+            self.attestation_stale_version_total += 1;
+            if self.scope_warn_allowed(&key_range.prefix, &authority_id, "stale") {
+                tracing::warn!(
+                    authority = %authority_id.0,
+                    key_range = %key_range.prefix,
+                    policy_version = policy_version.0,
+                    current,
+                    "authority is reporting a STALE policy version (behind the \
+                     current one): its namespace is lagging the control plane — \
+                     after the old version is fenced it will stop contributing \
+                     to certification for this range (M-17)"
+                );
+            }
         }
         let fenced = self
             .frontiers
             .is_version_fenced(&frontier.key_range, &frontier.policy_version);
+        if fenced {
+            // Fenced drop (M-17): previously completely silent — the
+            // frontier no longer advances (`AckFrontierSet::update` refuses
+            // fenced scopes) and no attestation is pooled below, so this
+            // authority contributes NOTHING to certification for this
+            // scope. The certification quorum numerator shrinks while the
+            // denominator stays fixed (errs safe); this counter + WARN is
+            // the operator's confirmation that the fence has been reached.
+            self.attestation_rejected_fenced_total += 1;
+            if self.scope_warn_allowed(&key_range.prefix, &authority_id, "fenced") {
+                tracing::warn!(
+                    authority = %authority_id.0,
+                    key_range = %key_range.prefix,
+                    policy_version = policy_version.0,
+                    current,
+                    "dropping frontier report for a FENCED policy version: this \
+                     authority contributes nothing to certification for this scope \
+                     until it reports the current version (lagging namespace? see \
+                     observer pull metrics in /api/control-plane/raft/status)"
+                );
+            }
+        }
         let advanced = self.frontiers.update(frontier);
         if let Some(att) = verified
             && !fenced
@@ -904,6 +986,24 @@ impl CertifiedApi {
             );
         }
         advanced
+    }
+
+    /// Log-throttle gate for the per-scope stale/fenced WARNs (M-17): a
+    /// lagging reporter re-reports every tick, so the counters increment on
+    /// every report but the log line fires at most ~1/minute per
+    /// `(range, authority, lane)`. A backward wall-clock step counts as
+    /// throttle expiry (same posture as the cap-pressure sweep throttle).
+    fn scope_warn_allowed(&mut self, prefix: &str, authority: &NodeId, lane: &str) -> bool {
+        const WARN_INTERVAL_MS: u64 = 60_000;
+        let now_ms = crate::hlc::wall_clock_ms();
+        let key = (prefix.to_string(), format!("{}#{lane}", authority.0));
+        match self.stale_version_warned_ms.get(&key) {
+            Some(&last) if now_ms >= last && now_ms - last < WARN_INTERVAL_MS => false,
+            _ => {
+                self.stale_version_warned_ms.insert(key, now_ms);
+                true
+            }
+        }
     }
 
     /// Count and log one admission rejection (M-4).
@@ -1052,6 +1152,8 @@ impl CertifiedApi {
             scopes: self.attestations.scope_count() as u64,
             rejected_unknown_range_total: self.attestation_rejected_unknown_range_total,
             rejected_version_window_total: self.attestation_rejected_version_window_total,
+            stale_version_total: self.attestation_stale_version_total,
+            rejected_fenced_total: self.attestation_rejected_fenced_total,
             rejected_scope_cap_total: self.attestations.rejected_scope_cap_total(),
             rejected_authority_cap_total: self.attestations.rejected_authority_cap_total(),
             purged_total: self.attestations.purged_attestations_total(),
@@ -3193,6 +3295,60 @@ mod tests {
         assert_eq!(stats.scopes, 0);
         assert_eq!(stats.rejected_unknown_range_total, 0);
         assert_eq!(stats.rejected_version_window_total, 0);
+    }
+
+    /// M-17 observability: stale-but-admissible reports and fenced drops
+    /// are counted (previously the fenced drop was fully silent, which is
+    /// what made the observer silent-fence failure invisible).
+    #[test]
+    fn stale_and_fenced_reports_are_counted() {
+        // Current policy version 5.
+        let mut api = CertifiedApi::new(
+            node("node-1"),
+            namespace_with_version("", &["auth-1", "auth-2", "auth-3"], 5),
+        );
+        let signer = make_signer("auth-1", 26);
+
+        // Current-version report: no stale / fenced movement.
+        let (f, a) = make_signed_frontier_v(&signer, 10_500, "", 5);
+        assert!(api.update_frontier_verified(f, Some(a)));
+        // Leading report (cur+1): ahead, not stale.
+        let (f, a) = make_signed_frontier_v(&signer, 10_510, "", 6);
+        assert!(api.update_frontier_verified(f, Some(a)));
+        let stats = api.attestation_stats();
+        assert_eq!(stats.stale_version_total, 0);
+        assert_eq!(stats.rejected_fenced_total, 0);
+
+        // Stage A: in-window but behind current (pv 4 < 5) — admitted
+        // (frontier advances, attestation pools) AND counted as stale.
+        let (f, a) = make_signed_frontier_v(&signer, 10_600, "", 4);
+        assert!(api.update_frontier_verified(f, Some(a)));
+        let stats = api.attestation_stats();
+        assert_eq!(stats.stale_version_total, 1);
+        assert_eq!(stats.rejected_fenced_total, 0);
+
+        // Fence pv 4 (what detect_version_changes does on a bump): the
+        // same report now drops — frontier refuses to advance, nothing
+        // pools — and the fenced counter records it.
+        api.fence_version(&kr(""), PolicyVersion(4));
+        let (f, a) = make_signed_frontier_v(&signer, 10_700, "", 4);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+        let stats = api.attestation_stats();
+        assert_eq!(
+            stats.stale_version_total, 2,
+            "fenced reports stay stale too"
+        );
+        assert_eq!(stats.rejected_fenced_total, 1);
+
+        // Stage B: outside the window (pv 2 < 5-2) — rejected at
+        // admission; the stale / fenced counters must NOT move (the
+        // window counter owns that phase).
+        let (f, a) = make_signed_frontier_v(&signer, 10_800, "", 2);
+        assert!(!api.update_frontier_verified(f, Some(a)));
+        let stats = api.attestation_stats();
+        assert_eq!(stats.stale_version_total, 2);
+        assert_eq!(stats.rejected_fenced_total, 1);
+        assert_eq!(stats.rejected_version_window_total, 1);
     }
 
     #[test]

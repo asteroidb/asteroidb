@@ -1501,7 +1501,7 @@ curl http://localhost:3000/api/internal/frontiers
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `peers` | PeerInfo[] | 現在のピアリスト（シードノード自身を含む） |
-| `namespace` | object | system namespace の JSON スナップショット |
+| `namespace` | object | system namespace の JSON スナップショット。**参考情報**: 参加ノード側の組み込みクライアントはこのフィールドを自動適用しない（制御プレーン状態は voter なら Raft 複製、非 voter なら observer namespace pull（ops-guide §14.8）で継続的に追随する。join 時の一回きりスナップショットは陳腐化するため採用経路にしていない） |
 
 **curl 例:**
 

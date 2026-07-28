@@ -444,6 +444,11 @@ async fn main() {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(4096),
+        // Observer namespace pull (M-17): non-voters periodically fetch the
+        // voters' committed control-plane state so their namespace — and
+        // the policy version their authority signatures carry — keeps
+        // following policy bumps. 0 disables the pull (repro/testing only).
+        observer_pull_interval: env_duration_ms("ASTEROIDB_OBSERVER_NS_PULL_MS", 5_000),
     };
     if raft_config.election_timeout_max < raft_config.election_timeout_min {
         eprintln!(
@@ -489,13 +494,39 @@ async fn main() {
         }
     };
     if !cp_voters.contains(&node_id) {
+        let pull_ms = raft_node.config().observer_pull_interval.as_millis() as u64;
         eprintln!(
             "warning: this node ({}) is NOT in ASTEROIDB_CONTROL_PLANE_NODES {:?}; \
-             it runs as an inert control-plane observer and will reject policy/authority \
-             mutations",
+             it runs as a control-plane observer: it rejects policy/authority \
+             mutations and follows the voters' committed namespace via periodic \
+             pull (ASTEROIDB_OBSERVER_NS_PULL_MS={pull_ms}, 0=disabled)",
             node_id.0,
             cp_voters.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
         );
+        // Observer-authority lifeline warning (M-17): when this non-voter
+        // is named in a local authority definition, its signatures only
+        // keep counting toward certification quorums as long as the
+        // namespace pull keeps its policy versions fresh.
+        let authority_prefixes: Vec<String> = {
+            let ns = namespace.read().unwrap_or_else(|e| e.into_inner());
+            ns.all_authority_definitions()
+                .into_iter()
+                .filter(|def| def.authority_nodes.contains(&node_id))
+                .map(|def| def.key_range.prefix.clone())
+                .collect()
+        };
+        if !authority_prefixes.is_empty() {
+            eprintln!(
+                "warning: this observer node is a certification AUTHORITY for \
+                 prefixes {authority_prefixes:?}: the namespace pull \
+                 (interval {pull_ms}ms) is the lifeline of its signature \
+                 validity — if the pull goes stale, the next policy bump \
+                 silently removes this node's contribution from the \
+                 certification quorum (watch observer_ns_last_pull_unix_ms \
+                 in GET /api/control-plane/raft/status and \
+                 attestation_stale_version_total on the voters)"
+            );
+        }
     }
     if cp_voters.len() > 1 && raft_static_peers.is_empty() {
         eprintln!(
@@ -514,7 +545,12 @@ async fn main() {
             "warning: ASTEROIDB_RAFT_PEERS is set but the control-plane voter set is \
              just this node ({}); if this is a multi-node deployment, set \
              ASTEROIDB_CONTROL_PLANE_NODES identically on EVERY node — a lone default \
-             self-elects with majority=1 and diverges from the real cluster",
+             self-elects with majority=1 and diverges from the real cluster. If this \
+             node is meant to be a non-voting OBSERVER, leaving \
+             ASTEROIDB_CONTROL_PLANE_NODES unset is also wrong: the node then \
+             considers itself a single-node voter cluster and the observer \
+             namespace pull (M-17) never starts — set the variable to the real \
+             voter set (excluding this node)",
             node_id.0,
         );
     }

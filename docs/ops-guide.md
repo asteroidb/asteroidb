@@ -198,6 +198,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_RAFT_HEARTBEAT_MS` | いいえ | `1000` | リーダーのハートビート（AppendEntries）周期。`heartbeat * 3 > election_timeout_min` の場合は起動時に警告が出る |
 | `ASTEROIDB_RAFT_PROPOSE_TIMEOUT_MS` | いいえ | `30000` | ポリシー変更 1 件が commit されるまでの待ち時間。超過時は HTTP 504（少数派側の分断中はこのタイムアウトで失敗する） |
 | `ASTEROIDB_RAFT_LOG_MAX` | いいえ | `4096` | ログ tail がこのエントリ数を超えると、適用済みエントリをスナップショットへ畳み込む（コンパクション）。無制限成長の防止線 |
+| `ASTEROIDB_OBSERVER_NS_PULL_MS` | いいえ | `5000` | **非 voter（observer）ノードのみ**: voter から committed 済み制御プレーン状態を pull する周期（M-17）。observer の namespace（＝その authority 署名が乗せる policy_version）はこの pull だけで policy bump に追随する。`0` で無効（テスト・再現用。無効化すると observer namespace は凍結し、observer authority は次の bump で **無音で** certification 定足数から脱落する——§14.8）。voter では無視される |
 
 **Raft 永続化は `ASTEROIDB_PERSISTENCE=off` でも常時有効**:
 `currentTerm` / `votedFor` / ログの fsync（`$ASTEROIDB_DATA_DIR/raft/` 配下）は
@@ -394,6 +395,8 @@ curl -s http://localhost:3000/api/slo | jq .
 | `attestation_pool_scopes` | u64 | attestation pool が追跡中の scope 数（ゲージ。正常時は「定義 range 数 × 高々 4 バージョン」以下） |
 | `attestation_rejected_unknown_range_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：未定義 range・authority set 非メンバー報告者・placement policy なし。**正常時ゼロ**、増加は flood または設定不整合の一次信号 |
 | `attestation_rejected_version_window_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：policy_version が現行版の `-2..=+1` ウィンドウ外。**正常時ゼロ** |
+| `attestation_stale_version_total` | u64 | 現行版より**古い** policy_version を報告してきた frontier の受理累計（M-17。ウィンドウ内なので受理はされるが、報告者の namespace が制御プレーンに追随できていない一次信号——凍結 observer や分断少数派 voter は **policy bump 1 回目からここに現れる**）。**正常時ゼロ**、継続増加はアラート推奨（§14.8） |
+| `attestation_rejected_fenced_total` | u64 | fence 済み `(range, version)` scope への frontier 報告の破棄累計（M-17。frontier は前進せず attestation も pool されない = 当該 authority はその scope の certification に寄与していない確証）。**正常時ゼロ**。M-17 以前この破棄は完全無音だった |
 | `attestation_rejected_scope_cap_total` | u64 | pool のグローバル scope 上限（1024）による insert 拒否累計。**正常時ゼロ** |
 | `attestation_rejected_authority_cap_total` | u64 | pool の per-authority scope 上限（64）による insert 拒否累計。**正常時ゼロ** |
 | `attestation_purged_total` | u64 | 告発された Authority の pool 済み attestation の purge 除去累計（`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1` 時のみ増加し得る） |
@@ -1723,7 +1726,11 @@ curl -s http://localhost:3000/api/control-plane/raft/status | jq .
 #   "commit_index": 12,
 #   "last_applied": 12,
 #   "last_log_index": 12,
-#   "voters": ["node-1", "node-2", "node-3"]
+#   "voters": ["node-1", "node-2", "node-3"],
+#   "observer_ns_pull_success_total": 0,   # 非 voter のみ増加（M-17、§14.8）
+#   "observer_ns_pull_failure_total": 0,
+#   "observer_ns_last_pull_unix_ms": 0,
+#   "observer_ns_version_counter": 12
 # }
 ```
 
@@ -1779,6 +1786,15 @@ joint consensus / single-server 変更は実装していない。投票者集合
 ポリシーバージョンフェンシングの単調性を担保する。非 canonical ノードに
 だけ存在した余剰ローカルポリシーは Bootstrap で置換（削除）される。
 
+**災害復旧時の observer 追随の注意（M-17）**: observer の pull 採用ガードは
+`(version_counter, last_applied_index)` の辞書式単調比較で新旧を判定する。
+Bootstrap はポリシーが 1 件以上あれば version_counter を必ず floor より増や
+すため、上記どおり「最新 namespace バージョンのノードを最初のリーダーに」
+していれば再構築後の状態は observer に自動採用される。**ポリシー 0 件で
+Bootstrap した直後**だけは counter が floor のまま進まず、既存 observer の
+採用が保留され得る（その状態には certify 対象も存在しないため実害はなく、
+最初のポリシー作成で解消する）。
+
 ### 14.3 分断時の挙動
 
 - **少数派側**（過半数と通信できない側）: ポリシーの**参照は可能**
@@ -1787,6 +1803,8 @@ joint consensus / single-server 変更は実装していない。投票者集合
 - **データプレーンの Eventual write は無影響**——可用性は CRDT 経路が担う。
 - 分断復帰後は少数派側のノードが自動的に follower へ降格し、未 commit の
   エントリは上書きされる。commit 済みエントリが失われることはない。
+- **observer（非 voter）の分断時挙動**は §14.8 を参照（署名は止めない・
+  分断中 bump の寄与消失は可視化＋自動復帰）。
 
 ### 14.4 単一ノード運用
 
@@ -1827,6 +1845,68 @@ term で二重投票し split-brain を招くため。復旧手順:
 やり取りされるため、**これらの型へのフィールド追加はワイヤ互換を壊す**。
 追加が必要な場合は新エンドポイントの追加か JSON 移行を伴うリリース手順が
 必要（`src/control_plane/raft/types.rs` の先頭コメントを参照）。
+
+### 14.8 observer（非 voter）ノードの運用と namespace pull（M-17）
+
+`ASTEROIDB_CONTROL_PLANE_NODES` に含まれないノードは **observer** として
+動作する: 選挙に参加せず、ポリシー / Authority 定義の変更を受け付けない。
+Raft は voter にしか複製しないため、observer の namespace は
+**committed 済み制御プレーン状態の定期 pull**
+（`POST /api/internal/raft/namespace`、周期 `ASTEROIDB_OBSERVER_NS_PULL_MS`、
+既定 5 秒）で voter に追随する。pull は選挙状態（term / votedFor）と定足数
+会計に一切触れず、採用は `(version_counter, last_applied_index)` の辞書式
+単調比較でガードされる（古い状態へのロールバックは構造的に不可能）。
+
+**なぜ重要か**: observer が certification authority を兼ねる場合、その署名が
+乗せる policy_version は **observer 自身の namespace** から決まる。pull が
+止まったまま policy bump が起きると、observer は旧版で署名し続け、受信側
+voter で fence され、**certification 定足数から無音で脱落する**（分母
+`total_authorities` は縮まないため、書き込みは Pending→Timeout として顕在化
+する）。M-17 以前はこの脱落を示すカウンタが存在しなかった。
+
+**監視（アラート推奨）**:
+
+- observer 側 `GET /api/control-plane/raft/status`:
+  `observer_ns_pull_success_total` / `observer_ns_pull_failure_total` /
+  `observer_ns_last_pull_unix_ms`（`now − last_pull` が **pull 間隔 × 6 超**
+  で WARN ログも出る）/ `observer_ns_version_counter`（voter の値との差が
+  namespace ラグ）。失敗カウンタは到達不能だけでなく、**応答者が voter
+  集合外だった場合（アドレス誤解決——HTTP としては毎回成功するが採用され
+  ない）と、採用時のローカル永続化失敗（ディスク満杯・read-only）も数える**。
+  これらの異常では `observer_ns_last_pull_unix_ms` は更新されないため、
+  pull-age アラートは誤設定・ローカルディスク障害でも必ず発火する（成功
+  扱いになるのは「採用した」「相手の状態が新しくなかった」健全ラウンド
+  のみ）。原因の切り分けは pull 失敗 WARN ログの error フィールドで行う。
+- voter 側 `GET /api/metrics`: `attestation_stale_version_total` の継続増加
+  （= どこかの authority——分断中の少数派 voter を含む——が旧版で報告して
+  いる。**bump 1 回目から発火する最速の信号**）、
+  `attestation_rejected_fenced_total`（fence 到達 = 寄与消失の確証）。
+
+**分断時の挙動（設計判断）**: 分断中も observer authority は**署名を止めない**。
+分断中に bump が無ければ、最後に pull 済みの版での署名は完全に有効で定足数
+に寄与し続ける（高遅延・分断環境で observer authority を置く動機そのもの）。
+分断中に bump があった場合の寄与消失は certification 意味論上どの設計でも
+不可避であり、本実装はそれを「無音の恒久欠損」から「両側で可視の一時欠損 +
+分断解消後 1 pull 間隔 + 1 tick（既定 ~6 秒）での自動復帰」に変えている。
+
+**Runbook**: observer authority の pull age が警報中（stale WARN が出ている /
+`observer_ns_last_pull_unix_ms` が古い）に policy 変更を行うと、その authority
+の寄与を分断解消まで失う。**bump 前に pull age を確認すること。**
+
+**構成の注意**:
+
+- 非 voter を authority 定義に含める `PUT /api/control-plane/authorities` は
+  拒否されず 200 で通り、レスポンスの `warnings` フィールドと WARN ログで
+  通知される（pull が生きていれば正当な構成のため）。
+- observer にするつもりのノードで `ASTEROIDB_CONTROL_PLANE_NODES` を未設定に
+  するのは誤り: そのノードは「自分だけの単一 voter クラスタ」として自己選出
+  し、**pull は起動しない**（起動時警告あり）。observer には必ず実際の voter
+  集合（自分を含まない）を設定する。
+- **デプロイ順序**: 新エンドポイントを知らない旧 voter への pull は 404 →
+  失敗カウンタ増＋バックオフとなり、従来挙動（凍結）への劣化に留まる。
+  **voter 先行 → observer 後追い**でアップグレードすること。
+- 鮮度 TTL（署名の自発停止）は実装していない。将来の opt-in ノブ候補として
+  `docs/followup-plan.md` に記録がある。
 
 ---
 

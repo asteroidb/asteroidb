@@ -4,6 +4,7 @@
 //! - `/api/internal/raft/vote`
 //! - `/api/internal/raft/append`
 //! - `/api/internal/raft/snapshot`
+//! - `/api/internal/raft/namespace` (M-17 observer committed-state pull)
 //!
 //! Follows the internal-endpoint conventions: Bearer internal token when
 //! configured, bincode body with JSON fallback for rolling upgrades (an old
@@ -25,7 +26,7 @@ use serde::de::DeserializeOwned;
 use crate::control_plane::raft::transport::{RaftTransport, TransportError, TransportFuture};
 use crate::control_plane::raft::types::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    NamespaceSnapshotRequest, NamespaceSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
 };
 use crate::http::codec::{self, CONTENT_TYPE_BINCODE, serialize_internal};
 use crate::types::NodeId;
@@ -213,6 +214,21 @@ impl RaftTransport for HttpRaftTransport {
     ) -> TransportFuture<'_, InstallSnapshotResponse> {
         Box::pin(async move {
             self.post_internal(&to, "/api/internal/raft/snapshot", &req)
+                .await
+        })
+    }
+
+    fn fetch_namespace_snapshot(
+        &self,
+        to: NodeId,
+        req: NamespaceSnapshotRequest,
+    ) -> TransportFuture<'_, NamespaceSnapshotResponse> {
+        Box::pin(async move {
+            // A pre-M-17 voter answers 404 here: surfaces as a transport
+            // error, counted and backed off by the observer pull loop —
+            // the observer degrades to the old (frozen) behaviour until
+            // the voters are upgraded (deploy voters first).
+            self.post_internal(&to, "/api/internal/raft/namespace", &req)
                 .await
         })
     }

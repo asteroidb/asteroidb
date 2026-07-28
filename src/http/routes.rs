@@ -9,8 +9,9 @@ use super::handlers::{
     get_internal_frontiers, get_metrics, get_policy, get_raft_status, get_slo, get_topology,
     get_version_history, healthz, internal_announce, internal_delta_sync, internal_digest_sync,
     internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
-    list_policies, post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote,
-    remove_policy, set_authority_definition, set_placement_policy, verify_proof,
+    list_policies, post_internal_frontiers, raft_append, raft_install_snapshot,
+    raft_namespace_snapshot, raft_vote, remove_policy, set_authority_definition,
+    set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -40,7 +41,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // see the ops guide security warning).
         .route("/api/internal/raft/vote", post(raft_vote))
         .route("/api/internal/raft/append", post(raft_append))
-        .route("/api/internal/raft/snapshot", post(raft_install_snapshot));
+        .route("/api/internal/raft/snapshot", post(raft_install_snapshot))
+        .route(
+            "/api/internal/raft/namespace",
+            post(raft_namespace_snapshot),
+        );
 
     // Control-plane mutation routes sub-router (PUT / DELETE).
     // These require internal token auth like the internal routes.
@@ -2398,6 +2403,7 @@ mod tests {
             "/api/internal/raft/vote",
             "/api/internal/raft/append",
             "/api/internal/raft/snapshot",
+            "/api/internal/raft/namespace",
         ] {
             let req = Request::builder()
                 .method("POST")

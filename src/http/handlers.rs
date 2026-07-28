@@ -751,6 +751,8 @@ pub async fn post_internal_frontiers(
         stats.scopes,
         stats.rejected_unknown_range_total,
         stats.rejected_version_window_total,
+        stats.stale_version_total,
+        stats.rejected_fenced_total,
         stats.rejected_scope_cap_total,
         stats.rejected_authority_cap_total,
         stats.purged_total,
@@ -992,6 +994,7 @@ pub async fn list_authorities(
         .map(|def| AuthorityDefinitionResponse {
             key_range_prefix: def.key_range.prefix.clone(),
             authority_nodes: def.authority_nodes.iter().map(|n| n.0.clone()).collect(),
+            warnings: Vec::new(),
         })
         .collect();
     Json(defs)
@@ -1013,6 +1016,7 @@ pub async fn get_authority_definition(
     Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: def.key_range.prefix.clone(),
         authority_nodes: def.authority_nodes.iter().map(|n| n.0.clone()).collect(),
+        warnings: Vec::new(),
     }))
 }
 
@@ -1042,11 +1046,40 @@ pub async fn set_authority_definition(
     // awaiting the proposal, so a slow commit never serializes unrelated
     // requests behind it.
     let consensus = state.consensus.lock().await.clone();
+
+    // Non-voter authority advisory (M-17): a non-voter authority is a
+    // LEGITIMATE configuration — its namespace follows the voters via the
+    // observer pull — but its certification contribution depends on that
+    // pull staying fresh, so the proposal is accepted (200) with an
+    // explicit warning rather than rejected.
+    let warnings: Vec<String> = match consensus.raft_handle() {
+        Some(node) => spec
+            .authority_nodes
+            .iter()
+            .filter(|n| !node.voters().contains(n))
+            .map(|n| {
+                format!(
+                    "authority node {} is not a control-plane voter; its \
+                     certification contribution depends on observer namespace \
+                     pull freshness (M-17) — monitor its \
+                     observer_ns_last_pull_unix_ms via GET \
+                     /api/control-plane/raft/status",
+                    n.0
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for warning in &warnings {
+        tracing::warn!(prefix = %spec.prefix, "{warning}");
+    }
+
     let def = consensus.propose_authority_update(spec).await?;
 
     Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: def.key_range.prefix,
         authority_nodes: def.authority_nodes.into_iter().map(|n| n.0).collect(),
+        warnings,
     }))
 }
 
@@ -1197,6 +1230,10 @@ pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftSta
             last_applied: status.last_applied,
             last_log_index: status.last_log_index,
             voters: status.voters,
+            observer_ns_pull_success_total: status.observer_ns_pull_success_total,
+            observer_ns_pull_failure_total: status.observer_ns_pull_failure_total,
+            observer_ns_last_pull_unix_ms: status.observer_ns_last_pull_unix_ms,
+            observer_ns_version_counter: status.observer_ns_version_counter,
         },
         None => RaftStatusResponse {
             node_id: state
@@ -1212,6 +1249,10 @@ pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftSta
             last_applied: 0,
             last_log_index: 0,
             voters: Vec::new(),
+            observer_ns_pull_success_total: 0,
+            observer_ns_pull_failure_total: 0,
+            observer_ns_last_pull_unix_ms: 0,
+            observer_ns_version_counter: 0,
         },
     };
     Json(resp)
@@ -1286,6 +1327,35 @@ pub async fn raft_install_snapshot(
             .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
     let node = raft_node_or_unavailable(&state).await?;
     let resp = node.handle_install_snapshot(req).map_err(ApiError)?;
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
+/// `POST /api/internal/raft/namespace`
+///
+/// Committed control-plane state pull (M-17): serves this node's applied
+/// `ControlPlaneState` to a non-voter (observer) so its namespace
+/// projection keeps following policy bumps. The state machine only ever
+/// applies committed entries, so any voter can serve this — no leadership
+/// or linearizable read required (the puller's adoption guard enforces
+/// monotonicity).
+pub async fn raft_namespace_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::NamespaceSnapshotRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.committed_snapshot();
+    tracing::debug!(
+        requester = %req.requester.0,
+        last_applied_index = resp.last_applied_index,
+        version_counter = resp.state.version_counter,
+        "served committed namespace snapshot to observer"
+    );
     internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
 }
 

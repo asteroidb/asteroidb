@@ -433,6 +433,18 @@ pub struct RuntimeMetrics {
     /// accepted window around the current version (zero under honest load).
     pub attestation_rejected_version_window_total: AtomicU64,
 
+    /// Frontier reports admitted with a policy version BEHIND the range's
+    /// current version (M-17). Sustained growth means some authority's
+    /// namespace is lagging the control plane (frozen observer, minority
+    /// partition voter) — its certification contribution disappears once
+    /// the stale version is fenced. Zero in steady state.
+    pub attestation_stale_version_total: AtomicU64,
+
+    /// Frontier reports dropped because their (range, version) scope was
+    /// fenced (M-17): confirmation that a lagging authority has stopped
+    /// contributing to certification for that scope. Zero in steady state.
+    pub attestation_rejected_fenced_total: AtomicU64,
+
     /// Attestation inserts rejected by the pool's global scope cap.
     pub attestation_rejected_scope_cap_total: AtomicU64,
 
@@ -532,6 +544,8 @@ impl Default for RuntimeMetrics {
             observed_relay_sync_accepted_total: AtomicU64::default(),
             attestation_rejected_unknown_range_total: AtomicU64::default(),
             attestation_rejected_version_window_total: AtomicU64::default(),
+            attestation_stale_version_total: AtomicU64::default(),
+            attestation_rejected_fenced_total: AtomicU64::default(),
             attestation_rejected_scope_cap_total: AtomicU64::default(),
             attestation_rejected_authority_cap_total: AtomicU64::default(),
             attestation_pool_scopes: AtomicU64::default(),
@@ -751,6 +765,8 @@ impl RuntimeMetrics {
         scopes: u64,
         rejected_unknown_range: u64,
         rejected_version_window: u64,
+        stale_version: u64,
+        rejected_fenced: u64,
         rejected_scope_cap: u64,
         rejected_authority_cap: u64,
         purged: u64,
@@ -761,6 +777,10 @@ impl RuntimeMetrics {
             .store(rejected_unknown_range, Ordering::Relaxed);
         self.attestation_rejected_version_window_total
             .store(rejected_version_window, Ordering::Relaxed);
+        self.attestation_stale_version_total
+            .store(stale_version, Ordering::Relaxed);
+        self.attestation_rejected_fenced_total
+            .store(rejected_fenced, Ordering::Relaxed);
         self.attestation_rejected_scope_cap_total
             .store(rejected_scope_cap, Ordering::Relaxed);
         self.attestation_rejected_authority_cap_total
@@ -848,6 +868,12 @@ impl RuntimeMetrics {
                 .load(Ordering::Relaxed),
             attestation_rejected_version_window_total: self
                 .attestation_rejected_version_window_total
+                .load(Ordering::Relaxed),
+            attestation_stale_version_total: self
+                .attestation_stale_version_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_fenced_total: self
+                .attestation_rejected_fenced_total
                 .load(Ordering::Relaxed),
             attestation_rejected_scope_cap_total: self
                 .attestation_rejected_scope_cap_total
@@ -984,6 +1010,13 @@ pub struct MetricsSnapshot {
     /// Attestations rejected at pool admission (policy version outside the
     /// accepted window). Zero under honest load.
     pub attestation_rejected_version_window_total: u64,
+    /// Frontier reports admitted with a policy version behind the current
+    /// one (M-17: lagging authority namespace — the earliest silent-fence
+    /// symptom, fires from the first bump). Zero in steady state.
+    pub attestation_stale_version_total: u64,
+    /// Frontier reports dropped because their (range, version) scope was
+    /// fenced (M-17: the lagging authority has stopped contributing).
+    pub attestation_rejected_fenced_total: u64,
     /// Attestation inserts rejected by the pool's global scope cap.
     pub attestation_rejected_scope_cap_total: u64,
     /// Attestation inserts rejected by the pool's per-authority scope cap.
@@ -1073,22 +1106,26 @@ mod tests {
         let snap = metrics.snapshot();
         assert_eq!(snap.attestation_rejected_unknown_range_total, 0);
         assert_eq!(snap.attestation_rejected_version_window_total, 0);
+        assert_eq!(snap.attestation_stale_version_total, 0);
+        assert_eq!(snap.attestation_rejected_fenced_total, 0);
         assert_eq!(snap.attestation_rejected_scope_cap_total, 0);
         assert_eq!(snap.attestation_rejected_authority_cap_total, 0);
         assert_eq!(snap.attestation_pool_scopes, 0);
         assert_eq!(snap.attestation_purged_total, 0);
 
-        metrics.set_attestation_pool_stats(4, 1, 2, 3, 5, 6);
+        metrics.set_attestation_pool_stats(4, 1, 2, 7, 8, 3, 5, 6);
         let snap = metrics.snapshot();
         assert_eq!(snap.attestation_pool_scopes, 4);
         assert_eq!(snap.attestation_rejected_unknown_range_total, 1);
         assert_eq!(snap.attestation_rejected_version_window_total, 2);
+        assert_eq!(snap.attestation_stale_version_total, 7);
+        assert_eq!(snap.attestation_rejected_fenced_total, 8);
         assert_eq!(snap.attestation_rejected_scope_cap_total, 3);
         assert_eq!(snap.attestation_rejected_authority_cap_total, 5);
         assert_eq!(snap.attestation_purged_total, 6);
 
         // Absolute-value semantics: a later sync overwrites, never adds.
-        metrics.set_attestation_pool_stats(1, 1, 2, 3, 5, 6);
+        metrics.set_attestation_pool_stats(1, 1, 2, 7, 8, 3, 5, 6);
         let snap = metrics.snapshot();
         assert_eq!(snap.attestation_pool_scopes, 1);
 

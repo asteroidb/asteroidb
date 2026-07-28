@@ -14,7 +14,7 @@
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
 3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
-4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, M-17)とテスト(M-16)
+4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, ~~M-17~~ 完了 — 下記「M-17 クローズ記録」参照)とテスト(M-16)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
 ## M-4/m-7 クローズ記録(実装済み)
@@ -343,6 +343,92 @@ Fallback の非記録と次サイクル再添付)、ワイヤ互換(legacy ミ�
 - 恒久対策としての期限付き legacy ミラー二段デコード(混在期 4xx ノイズが
   問題化した場合の後付け案)。
 
+## M-17 クローズ記録(実装済み)
+
+**方式**: 非 voter(observer)ノードが voter から **committed 済み
+`ControlPlaneState` を定期 pull**(新 internal RPC
+`POST /api/internal/raft/namespace`、`ASTEROIDB_OBSERVER_NS_PULL_MS` 既定
+5000ms、0=無効)して追随する。pull ループは driver の非 voter 分岐
+(ラウンドロビン + ジッタ ±20% + 失敗時指数バックオフ上限 30s + pull age
+6 間隔超で WARN)。採用ガードは (1) voter は無条件拒否、(2) 応答者が
+ローカル voter set 外なら拒否、(3) **`(version_counter, last_applied_index)`
+の辞書式単調比較**(OR 合成だと zombie voter の高 index でロールバックする
+ため不採用)。適用は `handle_install_snapshot` から抽出した `install_state`
+を push/pull で共用し、snapshot meta・log 切り詰め・storage 永続化・
+namespace 永続化(applied marker 込み)まで InstallSnapshot 受信 follower と
+同一のディスク状態を残す——以後の fence/unfence/`recalculate_authorities`/
+`refresh_scopes` は既存 `detect_version_changes` 連鎖(observer 上の
+NodeRunner)がそのまま実施。fail-stop は不採用(非 voter authority は
+`recalculate_authorities` の正常出力であり、propose 時
+(`PUT /api/control-plane/authorities` に非 voter が含まれる場合は 200 +
+`warnings` フィールド + WARN)と起動時(observer authority の lifeline
+警告、`CONTROL_PLANE_NODES` 未設定誤構成の警告文面追記)に留める)。
+
+**可観測化(全段)**: voter 受信側は `CertifiedApi` 内部カウンタ →
+`AttestationPoolStats` → `RuntimeMetrics` の既存パターンで
+`attestation_stale_version_total`(**窓内だが現行版より古い pv の受理**。
+bump 1 回目から発火する最速信号、per-scope 1 分スロットルの WARN 付き)と
+`attestation_rejected_fenced_total`(fence 済み scope への報告破棄。M-17
+以前は完全無音)を追加。observer 側は `RaftStatus`/`RaftStatusResponse` に
+`observer_ns_pull_success_total` / `observer_ns_pull_failure_total` /
+`observer_ns_last_pull_unix_ms` / `observer_ns_version_counter` を追加。
+
+**分断時の設計判断**: observer authority は**署名を止めない**(分断中に
+bump が無ければ寄与は完全有効。bump があった場合の寄与消失はどの設計でも
+不可避であり、「無音の恒久欠損」→「両側可視の一時欠損 + 分断解消後
+1 pull 間隔 + 1 tick での自動復帰」に変換)。分母 `total_authorities` は
+縮めない(既存方針踏襲)。
+
+**実装中に発見した設計欠陥(2 件、最小修正済み)**:
+1. observer は投票しないため `hard_state.json` が存在せず、pull 採用が
+   `log.json` だけを書くと**次回起動時に storage の「log あり hard state
+   なし」fail-stop で起動不能**になる——採用時に hard state も併せて永続化。
+2. storage の整合性検査は `current_term >= ログ最大 term` を要求するため、
+   採用する snapshot 境界の term が自 term より新しい場合は term を単調に
+   引き上げる(voted_for は新 term 突入時のみクリア。InstallSnapshot 受信
+   follower と同じ挙動で、二重投票リスクなし。応答者の current term
+   (`resp.term`)は設計どおり不使用のまま)。
+
+**レビュー指摘の修正(マージ前検証で確定した 2 系統)**:
+1. **採用ガードの再起動時フロア**: ガード(3) の local 基準は再起動後
+   コンパクション snapshot から復元されるが、voter は apply 毎に
+   namespace + marker を永続化し compaction は稀(最大 `log_max` apply 分
+   先行)。降格 ex-voter observer が「snapshot より新しいが保持済み
+   namespace ビューより古い」pull(遅れた voter の応答)を採用すると
+   ビューが耐久的にロールバックするため、apply marker に
+   `version_counter` を追記し(旧形式は `None` → snapshot 対へフォール
+   バック)、起動時にビューを保持した場合は marker の対をガードの下限
+   (`adopt_floor`)にした。
+2. **pull カウンタの正確化**: 成功計上と `observer_ns_last_pull_unix_ms`
+   更新は「採用 / not-newer」の健全ラウンドのみ。応答者 voter set 外
+   (アドレス誤解決——HTTP は成功し続ける)と採用時ローカル永続化失敗は
+   `observer_ns_pull_failure_total` に計上して freshness を更新しない
+   (でなければ pull-age アラートが誤設定・ディスク障害で沈黙する)。
+   `adopt_pulled_snapshot` は bool ではなく `AdoptOutcome`
+   (Adopted/NotNewer/VoterRefusal/RejectedResponder)を返し、driver の
+   pull 失敗ログは error クラス付き WARN(頻度はバックオフで有界)。
+
+**テスト**(`tests/observer_namespace_sync.rs` + `certified.rs` 単体):
+T-0 silent fence 再現(pull 無効 = 旧世界。obs 寄与確認 → bump → stale/
+fenced カウンタ発火 → 1 voter 停止で certified write Timeout → 復旧後も
+`contributing_authorities` から obs 不在)/ T-1 pull end-to-end(多段 bump
+窓外跨ぎ追随 + 段階 A→B カウンタ遷移 + 寄与復帰 + 非 voter authority PUT の
+warnings)/ T-2 採用ガード(辞書式単調・zombie 拒否・voter set 外拒否・
+voter 拒否・`committed_snapshot` 正当性)/ T-3 再起動永続化 / T-4 分断
+(失敗カウンタ → 自動復旧 → observer 上の fence)/ 単独 voter で pull
+不起動の回帰。
+
+**読解発見(記録)**: `JoinResponse.namespace` には in-process 消費者が
+存在しない(一回きり同期としても未配線)。api-reference.md に「参考情報・
+自動適用されない」旨を明記した。継続伝搬は本 pull が担うため、join 時
+スナップショット適用の配線は行わない。
+
+**将来の opt-in ノブ候補(実装しない)**: 鮮度 TTL
+`ASTEROIDB_AUTHORITY_MAX_NS_AGE_MS`(0=無効既定)——pull age が閾値を超えた
+observer authority が署名を自発停止する案。分断中の無害な寄与まで放棄する
+ため既定挙動としては不採用と判定した(判定者全員一致)。必要になった場合に
+別タスク化。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -365,10 +451,8 @@ Fallback の非記録と次サイクル再添付)、ワイヤ互換(legacy ミ�
 - **M-16** `tests/wal_recovery.rs`: WAL の HTTP レベル耐久性 ack 経路(wait_wal_durable + last_wal_pos)の
   テストが皆無(全テストが eventual_wal/certified_wal=None)。Some(WalSyncer) を配線した AppState で
   書き込み→ack→クラッシュ再現の統合テストを追加。
-- **M-17** `src/main.rs`(Raft observer): Raft は voter にしか複製しないため非 voter(observer)ノードの
-  namespace が join 時スナップショットで凍結し、observer authority が旧 policy_version で署名し続けて黙って
-  fence され、certification 定足数が静かに縮む。observer への namespace 伝搬経路を追加するか、
-  authority が非 voter なら起動を fail-stop。
+- ~~**M-17**~~ **完了** — 下記「M-17 クローズ記録」参照(observer への committed namespace pull 同期 +
+  無音 fence の全段可観測化。fail-stop は不採用)。
 
 ## 残 minor
 

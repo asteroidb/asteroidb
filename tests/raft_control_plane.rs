@@ -55,6 +55,7 @@ fn fast_config() -> RaftConfig {
         heartbeat_interval: Duration::from_millis(50),
         propose_timeout: Duration::from_millis(3_000),
         log_max: 4096,
+        ..RaftConfig::default()
     }
 }
 
@@ -370,8 +371,19 @@ async fn restart_restores_state_and_committed_entries() {
         committed_version = policy.version;
         term_before = nodes[leader].status().term;
 
-        // Let the commit index propagate to the followers, then stop.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait until every node has APPLIED the committed entry before
+        // stopping (a fixed sleep here was load-sensitive: on a busy CI
+        // machine the followers could be shut down before the commit
+        // index propagated on a heartbeat).
+        let target = nodes[leader].status().last_applied;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !nodes.iter().all(|n| n.status().last_applied >= target) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "followers did not apply the committed entry within 10s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let _ = shutdown_tx.send(true);
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Nodes dropped here (crash: no graceful shutdown persistence —

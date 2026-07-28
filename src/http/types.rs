@@ -416,6 +416,11 @@ pub struct RemovePolicyRequest {
 pub struct AuthorityDefinitionResponse {
     pub key_range_prefix: String,
     pub authority_nodes: Vec<String>,
+    /// Advisory warnings attached by mutation endpoints (M-17: authority
+    /// nodes outside the control-plane voter set). Empty on reads; omitted
+    /// from the JSON when empty for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Response for placement policy endpoints.
@@ -463,6 +468,22 @@ pub struct RaftStatusResponse {
     pub last_log_index: u64,
     /// Static voter set (`ASTEROIDB_CONTROL_PLANE_NODES`).
     pub voters: Vec<String>,
+    /// Cumulative successful observer namespace pulls (M-17). Always 0 on
+    /// voters; on an observer this should keep rising.
+    #[serde(default)]
+    pub observer_ns_pull_success_total: u64,
+    /// Cumulative failed observer namespace pulls (M-17).
+    #[serde(default)]
+    pub observer_ns_pull_failure_total: u64,
+    /// Wall-clock ms of the last successful observer pull (0 = never).
+    /// Alert when `now - this` exceeds ~6 pull intervals: the namespace no
+    /// longer follows policy bumps.
+    #[serde(default)]
+    pub observer_ns_last_pull_unix_ms: u64,
+    /// Replicated control-plane version counter of the local state —
+    /// compare an observer's against a voter's to gauge namespace lag.
+    #[serde(default)]
+    pub observer_ns_version_counter: u64,
 }
 
 // ---------------------------------------------------------------

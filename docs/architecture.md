@@ -171,7 +171,19 @@ Raft の適用パスはこれらを直接呼ばない（二重実行の防止）
   分岐初期状態解決のためスコープ内に含めた、当初計画からの明示的な逸脱）。
 - 線形化 read — 制御プレーンの GET はローカル読み（leader lease は高クロック
   スキュー環境で安全性根拠にできないため不採用）。
-- 非投票ノードへの learner 複製 — voter 以外のノードはポリシーを GET API 経由で参照。
+- 非投票ノードへの learner 複製（AppendEntries/InstallSnapshot の push）—
+  voter 以外のノード（observer）は **committed 済み制御プレーン状態を internal
+  RPC（`POST /api/internal/raft/namespace`）で定期 pull して追随**する（M-17。
+  従来の「GET API 経由で参照」方針の実装形）。pull は observer 起点の
+  out-of-band 読み取りで、選挙状態・commit 集計・定足数計算には一切関与しない。
+  採用は `(version_counter, last_applied_index)` の辞書式単調ガードで保護され
+  （再起動時は apply marker に記録した「保持された永続 namespace ビュー」の対を
+  ガードの下限にするため、コンパクション snapshot まで巻き戻った in-memory 基準を
+  突いた古い pull がビューをロールバックさせることもない）、
+  適用は InstallSnapshot 受信と同一の install 経路（永続化込み）を共用する——
+  以後の fence / unfence / authority 再計算は voter と同じ
+  `detect_version_changes` 連鎖が行う。observer authority の署名有効性はこの
+  pull の鮮度に依存する（運用は ops-guide §14.8、分断時の設計判断も同節）。
 - データプレーンへの Raft 適用 — Eventual/CRDT 経路の可用性がデータプレーンの責務。
 - 「制御プレーンの制御プレーン」問題（非単一 quorum 制御プレーン、Scatter 型分割）は
   research 上も未解決の白地であり、本実装は単一固定 quorum で進める。
