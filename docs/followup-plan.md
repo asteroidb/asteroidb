@@ -14,7 +14,7 @@
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
 3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
-4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, ~~M-17~~ 完了 — 下記「M-17 クローズ記録」参照)とテスト(M-16)
+4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, ~~M-17~~ 完了 — 下記「M-17 クローズ記録」参照)とテスト(~~M-16~~ 完了 — 下記「M-16 クローズ記録」参照)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
 ## M-4/m-7 クローズ記録(実装済み)
@@ -429,6 +429,45 @@ observer authority が署名を自発停止する案。分断中の無害な寄�
 ため既定挙動としては不採用と判定した(判定者全員一致)。必要になった場合に
 別タスク化。
 
+## M-16 クローズ記録(実装済み)
+
+**成果物**: 新規 `tests/http_wal_durability.rs`(8 テスト)+ Cargo.toml の
+`[[test]] required-features = ["native-runtime"]` 宣言。プロダクション変更は
+`WalSyncer::durable_watermark()`(read-only getter、durable カウンタの
+Acquire ロードのみ)の 1 点だけで、耐久性セマンティクスには触れていない。
+
+**方式**: AppState に `Some(WalSyncer)` を配線し、リカバリは常に本番経路
+(`recover_eventual` / `recover_certified`)。flusher を spawn しない
+`Held` モードで durable 前進手段(flusher / `wal_rotate`)をテストが独占し、
+「300ms 経っても ack が返らない」pend 断定をタイミング非依存にした
+(正実装は永久 pend、壊れた実装は μs で 200 → 判定にタイミングが関与しない。
+`advance_durable` の呼び出し元が増えた場合はこのファイルの見直しが必要——
+ファイル冒頭 INVARIANT コメントに明記)。テスト一覧:
+ack 済み書き込みのクラッシュ生存(本番 `spawn_persistence_tasks` 配線 +
+ack 時点の on-disk frame 検査)/ Always の ack ゲート(held で pend →
+後入れ flusher で解放。Notify permit 貯留を根拠にコメント化)/ certified 側
+ゲート + 復旧で Pending 回帰 / 未 ack 書き込みの torn tail 切除と非対称復旧
+(ack 済みは残り、未 ack は復元されない)/ WAL append 失敗時の 503 +
+token 不在 + 復旧後の非復活(chmod 0o555 + tiny segment、Drop guard で復元、
+特権実行時は skip)/ group commit(1 回の rotate で複数 waiter 一括解放 =
+`wait_durable` の `>=` と `fetch_max` 単調性の pin)/ Interval 政策の
+即 ack(`durable_watermark()==0` の直接証明)/ `internal_sync` の
+durable ゲート。fail-first は 2 変異で実施済み:
+(1) `wait_wal_durable` の wait 除去 → 6/8 RED、
+(2) `wait_durable` の `>=`→`==` → group commit テストが timeout で RED。
+
+**設計書からの逸脱(1 点)**: 設計書 T5 は「ok-1 を rotate で解放してから
+chmod → fail-key」だったが、rotate 直後の空セグメントへの初回 append は
+ローテーションを起こさない(`seg_records > 0` ガード)ため EACCES が
+発火しない。ok-1 の解放 rotate を chmod 前に行わず、失敗フェーズを跨いで
+pend させたまま ok-2 の poison-flush ローテーション(seal 副作用の
+`advance_durable`)で解放する順序に修正した(テスト内コメントに記録)。
+
+**ack 経路の実バグ**: テスト作成過程・変異検証を通じて未発見(設計書 §7 の
+コード精読結論と一致)。既知の意図的挙動 3 点(internal_sync の wait エラー
+握りつぶし / 非 Always の即 ack + recovery fence 補償 / fsync 失敗の
+process::abort)はバグ扱いしない。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -448,9 +487,8 @@ observer authority が署名を自発停止する案。分断中の無害な寄�
 - ~~**M-12**~~ **完了** — 上記「M-12 クローズ記録」参照(root digest 束縛 + ReportClockFloor +
   activation grace + 誤検知回復エンドポイント。per-scope 帰属は M-12b として残余記録)。
 - ~~**M-14**~~ **完了** — 下記「M-14 クローズ記録」参照(observed レーンの delta/digest sync request 相乗り)。
-- **M-16** `tests/wal_recovery.rs`: WAL の HTTP レベル耐久性 ack 経路(wait_wal_durable + last_wal_pos)の
-  テストが皆無(全テストが eventual_wal/certified_wal=None)。Some(WalSyncer) を配線した AppState で
-  書き込み→ack→クラッシュ再現の統合テストを追加。
+- ~~**M-16**~~ **完了** — 下記「M-16 クローズ記録」参照(`tests/http_wal_durability.rs`:
+  Some(WalSyncer) 配線 AppState での書き込み→ack→クラッシュ再現統合テスト 8 本)。
 - ~~**M-17**~~ **完了** — 下記「M-17 クローズ記録」参照(observer への committed namespace pull 同期 +
   無音 fence の全段可観測化。fail-stop は不採用)。
 

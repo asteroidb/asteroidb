@@ -478,6 +478,16 @@ impl WalSyncer {
         self.policy
     }
 
+    /// Current durable watermark: the highest append count known to be
+    /// durable (fdatasynced, or on a sealed-and-synced segment).
+    ///
+    /// Read-only observation hook (tests / diagnostics). Durability
+    /// decisions must go through [`wait_durable`](Self::wait_durable);
+    /// this getter never changes the durability semantics.
+    pub fn durable_watermark(&self) -> u64 {
+        self.shared.durable.load(Ordering::Acquire)
+    }
+
     /// Wait until the record at `pos` is durable.
     ///
     /// Errors only if the flusher task is gone (which, given the fail-stop
