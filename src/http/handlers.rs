@@ -669,68 +669,25 @@ pub async fn post_internal_frontiers(
                         }
                     }
                 }
-
-                // Split-view lane (CT-gossip Protocol 2): attestations the
-                // sender observed elsewhere, relayed for cross-checking.
-                // Evidence only — never applied to frontier state. Each
-                // relayed pair is re-verified against the registry before it
-                // is allowed to become evidence, so a malicious relayer
-                // cannot frame an honest authority; a failed verification is
-                // *not* an accusation either, because the relayer of a
-                // forged pair cannot be identified from the payload.
-                for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
-                    if !is_range_authority(&obs.frontier) {
-                        continue;
-                    }
-                    // Byte-equivalent echoes skip re-verification (CPU DoS
-                    // mitigation): the exact (scope, hlc, digest) is already
-                    // indexed and would compare Consistent anyway.
-                    if state.equivocation.is_known_exact(&obs.frontier) {
-                        continue;
-                    }
-                    match verify_frontier_signature(
-                        &obs.frontier,
-                        &obs.signature,
-                        &registry,
-                        current_epoch,
-                        &state.epoch_config,
-                    ) {
-                        Ok(_) => {
-                            state.metrics.record_split_view_observation();
-                            if let ObserveOutcome::Equivocation(ev) =
-                                state
-                                    .equivocation
-                                    .observe(&obs.frontier, &obs.signature, now_ms)
-                            {
-                                warn_equivocation(&ev);
-                                state.metrics.record_equivocation_at(now_ms);
-                                state
-                                    .metrics
-                                    .set_accused_authorities(state.equivocation.accused_count());
-                                evidence_dirty = true;
-                                if state.exclude_accused_authorities
-                                    && !newly_accused.contains(&ev.authority_id)
-                                {
-                                    newly_accused.push(ev.authority_id.clone());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                "ignoring relayed observation with invalid signature"
-                            );
-                        }
-                    }
-                }
             }
+        }
+    }
+
+    // Split-view lane (CT-gossip Protocol 2): attestations the sender
+    // observed elsewhere, relayed for cross-checking. Shared with the
+    // delta/digest sync piggyback lane since M-14 — see
+    // `ingest_relayed_observations` for the gate order and rationale.
+    for id in ingest_relayed_observations(&state, observed, now_ms, RelayLane::Frontier) {
+        if !newly_accused.contains(&id) {
+            newly_accused.push(id);
         }
     }
 
     // Persist new evidence after every sync guard is released; the write
     // itself happens on a blocking thread (never inside the detector lock)
     // and concurrent writers are serialized inside `spawn_persist` so an
-    // older snapshot can never overwrite a newer one.
+    // older snapshot can never overwrite a newer one. (Evidence recorded
+    // from the relayed observations above is persisted inside the helper.)
     if evidence_dirty {
         state.equivocation.spawn_persist();
     }
@@ -814,6 +771,133 @@ fn warn_equivocation(ev: &crate::authority::equivocation::EquivocationEvidence) 
         digest_second = %ev.second.frontier.digest_hash,
         "EQUIVOCATION DETECTED: authority signed conflicting frontier attestations; evidence stored"
     );
+}
+
+/// Which receive lane delivered a batch of relayed split-view observations
+/// (metrics attribution only — the ingest gates are identical).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayLane {
+    /// The frontier push lane (`POST /api/internal/frontiers`).
+    Frontier,
+    /// The delta/digest sync piggyback lane (M-14).
+    Sync,
+}
+
+/// Ingest relayed split-view observations (CT-gossip Protocol 2).
+///
+/// Shared by the frontier push lane and, since M-14, the delta/digest sync
+/// piggyback lane — every node runs the sync loop, so observations relayed
+/// here meet even when a split view targets only non-authority nodes.
+/// Evidence only: nothing here touches frontier or store state.
+///
+/// Each relayed pair is re-verified against the registry before it is
+/// allowed to become evidence, so a malicious relayer cannot frame an
+/// honest authority; a failed verification is *not* an accusation either,
+/// because the relayer of a forged pair cannot be identified from the
+/// payload. Without a keyset registry the whole batch is dropped —
+/// unverifiable pairs must never become evidence.
+///
+/// Not async and never holds a lock across I/O: the namespace/registry
+/// read locks live only for the in-memory verification loop (same scope
+/// discipline as `post_internal_frontiers`), and evidence persistence is
+/// spawned after every guard is released.
+///
+/// Returns the authorities newly accused by THIS batch (deduplicated,
+/// non-empty only when `exclude_accused_authorities` is set) so the caller
+/// can purge their pooled attestations under the certified lock.
+pub(crate) fn ingest_relayed_observations(
+    state: &AppState,
+    observed: Vec<crate::authority::equivocation::ObservedAttestation>,
+    now_ms: u64,
+    lane: RelayLane,
+) -> Vec<NodeId> {
+    use crate::authority::frontier_sig::verify_frontier_signature;
+
+    if observed.is_empty() {
+        return Vec::new();
+    }
+    // Without a registry, relayed observations cannot be verified — and
+    // unverifiable pairs must never become evidence (they could frame an
+    // honest authority).
+    let Some(registry_lock) = &state.keyset_registry else {
+        return Vec::new();
+    };
+    if lane == RelayLane::Sync {
+        state.metrics.record_observed_relay_sync_request();
+    }
+    let mut evidence_dirty = false;
+    let mut newly_accused: Vec<NodeId> = Vec::new();
+    {
+        let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+        let current_epoch = state
+            .current_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Authority-set membership gate (FR-008), same as the primary
+        // frontier lane: observations about non-members of the range's
+        // authority set are ignored outright.
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
+            match ns.get_authorities_for_key(&frontier.key_range.prefix) {
+                Some(def) => def.authority_nodes.contains(&frontier.authority_id),
+                None => true,
+            }
+        };
+        for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
+            if !is_range_authority(&obs.frontier) {
+                continue;
+            }
+            // Byte-equivalent echoes skip re-verification (CPU DoS
+            // mitigation): the exact (scope, hlc, digest) is already
+            // indexed and would compare Consistent anyway.
+            if state.equivocation.is_known_exact(&obs.frontier) {
+                continue;
+            }
+            match verify_frontier_signature(
+                &obs.frontier,
+                &obs.signature,
+                &registry,
+                current_epoch,
+                &state.epoch_config,
+            ) {
+                Ok(_) => {
+                    state.metrics.record_split_view_observation();
+                    if lane == RelayLane::Sync {
+                        state.metrics.record_observed_relay_sync_accepted();
+                    }
+                    if let ObserveOutcome::Equivocation(ev) =
+                        state
+                            .equivocation
+                            .observe(&obs.frontier, &obs.signature, now_ms)
+                    {
+                        warn_equivocation(&ev);
+                        state.metrics.record_equivocation_at(now_ms);
+                        state
+                            .metrics
+                            .set_accused_authorities(state.equivocation.accused_count());
+                        evidence_dirty = true;
+                        if state.exclude_accused_authorities
+                            && !newly_accused.contains(&ev.authority_id)
+                        {
+                            newly_accused.push(ev.authority_id.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "ignoring relayed observation with invalid signature"
+                    );
+                }
+            }
+        }
+    }
+    // Persist new evidence after every guard is released; the write itself
+    // happens on a blocking thread and concurrent writers are serialized
+    // inside `spawn_persist`.
+    if evidence_dirty {
+        state.equivocation.spawn_persist();
+    }
+    newly_accused
 }
 
 /// `GET /api/authority/equivocations`
@@ -1592,7 +1676,27 @@ pub async fn internal_delta_sync(
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
-    let req: DeltaSyncRequest = deserialize_internal(&body, content_type)?;
+    let mut req: DeltaSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Split-view relay lane (M-14), processed BEFORE the store lock is
+    // taken (the Ed25519 verification CPU must not serialize with other
+    // store users) and with NO effect on the response below.
+    let observed = std::mem::take(&mut req.observed);
+    let newly_accused = ingest_relayed_observations(
+        &state,
+        observed,
+        crate::hlc::wall_clock_ms(),
+        RelayLane::Sync,
+    );
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let mut api = state.certified.lock().await;
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
 
     let api = state.eventual.lock().await;
     let store = api.store();
@@ -1679,7 +1783,28 @@ pub async fn internal_digest_sync(
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
-    let req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+    let mut req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Split-view relay lane (M-14), processed BEFORE the scheme check and
+    // the store lock: observation relay is orthogonal to the digest scheme
+    // (a `scheme_ok = false` answer still ingests the sample) and never
+    // affects the response.
+    let observed = std::mem::take(&mut req.observed);
+    let newly_accused = ingest_relayed_observations(
+        &state,
+        observed,
+        crate::hlc::wall_clock_ms(),
+        RelayLane::Sync,
+    );
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let mut api = state.certified.lock().await;
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
 
     // Scheme validation: a version or shape mismatch is NOT an error —
     // answer 200 with `scheme_ok = false` so the requester falls back to

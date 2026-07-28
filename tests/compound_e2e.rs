@@ -184,6 +184,7 @@ async fn sync_delta(
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "sync-agent".into(),
         frontier,
+        observed: vec![],
     })
     .unwrap();
 

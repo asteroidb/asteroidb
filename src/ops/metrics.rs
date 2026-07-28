@@ -411,8 +411,19 @@ pub struct RuntimeMetrics {
     pub equivocation_accused_authorities: AtomicU64,
 
     /// Cumulative count of relayed attestations verified and cross-checked
-    /// via the split-view gossip lane.
+    /// via the split-view gossip lane (both lanes: frontier push and, since
+    /// M-14, the delta/digest sync piggyback — continuity metric).
     pub split_view_observations_total: AtomicU64,
+
+    /// Delta/digest sync requests whose piggybacked observation lane was
+    /// non-empty and processed (M-14; registry-less nodes drop the lane
+    /// without counting).
+    pub observed_relay_sync_requests_total: AtomicU64,
+
+    /// Relayed attestations that passed signature verification and were
+    /// fed to the equivocation detector via the sync piggyback lane (M-14).
+    /// Known-exact echoes and range non-members are not counted.
+    pub observed_relay_sync_accepted_total: AtomicU64,
 
     /// Attestations rejected at pool admission: unknown range, non-member
     /// signer, or missing placement policy (zero under honest load).
@@ -517,6 +528,8 @@ impl Default for RuntimeMetrics {
             equivocation_last_detected_ms: AtomicU64::default(),
             equivocation_accused_authorities: AtomicU64::default(),
             split_view_observations_total: AtomicU64::default(),
+            observed_relay_sync_requests_total: AtomicU64::default(),
+            observed_relay_sync_accepted_total: AtomicU64::default(),
             attestation_rejected_unknown_range_total: AtomicU64::default(),
             attestation_rejected_version_window_total: AtomicU64::default(),
             attestation_rejected_scope_cap_total: AtomicU64::default(),
@@ -713,6 +726,20 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one sync request (delta/digest) that carried a non-empty
+    /// piggybacked observation lane (M-14).
+    pub fn record_observed_relay_sync_request(&self) {
+        self.observed_relay_sync_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one relayed attestation accepted (verified and fed to the
+    /// detector) via the sync piggyback lane (M-14).
+    pub fn record_observed_relay_sync_accepted(&self) {
+        self.observed_relay_sync_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Sync the attestation pool gauges/counters from a
     /// `CertifiedApi::attestation_stats()` snapshot (event-driven: called
     /// after frontier applies and self-reports). The stats are owned by the
@@ -809,6 +836,12 @@ impl RuntimeMetrics {
                 .load(Ordering::Relaxed),
             split_view_observations_total: self
                 .split_view_observations_total
+                .load(Ordering::Relaxed),
+            observed_relay_sync_requests_total: self
+                .observed_relay_sync_requests_total
+                .load(Ordering::Relaxed),
+            observed_relay_sync_accepted_total: self
+                .observed_relay_sync_accepted_total
                 .load(Ordering::Relaxed),
             attestation_rejected_unknown_range_total: self
                 .attestation_rejected_unknown_range_total
@@ -938,6 +971,12 @@ pub struct MetricsSnapshot {
     pub equivocation_accused_authorities: u64,
     /// Cumulative relayed attestations processed via the split-view gossip lane.
     pub split_view_observations_total: u64,
+    /// Sync requests (delta/digest) whose piggybacked observation lane was
+    /// non-empty and processed (M-14).
+    pub observed_relay_sync_requests_total: u64,
+    /// Relayed attestations verified and fed to the detector via the sync
+    /// piggyback lane (M-14).
+    pub observed_relay_sync_accepted_total: u64,
     /// Attestations rejected at pool admission (unknown range / non-member
     /// signer / missing policy). Zero under honest load; growth signals a
     /// flood or a misconfigured authority.

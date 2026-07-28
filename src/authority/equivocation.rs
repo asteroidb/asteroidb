@@ -137,6 +137,41 @@ pub struct ObservedAttestation {
     pub signature: FrontierSignature,
 }
 
+impl ObservedAttestation {
+    /// Copy of this attestation as it travels on the gossip/relay lanes
+    /// (the frontier push `observed` lane and the M-14 sync piggyback).
+    ///
+    /// Builds WITHOUT `native-crypto` carry the optional BLS fields as
+    /// unvalidated hex strings (stub types) and `verify_frontier_signature`
+    /// ignores the BLS lane entirely, so a stub node can index an
+    /// attestation whose Ed25519 lane verified but whose BLS fields are
+    /// attacker-controlled garbage. Native builds hard-validate those
+    /// fields inside `Deserialize` (bincode AND JSON), so relaying such a
+    /// field would make the ENTIRE carrier request undecodable on a
+    /// native peer — one poisoned observation would disable the whole
+    /// delta/digest sync path between a stub sender and a native
+    /// receiver. A build therefore never relays BLS material it could
+    /// not have validated: on stub builds the BLS lane is stripped from
+    /// the relayed copy. This costs nothing semantically — receivers
+    /// re-verify via the registry key and the Ed25519 lane alone fully
+    /// determines evidence admissibility on every build (`(None, None)`
+    /// is an accepted shape). Native builds relay the lane unchanged:
+    /// their parsed key/signature types are wire-safe by construction.
+    pub fn for_wire_relay(&self) -> Self {
+        #[cfg(feature = "native-crypto")]
+        {
+            self.clone()
+        }
+        #[cfg(not(feature = "native-crypto"))]
+        {
+            let mut copy = self.clone();
+            copy.signature.bls_public_key = None;
+            copy.signature.bls_cert_signature = None;
+            copy
+        }
+    }
+}
+
 /// Non-repudiable equivocation evidence: both conflicting signed messages
 /// are stored verbatim, so the pair can be presented to a third party and
 /// re-verified against the registry key (proof of misbehaviour).
@@ -663,6 +698,12 @@ impl EquivocationDetector {
     /// — frontier HLCs are monotone append heads, so newer heads subsume
     /// older ones and the gossip state does not grow linearly. Any budget
     /// left after the heads is topped up with further evidence halves.
+    ///
+    /// Every sampled attestation is copied through
+    /// [`ObservedAttestation::for_wire_relay`]: this is THE producer of
+    /// relay material for both wire lanes, so wire-safety (stripping the
+    /// unvalidatable BLS lane on non-`native-crypto` builds) is enforced
+    /// here once instead of at every attach site.
     pub fn gossip_summaries(&self, max: usize) -> Vec<ObservedAttestation> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *state;
@@ -678,7 +719,7 @@ impl EquivocationDetector {
                 obs.frontier.digest_hash.clone(),
             );
             if seen.insert(key) {
-                out.push(obs.clone());
+                out.push(obs.for_wire_relay());
             }
         };
 
@@ -1284,6 +1325,97 @@ mod tests {
         ));
         assert!(!det.is_known_exact(&old), "old head should have aged out");
         assert!(det.is_known_exact(&new));
+    }
+
+    #[test]
+    /// Stub builds carry BLS fields as unvalidated strings and never check
+    /// them at verification time, so attacker garbage can be indexed. It
+    /// must NOT travel: native receivers hard-validate BLS fields inside
+    /// `Deserialize` (bincode and JSON alike), so one relayed garbage field
+    /// would make the whole carrier request undecodable on a native peer.
+    /// `gossip_summaries` therefore strips the BLS lane on stub builds; the
+    /// stripped copy stays fully admissible via the Ed25519 lane.
+    #[cfg(not(feature = "native-crypto"))]
+    #[test]
+    fn gossip_sample_strips_unvalidated_bls_lane_on_stub_builds() {
+        use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
+
+        let signer = make_signer("auth-1", 66);
+        let det = EquivocationDetector::new(None);
+
+        // Attacker-poisoned attestation: valid Ed25519 lane, garbage BLS
+        // fields (the stub verification path ignores them, so it indexes).
+        let f = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let (f, mut s) = signed(&signer, &f);
+        s.bls_public_key = Some(BlsPublicKey("zz-not-hex".into()));
+        s.bls_cert_signature = Some(BlsSignature("also-garbage".into()));
+        det.observe(&f, &s, NOW_MS);
+
+        // Half-populated pair on a second scope: stripped the same way.
+        let f2 = make_frontier("auth-1", "order/", 1, 4_100, 0, "digest-b");
+        let (f2, mut s2) = signed(&signer, &f2);
+        s2.bls_public_key = Some(BlsPublicKey("half-populated".into()));
+        det.observe(&f2, &s2, NOW_MS);
+
+        let sample = det.gossip_summaries(GOSSIP_SAMPLE_MAX);
+        assert_eq!(sample.len(), 2);
+        for obs in &sample {
+            assert!(
+                obs.signature.bls_public_key.is_none()
+                    && obs.signature.bls_cert_signature.is_none(),
+                "a stub build must never relay BLS material it could not validate"
+            );
+        }
+
+        // The stripped copy remains fully admissible as evidence: the
+        // Ed25519 lane alone passes registry verification.
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(node("auth-1"), signer.verifying_key())],
+            )
+            .unwrap();
+        for obs in &sample {
+            verify_frontier_signature(
+                &obs.frontier,
+                &obs.signature,
+                &registry,
+                0,
+                &EpochConfig::default(),
+            )
+            .expect("stripped relay copies must still verify via Ed25519");
+        }
+
+        // The detector's own stored state is untouched (the strip happens
+        // on the relayed copy only): the poisoned original is still the
+        // indexed head.
+        assert!(det.is_known_exact(&f));
+    }
+
+    /// Native builds hold parsed (wire-safe by construction) BLS values,
+    /// so the relay copy keeps the BLS lane intact.
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn gossip_sample_preserves_bls_lane_on_native_builds() {
+        let mut seed = [0u8; 32];
+        seed[0] = 67;
+        let signer = NodeSigner::from_seed(node("auth-1"), &seed, true);
+        let det = EquivocationDetector::new(None);
+
+        let f = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let (f, s) = signed(&signer, &f);
+        assert!(s.bls_public_key.is_some(), "test setup: BLS lane populated");
+        det.observe(&f, &s, NOW_MS);
+
+        let sample = det.gossip_summaries(GOSSIP_SAMPLE_MAX);
+        assert_eq!(sample.len(), 1);
+        assert!(
+            sample[0].signature.bls_public_key.is_some()
+                && sample[0].signature.bls_cert_signature.is_some(),
+            "validated BLS material must relay unchanged on native builds"
+        );
     }
 
     #[test]

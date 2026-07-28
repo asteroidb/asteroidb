@@ -103,6 +103,7 @@ async fn delta_sync_returns_empty_for_fresh_store() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
 
@@ -139,6 +140,7 @@ async fn delta_sync_returns_all_entries_for_zero_frontier() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
 
@@ -192,6 +194,7 @@ async fn delta_sync_returns_only_changes_after_frontier() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier,
+        observed: vec![],
     })
     .unwrap();
 
@@ -243,6 +246,7 @@ async fn two_node_delta_sync_convergence() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-b".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
 
@@ -312,6 +316,7 @@ async fn three_node_delta_sync_convergence() {
         let req_body = serde_json::to_string(&DeltaSyncRequest {
             sender: "sync".into(),
             frontier: hlc(0, 0, ""),
+            observed: vec![],
         })
         .unwrap();
 
@@ -380,6 +385,7 @@ async fn delta_sync_frontier_advances_correctly() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
 
@@ -406,6 +412,7 @@ async fn delta_sync_frontier_advances_correctly() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: frontier1,
+        observed: vec![],
     })
     .unwrap();
 
@@ -570,6 +577,7 @@ async fn zero_frontier_delta_includes_untracked_entries() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
     let req = Request::builder()
@@ -594,6 +602,7 @@ async fn zero_frontier_delta_includes_untracked_entries() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(1, 0, "node-2"),
+        observed: vec![],
     })
     .unwrap();
     let req = Request::builder()
@@ -637,6 +646,7 @@ async fn compacted_sender_ships_no_untracked_entries() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-2".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
     let req = Request::builder()
@@ -743,6 +753,7 @@ async fn converged_key_stops_retransmitting() {
     let req_body = serde_json::to_string(&DeltaSyncRequest {
         sender: "node-b".into(),
         frontier: hlc(0, 0, ""),
+        observed: vec![],
     })
     .unwrap();
     let req = Request::builder()

@@ -408,6 +408,19 @@ digest の利用箇所は anti-entropy 同期に加えてもう一つある:
 （詳細は ops-guide「Equivocation / split-view 検知」と
 `src/runtime/report_clock.rs` の設計コメント）。
 
+観測（`ObservedAttestation`）の中継レーンは 2 本ある（M-14）:
+authority 発の frontier push への相乗り（従来）に加え、**全ノード共通の
+anti-entropy 同期リクエスト（delta / digest）にも同じ gossip サンプルが
+相乗りする**。frontier push レーンだけでは、authority が非 authority
+ノードだけを狙って矛盾ヘッドを配った場合（非 authority は frontier
+reporter を持たず観測を送出しない）に矛盾ヘッドが出会わなかった——
+sync レーンは全ノードが周期実行するため、この盲点を閉じる。中継は
+1 サイクル・ピアごとに最大 1 リクエストへの添付で、未変化サンプルは
+送出抑止（定常時 0 バイト。ただし配達済み記録は保持窓 120 秒で失効し、
+1 窓 1 回は再送——受信側の観測索引はメモリのみのため）、受信側は
+既存の検知プール上限
+（scope あたり 128 + overflow 32、リクエストあたり 64 件）で有界。
+
 **保守契約**: CRDT 型へのフィールド追加・正準エンコーディングの変更は
 `DIGEST_SCHEME_VERSION` の bump と golden テストの更新を必須とする
 （怠ると「一致」が嘘になり claims が不健全化する）。バージョン不一致の

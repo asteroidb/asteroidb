@@ -68,13 +68,42 @@ const DIGEST_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
 /// existence always proves that its lease covers every report signed
 /// since — never a partially-served grace.
 ///
-/// Width = the peers' observed-head retention window plus the cluster
-/// clock-skew budget: by the time it elapses, every head this authority
-/// signed BEFORE the floorless restart has aged out of every honest peer's
-/// detector (heads are memory-only and never survive peer restarts), so
-/// the first post-grace report cannot meet a pre-restart head at the same
-/// HLC. Cost: ~3 minutes without frontier reports from this authority,
-/// only on first boot / floor loss.
+/// Width — the safety argument (revised for M-14): the former argument
+/// ("every head signed before the floorless restart has aged out of every
+/// peer's detector by the time the grace elapses") no longer holds once
+/// observed heads are RELAYED between nodes (frontier gossip + the M-14
+/// sync piggyback): every relay hop re-stamps `seen_ms` on the receiving
+/// detector, and an aged-out head can be re-indexed by a later echo, so a
+/// head's total lifetime across the cluster is unbounded (ping-pong
+/// between nodes with offset windows). Safety therefore does NOT depend
+/// on head lifetime; it is a clock-arithmetic invariant instead:
+///
+/// - Any pre-restart head a peer can hold satisfies
+///   `head.physical <= W_old + MAX_CLOCK_SKEW_MS`, where `W_old` is the
+///   wall clock at the crash — enforced on every ingest path by the HLC
+///   receive bound (`hlc.rs`) and the detector's own `MAX_FUTURE_SKEW_MS`
+///   guard, regardless of how long relaying keeps the head alive.
+/// - With a wall-clock rollback within the ordinary skew budget
+///   (<= MAX_CLOCK_SKEW_MS), the first post-grace report satisfies
+///   `report.physical >= W_old - MAX_CLOCK_SKEW_MS + grace`.
+///
+/// Both bounds are INCLUSIVE (the HLC receive gate and the detector guard
+/// reject only strictly-beyond-bound physicals), so strict exceedance of
+/// every pre-restart head requires the STRICT inequality
+/// `grace > 2 x MAX_CLOCK_SKEW_MS`: at exactly `grace = 2 x skew` the two
+/// bounds meet — the first post-grace report could carry the same
+/// physical (and hence, with a colliding logical, the same HLC) as a
+/// still-relayed pre-restart head, which is precisely the
+/// false-evidence case the grace exists to prevent, and M-14 relaying
+/// makes head lifetime unbounded so age-out cannot save it. Currently
+/// 180s > 120s, a 60s margin (pinned strictly by the
+/// `digest_activation_grace_covers_clock_swing_budget` test). A same-HLC
+/// false pair would need a rollback beyond the skew budget, which is
+/// outside the threat model (same failure class as before M-14). The
+/// `OBSERVED_RETENTION_MS` term in the constant is kept as the
+/// definition of the local detection window, not as a safety
+/// precondition. Cost: ~3 minutes without frontier reports from this
+/// authority, only on first boot / floor loss.
 pub const DIGEST_ACTIVATION_GRACE: Duration =
     Duration::from_millis(OBSERVED_RETENTION_MS + MAX_CLOCK_SKEW_MS);
 
@@ -374,6 +403,25 @@ pub struct NodeRunner {
     /// up rolling upgrades). Cleaned together with `peer_frontiers` when
     /// peers leave the registry.
     digest_unsupported: HashMap<String, Instant>,
+    /// Per-peer `(fingerprint, delivered_at_wall_ms)` of the last
+    /// split-view gossip sample that was provably DELIVERED to the peer
+    /// on the sync piggyback lane (M-14): a carrier request that reached
+    /// a server (any decoded response) while carrying a non-empty sample
+    /// records the sample's fingerprint here, and an unchanged sample is
+    /// then suppressed for that peer — the steady state (no new heads)
+    /// costs zero relay bytes.
+    ///
+    /// The suppression is TIME-BOUNDED to [`OBSERVED_RETENTION_MS`]: the
+    /// receiver's detector state is memory-only and its heads age out
+    /// after that same window, so a delivered-mark older than the window
+    /// is treated as absent and the sample re-attached (see
+    /// [`Self::observed_delivery_fresh`]). Without the bound, a static
+    /// sample marked delivered once would be withheld forever — outliving
+    /// a receiver restart (detector wiped) or a pre-M-14 peer's upgrade
+    /// (the old peer decoded the request while silently dropping the
+    /// trailing `observed` bytes) and permanently starving that relay
+    /// path. Bounded by the peer count (pruned with `peer_frontiers`).
+    observed_last_sent: HashMap<String, (u64, u64)>,
     /// Known cluster nodes for authority auto-reconfiguration.
     ///
     /// When this list changes (node join/leave), the runner triggers
@@ -726,6 +774,7 @@ impl NodeRunner {
             pull_reconciled_wall_ms: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
+            observed_last_sent: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
@@ -850,6 +899,7 @@ impl NodeRunner {
             pull_reconciled_wall_ms: HashMap::new(),
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
+            observed_last_sent: HashMap::new(),
             cluster_nodes,
             // Use sentinel value to force initial recalculation on first tick,
             // consistent with `with_cluster_nodes()`.
@@ -1703,6 +1753,21 @@ impl NodeRunner {
             && self.sync_client.is_some()
             && self.eventual_api.is_some();
         let mut sync_interval = tokio::time::interval_at(start + sync_duration, sync_duration);
+        // Split-view relay effectiveness check (M-14): the sync piggyback
+        // re-delivers observed heads once per cycle, so a cycle at/above
+        // the detector's retention window lets heads age out between
+        // relays and the cross-check largely stops meeting.
+        if sync_enabled
+            && self.equivocation.is_some()
+            && sync_duration.as_millis() as u64 >= OBSERVED_RETENTION_MS
+        {
+            tracing::warn!(
+                sync_interval_ms = sync_duration.as_millis() as u64,
+                observed_retention_ms = OBSERVED_RETENTION_MS,
+                "sync_interval is at or above the observed-head retention window; \
+                 split-view relay via sync piggyback loses effectiveness"
+            );
+        }
 
         // Ping interval: only create if membership client is configured.
         let ping_duration = self
@@ -2278,6 +2343,56 @@ impl NodeRunner {
             .store(max_skew_ms, Ordering::Relaxed);
     }
 
+    /// True when `peer_key` has a recorded delivery of exactly this
+    /// sample fingerprint that is still fresh, i.e. younger than
+    /// [`OBSERVED_RETENTION_MS`].
+    ///
+    /// Expiring the delivered-mark is load-bearing for detection
+    /// reachability: the receiver's observed-head index is memory-only
+    /// (only evidence pairs are persisted) and ages heads out after the
+    /// same window, so "delivered once" says nothing about the receiver
+    /// still holding the sample. A restarted relay hop, an aged-out head,
+    /// or a pre-M-14 peer that decoded the carrier while dropping the
+    /// trailing bytes are all re-covered at most one window later. The
+    /// steady-state cost of the bound is one redundant sample (~80KB max)
+    /// per peer per window, deduplicated at the receiver by
+    /// `is_known_exact` with no extra signature verification.
+    fn observed_delivery_fresh(
+        observed_last_sent: &HashMap<String, (u64, u64)>,
+        peer_key: &str,
+        sample_fp: u64,
+        now_wall_ms: u64,
+    ) -> bool {
+        observed_last_sent
+            .get(peer_key)
+            .is_some_and(|&(fp, delivered_at_ms)| {
+                fp == sample_fp
+                    && now_wall_ms.saturating_sub(delivered_at_ms) < OBSERVED_RETENTION_MS
+            })
+    }
+
+    /// Deterministic fingerprint of a split-view gossip sample (M-14),
+    /// over the identity fields of each observation in sample order.
+    /// Used to suppress re-sending an unchanged sample to a peer; a
+    /// spurious mismatch only costs a redundant (deduplicated) relay,
+    /// never a missed one. Empty sample → 0.
+    fn observed_sample_fingerprint(
+        sample: &[crate::authority::equivocation::ObservedAttestation],
+    ) -> u64 {
+        if sample.is_empty() {
+            return 0;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for obs in sample {
+            obs.frontier.authority_id.0.hash(&mut hasher);
+            obs.frontier.key_range.prefix.hash(&mut hasher);
+            obs.frontier.policy_version.0.hash(&mut hasher);
+            obs.frontier.frontier_hlc.hash(&mut hasher);
+            obs.frontier.digest_hash.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// Run one cycle of delta-based anti-entropy sync.
     ///
     /// For each peer:
@@ -2302,6 +2417,20 @@ impl NodeRunner {
             let _ = crate::api::digest_warmup::ensure_digest_warm(eventual_api).await;
         }
 
+        // Split-view relay sample (M-14): every node — authority or not —
+        // piggybacks its observed-attestation gossip sample on the sync
+        // lane, so conflicting heads meet even when a split view targets
+        // only non-authority nodes (the frontier push lane relays only
+        // from authorities). Sampled ONCE per cycle; each peer gets it on
+        // at most one carrier request below, and an unchanged sample
+        // already delivered to a peer is suppressed entirely.
+        let gossip_sample = self
+            .equivocation
+            .as_ref()
+            .map(|d| d.gossip_summaries(GOSSIP_SAMPLE_MAX))
+            .unwrap_or_default();
+        let sample_fp = Self::observed_sample_fingerprint(&gossip_sample);
+
         let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
 
@@ -2325,6 +2454,22 @@ impl NodeRunner {
                 );
                 continue;
             }
+
+            // Relay sample pending for THIS peer (attach-once): the first
+            // carrier request sent to the peer takes it; `None` when the
+            // sample is empty or unchanged since a still-fresh delivery
+            // (delivered-marks expire after OBSERVED_RETENTION_MS — see
+            // `observed_delivery_fresh`).
+            let mut observed_pending: Option<
+                Vec<crate::authority::equivocation::ObservedAttestation>,
+            > = (!gossip_sample.is_empty()
+                && !Self::observed_delivery_fresh(
+                    &self.observed_last_sent,
+                    &peer_key,
+                    sample_fp,
+                    crate::hlc::wall_clock_ms(),
+                ))
+            .then(|| gossip_sample.clone());
 
             // --- Push phase: send only changed local keys to peer ---
             // When the change rate is too high (changed_keys / total_keys > threshold),
@@ -2393,23 +2538,31 @@ impl NodeRunner {
                         self.config.digest_sync_enabled,
                         &peer_key,
                     ) {
-                        matches!(
-                            Self::try_digest_push(
-                                sync_client,
-                                eventual_api,
-                                &self.metrics,
-                                &self.node_id.0,
-                                peer_id,
-                                &peer_key,
-                                &peer.addr,
-                                &mut self.peer_frontiers,
-                                &mut self.push_frontiers,
-                                &mut self.push_acked_wall_ms,
-                                &mut self.digest_unsupported,
-                            )
-                            .await,
-                            DigestPushOutcome::Handled
+                        // First carrier candidate for the relay sample.
+                        let relay_observed = observed_pending.take().unwrap_or_default();
+                        let relay_attached = !relay_observed.is_empty();
+                        let outcome = Self::try_digest_push(
+                            sync_client,
+                            eventual_api,
+                            &self.metrics,
+                            &self.node_id.0,
+                            peer_id,
+                            &peer_key,
+                            &peer.addr,
+                            &mut self.peer_frontiers,
+                            &mut self.push_frontiers,
+                            &mut self.push_acked_wall_ms,
+                            &mut self.digest_unsupported,
+                            relay_observed,
                         )
+                        .await;
+                        if relay_attached && matches!(outcome, DigestPushOutcome::Handled) {
+                            // Handled implies a decoded scheme-ok response:
+                            // the peer ingested the sample.
+                            self.observed_last_sent
+                                .insert(peer_key.clone(), (sample_fp, crate::hlc::wall_clock_ms()));
+                        }
+                        matches!(outcome, DigestPushOutcome::Handled)
                     } else {
                         false
                     };
@@ -2506,23 +2659,32 @@ impl NodeRunner {
                                 self.config.digest_sync_enabled,
                                 &peer_key,
                             ) {
-                                matches!(
-                                    Self::try_digest_push(
-                                        sync_client,
-                                        eventual_api,
-                                        &self.metrics,
-                                        &self.node_id.0,
-                                        peer_id,
-                                        &peer_key,
-                                        &peer.addr,
-                                        &mut self.peer_frontiers,
-                                        &mut self.push_frontiers,
-                                        &mut self.push_acked_wall_ms,
-                                        &mut self.digest_unsupported,
-                                    )
-                                    .await,
-                                    DigestPushOutcome::Handled
+                                // Carrier candidate for the relay sample
+                                // (oversized-delta branch).
+                                let relay_observed = observed_pending.take().unwrap_or_default();
+                                let relay_attached = !relay_observed.is_empty();
+                                let outcome = Self::try_digest_push(
+                                    sync_client,
+                                    eventual_api,
+                                    &self.metrics,
+                                    &self.node_id.0,
+                                    peer_id,
+                                    &peer_key,
+                                    &peer.addr,
+                                    &mut self.peer_frontiers,
+                                    &mut self.push_frontiers,
+                                    &mut self.push_acked_wall_ms,
+                                    &mut self.digest_unsupported,
+                                    relay_observed,
                                 )
+                                .await;
+                                if relay_attached && matches!(outcome, DigestPushOutcome::Handled) {
+                                    self.observed_last_sent.insert(
+                                        peer_key.clone(),
+                                        (sample_fp, crate::hlc::wall_clock_ms()),
+                                    );
+                                }
+                                matches!(outcome, DigestPushOutcome::Handled)
                             } else {
                                 false
                             };
@@ -2789,9 +2951,26 @@ impl NodeRunner {
                 &self.pull_verified_frontiers,
                 &peer_key,
             ) {
+                // Carrier candidate for the relay sample: on NetworkError
+                // the request never reached the server, so the SAME sample
+                // is re-attached to the built-in retry below (a decoded
+                // response of any kind counts as delivered — echoes of an
+                // over-delivered sample are deduped by `is_known_exact`).
+                let relay_observed = observed_pending.take().unwrap_or_default();
                 let delta_result = sync_client
-                    .pull_delta(&peer.addr, &self.node_id.0, &frontier)
+                    .pull_delta(
+                        &peer.addr,
+                        &self.node_id.0,
+                        &frontier,
+                        relay_observed.clone(),
+                    )
                     .await;
+                if !relay_observed.is_empty()
+                    && !matches!(delta_result, PullDeltaResult::NetworkError)
+                {
+                    self.observed_last_sent
+                        .insert(peer_key.clone(), (sample_fp, crate::hlc::wall_clock_ms()));
+                }
 
                 match delta_result {
                     PullDeltaResult::Ok(delta_resp) => {
@@ -2855,9 +3034,23 @@ impl NodeRunner {
                     }
                     PullDeltaResult::NetworkError => {
                         // Network-level failure; retry once before full sync.
+                        // The relay sample (if any) did not reach the server,
+                        // so it rides the retry too (re-attach once — the
+                        // built-in retry itself is single-shot).
                         let retry_result = sync_client
-                            .pull_delta(&peer.addr, &self.node_id.0, &frontier)
+                            .pull_delta(
+                                &peer.addr,
+                                &self.node_id.0,
+                                &frontier,
+                                relay_observed.clone(),
+                            )
                             .await;
+                        if !relay_observed.is_empty()
+                            && !matches!(retry_result, PullDeltaResult::NetworkError)
+                        {
+                            self.observed_last_sent
+                                .insert(peer_key.clone(), (sample_fp, crate::hlc::wall_clock_ms()));
+                        }
 
                         match retry_result {
                             PullDeltaResult::Ok(delta_resp) => {
@@ -2925,6 +3118,10 @@ impl NodeRunner {
                 self.config.digest_sync_enabled,
                 &peer_key,
             ) {
+                // Carrier candidate for the relay sample (digest pull —
+                // reached only when no earlier carrier took the sample).
+                let relay_observed = observed_pending.take().unwrap_or_default();
+                let relay_attached = !relay_observed.is_empty();
                 let outcome = Self::try_digest_pull(
                     sync_client,
                     eventual_api,
@@ -2937,8 +3134,13 @@ impl NodeRunner {
                     &mut self.pull_verified_frontiers,
                     &mut self.digest_unsupported,
                     &mut self.pull_reconciled_wall_ms,
+                    relay_observed,
                 )
                 .await;
+                if relay_attached && matches!(outcome, DigestPullOutcome::Synced) {
+                    self.observed_last_sent
+                        .insert(peer_key.clone(), (sample_fp, crate::hlc::wall_clock_ms()));
+                }
                 if matches!(outcome, DigestPullOutcome::Synced) {
                     any_success = true;
                     let elapsed = peer_start.elapsed();
@@ -3037,6 +3239,8 @@ impl NodeRunner {
         self.peer_backoffs
             .retain(|addr, _| active_addrs.contains(addr));
         self.digest_unsupported
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.observed_last_sent
             .retain(|addr, _| active_addrs.contains(addr));
 
         // NOTE: sync_failure_total is incremented per-peer on failure above,
@@ -4017,6 +4221,7 @@ impl NodeRunner {
         pull_verified_frontiers: &mut HashMap<String, HlcTimestamp>,
         digest_unsupported: &mut HashMap<String, Instant>,
         pull_reconciled_wall_ms: &mut HashMap<String, u64>,
+        observed: Vec<crate::authority::equivocation::ObservedAttestation>,
     ) -> DigestPullOutcome {
         metrics
             .digest_sync_attempt_total
@@ -4029,9 +4234,13 @@ impl NodeRunner {
 
         // Only the digest is needed here (the peer answers with ITS
         // entries); the warm path makes this a zero-clone lock scope.
+        // `observed` piggybacks the split-view relay sample (M-14) when
+        // this request is the cycle's carrier for the peer.
         let request = {
             let source = Self::local_digest(eventual_api).await;
-            DigestSyncRequest::from_digest(node_id, source.digest(), true)
+            let mut req = DigestSyncRequest::from_digest(node_id, source.digest(), true);
+            req.observed = observed;
+            req
         };
 
         match sync_client.digest_sync(peer_addr, &request).await {
@@ -4171,6 +4380,7 @@ impl NodeRunner {
         push_frontiers: &mut HashMap<String, HlcTimestamp>,
         push_acked_wall_ms: &mut HashMap<String, u64>,
         digest_unsupported: &mut HashMap<String, Instant>,
+        observed: Vec<crate::authority::equivocation::ObservedAttestation>,
     ) -> DigestPushOutcome {
         metrics
             .digest_push_probe_total
@@ -4178,7 +4388,10 @@ impl NodeRunner {
 
         let snapshot_wall_ms = crate::hlc::wall_clock_ms();
         let source = Self::local_digest(eventual_api).await;
-        let request = DigestSyncRequest::from_digest(node_id, source.digest(), false);
+        // `observed` piggybacks the split-view relay sample (M-14) when
+        // this probe is the cycle's carrier for the peer.
+        let mut request = DigestSyncRequest::from_digest(node_id, source.digest(), false);
+        request.observed = observed;
 
         match sync_client.digest_sync(peer_addr, &request).await {
             DigestSyncResult::Ok(resp) if resp.scheme_ok => {
@@ -8277,5 +8490,630 @@ mod tests {
             0
         );
         assert!(runner.tombstone_gc.total_collected() >= 1);
+    }
+
+    // -----------------------------------------------------------------
+    // M-14: observed-attestation relay piggybacked on the sync lane
+    // -----------------------------------------------------------------
+
+    use crate::authority::equivocation::{
+        EquivocationDetector, GOSSIP_SAMPLE_MAX as SAMPLE_MAX, ObservedAttestation,
+    };
+    use crate::network::sync::{
+        DeltaSyncRequest, DeltaSyncResponse, DigestSyncRequest, DigestSyncResponse,
+    };
+
+    /// M-12 grace invariant, restated for M-14 (see the
+    /// `DIGEST_ACTIVATION_GRACE` doc): relaying keeps observed heads alive
+    /// indefinitely, so restart safety rests on clock arithmetic alone —
+    /// the grace must cover a full skew swing (rollback + future-skew
+    /// admission), NOT the head retention window. STRICT inequality is
+    /// required: both the pre-restart head bound and the post-grace
+    /// report bound are inclusive, so at `grace == 2 x skew` a
+    /// same-physical (hence potentially same-HLC) pre/post-restart pair
+    /// is no longer excluded.
+    #[test]
+    fn digest_activation_grace_covers_clock_swing_budget() {
+        assert!(
+            DIGEST_ACTIVATION_GRACE.as_millis() as u64 > 2 * MAX_CLOCK_SKEW_MS,
+            "DIGEST_ACTIVATION_GRACE ({}ms) must STRICTLY exceed 2 x MAX_CLOCK_SKEW_MS ({}ms): \
+             equality would re-admit a same-HLC pre/post-restart pair (false evidence), and \
+             observed-head relay (M-14) voids any age-out-based argument",
+            DIGEST_ACTIVATION_GRACE.as_millis(),
+            2 * MAX_CLOCK_SKEW_MS
+        );
+    }
+
+    fn signed_observation(seed_byte: u8, physical: u64, digest: &str) -> ObservedAttestation {
+        let signer = make_signer("auth-1", seed_byte);
+        let frontier = AckFrontier {
+            authority_id: node_id("auth-1"),
+            frontier_hlc: HlcTimestamp {
+                physical,
+                logical: 0,
+                node_id: "auth-1".into(),
+            },
+            key_range: kr(""),
+            policy_version: PolicyVersion(1),
+            digest_hash: digest.into(),
+        };
+        let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+        ObservedAttestation {
+            frontier,
+            signature,
+        }
+    }
+
+    #[test]
+    fn observed_sample_fingerprint_is_deterministic_and_content_sensitive() {
+        let now = crate::hlc::wall_clock_ms();
+        let a = signed_observation(70, now, "sd2:aaaa");
+        let b = signed_observation(70, now, "sd2:bbbb");
+        assert_eq!(NodeRunner::observed_sample_fingerprint(&[]), 0);
+        assert_eq!(
+            NodeRunner::observed_sample_fingerprint(std::slice::from_ref(&a)),
+            NodeRunner::observed_sample_fingerprint(std::slice::from_ref(&a)),
+        );
+        assert_ne!(
+            NodeRunner::observed_sample_fingerprint(std::slice::from_ref(&a)),
+            NodeRunner::observed_sample_fingerprint(std::slice::from_ref(&b)),
+            "a changed digest must change the fingerprint"
+        );
+    }
+
+    /// Captured request bodies: (content-type, raw body) per request.
+    type CapturedRequests = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Mock sync peer capturing every delta request body. When `healthy`
+    /// is false, the delta route answers 500 (both the bincode attempt
+    /// and the JSON fallback), and the full-sync key dump 404s.
+    async fn spawn_delta_mock(
+        healthy: bool,
+    ) -> (
+        std::net::SocketAddr,
+        CapturedRequests,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::response::IntoResponse;
+
+        let captured: CapturedRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/api/internal/sync/delta",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let cap = Arc::clone(&cap);
+                    async move {
+                        let ct = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        cap.lock().unwrap().push((ct, body.to_vec()));
+                        if healthy {
+                            axum::Json(DeltaSyncResponse {
+                                entries: vec![],
+                                sender_frontier: None,
+                                applied_origins: HashMap::new(),
+                                merge_failed_keys: vec![],
+                                pruned_floor: None,
+                                visible_origins: HashMap::new(),
+                                untracked_entries: HashMap::new(),
+                            })
+                            .into_response()
+                        } else {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, captured, handle)
+    }
+
+    /// Runner wired to the mock peer, with a detector holding one head.
+    async fn relay_test_runner(
+        peer_addr: std::net::SocketAddr,
+        detector: Arc<EquivocationDetector>,
+    ) -> NodeRunner {
+        use crate::network::{PeerConfig, PeerRegistry};
+
+        let certified = wrap_api(CertifiedApi::new(node_id("node-x"), default_namespace()));
+        let eventual = Arc::new(Mutex::new(EventualApi::new(node_id("node-x"))));
+        let registry = PeerRegistry::new(
+            node_id("node-x"),
+            vec![PeerConfig {
+                node_id: node_id("peer-1"),
+                addr: peer_addr.to_string(),
+            }],
+        )
+        .unwrap();
+        let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+        let config = NodeRunnerConfig {
+            sync_interval: Some(Duration::from_millis(50)),
+            ping_interval: None,
+            // Delta-only carriers keep this mock minimal; the digest
+            // carriers have dedicated runner tests below
+            // (`digest_push_probe_carries_sample_and_records_delivery`,
+            // `digest_carrier_fallback_does_not_record_delivery_and_reattaches`).
+            digest_sync_enabled: false,
+            equivocation: Some(detector),
+            ..NodeRunnerConfig::default()
+        };
+        NodeRunner::with_sync(
+            node_id("node-x"),
+            certified,
+            CompactionEngine::with_defaults(),
+            config,
+            sync_client,
+            eventual,
+            default_metrics(),
+        )
+        .await
+    }
+
+    fn decode_delta_requests(captured: &CapturedRequests) -> Vec<DeltaSyncRequest> {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(ct, body)| {
+                if ct.starts_with("application/json") {
+                    serde_json::from_slice(body).unwrap()
+                } else {
+                    bincode::serde::decode_from_slice(body, bincode::config::standard())
+                        .unwrap()
+                        .0
+                }
+            })
+            .collect()
+    }
+
+    /// T-12: one cycle attaches the (bounded) sample to at most one
+    /// request per peer, and records the delivery.
+    #[tokio::test]
+    async fn run_sync_attaches_observed_at_most_once_per_peer() {
+        let (addr, captured, server) = spawn_delta_mock(true).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let obs = signed_observation(71, crate::hlc::wall_clock_ms(), "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, crate::hlc::wall_clock_ms());
+        let mut runner = relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await;
+
+        let requests = decode_delta_requests(&captured);
+        let non_empty: Vec<_> = requests.iter().filter(|r| !r.observed.is_empty()).collect();
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "exactly one carrier request must attach the sample (got {} of {})",
+            non_empty.len(),
+            requests.len()
+        );
+        assert!(non_empty[0].observed.len() <= SAMPLE_MAX);
+        assert_eq!(non_empty[0].observed[0].frontier.digest_hash, "sd2:head-1");
+        assert_eq!(
+            runner.observed_last_sent.len(),
+            1,
+            "a delivered sample must be recorded for the peer"
+        );
+        server.abort();
+    }
+
+    /// T-13: an unchanged sample already delivered to the peer is
+    /// suppressed (zero relay bytes in the steady state); a new head
+    /// re-arms the relay.
+    #[tokio::test]
+    async fn run_sync_suppresses_unchanged_sample() {
+        let (addr, captured, server) = spawn_delta_mock(true).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let now = crate::hlc::wall_clock_ms();
+        let obs = signed_observation(72, now, "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, now);
+        let mut runner = relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await; // cycle 1: delivers the sample
+        runner.run_sync().await; // cycle 2: nothing new to relay
+
+        let requests = decode_delta_requests(&captured);
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].observed.is_empty(), "cycle 1 must carry it");
+        assert!(
+            requests[1].observed.is_empty(),
+            "an unchanged sample must not be re-sent"
+        );
+
+        // A new observed head changes the fingerprint and re-arms relay.
+        let obs2 = signed_observation(72, now + 1, "sd2:head-2");
+        detector.observe(&obs2.frontier, &obs2.signature, now);
+        runner.run_sync().await; // cycle 3
+
+        let requests = decode_delta_requests(&captured);
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !requests[2].observed.is_empty(),
+            "a new head must re-arm the relay"
+        );
+        assert!(
+            requests[2]
+                .observed
+                .iter()
+                .any(|o| o.frontier.digest_hash == "sd2:head-2")
+        );
+        server.abort();
+    }
+
+    /// T-14: a carrier that never reached the server (NetworkError) does
+    /// not consume the sample — it rides the built-in retry and is
+    /// re-attached on the next cycle too.
+    #[tokio::test]
+    async fn observed_reattached_after_network_error() {
+        let (addr, captured, server) = spawn_delta_mock(false).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let now = crate::hlc::wall_clock_ms();
+        let obs = signed_observation(73, now, "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, now);
+        let mut runner = relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await;
+
+        let requests = decode_delta_requests(&captured);
+        // pull_delta + its NetworkError retry, each with the built-in
+        // JSON fallback POST: 4 delta bodies, ALL carrying the sample.
+        assert!(
+            requests.len() >= 2,
+            "expected the initial attempt and at least one retry"
+        );
+        for req in &requests {
+            assert!(
+                !req.observed.is_empty(),
+                "undelivered samples must ride every retry"
+            );
+        }
+        assert!(
+            runner.observed_last_sent.is_empty(),
+            "a sample that never reached a server must not be marked delivered"
+        );
+
+        // Next cycle (peer still failing, after backoff): re-attached.
+        runner
+            .peer_backoffs
+            .values_mut()
+            .for_each(|b| b.record_success());
+        let before = captured.lock().unwrap().len();
+        runner.run_sync().await;
+        let requests = decode_delta_requests(&captured);
+        assert!(requests.len() > before);
+        assert!(
+            requests[before..].iter().all(|r| !r.observed.is_empty()),
+            "the sample must be re-attached on the next cycle"
+        );
+        server.abort();
+    }
+
+    /// A delivered-mark older than `OBSERVED_RETENTION_MS` is treated as
+    /// absent and the (unchanged) sample re-attached. Load-bearing: the
+    /// receiver's detector state is memory-only — a restarted relay hop,
+    /// an aged-out head or a freshly upgraded pre-M-14 peer would
+    /// otherwise never receive a fingerprint-static sample again,
+    /// permanently starving that relay path.
+    #[tokio::test]
+    async fn expired_delivery_mark_rearms_relay() {
+        let (addr, captured, server) = spawn_delta_mock(true).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let now = crate::hlc::wall_clock_ms();
+        let obs = signed_observation(75, now, "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, now);
+        let mut runner = relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await; // cycle 1: delivers and records the mark
+        runner.run_sync().await; // cycle 2: fresh mark suppresses
+        let requests = decode_delta_requests(&captured);
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].observed.is_empty());
+        assert!(
+            requests[1].observed.is_empty(),
+            "a fresh delivered-mark must suppress the unchanged sample"
+        );
+
+        // Age the delivered-mark past the retention window (as if the
+        // cluster stayed quiet while the receiver restarted or upgraded).
+        for entry in runner.observed_last_sent.values_mut() {
+            entry.1 = entry.1.saturating_sub(OBSERVED_RETENTION_MS + 1);
+        }
+
+        runner.run_sync().await; // cycle 3: expired mark re-arms the relay
+        let requests = decode_delta_requests(&captured);
+        assert_eq!(requests.len(), 3);
+        assert!(
+            !requests[2].observed.is_empty(),
+            "an expired delivered-mark must be treated as not-delivered"
+        );
+        // The re-delivery records a fresh mark again.
+        let &(_, delivered_at_ms) = runner.observed_last_sent.values().next().unwrap();
+        assert!(
+            crate::hlc::wall_clock_ms().saturating_sub(delivered_at_ms) < OBSERVED_RETENTION_MS,
+            "the re-delivery must refresh the delivered-mark timestamp"
+        );
+        server.abort();
+    }
+
+    /// Captured request bodies per route: (path, content-type, raw body).
+    type CapturedRouteRequests = Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+
+    /// Mock sync peer serving BOTH the delta and the digest routes. The
+    /// delta route always answers a healthy empty response. The digest
+    /// route answers a scheme-ok root-match when `digest_ok`, and 404
+    /// (a digest-unsupported old node) otherwise. Every other route
+    /// (full-state push, key dump) 404s — those failures only exercise
+    /// the fallback paths, which is exactly what these tests need.
+    async fn spawn_digest_mock(
+        digest_ok: bool,
+    ) -> (
+        std::net::SocketAddr,
+        CapturedRouteRequests,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::response::IntoResponse;
+
+        let captured: CapturedRouteRequests = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        fn capture(
+            cap: &CapturedRouteRequests,
+            path: &str,
+            headers: &axum::http::HeaderMap,
+            body: &[u8],
+        ) {
+            let ct = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            cap.lock()
+                .unwrap()
+                .push((path.to_string(), ct, body.to_vec()));
+        }
+
+        let delta_cap = Arc::clone(&captured);
+        let digest_cap = Arc::clone(&captured);
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/sync/delta",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let cap = Arc::clone(&delta_cap);
+                        async move {
+                            capture(&cap, "delta", &headers, &body);
+                            axum::Json(DeltaSyncResponse {
+                                entries: vec![],
+                                sender_frontier: None,
+                                applied_origins: HashMap::new(),
+                                merge_failed_keys: vec![],
+                                pruned_floor: None,
+                                visible_origins: HashMap::new(),
+                                untracked_entries: HashMap::new(),
+                            })
+                            .into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/internal/sync/digest",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let cap = Arc::clone(&digest_cap);
+                        async move {
+                            capture(&cap, "digest", &headers, &body);
+                            if digest_ok {
+                                axum::Json(DigestSyncResponse {
+                                    scheme_ok: true,
+                                    root_matched: true,
+                                    total_keys: 1,
+                                    ..DigestSyncResponse::default()
+                                })
+                                .into_response()
+                            } else {
+                                axum::http::StatusCode::NOT_FOUND.into_response()
+                            }
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, captured, handle)
+    }
+
+    fn decode_routed<T: serde::de::DeserializeOwned>(
+        captured: &CapturedRouteRequests,
+        path: &str,
+    ) -> Vec<T> {
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| p == path)
+            .map(|(_, ct, body)| {
+                if ct.starts_with("application/json") {
+                    serde_json::from_slice(body).unwrap()
+                } else {
+                    bincode::serde::decode_from_slice(body, bincode::config::standard())
+                        .unwrap()
+                        .0
+                }
+            })
+            .collect()
+    }
+
+    /// Runner wired for the DIGEST carriers: digest sync enabled, one
+    /// seeded local key and a zero push frontier so the push phase sees a
+    /// 100% change rate (> full_sync_threshold) and elects the digest
+    /// push probe as the cycle's FIRST carrier.
+    async fn digest_relay_test_runner(
+        peer_addr: std::net::SocketAddr,
+        detector: Arc<EquivocationDetector>,
+    ) -> NodeRunner {
+        use crate::network::{PeerConfig, PeerRegistry};
+
+        let certified = wrap_api(CertifiedApi::new(node_id("node-x"), default_namespace()));
+        let eventual = Arc::new(Mutex::new(EventualApi::new(node_id("node-x"))));
+        eventual
+            .lock()
+            .await
+            .eventual_register_set("k1", "v1".into())
+            .unwrap();
+        let registry = PeerRegistry::new(
+            node_id("node-x"),
+            vec![PeerConfig {
+                node_id: node_id("peer-1"),
+                addr: peer_addr.to_string(),
+            }],
+        )
+        .unwrap();
+        let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+        let config = NodeRunnerConfig {
+            sync_interval: Some(Duration::from_millis(50)),
+            ping_interval: None,
+            digest_sync_enabled: true,
+            equivocation: Some(detector),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::with_sync(
+            node_id("node-x"),
+            certified,
+            CompactionEngine::with_defaults(),
+            config,
+            sync_client,
+            eventual,
+            default_metrics(),
+        )
+        .await;
+        // A known peer frontier with an empty push frontier: every local
+        // key counts as changed (rate 1.0 > threshold 0.5), driving the
+        // full-sync-threshold branch whose first carrier is the digest
+        // push probe.
+        runner.peer_frontiers.insert(
+            peer_addr.to_string(),
+            HlcTimestamp {
+                physical: 1,
+                logical: 0,
+                node_id: "seed".into(),
+            },
+        );
+        runner
+    }
+
+    /// Digest carrier, success path: the digest PUSH PROBE (first carrier
+    /// of the full-sync-threshold branch) transmits the sample, no other
+    /// request re-attaches it, and the scheme-ok (`Handled`) response
+    /// records the delivery. Guards the `request.observed = observed;`
+    /// wiring in `try_digest_push` — dropping it would silently disable
+    /// the whole M-14 relay in digest-push-dominant deployments.
+    #[tokio::test]
+    async fn digest_push_probe_carries_sample_and_records_delivery() {
+        let (addr, captured, server) = spawn_digest_mock(true).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let now = crate::hlc::wall_clock_ms();
+        let obs = signed_observation(76, now, "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, now);
+        let mut runner = digest_relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await;
+
+        let digest_reqs: Vec<DigestSyncRequest> = decode_routed(&captured, "digest");
+        assert!(!digest_reqs.is_empty(), "the digest push probe must run");
+        assert!(
+            !digest_reqs[0].include_entries,
+            "the first digest request must be the push probe"
+        );
+        assert!(
+            !digest_reqs[0].observed.is_empty(),
+            "the push probe is the cycle's first carrier and must transmit the sample"
+        );
+        assert_eq!(
+            digest_reqs[0].observed[0].frontier.digest_hash,
+            "sd2:head-1"
+        );
+
+        // Attach-once across ALL carrier requests of the cycle.
+        let delta_reqs: Vec<DeltaSyncRequest> = decode_routed(&captured, "delta");
+        let non_empty = digest_reqs
+            .iter()
+            .filter(|r| !r.observed.is_empty())
+            .count()
+            + delta_reqs.iter().filter(|r| !r.observed.is_empty()).count();
+        assert_eq!(non_empty, 1, "exactly one carrier must transmit the sample");
+
+        assert!(
+            runner.observed_last_sent.contains_key(&addr.to_string()),
+            "a scheme-ok digest response must record the delivery"
+        );
+        server.abort();
+    }
+
+    /// Digest carrier, fallback path: a 404 (digest-unsupported peer)
+    /// consumes the probe but must NOT record a delivery — the sample
+    /// re-attaches to the next cycle's carrier (the delta pull, since the
+    /// peer is now cached as digest-unsupported).
+    #[tokio::test]
+    async fn digest_carrier_fallback_does_not_record_delivery_and_reattaches() {
+        let (addr, captured, server) = spawn_digest_mock(false).await;
+        let detector = Arc::new(EquivocationDetector::new(None));
+        let now = crate::hlc::wall_clock_ms();
+        let obs = signed_observation(77, now, "sd2:head-1");
+        detector.observe(&obs.frontier, &obs.signature, now);
+        let mut runner = digest_relay_test_runner(addr, Arc::clone(&detector)).await;
+
+        runner.run_sync().await; // cycle 1: probe 404s (Fallback)
+
+        let digest_reqs: Vec<DigestSyncRequest> = decode_routed(&captured, "digest");
+        assert!(!digest_reqs.is_empty(), "the digest push probe must run");
+        assert!(
+            digest_reqs.iter().all(|r| !r.observed.is_empty()),
+            "every probe attempt (bincode + JSON fallback) carries the sample"
+        );
+        assert!(
+            runner.observed_last_sent.is_empty(),
+            "a Fallback outcome must not be recorded as a delivery"
+        );
+
+        // Cycle 2: the peer is cached digest-unsupported, so the delta
+        // pull is the first carrier — the undelivered sample rides it.
+        runner
+            .peer_backoffs
+            .values_mut()
+            .for_each(|b| b.record_success());
+        let digest_before = digest_reqs.len();
+        let delta_before: usize = decode_routed::<DeltaSyncRequest>(&captured, "delta").len();
+        runner.run_sync().await;
+
+        let digest_reqs: Vec<DigestSyncRequest> = decode_routed(&captured, "digest");
+        assert_eq!(
+            digest_reqs.len(),
+            digest_before,
+            "an unsupported peer must not be re-probed within the cache TTL"
+        );
+        let delta_reqs: Vec<DeltaSyncRequest> = decode_routed(&captured, "delta");
+        assert!(delta_reqs.len() > delta_before);
+        assert!(
+            delta_reqs[delta_before..]
+                .iter()
+                .any(|r| !r.observed.is_empty()),
+            "the undelivered sample must re-attach to the next cycle's carrier"
+        );
+        assert!(
+            !runner.observed_last_sent.is_empty(),
+            "the delta delivery must record the mark"
+        );
+        server.abort();
     }
 }

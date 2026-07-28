@@ -14,7 +14,7 @@
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
 3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
-4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, M-14, M-17)とテスト(M-16)
+4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
 ## M-4/m-7 クローズ記録(実装済み)
@@ -265,6 +265,84 @@ purge エンドポイントの認可・永続化・attestation 復帰)。
   メタデータのみの分岐・観測窓外・cold の非束縛 tick・grace 中の報告空白・
   非束縛形式へのオプトアウト(メトリクスで可視化のみ)。
 
+## M-14 クローズ記録(実装済み)
+
+**方式**: `DeltaSyncRequest` / `DigestSyncRequest` の**末尾**に
+`#[serde(default)] pub observed: Vec<ObservedAttestation>` を追加(append-only、
+`skip_serializing_if` 禁止 — bincode 位置依存の既存規約どおり)。全ノード共通の
+`run_sync` が 1 サイクルに 1 回 `gossip_summaries(GOSSIP_SAMPLE_MAX=64)` を採取し、
+ピアごとに**最初に送出する 1 carrier**(digest push probe → delta pull 初回 →
+delta pull の NetworkError リトライ(未達時のみ同一サンプル再添付)→ digest pull の順)
+へ相乗りさせる。同一サンプルの再送はピアごとの
+`(フィンガープリント, 配達時刻)`(`observed_last_sent`、ピア数で有界・レジストリ離脱時に
+prune)で抑止し、**ヘッドが動かない定常時は 0 バイト**。抑止は
+`OBSERVED_RETENTION_MS`(120s)で失効する時限式——受信側の観測索引はメモリのみ
+(再起動で消え、ヘッドも同じ窓で age-out)のため、無期限の抑止は中継ホップの再起動や
+混在期の旧ピア(末尾バイトを捨てて 200 を返す)のアップグレード後に中継経路を恒久沈黙
+させ得る。コストは最悪でもピアあたり 1 窓 1 回の冗長サンプル(受信側 `is_known_exact`
+で検証前 dedupe)。受信側は `post_internal_frontiers` の
+split-view ブロックを `ingest_relayed_observations`(handlers.rs)へ共通化し、
+delta/digest ハンドラがデシリアライズ直後・store ロック取得前・digest scheme 判定前に
+呼ぶ(observed はレスポンス内容・ステータスに一切影響しない。`scheme_ok=false`
+応答パスでも取込む)。ゲート順は frontier レーンと同一
+(registry 無し全捨て → range メンバーシップ → `take(64)` → `is_known_exact` dedupe →
+署名検証(失敗は非告発)→ `observe`)。検知時は frontier レーンと同一手順で
+`exclude_accused_authorities` 時の attestation purge も発火。
+
+**ワイヤ互換**: 新→旧 bincode は旧デコーダが末尾 observed を残余として無視(200)。
+旧→新 bincode は位置 decode 失敗 → 400 → 旧側実装済みの JSON 再送で成功
+(`serde(default)` が空充足。M-8 `compaction_floor` と同一の実証済みパターン)。
+response 型・`SyncRequest`・frontier レーンは不変(M-6 却下類型を構造的に回避)。
+混在期は旧→新方向の**毎リクエスト**が 400+JSON 再送になる(4xx アラート誤報要因、
+ops-guide に想定内と明記)。回帰は legacy ミラー構造体テストで固定
+(`new_bincode_requests_decode_on_legacy_mirrors_ignoring_trailing_observed` ほか、
+bincode 残余非検証への依存も明示的にピン)。
+
+**M-12 整合(grace 論証の改訂)**: 中継は hop ごとに `seen_ms` を再計時し age-out 後の
+再 index もあり得るため、「grace 明けには旧世代ヘッドが全ピアで期限切れ」という旧論証は
+**廃棄**。安全性はヘッド寿命と無関係のクロック算術
+(索引され得る旧ヘッド HLC ≤ W_old+60s、grace 明け初回報告 ≥ W_old+120s)で成立し、
+不変量 **`DIGEST_ACTIVATION_GRACE > 2 × MAX_CLOCK_SKEW_MS`**(180s > 120s、
+**厳密不等号** — 両側の受理境界は包含的なため、等号では同一 physical の
+pre/post-restart ペアが排除できない)を
+`digest_activation_grace_covers_clock_swing_budget` で固定。grace 値・沈黙幅・
+M-12 テストの変更は不要(実測: 既存 M-12 e2e 全て無変更で通過)。
+`equivocation.rs` の detector コア(定数・observe・索引構造)は不変で、検知プール
+上限 M-4 がそのまま中継の受信メモリ上限として効く。唯一の変更は
+`gossip_summaries` の出力コピーが `ObservedAttestation::for_wire_relay` を通ること:
+non-native-crypto(stub)ビルドは BLS フィールドを検証せずに索引し得るが、native
+受信側は BLS フィールドをデシリアライズ時(bincode/JSON 両方)に厳格検証するため、
+不正な BLS 文字列を 1 件でも中継すると carrier リクエスト全体がデコード不能になる。
+そのため stub ビルドは中継コピーから BLS レーンを剥離する(証拠採否は全ビルドで
+Ed25519 レーンのみで決まるため検知能力は不変。native ビルドは検証済みの BLS レーンを
+そのまま中継)。
+
+**有界性**: 送信 ≤ 64 件 × ~1.2KB ≈ 80KB/peer/サイクル(定常 0)、受信 ≤ 64 件
+× 最大 2 Ed25519 検証/request(frontier レーンと同一上限)、中継は周期 tick のみで
+reactive flooding 無し・既知エコーは検証前 dedupe(ループ不成立)。
+`sync_interval ≥ OBSERVED_RETENTION_MS` の構成は起動時 WARN。
+メトリクス: `observed_relay_sync_requests_total` / `observed_relay_sync_accepted_total`
+(sync レーン専用)、`split_view_observations_total` は両レーン共通で連続性維持。
+
+**テスト**: 非 authority 標的 split-view の e2e
+(`split_view_targeting_non_authorities_detected_via_sync_relay` — 修正前コードで
+赤(タイムアウト)を確認済み)、多段中継 e2e(X—Z—Y チェーン)、ハンドラ単体
+(取込・scheme_ok=false 取込・偽造非告発・64 件 cap・registry 無し全捨て・
+response バイト不変・purge 連動)、runner(attach-once・未変化抑止・NetworkError
+再添付・配達記録の失効再送・digest push probe carrier の搭載/配達記録・digest 404
+Fallback の非記録と次サイクル再添付)、ワイヤ互換(legacy ミラー)、JSON リトライ
+同一 req 再送、grace 不変量(厳密)、stub ビルドの BLS レーン剥離。
+
+**残余(未着手の独立タスク)**:
+- サンプラ希釈対策: scope 横断ラウンドロビンのカーソルを呼び出し跨ぎで永続化
+  (既存 authority レーンにも効く独立改善)。
+- digest は不透明比較のため HLC 完全一致ペア以外の一過性 split-view は検知不能
+  (CT 系譜との本質差、ops-guide 限界節 5b に明記)。
+- `HeadEntry` への provenance フラグ(中継由来ヘッドの metrics 専用属性)は
+  必要になった時点で別タスク化(安全クリティカルな detector コアへの侵襲を回避)。
+- 恒久対策としての期限付き legacy ミラー二段デコード(混在期 4xx ノイズが
+  問題化した場合の後付け案)。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -283,9 +361,7 @@ purge エンドポイントの認可・永続化・attestation 復帰)。
   generation 検証)。
 - ~~**M-12**~~ **完了** — 上記「M-12 クローズ記録」参照(root digest 束縛 + ReportClockFloor +
   activation grace + 誤検知回復エンドポイント。per-scope 帰属は M-12b として残余記録)。
-- **M-14** `src/runtime/node_runner.rs`: ObservedAttestation の gossip レーンが authority 発 frontier push のみに載り、
-  非 authority ノードは観測を中継しない。非 authority を狙った split-view は矛盾ヘッドが出会わない。
-  observed レーンを delta/digest sync メッセージにも相乗りさせる(CT gossip の前提回復)。
+- ~~**M-14**~~ **完了** — 下記「M-14 クローズ記録」参照(observed レーンの delta/digest sync request 相乗り)。
 - **M-16** `tests/wal_recovery.rs`: WAL の HTTP レベル耐久性 ack 経路(wait_wal_durable + last_wal_pos)の
   テストが皆無(全テストが eventual_wal/certified_wal=None)。Some(WalSyncer) を配線した AppState で
   書き込み→ack→クラッシュ再現の統合テストを追加。

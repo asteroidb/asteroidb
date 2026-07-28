@@ -229,6 +229,7 @@ mod tests {
         let req = DeltaSyncRequest {
             sender: "node-2".to_string(),
             frontier: hlc(300, 1, "node-2"),
+            observed: vec![],
         };
 
         let (bytes, _) = serialize_internal(&req, Some(CONTENT_TYPE_BINCODE)).unwrap();
