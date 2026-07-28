@@ -779,6 +779,18 @@ async fn main() {
         })
         .unwrap_or(false);
 
+    // Ops kill switch for the store-digest frontier report format (M-12):
+    // when set to 0/false, authority reports keep the legacy placeholder
+    // digest_hash. Takes effect on restart, which is safe by construction —
+    // the report clock floor guarantees the post-restart HLCs are fresh, so
+    // the two formats never meet at the same frontier HLC.
+    let frontier_store_digest = !std::env::var("ASTEROIDB_FRONTIER_STORE_DIGEST")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "0" || v == "false"
+        })
+        .unwrap_or(false);
+
     let runner_config = NodeRunnerConfig {
         bls_config,
         node_signer,
@@ -793,6 +805,11 @@ async fn main() {
         digest_sync_enabled,
         gc_retention,
         gc_hole_jump_enabled,
+        frontier_store_digest,
+        // Write-ahead floor for frontier report HLCs (M-12): lives next to
+        // the other node state; without it the store-digest format never
+        // activates (fail-safe).
+        frontier_clock_floor_path: Some(data_dir.join("frontier_report_clock.json")),
         ..NodeRunnerConfig::default()
     };
 

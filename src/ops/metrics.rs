@@ -434,6 +434,31 @@ pub struct RuntimeMetrics {
     /// Cumulative attestations removed by accused-authority purges (m-7).
     pub attestation_purged_total: AtomicU64,
 
+    /// Frontier report ticks whose `digest_hash` fell back to the cold
+    /// sentinel because the store digest cache was not warm (M-12).
+    /// Occasional after restarts/bursts; sustained growth means warm-up
+    /// never converges and reports carry no content binding.
+    pub frontier_digest_cold_total: AtomicU64,
+
+    /// Frontier report ticks skipped entirely because the report clock
+    /// floor could not be persisted (M-12). Zero in healthy operation; any
+    /// growth means the data dir is not writable and this authority has
+    /// stopped reporting (certification liveness impact).
+    pub frontier_report_skipped_floor_total: AtomicU64,
+
+    /// Frontier reports ACCEPTED from remote authorities whose
+    /// `digest_hash` does not bind store content (not `sd<v>:<64 hex>` —
+    /// legacy placeholders, `sd2:cold`/`sd2:unavailable` sentinels, or
+    /// arbitrary strings). Receive-side observability (M-12): content
+    /// binding is enforced only by the reporter's own honest code path, so
+    /// a malicious authority can permanently opt out of it without ever
+    /// producing detectable misbehaviour; sustained growth attributable to
+    /// one authority (see the per-report debug log / GET
+    /// /api/internal/frontiers) is the only signal of that opt-out.
+    /// Transient non-zero values are normal during rolling upgrades
+    /// (placeholder-era peers) and cold-cache windows.
+    pub frontier_nonbinding_digest_total: AtomicU64,
+
     /// Per-key write operation counts for accurate per-range compaction tracking.
     ///
     /// Maps written keys to their cumulative op count since last drain.
@@ -498,6 +523,9 @@ impl Default for RuntimeMetrics {
             attestation_rejected_authority_cap_total: AtomicU64::default(),
             attestation_pool_scopes: AtomicU64::default(),
             attestation_purged_total: AtomicU64::default(),
+            frontier_digest_cold_total: AtomicU64::default(),
+            frontier_report_skipped_floor_total: AtomicU64::default(),
+            frontier_nonbinding_digest_total: AtomicU64::default(),
             write_ops_by_key: Mutex::new(HashMap::new()),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
@@ -796,6 +824,13 @@ impl RuntimeMetrics {
                 .load(Ordering::Relaxed),
             attestation_pool_scopes: self.attestation_pool_scopes.load(Ordering::Relaxed),
             attestation_purged_total: self.attestation_purged_total.load(Ordering::Relaxed),
+            frontier_digest_cold_total: self.frontier_digest_cold_total.load(Ordering::Relaxed),
+            frontier_report_skipped_floor_total: self
+                .frontier_report_skipped_floor_total
+                .load(Ordering::Relaxed),
+            frontier_nonbinding_digest_total: self
+                .frontier_nonbinding_digest_total
+                .load(Ordering::Relaxed),
             delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
             full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
             full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
@@ -918,6 +953,13 @@ pub struct MetricsSnapshot {
     pub attestation_pool_scopes: u64,
     /// Cumulative attestations removed by accused-authority purges.
     pub attestation_purged_total: u64,
+    /// Frontier report ticks that fell back to the cold digest sentinel.
+    pub frontier_digest_cold_total: u64,
+    /// Frontier report ticks skipped because the clock floor fsync failed.
+    pub frontier_report_skipped_floor_total: u64,
+    /// Accepted remote frontier reports whose digest binds no store
+    /// content (placeholder / sentinel / malformed format).
+    pub frontier_nonbinding_digest_total: u64,
     /// Cumulative number of delta syncs performed (push phase).
     pub delta_sync_count: u64,
     /// Cumulative number of full sync fallbacks triggered by high change rate.

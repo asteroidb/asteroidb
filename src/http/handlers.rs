@@ -51,10 +51,10 @@ use crate::session::SessionToken;
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteQuery,
-    EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse,
-    PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse, ProofBundleJson,
-    RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
+    EquivocationPurgeResponse, EquivocationReport, EventualReadQuery, EventualReadResponse,
+    EventualWriteQuery, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
+    LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
+    ProofBundleJson, RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
     SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
     VersionHistoryResponse, WriteResponse,
 };
@@ -738,6 +738,27 @@ pub async fn post_internal_frontiers(
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for (frontier, attestation) in to_apply {
+        // Receive-side observability (M-12): content binding is enforced
+        // only by the reporter's own honest code path — a compromised
+        // authority can permanently opt out by signing placeholder- or
+        // sentinel-shaped digests forever, and the detector (which
+        // deliberately compares digests as opaque strings) will never
+        // flag that as misbehaviour. Count every accepted non-binding
+        // report so the opt-out is at least visible to operators; this is
+        // never a rejection path (rolling upgrades and cold-cache ticks
+        // legitimately produce non-binding digests).
+        if !crate::authority::frontier_reporter::is_binding_store_digest(&frontier.digest_hash) {
+            state
+                .metrics
+                .frontier_nonbinding_digest_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                authority = %frontier.authority_id.0,
+                digest_hash = %frontier.digest_hash,
+                "accepted frontier report binds no store content \
+                 (placeholder/sentinel/unknown digest format)"
+            );
+        }
         // Re-check the accusation set at APPLY time (m-7): an attestation
         // batched ahead of the equivocating pair in this request — or
         // applied concurrently with an accusation from another request —
@@ -813,6 +834,45 @@ pub async fn get_equivocations(State(state): State<Arc<AppState>>) -> Json<Equiv
         evidence_count: evidence.len(),
         evidence_overflow_total: state.equivocation.evidence_overflow_total(),
         evidence,
+    })
+}
+
+/// `DELETE /api/authority/equivocations/{authority_id}`
+///
+/// Operator recovery path for a confirmed FALSE-POSITIVE accusation
+/// (M-12): removes the authority's stored evidence, its accused flag and
+/// its observed heads from THIS node's detector, persists the shrunken
+/// store, and refreshes the accused gauge. Protected by the internal
+/// bearer token (mutation, unlike the public read-only GET).
+///
+/// Scope caveats (mirrored in the runbook):
+/// - evidence gossips: purge EVERY node, or a peer re-delivers the pair
+///   and this node re-accuses within a report tick;
+/// - purging is NOT exoneration of a genuine equivocation — the signed
+///   pair remains valid proof wherever a copy survives. Use only after
+///   the diagnosis steps confirm a false positive.
+pub async fn delete_equivocations(
+    State(state): State<Arc<AppState>>,
+    Path(authority_id): Path<String>,
+) -> Json<EquivocationPurgeResponse> {
+    let authority = NodeId(authority_id.clone());
+    let stats = state.equivocation.purge_authority(&authority);
+    // Persist the shrunken store (blocking pool, writers serialized) so a
+    // restart does not resurrect the purged accusation from disk.
+    state.equivocation.spawn_persist();
+    let accused_remaining = state.equivocation.accused_count();
+    state.metrics.set_accused_authorities(accused_remaining);
+    tracing::warn!(
+        authority = %authority.0,
+        evidence_removed = stats.evidence_removed,
+        heads_removed = stats.heads_removed,
+        "operator purged equivocation state for authority (false-positive recovery)"
+    );
+    Json(EquivocationPurgeResponse {
+        authority_id,
+        evidence_removed: stats.evidence_removed,
+        heads_removed: stats.heads_removed,
+        accused_remaining,
     })
 }
 

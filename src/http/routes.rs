@@ -4,13 +4,13 @@ use axum::Router;
 use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
-    AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
-    get_policy, get_raft_status, get_slo, get_topology, get_version_history, healthz,
-    internal_announce, internal_delta_sync, internal_digest_sync, internal_join, internal_keys,
-    internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
-    post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote, remove_policy,
-    set_authority_definition, set_placement_policy, verify_proof,
+    AppState, certified_write, delete_equivocations, eventual_write, get_authority_definition,
+    get_certification_status, get_certified, get_equivocations, get_eventual,
+    get_internal_frontiers, get_metrics, get_policy, get_raft_status, get_slo, get_topology,
+    get_version_history, healthz, internal_announce, internal_delta_sync, internal_digest_sync,
+    internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
+    list_policies, post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote,
+    remove_policy, set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -53,6 +53,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/control-plane/policies/{prefix}",
             delete(remove_policy),
+        )
+        // Equivocation false-positive recovery (M-12): a mutation, so it
+        // rides the token-protected sub-router — unlike the public
+        // read-only GET /api/authority/equivocations.
+        .route(
+            "/api/authority/equivocations/{authority_id}",
+            delete(delete_equivocations),
         );
 
     let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token

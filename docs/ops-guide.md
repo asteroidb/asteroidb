@@ -180,6 +180,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。除外は 3 点で強制される: (1) HTTP 受信経路での検証時＋**apply 時の再チェック**（同一リクエスト内で告発が後続しても前方の attestation がすり抜けない）、(2) **告発時の attestation pool purge**（告発前にプール済みの最大 128 checkpoint 分の attestation を除去。`attestation_purged_total` で観測可能）、(3) **自己報告経路**（自ノードが告発された場合、自身の attestation も pool へ入れず、既存分を purge する）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in。**`0`（既定）では purge は発動せず、告発済み Authority の attestation は detect-only 契約どおり証明書に混入し続ける**。なお、告発**前**に組み立て済み・キャッシュ済みの証明書の遡及失効は行わない（証明書失効プロトコルは将来課題、`docs/followup-plan.md` 参照） |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
+| `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
@@ -279,7 +280,7 @@ frame を含む可能性があるため自動では削除・切り詰めされ�
   fail-stop を誘発することがある。FS 選定時に error / corruption の扱い
   分けを確認すること
 
-> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
+> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明する。frontier 報告の `digest_hash` は eventual store 全体の M-7 root digest（scheme v2、`sd2:<hex64>` 形式。warm-up 未完了 tick は `sd2:cold`、eventual store 未接続は `sd2:unavailable` のセンチネル）であり、report 署名がこの内容主張を反証不能に束縛する——同一 Authority が同一 checkpoint HLC に異なるストア内容を主張すれば equivocation 証拠になる（M-12）。ただし **majority certificate 自体は digest を集約しない**。これは意図的な設計である: eventual モードでは正当な複製遅延により Authority ごとにストア内容（= digest）が異なるのが常態であり、「共通 digest 値の過半数合意」は意味論的に成立しない（延期ではなく原理的却下）。また frontier は certified レーンの主張だが digest は eventual store の内容を束縛する——検知は同一 Authority の自己主張同士の比較なので、このレーン差は健全性に影響しない。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
 
 ### Frontier 追跡と attestation pool の資源上限（M-4）
 
@@ -293,17 +294,24 @@ frontier 追跡（`AckFrontierSet`——scope ごとに 1 エントリで固有�
 
 同一 Authority が矛盾する frontier 報告を（同一ピアまたは別ピアへ）署名付きで送った場合、受信ノードはこれをローカルで検知し、否認不能な証拠を保存する。
 
-- **判定条件**: 同一 `(authority_id, key_range, policy_version, frontier_hlc)` に対して `digest_hash` が異なる、**署名検証済み** attestation のペア。report 署名は frontier の全フィールド（digest 含む）を束縛するため、このペアは 2 つの相異なる署名済みメッセージそのものであり、第三者がレジストリ鍵で再検証できる **proof of misbehaviour（POM）** になる。同一チェックポイント内での frontier_hlc の前進や、鍵ローテーション中の同一 digest 再署名は定義上検知対象外（誤検知ゼロ）。無署名報告・検証に失敗した報告は証拠にならない。
+- **判定条件**: 同一 `(authority_id, key_range, policy_version, frontier_hlc)` に対して `digest_hash` が異なる、**署名検証済み** attestation のペア。report 署名は frontier の全フィールド（digest 含む）を束縛するため、このペアは 2 つの相異なる署名済みメッセージそのものであり、第三者がレジストリ鍵で再検証できる **proof of misbehaviour（POM）** になる。同一チェックポイント内での frontier_hlc の前進や、鍵ローテーション中の同一 digest 再署名は定義上検知対象外。無署名報告・検証に失敗した報告は証拠にならない。
+- **誤検知ゼロの根拠（M-12 以降）**: digest が実ストア内容（tick 間で正当に変化する値）になったため、誤検知ゼロは「digest が HLC の決定的関数であること」ではなく次の機構で保証される: (1) digest は **tick ごとに一度だけ**計算され、report 署名で凍結される（全 scope・全ピア・自己観測に同一バイト）。(2) report HLC はプロセス内で厳密単調。(3) 再起動を跨ぐ単調性は **ReportClockFloor**（`<data_dir>/frontier_report_clock.json`、10 秒幅リースの write-ahead fsync。fsync 失敗 tick は報告ごとスキップ = `frontier_report_skipped_floor_total`）が保証し、起動時にリース値から clock を seed する。(4) floor ファイルが無い起動（初回起動・floor 喪失）では **activation grace（180 秒 = 観測ヘッド保持 120 秒 + skew 前提 60 秒）** の間 **frontier 報告そのものを完全停止**する（形式を問わず何も署名しない）。前世代の報告形式は floor 喪失後には判別できず、プレースホルダを出すと「旧世代の `sd2:` ヘッドをピアが保持したまま、壁時計逆行（60 秒以内でも）で同一 HLC を再発行」した場合に placeholder-vs-sd2 の偽証拠が成立し得るため、無署名だけが両形式方向に安全。grace 中は floor ファイルも作成されない（grace 中にクラッシュしても次回起動は grace を最初からやり直す——floor ファイルの存在は常に「リースが全署名済み report を覆う」ことの証拠であり続ける）。grace 明けに `sd2:` 形式で報告を再開する（この時点でピア上の旧世代ヘッドは全て期限切れ）。コスト: floor 喪失・初回起動時のみ、当該 authority の frontier 報告が約 3 分停止する。ノード間のストア内容差（複製遅延・GC タイミング差・anti-entropy 途中）は **authority_id が異なるため構造上比較されない**——split-view 検知は「同一 Authority が同一 checkpoint に異なる内容を主張すること」の検出であり、ノード間差異の検出ではない。
+- **運用前提（M-12）**: (a) authority ノードは floor の永続化のため書き込み可能な data dir が必須（floor path 未構成なら `sd2:` 形式は決して有効化されず、プレースホルダのまま fail-safe）。(b) クロックの逆行はクラスタ前提の skew 上限 60 秒（`MAX_CLOCK_SKEW_MS`）以内であること——activation grace の幅はピア側壁時計がこの前提内であることに依存する。(c) **`frontier_report_clock.json` をバックアップから復元しないこと**。復元された floor のリースはバックアップ時点の値であり、バックアップ以降クラッシュまでに署名した report を覆わない（= 単調性証拠として偽）。しかも staleness はローカルで判別不能なため、ノードはそれを信頼して即時 `sd2:` 署名を再開してしまう。data dir をバックアップから復元する場合はこのファイルを**削除してから**起動する（削除すれば grace が適用され安全に劣化する。下の「データ復旧」表も参照）。切替・ロールバックは `ASTEROIDB_FRONTIER_STORE_DIGEST=0` + 再起動（floor により再起動後 HLC は常に新規なので、新旧形式が同一ヘッドで衝突することはない）。ローリングアップグレードに順序制約はなく（`sd2:` 文字列は旧ノードにも不透明な digest として検証・比較・中継される）、旧バイナリへのダウングレードも安全（floor ファイルは旧バイナリには読まれない無害な JSON として残るだけ）。
 - **split-view 検知（CT-gossip Protocol 2 型）**: 各ノードは自身が観測した署名付き attestation の要約を既存の frontier push（`observed` レーン、旧ノードは無視して decode 可能）に相乗りさせて交換する。悪意 Authority がピアごとに異なる digest を報告しても、ピア間の gossip 交換後に受信側が矛盾を検知する。検知済み証拠のペアは gossip で全ピアへ能動的に伝播する。
 - **検知時の動作**: `EQUIVOCATION DETECTED` の警告ログ（構造化フィールド付き）、メトリクス計上（`equivocation_detected_total` ほか）、証拠のデータディレクトリへの永続化（`equivocation_evidence.json`、再起動後も保持）。**自動隔離は行わない**——Authority の排除には合意が必要であり、検知レイヤに強制を混ぜない設計（除外の opt-in は `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` を参照）。証拠は `GET /api/authority/equivocations` で取得できる。対応手順は `docs/runbook/troubleshooting.md` の「Authority Equivocation Detected」を参照。
+- **検知可能になったもの（M-12）**: 同一 Authority が同一 `(key_range, policy_version, frontier_hlc)` に**異なるストア内容**を主張する data-content split view。root digest は全キーの正準 CRDT ストリーム digest（D(k)）を集約するため、任意の 1 キーの差異が root を変える（SHA-256 衝突を除く）。比較は文字列等価なので**旧ノードの検知器も新形式の split view をそのまま検知できる**（ロールアウト即時に全観測者へ波及）。同一署名鍵を共有する重複プロセス（誤構成・鍵漏洩）も、ストア内容が分岐した時点で自己検知される。
 - **限界（重要・脅威モデル上の正直な注記）**:
   1. 検知は**事後的・確率的**であり防止ではない（reactive security）。矛盾する報告が一時的に受理・配布される時間窓を許す。
-  2. **結託した過半数**が全ノードに一貫して同じ嘘をつく非分岐型の不正は、本機構（および fork*/ハッシュチェーン系一般）では検知できない。対抗手段は Authority 群の独立配置のみ。
-  3. 悪意 Authority がピアごとに frontier_hlc を僅かにずらして報告すると、完全一致ベースの検知確率は下がる（その場合も certificate は checkpoint 単位で束縛される）。
+  2. **結託した過半数**が全ノードに一貫して同じ嘘をつく非分岐型の不正は、本機構（および fork*/ハッシュチェーン系一般）では検知できない。対抗手段は Authority 群の独立配置のみ。また digest は自己申告であり、実際にサービングしている内容との照合（PeerReview 型監査）は未実装——「全員に一貫した嘘」は digest が実体化しても不可視。さらに**内容束縛は報告側の正直な実装パスのみが強制**する: 悪意 Authority はプレースホルダ形式（HLC の決定的関数なので split の両側が常にバイト一致）や固定センチネル文字列を署名し続けることで、data-content split-view 検知から**恒久的に離脱**できる。これは検知器では不正として扱われず（digest は意図的に不透明文字列比較）、受信側メトリクス `frontier_nonbinding_digest_total` の恒常増加と `GET /api/internal/frontiers` の目視でのみ観測できる。
+  3. 悪意 Authority がピアごとに frontier_hlc を僅かにずらして報告すると、完全一致ベースの検知確率は下がる（その場合も certificate は checkpoint 単位で束縛される）。CT 型 consistency proof は将来課題。
   4. 検知遅延 ≈ frontier 報告周期 + push 伝搬遅延 + クロックスキュー。honest なピアが定期的に push し合うことが前提で、長期分断では検知が遅れる。
   5. 観測索引は scope あたり 128 件（報告周期 1 秒でおよそ 2 分）に prune されるため、それより古い時点との矛盾はローカルでは検知できない（記録済みの証拠自体は消えない）。
   6. `observed` レーンは 1 件あたり Ed25519 検証コストがかかる（リクエストあたり 64 件で打ち切り）。内部 API には `ASTEROIDB_INTERNAL_TOKEN` の設定を推奨する。
-  7. **鍵配布そのものは検知の対象外（脅威モデル境界）**: この透明性レイヤが覆うのは frontier 報告の一致性のみであり、keyset 履歴に STR（Signed Tree Root）チェーンは無い。**鍵配布・ローテーション自体の split-view**——異なるノードに異なる `ASTEROIDB_AUTHORITY_KEYS` を配る攻撃——は検知できず、keyset の完全性は env 配布経路（構成管理・シークレット配布）の運用信頼に依存する。STR チェーンの導入は次期課題（`SECURITY.md`「既知の制限事項」および `docs/runbook/key-rotation.md` を参照）。
+  7. digest は per-key HLC・LWW タイムスタンプ等のメタデータを意図的に含まない（`src/store/digest.rs` の設計判断）ため、**メタデータのみの分岐**は不可視。
+  8. digest cache が cold の tick（`sd2:cold`、`frontier_digest_cold_total` で観測）と eventual store 未接続（`sd2:unavailable`）は内容を束縛しない。floor 無し起動の activation grace 中（最初の 180 秒）は frontier 報告そのものが停止する（内容束縛どころか報告が無い——安全性のための意図的な空白）。非束縛 tick は受信側でも `frontier_nonbinding_digest_total` で観測できる。
+  9. root digest は全ストア粒度であり、証拠は**どの key range が分岐したか**までは示さない（per-scope digest への細分化は followup M-12b）。
+  10. compaction checkpoint の digest（`src/compaction/engine.rs` 系統、FR-010）は**別系統で依然プレースホルダのまま**（未解決）。
+  11. **鍵配布そのものは検知の対象外（脅威モデル境界）**: この透明性レイヤが覆うのは frontier 報告の一致性のみであり、keyset 履歴に STR（Signed Tree Root）チェーンは無い。**鍵配布・ローテーション自体の split-view**——異なるノードに異なる `ASTEROIDB_AUTHORITY_KEYS` を配る攻撃——は検知できず、keyset の完全性は env 配布経路（構成管理・シークレット配布）の運用信頼に依存する。STR チェーンの導入は次期課題（`SECURITY.md`「既知の制限事項」および `docs/runbook/key-rotation.md` を参照）。
 
 ### BLS 鍵配布のローリングアップグレード手順（PoP 導入）
 
@@ -386,6 +394,9 @@ curl -s http://localhost:3000/api/slo | jq .
 | `attestation_rejected_scope_cap_total` | u64 | pool のグローバル scope 上限（1024）による insert 拒否累計。**正常時ゼロ** |
 | `attestation_rejected_authority_cap_total` | u64 | pool の per-authority scope 上限（64）による insert 拒否累計。**正常時ゼロ** |
 | `attestation_purged_total` | u64 | 告発された Authority の pool 済み attestation の purge 除去累計（`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1` 時のみ増加し得る） |
+| `frontier_digest_cold_total` | u64 | digest cache が cold のまま `sd2:cold` センチネルで報告した frontier tick 累計。再起動・大量書き込み直後の散発は正常、恒常増加は warm-up 不収束（当該 tick は内容を束縛しない） |
+| `frontier_report_skipped_floor_total` | u64 | ReportClockFloor の fsync 失敗により**報告ごとスキップ**した frontier tick 累計。正常時ゼロ。増加は data dir 書き込み不能を意味し、この Authority は報告を停止している（certification 可用性への影響大、即調査） |
+| `frontier_nonbinding_digest_total` | u64 | 受信・受理したリモート Authority の frontier 報告のうち、`digest_hash` が内容を束縛しない形式（プレースホルダ / `sd2:cold` / `sd2:unavailable` / 不明形式）だった件数の累計。ローリングアップグレード中や cold cache 窓では一時的な増加が正常。**特定 Authority に帰属する恒常増加**（debug ログ `accepted frontier report binds no store content` で帰属確認）は、その Authority が内容束縛から離脱している唯一のシグナル（限界 2 を参照） |
 | `peer_sync` | map | ピアごとの同期統計（60 秒スライディングウィンドウ） |
 | `certification_latency_window` | object | 証明レイテンシウィンドウ統計（60 秒） |
 
@@ -1628,6 +1639,7 @@ done
 > | `certified.snapshot.bin` + `wal/certified/` | Certified ストア | **不可**（anti-entropy 経路が無い — 破棄は恒久喪失） |
 > | `raft/`（`hard_state.json` / `log.json`） | Control-plane Raft 投票状態・ログ | **不可**（白紙化は投票済み term での二重投票を再導入し得る — §14.5 の手順以外で消さない） |
 > | `equivocation_evidence.json` | Equivocation 証拠（否認不能な POM） | **不可**（消失した証拠は戻らない） |
+> | `frontier_report_clock.json` | frontier 報告 HLC の write-ahead floor（M-12） | **喪失は安全に劣化 / 復元は禁止**。喪失しても起動は成功するが、activation grace 180 秒の間この Authority の frontier 報告が停止する（恒久喪失なし）。**バックアップからの復元は絶対にしない**——古いリースは「全署名済み report を覆う」という floor の証拠性を偽り、誤検知（正当 Authority への偽 equivocation 証拠）を招き得る。data dir を復元する場合はこのファイルを削除してから起動する |
 >
 > 退避するのは**壊れたストアのファイルのみ**。`raft/`・
 > `equivocation_evidence.json`・certified スナップショット/WAL は必ず保持する。

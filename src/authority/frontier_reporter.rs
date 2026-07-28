@@ -2,7 +2,72 @@ use crate::authority::ack_frontier::{AckFrontier, FrontierScope};
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::error::HlcError;
 use crate::hlc::{Hlc, HlcTimestamp};
+use crate::store::digest::{DIGEST_LEN, DIGEST_SCHEME_VERSION};
 use crate::types::NodeId;
+
+/// Sentinel `digest_hash` reported while the store's digest cache is still
+/// cold (warm-up pending): the report binds no content claim for this tick.
+/// Distinct from every real digest (`sd2:<64 hex>`), and constant within a
+/// tick like any other digest string, so it can never produce a
+/// self-conflicting pair.
+pub const SD_COLD: &str = "sd2:cold";
+
+/// Sentinel `digest_hash` reported when no eventual store is attached to
+/// the runner (certified-only wiring): content binding is unavailable.
+pub const SD_UNAVAILABLE: &str = "sd2:unavailable";
+
+/// Format an M-7 store root digest as a frontier `digest_hash` string:
+/// `"sd{DIGEST_SCHEME_VERSION}:{hex(root)}"` (e.g. `sd2:3fa9…`, 64 hex).
+///
+/// The scheme-version prefix makes the binding diagnosable on the wire and
+/// keeps a future scheme bump (v3 canonical form) visually distinct; the
+/// string is opaque to verification and comparison, so old nodes handle it
+/// unchanged (signature covers it byte-for-byte, detector compares equality).
+pub fn format_store_digest_hash(root: &[u8; DIGEST_LEN]) -> String {
+    format!("sd{DIGEST_SCHEME_VERSION}:{}", hex::encode(root))
+}
+
+/// The legacy placeholder `digest_hash`: a deterministic function of
+/// `(node_id, HLC)`. Still emitted while the store-digest form is inactive
+/// (kill switch off, or no clock-floor persistence configured). Note that a
+/// floorless-boot activation grace does NOT emit placeholders — it
+/// suppresses reporting entirely (see `NodeRunner`'s
+/// `DIGEST_ACTIVATION_GRACE`): placeholder determinism only protects
+/// against re-issued HLCs whose earlier head was ALSO placeholder-format,
+/// and a floorless boot cannot know which format its previous incarnation
+/// was signing.
+pub fn placeholder_digest_hash(node_id: &NodeId, ts: &HlcTimestamp) -> String {
+    format!("{}-{}-{}", node_id.0, ts.physical, ts.logical)
+}
+
+/// Whether a frontier `digest_hash` string actually binds store content:
+/// `sd<version>:<64 lowercase hex>` (any scheme version). Placeholder
+/// strings, the `sd2:cold` / `sd2:unavailable` sentinels and arbitrary
+/// garbage are all non-binding.
+///
+/// This is an OBSERVABILITY predicate, never a validity check: the
+/// detector deliberately treats the digest as an opaque string (old nodes
+/// keep detecting new-format conflicts, and format validation would add a
+/// rejection path that a malicious authority could aim at). Its purpose is
+/// the receive-side metric `frontier_nonbinding_digest_total` — a
+/// compromised authority can permanently opt out of content binding by
+/// signing placeholder-shaped or sentinel strings forever, which no
+/// detector flags as misbehaviour; the metric makes that visible to
+/// operators instead of leaving it silent.
+pub fn is_binding_store_digest(digest_hash: &str) -> bool {
+    let Some(rest) = digest_hash.strip_prefix("sd") else {
+        return false;
+    };
+    let Some((version, hex)) = rest.split_once(':') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_digit())
+        && hex.len() == DIGEST_LEN * 2
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// Generates frontier reports for authority scopes managed by this node.
 ///
@@ -59,20 +124,39 @@ impl FrontierReporter {
 
     /// Generate frontier reports for all authority scopes.
     ///
-    /// Each scope receives a frontier at the current HLC time. The returned
-    /// `AckFrontier` values can be applied via `AckFrontierSet::update()`.
+    /// Each scope receives a frontier at the current HLC time with the
+    /// given `digest_hash` (see [`report_frontiers_at`](Self::report_frontiers_at)
+    /// for the digest contract). The returned `AckFrontier` values can be
+    /// applied via `AckFrontierSet::update()`.
     ///
     /// Because `Hlc::now()` is monotonic, successive calls will never
     /// produce timestamps that go backwards.
-    pub fn report_frontiers(&self, clock: &mut Hlc) -> Result<Vec<AckFrontier>, HlcError> {
+    pub fn report_frontiers(
+        &self,
+        clock: &mut Hlc,
+        digest_hash: &str,
+    ) -> Result<Vec<AckFrontier>, HlcError> {
         let now = clock.now()?;
-        Ok(self.report_frontiers_at(&now))
+        Ok(self.report_frontiers_at(&now, digest_hash))
     }
 
-    /// Generate frontier reports for all authority scopes at a specific timestamp.
+    /// Generate frontier reports for all authority scopes at a specific
+    /// timestamp, binding `digest_hash` verbatim into every scope's report.
     ///
-    /// This is useful for testing or when the caller already has a timestamp.
-    pub fn report_frontiers_at(&self, timestamp: &HlcTimestamp) -> Vec<AckFrontier> {
+    /// **Digest contract (equivocation safety)**: the caller must NEVER
+    /// call this twice with the same `timestamp` but a different
+    /// `digest_hash`. A signed frontier pair with identical
+    /// `(authority, key_range, policy_version, frontier_hlc)` and
+    /// differing digests IS the definition of an equivocation
+    /// (`EquivocationDetector::observe`) — violating this rule makes an
+    /// honest node accuse itself. The only production caller is
+    /// `NodeRunner::report_frontiers`, which computes the digest exactly
+    /// once per freshly issued (strictly monotonic, restart-floored) HLC.
+    pub fn report_frontiers_at(
+        &self,
+        timestamp: &HlcTimestamp,
+        digest_hash: &str,
+    ) -> Vec<AckFrontier> {
         self.authority_scopes
             .iter()
             .map(|scope| AckFrontier {
@@ -80,10 +164,7 @@ impl FrontierReporter {
                 frontier_hlc: timestamp.clone(),
                 key_range: scope.key_range.clone(),
                 policy_version: scope.policy_version,
-                digest_hash: format!(
-                    "{}-{}-{}",
-                    self.node_id.0, timestamp.physical, timestamp.logical
-                ),
+                digest_hash: digest_hash.to_string(),
             })
             .collect()
     }
@@ -255,7 +336,8 @@ mod tests {
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         let ts = make_ts(1000, 5, "auth-1");
 
-        let frontiers = reporter.report_frontiers_at(&ts);
+        let frontiers =
+            reporter.report_frontiers_at(&ts, &placeholder_digest_hash(reporter.node_id(), &ts));
 
         assert_eq!(frontiers.len(), 1);
         assert_eq!(frontiers[0].authority_id, node("auth-1"));
@@ -271,10 +353,76 @@ mod tests {
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         let mut clock = Hlc::new("auth-1".into());
 
-        let frontiers = reporter.report_frontiers(&mut clock).unwrap();
+        let frontiers = reporter.report_frontiers(&mut clock, "sd-test").unwrap();
         assert_eq!(frontiers.len(), 1);
         // HLC clock should produce a valid timestamp.
         assert!(frontiers[0].frontier_hlc.physical > 0);
+    }
+
+    #[test]
+    fn report_frontiers_at_propagates_digest_verbatim_to_all_scopes() {
+        // The digest string is bound byte-for-byte into EVERY scope's
+        // report of the tick: scope count must never fan the tick out
+        // into per-scope digest variants (single-computation contract).
+        let mut ns = SystemNamespace::new();
+        add_scope(&mut ns, "user/", &["auth-1", "auth-2"]);
+        add_scope(&mut ns, "order/", &["auth-1", "auth-3"]);
+        let reporter = FrontierReporter::new(node("auth-1"), &ns);
+        let ts = make_ts(2_000, 3, "auth-1");
+
+        let digest = format_store_digest_hash(&[0xAB; DIGEST_LEN]);
+        let frontiers = reporter.report_frontiers_at(&ts, &digest);
+        assert_eq!(frontiers.len(), 2);
+        for f in &frontiers {
+            assert_eq!(f.digest_hash, digest, "digest must propagate verbatim");
+        }
+    }
+
+    #[test]
+    fn digest_hash_format_helpers() {
+        let digest = format_store_digest_hash(&[0u8; DIGEST_LEN]);
+        assert_eq!(
+            digest,
+            format!("sd{DIGEST_SCHEME_VERSION}:{}", "0".repeat(64))
+        );
+        // The sentinels share the live scheme prefix (diagnosability) but
+        // can never collide with a real digest (never 64 hex chars).
+        for sentinel in [SD_COLD, SD_UNAVAILABLE] {
+            assert!(sentinel.starts_with(&format!("sd{DIGEST_SCHEME_VERSION}:")));
+            assert_ne!(sentinel.len(), digest.len());
+        }
+        // The placeholder is a pure function of (node_id, HLC): two
+        // kill-switch-era (or no-floor-path) reports at one HLC are
+        // byte-identical and therefore Consistent on any peer.
+        let ts = make_ts(1_234, 7, "auth-1");
+        assert_eq!(
+            placeholder_digest_hash(&node("auth-1"), &ts),
+            "auth-1-1234-7"
+        );
+        assert_eq!(
+            placeholder_digest_hash(&node("auth-1"), &ts),
+            placeholder_digest_hash(&node("auth-1"), &ts.clone())
+        );
+    }
+
+    #[test]
+    fn is_binding_store_digest_classifies_formats() {
+        // Binding: real root digests, any scheme version.
+        assert!(is_binding_store_digest(&format_store_digest_hash(
+            &[0xAB; DIGEST_LEN]
+        )));
+        assert!(is_binding_store_digest(&format!("sd3:{}", "0".repeat(64))));
+        // Non-binding: sentinels, placeholders, malformed variants.
+        assert!(!is_binding_store_digest(SD_COLD));
+        assert!(!is_binding_store_digest(SD_UNAVAILABLE));
+        assert!(!is_binding_store_digest("auth-1-1234-0"));
+        assert!(!is_binding_store_digest(""));
+        assert!(!is_binding_store_digest("sd:0"));
+        assert!(!is_binding_store_digest(&format!("sd2:{}", "0".repeat(63))));
+        assert!(!is_binding_store_digest(&format!("sd2:{}", "0".repeat(65))));
+        // Uppercase hex is not the canonical `hex::encode` output.
+        assert!(!is_binding_store_digest(&format!("sd2:{}", "A".repeat(64))));
+        assert!(!is_binding_store_digest(&format!("sdX:{}", "0".repeat(64))));
     }
 
     #[test]
@@ -283,8 +431,8 @@ mod tests {
         let reporter = FrontierReporter::new(node("auth-1"), &ns);
         let mut clock = Hlc::new("auth-1".into());
 
-        let f1 = reporter.report_frontiers(&mut clock).unwrap();
-        let f2 = reporter.report_frontiers(&mut clock).unwrap();
+        let f1 = reporter.report_frontiers(&mut clock, "sd-test").unwrap();
+        let f2 = reporter.report_frontiers(&mut clock, "sd-test").unwrap();
 
         assert!(
             f2[0].frontier_hlc > f1[0].frontier_hlc,
@@ -304,14 +452,14 @@ mod tests {
 
         // Report at t=1000
         let ts_new = make_ts(1000, 0, "auth-1");
-        let frontiers = reporter.report_frontiers_at(&ts_new);
+        let frontiers = reporter.report_frontiers_at(&ts_new, "d-new");
         for f in &frontiers {
             set.update(f.clone());
         }
 
         // Try to apply an older frontier at t=500
         let ts_old = make_ts(500, 0, "auth-1");
-        let old_frontiers = reporter.report_frontiers_at(&ts_old);
+        let old_frontiers = reporter.report_frontiers_at(&ts_old, "d-old");
         for f in &old_frontiers {
             set.update(f.clone());
         }
@@ -336,7 +484,8 @@ mod tests {
         let mut set = AckFrontierSet::new();
 
         let ts = make_ts(1000, 0, "auth-1");
-        let frontiers = reporter.report_frontiers_at(&ts);
+        let frontiers =
+            reporter.report_frontiers_at(&ts, &placeholder_digest_hash(reporter.node_id(), &ts));
 
         // Apply the same frontier twice
         for f in &frontiers {
@@ -441,7 +590,7 @@ mod tests {
         let reporter = FrontierReporter::new(node("store-node"), &ns);
         let mut clock = Hlc::new("store-node".into());
 
-        let frontiers = reporter.report_frontiers(&mut clock).unwrap();
+        let frontiers = reporter.report_frontiers(&mut clock, "sd-test").unwrap();
         assert!(frontiers.is_empty());
     }
 
@@ -463,11 +612,11 @@ mod tests {
 
         // Only auth-1 and auth-2 report at t=1000 (above client write).
         let report_ts = make_ts(1000, 0, "auth-1");
-        for f in r1.report_frontiers_at(&report_ts) {
+        for f in r1.report_frontiers_at(&report_ts, "d1") {
             set.update(f);
         }
         let report_ts = make_ts(1000, 0, "auth-2");
-        for f in r2.report_frontiers_at(&report_ts) {
+        for f in r2.report_frontiers_at(&report_ts, "d2") {
             set.update(f);
         }
 
@@ -479,7 +628,7 @@ mod tests {
 
         // auth-3 hasn't reported yet; adding its frontier at t=200 shouldn't break anything.
         let report_ts = make_ts(200, 0, "auth-3");
-        for f in r3.report_frontiers_at(&report_ts) {
+        for f in r3.report_frontiers_at(&report_ts, "d3") {
             set.update(f);
         }
 

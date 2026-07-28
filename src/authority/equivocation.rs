@@ -19,13 +19,18 @@
 //!   comparison key is `digest_hash` only, never the signature bytes or
 //!   `keyset_version`.
 //!
-//! The current digest is a deterministic function of `(node_id, hlc)`
-//! (`frontier_reporter`), so an honest authority can never produce two
-//! digests for one `frontier_hlc`. If the digest is ever changed to a
-//! Merkle root over real data, the invariant "same `(authority,
-//! frontier_hlc)` implies same digest" must be preserved for this
-//! definition to stay false-positive-free; the detection pipeline itself
-//! does not depend on digest semantics.
+//! Since M-12 the digest binds real store content (the M-7 root digest,
+//! `sd2:<hex>` — see `frontier_reporter::format_store_digest_hash`), so it
+//! is no longer a deterministic function of the HLC. The invariant "same
+//! `(authority, frontier_hlc)` implies same digest" is instead maintained
+//! by the reporting side: the digest is computed exactly once per report
+//! tick and frozen by the report signature, the HLC is strictly monotone
+//! in-process, and restarts are covered by the persisted
+//! `runtime::report_clock::ReportClockFloor` write-ahead lease (a boot
+//! without a floor file signs NOTHING until an activation grace longer
+//! than the peers' head-retention window has elapsed). The detection
+//! pipeline itself does not depend on digest semantics — it only compares
+//! digest strings for equality.
 //!
 //! Detection is **cheap and passive** (CT-gossip Protocol 2 style summaries
 //! piggyback on the existing frontier push); *enforcement* is intentionally
@@ -151,6 +156,15 @@ pub struct EquivocationEvidence {
     pub second: ObservedAttestation,
     /// Wall-clock time (ms since epoch) when the conflict was detected.
     pub detected_at_ms: u64,
+}
+
+/// Result of [`EquivocationDetector::purge_authority`]: what was removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PurgeStats {
+    /// Stored evidence pairs removed for the authority.
+    pub evidence_removed: usize,
+    /// Observed heads (main window + overflow, across all scopes) removed.
+    pub heads_removed: usize,
 }
 
 /// Outcome of feeding one verified attestation into the detector.
@@ -744,6 +758,50 @@ impl EquivocationDetector {
             }
         }
         out
+    }
+
+    /// Remove every trace of `authority` from the detector: stored
+    /// evidence, the accused flag, and all observed heads (main windows,
+    /// overflow FIFOs and the scope index entries) — operator recovery
+    /// path for a confirmed FALSE POSITIVE
+    /// (`DELETE /api/authority/equivocations/{authority_id}`).
+    ///
+    /// Removing the observed heads too is deliberate: a retained head
+    /// could immediately re-detect against the next legitimate report and
+    /// re-accuse the authority the operator just cleared. It does NOT
+    /// forget anything gossip can restore — peers that still hold the
+    /// evidence will re-deliver it (which is why the runbook says to purge
+    /// on ALL nodes), and genuinely new equivocations are re-detected from
+    /// scratch.
+    ///
+    /// The caller is responsible for persisting the shrunken store
+    /// (`spawn_persist`) and refreshing the accused gauge.
+    pub fn purge_authority(&self, authority: &NodeId) -> PurgeStats {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let evidence_removed = state
+            .evidence
+            .remove(authority)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        state.accused.remove(authority);
+        let victim_scopes: Vec<ObsScope> = state
+            .observed
+            .keys()
+            .filter(|s| s.authority_id == *authority)
+            .cloned()
+            .collect();
+        let mut heads_removed = 0;
+        for scope in victim_scopes {
+            if let Some(scope_state) = state.observed.remove(&scope) {
+                heads_removed += scope_state.heads.len() + scope_state.overflow.len();
+            }
+        }
+        // The rotating gossip cursor may now be past the shrunken evidence
+        // list; it is re-modulo'd on the next sample, so no reset needed.
+        PurgeStats {
+            evidence_removed,
+            heads_removed,
+        }
     }
 
     /// Serialize the evidence store for persistence.
@@ -1505,6 +1563,98 @@ mod tests {
             2 * MAX_EVIDENCE_PER_AUTHORITY,
             "every evidence pair must propagate across successive samples"
         );
+    }
+
+    #[test]
+    fn purge_authority_clears_evidence_accusation_and_heads() {
+        let signer = make_signer("auth-1", 21);
+        let bystander = make_signer("auth-2", 22);
+        // Persist path configured: the test must prove the purge shrinks
+        // the ACTUAL serialized payload (what the endpoint writes back to
+        // equivocation_evidence.json), not just the in-memory view.
+        let dir = tempfile::tempdir().unwrap();
+        let det = EquivocationDetector::new(Some(dir.path().join("equivocation_evidence.json")));
+
+        // Accuse auth-1 (evidence + heads in two scopes) and index an
+        // unrelated head for auth-2.
+        let f_a = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let f_b = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-b");
+        let f_c = make_frontier("auth-1", "order/", 1, 4_100, 0, "digest-c");
+        let f_other = make_frontier("auth-2", "user/", 1, 4_000, 0, "digest-x");
+        for (signer, f) in [
+            (&signer, &f_a),
+            (&signer, &f_b),
+            (&signer, &f_c),
+            (&bystander, &f_other),
+        ] {
+            let (f, s) = signed(signer, f);
+            det.observe(&f, &s, NOW_MS);
+        }
+        assert!(det.is_accused(&node("auth-1")));
+        // Pre-purge, the serialized snapshot names auth-1 (guards against
+        // this assertion pair going vacuous).
+        let (_, bytes) = det.persist_payload().expect("persist path configured");
+        let pre: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            pre["accused"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "auth-1")
+                && !pre["evidence"].as_array().unwrap().is_empty(),
+            "precondition: persisted payload must carry auth-1 before the purge"
+        );
+
+        let stats = det.purge_authority(&node("auth-1"));
+        assert_eq!(stats.evidence_removed, 1);
+        // user/ head (digest-a; digest-b lives only in the evidence pair)
+        // + order/ head.
+        assert_eq!(stats.heads_removed, 2);
+
+        // Accusation, evidence and heads are gone...
+        assert!(!det.is_accused(&node("auth-1")));
+        assert!(det.evidence().is_empty());
+        assert!(!det.is_known_exact(&f_a));
+        assert!(!det.is_known_exact(&f_b));
+        assert!(!det.is_known_exact(&f_c));
+        // ...the persisted payload of THIS detector shrinks accordingly —
+        // a restart replaying equivocation_evidence.json must not
+        // resurrect the purged accusation...
+        let (_, bytes) = det.persist_payload().expect("persist path configured");
+        let post: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            post["evidence"].as_array().unwrap().is_empty(),
+            "purged evidence must not survive in the serialized snapshot"
+        );
+        assert!(
+            post["accused"].as_array().unwrap().is_empty(),
+            "purged accusation must not survive in the serialized snapshot"
+        );
+        // ...and other authorities' observations are untouched.
+        assert!(det.is_known_exact(&f_other));
+
+        // No residual head: the next legitimate report at the same HLC is
+        // FirstSeen, not an instant re-accusation.
+        let f_retry = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-new");
+        let (f, s) = signed(&signer, &f_retry);
+        assert!(matches!(
+            det.observe(&f, &s, NOW_MS),
+            ObserveOutcome::FirstSeen
+        ));
+        assert!(!det.is_accused(&node("auth-1")));
+
+        // A genuinely NEW equivocation after the purge is still detected.
+        let f_again = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-newer");
+        let (f, s) = signed(&signer, &f_again);
+        assert!(matches!(
+            det.observe(&f, &s, NOW_MS),
+            ObserveOutcome::Equivocation(_)
+        ));
+
+        // Purging an unknown authority is a no-op.
+        let stats = det.purge_authority(&node("auth-9"));
+        assert_eq!(stats.evidence_removed, 0);
+        assert_eq!(stats.heads_removed, 0);
     }
 
     #[cfg(feature = "native-runtime")]

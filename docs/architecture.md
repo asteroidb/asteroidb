@@ -398,6 +398,16 @@ digest の材料に関する設計判断:
   ライブロックがあった。v2 では sweep が情報等価な圧縮（floor への畳み込み）
   になり、同じバケット転送が floor を運んで 1 往復で自己治癒する。
 
+digest の利用箇所は anti-entropy 同期に加えてもう一つある:
+**frontier attestation の内容束縛（M-12）**。authority ノードの frontier
+報告は `digest_hash` として eventual store の root digest
+（`sd2:<hex64>` 形式）を署名対象に含める。frontier は certified レーンの
+主張だが digest は eventual store の内容を束縛する——equivocation 検知は
+同一 authority の自己主張同士の比較（同一 frontier HLC・異 digest）で
+あってノード間比較ではないため、このレーン差は健全性に影響しない
+（詳細は ops-guide「Equivocation / split-view 検知」と
+`src/runtime/report_clock.rs` の設計コメント）。
+
 **保守契約**: CRDT 型へのフィールド追加・正準エンコーディングの変更は
 `DIGEST_SCHEME_VERSION` の bump と golden テストの更新を必須とする
 （怠ると「一致」が嘘になり claims が不健全化する）。バージョン不一致の
@@ -564,6 +574,7 @@ wasm32 ビルドはファイルシステムを持たないため対象外（純�
 ├── system_namespace.json                  (既存)
 ├── peer_registry.json                     (既存)
 ├── equivocation_evidence.json             (既存)
+├── frontier_report_clock.json             (M-12: frontier 報告 HLC の write-ahead floor)
 ├── eventual.snapshot.bin                  (bincode v3 スナップショット)
 ├── certified.snapshot.bin
 └── wal/

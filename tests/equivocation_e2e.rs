@@ -18,6 +18,7 @@ use asteroidb_poc::authority::certificate::{EpochConfig, KeysetRegistry, KeysetV
 use asteroidb_poc::authority::equivocation::{
     EquivocationDetector, GOSSIP_SAMPLE_MAX, MAX_OBSERVED_PER_REQUEST, ObservedAttestation,
 };
+use asteroidb_poc::authority::frontier_reporter::format_store_digest_hash;
 use asteroidb_poc::authority::frontier_sig::{
     FrontierSignature, NodeSigner, verify_frontier_signature,
 };
@@ -1084,6 +1085,447 @@ async fn version_rotation_flood_is_bounded_and_certification_survives() {
         has_certificate,
         "honest 2-of-3 must still assemble a certificate during/after the flood"
     );
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------
+// M-12: real store digests in frontier reports
+// ---------------------------------------------------------------
+
+/// The M-12 headline scenario: one authority claims two DIFFERENT store
+/// contents for the same checkpoint HLC to two lanes. With `digest_hash`
+/// bound to the real M-7 root digest, the conflicting pair becomes
+/// non-repudiable evidence — exactly what the placeholder could never
+/// detect. Both digests are computed from real `Store::digest()` roots.
+#[tokio::test]
+async fn split_view_with_real_store_digests_produces_evidence() {
+    let s1 = make_signer("auth-1", 91);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // Two real stores whose contents genuinely differ (the split view the
+    // authority is trying to sell to two halves of the cluster).
+    let digest_view_a = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/balance").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let digest_view_b = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/balance").unwrap();
+        api.eventual_counter_inc("user/balance").unwrap(); // divergent content
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    assert_ne!(digest_view_a, digest_view_b);
+    assert!(digest_view_a.starts_with("sd2:") && digest_view_a.len() == 4 + 64);
+
+    // Same authority, same (scope, policy_version, frontier_hlc).
+    let hlc = wall_ms();
+    let f_a = make_frontier("auth-1", hlc, &digest_view_a);
+    let f_b = make_frontier("auth-1", hlc, &digest_view_b);
+
+    // View A arrives on the direct push lane...
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s1, &f_a))],
+        )
+        .await
+        .unwrap();
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+
+    // ...view B arrives as a relayed observation (gossip lane, as a peer
+    // that was told view B would relay it).
+    let obs = ObservedAttestation {
+        signature: sign(&s1, &f_b),
+        frontier: f_b.clone(),
+    };
+    client
+        .push_frontiers_with_observations(&addr.to_string(), vec![], vec![], vec![obs])
+        .await
+        .unwrap();
+
+    // The data-content split view IS detected, and the evidence binds the
+    // two real store roots.
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let report = get_json(&addr, "/api/authority/equivocations").await;
+    assert_eq!(report["evidence_count"], 1);
+    let ev = &report["evidence"][0];
+    let recorded: Vec<&str> = ["first", "second"]
+        .iter()
+        .map(|side| ev[side]["frontier"]["digest_hash"].as_str().unwrap())
+        .collect();
+    assert!(recorded.contains(&digest_view_a.as_str()));
+    assert!(recorded.contains(&digest_view_b.as_str()));
+
+    // And the pair remains third-party verifiable (report signature binds
+    // the sd2 digest bytes like any other digest string).
+    let registry = full_registry(&[&s1]);
+    for side in ["first", "second"] {
+        let obs: ObservedAttestation = serde_json::from_value(ev[side].clone()).unwrap();
+        verify_frontier_signature(
+            &obs.frontier,
+            &obs.signature,
+            &registry,
+            0,
+            &EpochConfig::default(),
+        )
+        .expect("sd2 evidence must be third-party verifiable");
+    }
+
+    handle.abort();
+}
+
+/// Legitimate redelivery of the SAME signed sd2 report (push retry, relay
+/// echo) is `Consistent` — byte-identical digest strings can never become
+/// evidence, no matter how often they are re-sent.
+#[tokio::test]
+async fn same_signed_report_resubmit_is_consistent() {
+    let s1 = make_signer("auth-1", 92);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    let digest = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/x").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let f = make_frontier("auth-1", wall_ms(), &digest);
+    let sig = sign(&s1, &f);
+
+    // Direct-lane retries and a gossip-lane echo of the same bytes.
+    for _ in 0..3 {
+        client
+            .push_signed_frontiers(&addr.to_string(), vec![f.clone()], vec![Some(sig.clone())])
+            .await
+            .unwrap();
+    }
+    let echo = ObservedAttestation {
+        frontier: f.clone(),
+        signature: sig,
+    };
+    client
+        .push_frontiers_with_observations(&addr.to_string(), vec![], vec![], vec![echo])
+        .await
+        .unwrap();
+
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    handle.abort();
+}
+
+/// Mixed-format regression (rolling upgrade): a pre-M-12 placeholder head
+/// and a post-upgrade sd2 report from the SAME authority coexist without
+/// evidence — restart freshness (floor / grace) guarantees they never
+/// share a frontier HLC, and at different HLCs the detector never
+/// compares them. Old-node behaviour against sd2 strings is also pinned:
+/// verification and equality comparison treat the digest as an opaque
+/// string, so an old node still detects an sd2-vs-sd2 conflict.
+#[tokio::test]
+async fn old_placeholder_head_and_new_sd2_report_different_hlc_no_evidence() {
+    let s1 = make_signer("auth-1", 93);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // Pre-upgrade tick: placeholder-format digest at HLC t.
+    let t = wall_ms();
+    let placeholder = format!("auth-1-{t}-0");
+    let f_old = make_frontier("auth-1", t, &placeholder);
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_old.clone()],
+            vec![Some(sign(&s1, &f_old))],
+        )
+        .await
+        .unwrap();
+
+    // Post-upgrade tick: sd2 format at the NEXT HLC (the floor/grace
+    // machinery guarantees a fresh HLC across the restart).
+    let digest = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/x").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let f_new = make_frontier("auth-1", t + 1, &digest);
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_new.clone()],
+            vec![Some(sign(&s1, &f_new))],
+        )
+        .await
+        .unwrap();
+
+    // Both formats are tracked, neither conflicts.
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    assert!(state.equivocation.is_known_exact(&f_old));
+    assert!(state.equivocation.is_known_exact(&f_new));
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    // A resend of the old-format head stays consistent too (the receiver
+    // compares strings, never parses formats).
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_old.clone()],
+            vec![Some(sign(&s1, &f_old))],
+        )
+        .await
+        .unwrap();
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    handle.abort();
+}
+
+/// Restart false-positive regression: an authority restarts (fresh clock,
+/// same signing key, floor file present) while a peer still holds its
+/// pre-restart observed heads, and the store content — hence the digest —
+/// differs after the restart. The persisted floor forces every
+/// post-restart report HLC above every pre-restart head, so the peer
+/// records ZERO evidence. (Store snapshot/WAL recovery itself is covered
+/// by tests/crash_recovery.rs; the subject here is the report clock
+/// floor's cross-restart guarantee through the real report/push loop.)
+#[tokio::test]
+async fn restart_with_recovery_reissues_reports_without_evidence() {
+    use std::time::Duration;
+
+    use asteroidb_poc::compaction::CompactionEngine;
+    use asteroidb_poc::network::sync::SyncClient;
+    use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+    use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
+
+    let s1 = make_signer("auth-1", 94);
+    let dir = tempfile::tempdir().unwrap();
+    let floor_path = dir.path().join("frontier_report_clock.json");
+
+    // Peer node that will retain the pre-restart heads in its detector
+    // (retention is 120s, far beyond this test's lifetime).
+    let (state2, addr2, h2) =
+        spawn_node("node-2", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+
+    let run_phase = |phase: u64| {
+        let floor_path = floor_path.clone();
+        let addr2 = addr2.to_string();
+        let signer = make_signer("auth-1", 94);
+        async move {
+            let namespace = Arc::new(RwLock::new(default_namespace()));
+            let certified = Arc::new(Mutex::new(CertifiedApi::new(
+                node_id("auth-1"),
+                Arc::clone(&namespace),
+            )));
+            // "Recovered" store: contents differ between phases — the
+            // digest of the first post-restart report differs from every
+            // pre-restart digest.
+            let eventual = {
+                let mut api = EventualApi::new(node_id("auth-1"));
+                for i in 0..=phase {
+                    api.eventual_counter_inc(&format!("phase-{i}")).unwrap();
+                }
+                Arc::new(Mutex::new(api))
+            };
+            let peer_registry = PeerRegistry::new(
+                node_id("auth-1"),
+                vec![PeerConfig {
+                    node_id: node_id("node-2"),
+                    addr: addr2,
+                }],
+            )
+            .unwrap();
+            let sync_client =
+                SyncClient::with_token(Arc::new(Mutex::new(peer_registry)), TOKEN.to_string());
+            let mut registry = KeysetRegistry::new();
+            registry
+                .register_keyset(
+                    KeysetVersion(1),
+                    0,
+                    vec![(signer.node_id().clone(), signer.verifying_key())],
+                )
+                .unwrap();
+            let config = NodeRunnerConfig {
+                certification_interval: Duration::from_millis(50),
+                frontier_report_interval: Duration::from_millis(25),
+                sync_interval: None,
+                ping_interval: None,
+                node_signer: Some(Arc::new(signer)),
+                keyset_registry: Some(Arc::new(std::sync::RwLock::new(registry))),
+                internal_token: Some(TOKEN.to_string()),
+                equivocation: Some(Arc::new(EquivocationDetector::new(None))),
+                frontier_clock_floor_path: Some(floor_path),
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            };
+            let mut runner = NodeRunner::with_sync(
+                node_id("auth-1"),
+                certified,
+                CompactionEngine::with_defaults(),
+                config,
+                sync_client,
+                eventual,
+                Arc::new(RuntimeMetrics::default()),
+            )
+            .await;
+            let shutdown = runner.shutdown_handle();
+            let handle = tokio::spawn(async move { runner.run().await });
+            (shutdown, handle)
+        }
+    };
+
+    // Phase 1: run until the peer has indexed at least one signed sd2
+    // head from auth-1.
+    let (shutdown1, handle1) = run_phase(0).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let heads = state2
+            .equivocation
+            .gossip_summaries(GOSSIP_SAMPLE_MAX)
+            .into_iter()
+            .filter(|o| {
+                o.frontier.authority_id == node_id("auth-1")
+                    && o.frontier.digest_hash.starts_with("sd2:")
+            })
+            .count();
+        if heads > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer never observed a pre-restart sd2 head"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = shutdown1.send(true);
+    let _ = handle1.await;
+
+    // Phase 2: "restart" — fresh clock, fresh detector, same floor file,
+    // different store content. Run several report ticks against the peer
+    // that still holds every phase-1 head.
+    let (shutdown2, handle2) = run_phase(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = shutdown2.send(true);
+    let _ = handle2.await;
+
+    assert_eq!(
+        state2.equivocation.accused_count(),
+        0,
+        "a floored restart must never read as an equivocation on peers"
+    );
+    assert!(state2.equivocation.evidence().is_empty());
+    let metrics = get_json(&addr2, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    h2.abort();
+}
+
+// ---------------------------------------------------------------
+// M-12: false-positive recovery endpoint
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn purge_endpoint_clears_accused_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("equivocation_evidence.json");
+
+    let s1 = make_signer("auth-1", 95);
+    let s2 = make_signer("auth-2", 96);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1, &s2])),
+            exclude_accused: true,
+            persist_path: Some(path.clone()),
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+    let http = reqwest::Client::new();
+
+    // Accuse auth-1 with a conflicting signed pair.
+    let hlc = wall_ms();
+    for digest in ["digest-a", "digest-b"] {
+        let f = make_frontier("auth-1", hlc, digest);
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(&s1, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_accused_authorities"], 1);
+
+    // The endpoint is a mutation: without the internal token it is 401.
+    let resp = http
+        .delete(format!("http://{addr}/api/authority/equivocations/auth-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+
+    // Authorized purge clears the accusation and reports what it removed.
+    let resp = http
+        .delete(format!("http://{addr}/api/authority/equivocations/auth-1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["authority_id"], "auth-1");
+    assert_eq!(body["evidence_removed"], 1);
+    assert!(body["heads_removed"].as_u64().unwrap() >= 1);
+    assert_eq!(body["accused_remaining"], 0);
+
+    // Local state, operator endpoint and gauge all reflect the purge.
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    let report = get_json(&addr, "/api/authority/equivocations").await;
+    assert_eq!(report["evidence_count"], 0);
+    assert!(report["accused_authorities"].as_array().unwrap().is_empty());
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_accused_authorities"], 0);
+
+    // The purge is persisted: a restarted detector must NOT resurrect the
+    // accusation from disk (poll — persistence runs on the blocking pool).
+    let mut cleared = false;
+    for _ in 0..1_500 {
+        let restored = EquivocationDetector::new(Some(path.clone()));
+        if !restored.is_accused(&node_id("auth-1")) && restored.evidence().is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cleared, "purge must be persisted to the evidence file");
+
+    // With exclusion enabled, the purged authority's attestations feed
+    // certificate assembly again (recovery is complete, not cosmetic).
+    let f = make_frontier("auth-1", wall_ms() + 1_000, "digest-after-recovery");
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f.clone()],
+            vec![Some(sign(&s1, &f))],
+        )
+        .await
+        .unwrap();
+    let api = state.certified.lock().await;
+    assert!(
+        api.attestation_stats().scopes >= 1,
+        "post-purge attestations must pool again"
+    );
+    drop(api);
 
     handle.abort();
 }

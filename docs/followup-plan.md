@@ -14,7 +14,7 @@
    digest scheme v2。下記「M-8 クローズ記録」参照)。
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
 3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
-4. 検知範囲・整合(M-12, M-14, M-17)とテスト(M-16)
+4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, M-14, M-17)とテスト(M-16)
 5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
 
 ## M-4/m-7 クローズ記録(実装済み)
@@ -200,6 +200,71 @@ delta_sync、GC ライブロック回帰)は全て無修正パス。ベンチ: `
 - **M-7-f4** key_meta 常駐メモリ(キー 1 重複製 + 33B/キー)の長大キー × 大 N 環境での監視/上限
   ドキュメント。
 
+## M-12 クローズ記録(実装済み)
+
+**方式(root-digest + ReportClockFloor hybrid)**: frontier 報告の `digest_hash` を
+プレースホルダ `(node_id, HLC)` から eventual store の M-7 root digest
+(`sd2:<hex64>` = `sd{DIGEST_SCHEME_VERSION}:{hex(StoreDigest.root)}`、
+`frontier_reporter::format_store_digest_hash`)へ置換。digest は tick ごとに一度だけ
+計算して全 scope に同一バイトを束縛し、report 署名で凍結する。warm-up 未完了 tick は
+`sd2:cold`、eventual 未接続は `sd2:unavailable` のセンチネル(内容非束縛、fail-safe)。
+ワイヤ・署名レイアウト・検証・admission・`AckFrontierSet::update` は一切不変
+(digest は不透明文字列。旧ノードも新形式の split-view をそのまま検知できる)。
+
+**誤検知ゼロの機構**(digest が HLC の決定的関数でなくなったため、不変条件
+「同一 (authority, frontier_hlc) ⇒ 同一 digest」は報告側で維持する):
+
+- プロセス内: `Hlc::now()` の厳密単調性 + tick 内単一計算 + 署名凍結。
+- 再起動跨ぎ: **`runtime::report_clock::ReportClockFloor`**
+  (`<data_dir>/frontier_report_clock.json`、リース幅 10 秒の write-ahead fsync)。
+  順序は「HLC 採番 → `cover()` fsync 成功 → 署名・自己観測・apply・push」で固定し、
+  fsync 失敗 tick は報告ごとスキップ(`frontier_report_skipped_floor_total`)。
+  起動時は `Hlc::seed_recovered`(skew ガードをバイパスする回復専用 API)でリース値から
+  clock を seed —— `Hlc::update` は壁時計逆行 60 秒超(floor が守るべきまさにそのケース)で
+  `ClockSkew` 拒否するため使えない(設計時の全案が見落とし、実装で確定した知見)。
+- 初回起動・floor 喪失時: **activation grace 180 秒**(= 観測ヘッド保持 120s +
+  skew 前提 60s、monotonic)の間は **frontier 報告を完全停止**(何も署名しない)、
+  grace 明けに sd2 で再開。プレースホルダ報告では「前世代が sd2 で署名 + floor 喪失 +
+  60 秒以内の壁時計逆行」で placeholder-vs-sd2 の偽証拠が成立し得るため(検証レビューで
+  確定した欠陥)、無署名だけが両形式方向に安全。grace 中は floor ファイルも作らない
+  (grace 中クラッシュは次回 grace を最初からやり直し——「floor 存在 = 全履歴カバー」の
+  証拠性を維持)。runtime での authority 昇格(membership 再計算)時もコンストラクタと
+  同一の floor 初期化を実行する。floor path 未構成なら sd2 形式は決して有効化しない
+  (fail-safe)。残余仮定は「クロック逆行はクラスタ前提 60 秒以内」と「floor ファイルを
+  バックアップから復元しない」(staleness はローカル判別不能。ops-guide に運用規則明記)。
+- store 復旧 max HLC からの clock seed は保険として実施(certified/eventual 両方)だが、
+  data HLC は report HLC を覆う保証がないため floor の代替ではない。
+
+**運用**: キルスイッチ `ASTEROIDB_FRONTIER_STORE_DIGEST=0`(要再起動、ローリング
+アップグレード順序制約なし・ダウングレード安全)。誤検知時の回復パスとして
+`EquivocationDetector::purge_authority` + `DELETE /api/authority/equivocations/{authority_id}`
+(internal token 保護、evidence/accused/observed heads を除去して永続化・gauge 更新)と
+runbook「False positive recovery」を新設。メトリクス `frontier_digest_cold_total` /
+`frontier_report_skipped_floor_total` / `frontier_nonbinding_digest_total`(受信側:
+非束縛 digest 形式の受理累計——悪意 authority の内容束縛オプトアウトの唯一の可観測点)追加。
+
+**テスト**: report_clock 単体(roundtrip/破損/境界 bump/write-ahead 永続化)、
+node_runner 単体(実 digest 束縛/SD_UNAVAILABLE/cold センチネル遷移無証拠/
+tick 間 store 変異の偽陽性ゼロ/floor 失敗 tick スキップ/far-future リース seed/
+floor path なし不活性/grace 中の報告完全停止 → sd2 再開/grace 中クラッシュの grace
+やり直し/runtime 昇格時の floor 初期化/キルスイッチ)、equivocation 単体(purge +
+永続 payload 縮小)、
+e2e(実 Store digest での split-view 検知 + 証拠の root 一致・第三者再検証/同一署名
+再送 Consistent/新旧形式混在無証拠/floor 付き再起動 + 内容変化でヘッド保持ピア無証拠/
+purge エンドポイントの認可・永続化・attestation 復帰)。
+
+**残余(未着手の独立タスク)**:
+
+- **M-12b**: per-scope digest による evidence の key_range 帰属(root は検知の上位集合
+  だが帰属を示さない。設計素案: key_meta の BTreeMap range 集約 + generation メモ、
+  per-scope dirty 追跡)。
+- PeerReview 型 cross-verification(digest 自己申告と実サービング内容の照合)、
+  CT 型 consistency proof(frontier_hlc ずらし回避への対抗)。
+- compaction checkpoint digest(engine.rs、FR-010 系統)は**別系統で未解決のまま**。
+- 検知不能残余(docs/ops-guide.md 限界節に列挙): HLC ずらし・結託過半数・per-key HLC 等
+  メタデータのみの分岐・観測窓外・cold の非束縛 tick・grace 中の報告空白・
+  非束縛形式へのオプトアウト(メトリクスで可視化のみ)。
+
 ## 残 major(マージ後速やかに)
 
 - ~~**M-8**~~ **完了** — 上記クローズ記録参照。
@@ -216,9 +281,8 @@ delta_sync、GC ライブロック回帰)は全て無修正パス。ベンチ: `
   BP は否定的知見として却下記録)。
 - ~~**M-7**~~ **完了** — 下記「M-7 クローズ記録」参照(Store 内蔵 dirty バケット増分 DigestCache +
   generation 検証)。
-- **M-12** `src/authority/frontier_reporter.rs`: frontier の `digest_hash` が (node_id, HLC) のプレースホルダのため
-  データ内容の split-view は原理的に検知不能。将来 store digest(D(k) 集約)へ置換。
-  (限界は docs 明記済み。コードは次期対応)
+- ~~**M-12**~~ **完了** — 上記「M-12 クローズ記録」参照(root digest 束縛 + ReportClockFloor +
+  activation grace + 誤検知回復エンドポイント。per-scope 帰属は M-12b として残余記録)。
 - **M-14** `src/runtime/node_runner.rs`: ObservedAttestation の gossip レーンが authority 発 frontier push のみに載り、
   非 authority ノードは観測を中継しない。非 authority を狙った split-view は矛盾ヘッドが出会わない。
   observed レーンを delta/digest sync メッセージにも相乗りさせる(CT gossip の前提回復)。

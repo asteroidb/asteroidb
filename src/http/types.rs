@@ -336,6 +336,24 @@ pub struct EquivocationReport {
     pub evidence: Vec<crate::authority::equivocation::EquivocationEvidence>,
 }
 
+/// Response for `DELETE /api/authority/equivocations/{authority_id}`.
+///
+/// Operator recovery path for a confirmed FALSE-POSITIVE accusation
+/// (see the "False positive recovery" runbook section): reports what the
+/// purge removed on THIS node. Evidence gossips, so the runbook requires
+/// issuing the DELETE against every node — a single purge re-infects.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EquivocationPurgeResponse {
+    /// The authority whose local accusation state was purged.
+    pub authority_id: String,
+    /// Stored evidence pairs removed.
+    pub evidence_removed: usize,
+    /// Observed heads (index + overflow) removed.
+    pub heads_removed: usize,
+    /// Authorities still accused on this node after the purge.
+    pub accused_remaining: u64,
+}
+
 // ---------------------------------------------------------------
 // Control-plane request types
 // ---------------------------------------------------------------

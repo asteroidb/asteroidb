@@ -141,9 +141,9 @@ async fn three_authority_auto_certification() {
         node_id: "frontier-gen".into(),
     };
 
-    let frontiers1 = reporter1.report_frontiers_at(&frontier_ts);
-    let frontiers2 = reporter2.report_frontiers_at(&frontier_ts);
-    let frontiers3 = reporter3.report_frontiers_at(&frontier_ts);
+    let frontiers1 = reporter1.report_frontiers_at(&frontier_ts, "digest-1");
+    let frontiers2 = reporter2.report_frontiers_at(&frontier_ts, "digest-2");
+    let frontiers3 = reporter3.report_frontiers_at(&frontier_ts, "digest-3");
 
     // Apply frontiers from all 3 authorities to the client.
     for f in frontiers1 {

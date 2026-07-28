@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -11,13 +12,17 @@ use crate::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use crate::authority::bls::BlsKeypair;
 use crate::authority::certificate::{EpochConfig, EpochManager, KeysetRegistry, KeysetVersion};
-use crate::authority::equivocation::{EquivocationDetector, GOSSIP_SAMPLE_MAX, ObserveOutcome};
-use crate::authority::frontier_reporter::FrontierReporter;
+use crate::authority::equivocation::{
+    EquivocationDetector, GOSSIP_SAMPLE_MAX, OBSERVED_RETENTION_MS, ObserveOutcome,
+};
+use crate::authority::frontier_reporter::{
+    FrontierReporter, SD_COLD, SD_UNAVAILABLE, format_store_digest_hash, placeholder_digest_hash,
+};
 use crate::authority::frontier_sig::{FrontierSignature, NodeSigner};
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
-use crate::hlc::{Hlc, HlcTimestamp};
+use crate::hlc::{Hlc, HlcTimestamp, MAX_CLOCK_SKEW_MS};
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
@@ -33,6 +38,7 @@ use crate::placement::rebalance::{
     DEFAULT_REBALANCE_BATCH_SIZE, RebalancePlan, contiguous_success_count,
 };
 use crate::placement::topology::TopologyView;
+use crate::runtime::report_clock::ReportClockFloor;
 use crate::store::digest::{StoreDigest, digest_pass};
 use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 
@@ -41,6 +47,36 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// Bounds the per-cycle probe overhead against not-yet-upgraded peers
 /// while letting upgraded peers be picked up within minutes.
 const DIGEST_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
+
+/// Activation grace when no report clock floor file exists at startup
+/// (first boot after the M-12 upgrade, or a lost/corrupt floor file).
+/// Until it elapses the node signs NO frontier reports at all — the tick
+/// is skipped entirely, in every digest format.
+///
+/// Silence (rather than the legacy placeholder format) is load-bearing: a
+/// floorless boot cannot know which format its previous incarnation was
+/// signing. If it emitted placeholder reports and the pre-crash era was
+/// `sd2:`-active, a wall-clock rollback within the ordinary 60s skew
+/// budget could re-issue an HLC that peers still retain as an `sd2:` head
+/// — placeholder-vs-sd2 at one HLC is a false equivocation against an
+/// honest node. Nothing signed means nothing can collide, in either
+/// format direction.
+///
+/// The floor file is also NOT created/covered during the grace (no report
+/// is issued, so there is nothing to cover): a crash mid-grace therefore
+/// restarts the grace from scratch on the next boot, and a floor file's
+/// existence always proves that its lease covers every report signed
+/// since — never a partially-served grace.
+///
+/// Width = the peers' observed-head retention window plus the cluster
+/// clock-skew budget: by the time it elapses, every head this authority
+/// signed BEFORE the floorless restart has aged out of every honest peer's
+/// detector (heads are memory-only and never survive peer restarts), so
+/// the first post-grace report cannot meet a pre-restart head at the same
+/// HLC. Cost: ~3 minutes without frontier reports from this authority,
+/// only on first boot / floor loss.
+pub const DIGEST_ACTIVATION_GRACE: Duration =
+    Duration::from_millis(OBSERVED_RETENTION_MS + MAX_CLOCK_SKEW_MS);
 
 /// Configuration for BLS key generation in [`NodeRunner`].
 ///
@@ -175,6 +211,24 @@ pub struct NodeRunnerConfig {
     /// self-report path re-inserts what the HTTP path excludes. Default:
     /// `false` (detect-only).
     pub exclude_accused_authorities: bool,
+    /// When `true` (default), authority frontier reports bind the M-7
+    /// eventual-store root digest (`sd2:<hex>`) as their `digest_hash`,
+    /// making data-content split views detectable (M-12). Requires
+    /// `frontier_clock_floor_path` to actually activate — without a
+    /// persisted floor, restart monotonicity of report HLCs cannot be
+    /// guaranteed and the legacy placeholder format is kept (fail-safe).
+    /// Ops kill switch: `ASTEROIDB_FRONTIER_STORE_DIGEST=0` in the binary.
+    pub frontier_store_digest: bool,
+    /// Persistence path of the frontier report clock floor
+    /// (`<data_dir>/frontier_report_clock.json` in the binary). `None`
+    /// (default, library/test wiring without a data dir) disables the
+    /// store-digest report format entirely.
+    pub frontier_clock_floor_path: Option<PathBuf>,
+    /// Test override for [`DIGEST_ACTIVATION_GRACE`] (the window during
+    /// which a floorless boot suppresses ALL frontier reporting, after
+    /// which the store-digest format activates). `None` (default) uses
+    /// the production constant.
+    pub frontier_digest_activation_grace: Option<Duration>,
 }
 
 impl Default for NodeRunnerConfig {
@@ -203,6 +257,9 @@ impl Default for NodeRunnerConfig {
             current_epoch: None,
             equivocation: None,
             exclude_accused_authorities: false,
+            frontier_store_digest: true,
+            frontier_clock_floor_path: None,
+            frontier_digest_activation_grace: None,
         }
     }
 }
@@ -390,6 +447,25 @@ pub struct NodeRunner {
     /// Feeds self-signed attestations into the index and samples gossip
     /// summaries for outgoing frontier pushes.
     equivocation: Option<Arc<EquivocationDetector>>,
+    /// Write-ahead persisted floor over frontier report HLCs (M-12).
+    /// `Some` only for authority nodes with a configured floor path. Every
+    /// report tick covers its issued HLC here BEFORE signing/observing;
+    /// on restart the clock is seeded from the lease, so a report HLC can
+    /// never be re-issued even across a wall-clock rollback.
+    report_floor: Option<ReportClockFloor>,
+    /// Instant from which the store-digest report format is active (M-12).
+    /// `None` = never (non-authority, kill switch semantics via helper);
+    /// a future instant = activation grace running (floor file was absent
+    /// at startup — see [`DIGEST_ACTIVATION_GRACE`]).
+    store_digest_active_at: Option<Instant>,
+    /// While `Some` and in the future, frontier reporting is fully
+    /// suppressed (M-12 activation grace after a floorless boot): nothing
+    /// is issued, covered, signed or observed, so no report of ANY format
+    /// can collide with a head a peer still retains from a pre-restart
+    /// incarnation. Cleared on the first tick at/after the instant. See
+    /// [`DIGEST_ACTIVATION_GRACE`] for why silence (not the placeholder
+    /// format) is required.
+    report_silence_until: Option<Instant>,
 }
 
 /// State for an in-progress rebalance operation.
@@ -587,19 +663,31 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies) = {
+        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies)
+            (reporter, versions, policies, api.store().max_known_hlc())
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
         } else {
             None
         };
+        let mut clock = Hlc::new(node_id.0.clone());
+        // Best-effort recovery seed from the certified store's max HLC.
+        // Insurance only: data HLCs do not necessarily cover report HLCs
+        // (an idle authority reports far past its last write), so this
+        // never replaces the report clock floor below.
+        if frontier_reporter.is_some()
+            && let Some(max) = &recovered_max_hlc
+        {
+            clock.seed_recovered(max);
+        }
+        let (report_floor, store_digest_active_at, report_silence_until) =
+            Self::init_report_floor(&config, &node_id, &mut clock, frontier_reporter.is_some());
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let frontier_sync_client =
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
@@ -612,7 +700,10 @@ impl NodeRunner {
             metrics.set_accused_authorities(detector.accused_count());
         }
         Self {
-            clock: Hlc::new(node_id.0.clone()),
+            clock,
+            report_floor,
+            store_digest_active_at,
+            report_silence_until,
             node_id,
             certified_api,
             compaction_engine,
@@ -693,13 +784,13 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies) = {
+        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies)
+            (reporter, versions, policies, api.store().max_known_hlc())
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -707,6 +798,21 @@ impl NodeRunner {
             None
         };
 
+        let mut clock = Hlc::new(node_id.0.clone());
+        // Best-effort recovery seed from the recovered stores' max HLCs
+        // (certified + eventual). Insurance only — data HLCs do not
+        // necessarily cover report HLCs; the report clock floor below is
+        // what actually guarantees restart monotonicity.
+        if frontier_reporter.is_some() {
+            if let Some(max) = &recovered_max_hlc {
+                clock.seed_recovered(max);
+            }
+            if let Some(max) = eventual_api.lock().await.store().max_known_hlc() {
+                clock.seed_recovered(&max);
+            }
+        }
+        let (report_floor, store_digest_active_at, report_silence_until) =
+            Self::init_report_floor(&config, &node_id, &mut clock, frontier_reporter.is_some());
         let (epoch_manager, bls_keypair) = Self::init_epoch_and_bls(&config, &node_id);
         let frontier_sync_client =
             Self::build_frontier_sync_client(&config, frontier_reporter.is_some());
@@ -718,7 +824,10 @@ impl NodeRunner {
             metrics.set_accused_authorities(detector.accused_count());
         }
         Self {
-            clock: Hlc::new(node_id.0.clone()),
+            clock,
+            report_floor,
+            store_digest_active_at,
+            report_silence_until,
             node_id,
             certified_api,
             compaction_engine,
@@ -756,6 +865,85 @@ impl NodeRunner {
             topology_view: None,
             frontier_sync_client,
         }
+    }
+
+    /// Initialize the report clock floor, the store-digest activation
+    /// instant and the report-silence window for an authority node (M-12).
+    ///
+    /// Called from the constructors and — with identical semantics — from
+    /// [`detect_membership_changes`](Self::detect_membership_changes) when
+    /// a running node is promoted to authority at runtime (the promoted
+    /// node has never reported in this process, so the same reasoning
+    /// applies from the moment of promotion).
+    ///
+    /// - Floor file present: seed the clock from the persisted lease via
+    ///   `seed_recovered` — NOT `Hlc::update`, whose `ClockSkew` guard
+    ///   would reject the lease after a wall-clock rollback beyond 60s,
+    ///   which is exactly the case the floor must cover. The artificial
+    ///   skew is bounded by the lease width (10s), well inside the
+    ///   detector's future-skew guard. The store-digest format is active
+    ///   immediately and no silence applies: the write-ahead lease covers
+    ///   every report this authority ever signed (the file is only ever
+    ///   created by a covered post-grace report tick), so every new HLC is
+    ///   fresh. CAVEAT (documented in the ops guide): this proof assumes
+    ///   the file is the node's own latest copy — a floor RESTORED FROM A
+    ///   BACKUP is stale monotonicity evidence and must be deleted
+    ///   instead, so that the grace applies.
+    /// - Floor file absent (first boot / lost data dir): frontier
+    ///   reporting is fully SUPPRESSED for [`DIGEST_ACTIVATION_GRACE`],
+    ///   in every format — the previous incarnation's format is unknown,
+    ///   and only silence is collision-free in both format directions
+    ///   (see the constant's docs). The store-digest format activates
+    ///   when the silence lifts.
+    /// - No floor path configured: the store-digest format NEVER activates
+    ///   (fail-safe — without a persisted floor, restart monotonicity of
+    ///   report HLCs cannot be guaranteed) and the legacy deterministic
+    ///   placeholder is reported without silence, preserving pre-M-12
+    ///   library/test behaviour.
+    fn init_report_floor(
+        config: &NodeRunnerConfig,
+        node_id: &NodeId,
+        clock: &mut Hlc,
+        is_authority: bool,
+    ) -> (Option<ReportClockFloor>, Option<Instant>, Option<Instant>) {
+        if !is_authority {
+            return (None, None, None);
+        }
+        let Some(path) = &config.frontier_clock_floor_path else {
+            if config.frontier_store_digest {
+                tracing::warn!(
+                    node_id = %node_id.0,
+                    "no frontier report clock floor path configured (no data dir?); \
+                     store-digest frontier reports stay DISABLED and the placeholder \
+                     digest format is kept"
+                );
+            }
+            return (None, None, None);
+        };
+        let (floor, existed) = ReportClockFloor::load(path.clone());
+        let (active_at, silence_until) = if existed {
+            clock.seed_recovered(&HlcTimestamp {
+                physical: floor.leased(),
+                logical: 0,
+                node_id: node_id.0.clone(),
+            });
+            (Instant::now(), None)
+        } else {
+            let grace = config
+                .frontier_digest_activation_grace
+                .unwrap_or(DIGEST_ACTIVATION_GRACE);
+            tracing::warn!(
+                node_id = %node_id.0,
+                grace_ms = grace.as_millis() as u64,
+                "frontier report clock floor absent (first boot or lost floor file); \
+                 SUPPRESSING all frontier reports for the activation grace — nothing \
+                 this node could sign is provably collision-free against heads peers \
+                 may retain from a previous incarnation"
+            );
+            let until = Instant::now() + grace;
+            (until, Some(until))
+        };
+        (Some(floor), Some(active_at), silence_until)
     }
 
     /// Build the frontier push client for authority nodes.
@@ -798,6 +986,16 @@ impl NodeRunner {
     /// used by HTTP handlers, ensuring that HTTP writes are visible
     /// to the anti-entropy sync loop.
     pub fn set_eventual_api(&mut self, api: Arc<Mutex<EventualApi>>) {
+        // Best-effort recovery seed (same insurance as the constructors —
+        // never a substitute for the report clock floor). `try_lock`
+        // because this setter is synchronous; a contended lock just means
+        // the seed is skipped, which is safe.
+        if self.frontier_reporter.is_some()
+            && let Ok(guard) = api.try_lock()
+            && let Some(max) = guard.store().max_known_hlc()
+        {
+            self.clock.seed_recovered(&max);
+        }
         self.eventual_api = Some(api);
     }
 
@@ -1417,7 +1615,28 @@ impl NodeRunner {
             let reporter = FrontierReporter::new(self.node_id.clone(), &ns);
             if reporter.is_authority() {
                 self.frontier_reporter = Some(reporter);
+                // Runtime promotion (M-12): a node promoted here was NOT an
+                // authority at construction time, so init_report_floor never
+                // ran and the store-digest machinery (floor, activation
+                // instant, floorless-boot silence) would silently stay off —
+                // the node would report the legacy placeholder for its whole
+                // process lifetime with no WARN and no restart-monotonicity
+                // coverage. Run the exact constructor initialization now.
+                // Guarded on report_floor so a demote/re-promote cycle keeps
+                // the already-initialized floor and does not re-arm the
+                // grace (the floor stays valid across demotion: it is only
+                // ever advanced, never regressed).
+                if self.report_floor.is_none() && self.store_digest_active_at.is_none() {
+                    let (floor, active_at, silence_until) =
+                        Self::init_report_floor(&self.config, &self.node_id, &mut self.clock, true);
+                    self.report_floor = floor;
+                    self.store_digest_active_at = active_at;
+                    self.report_silence_until = silence_until;
+                }
             } else {
+                // Demotion: keep report_floor / store_digest_active_at so a
+                // later re-promotion resumes with full restart-monotonicity
+                // evidence instead of re-running the activation grace.
                 self.frontier_reporter = None;
             }
         }
@@ -1690,129 +1909,52 @@ impl NodeRunner {
     /// recorded as a self-verified attestation. Signed or not, the frontiers
     /// are then pushed to all known peers as a fire-and-forget background
     /// task so that network latency never blocks the run loop.
+    ///
+    /// Per-tick order (M-12 — each step is load-bearing for the
+    /// no-self-equivocation invariant):
+    /// 0. if the floorless activation grace is still running, skip the
+    ///    WHOLE tick — nothing is issued, covered, signed or observed, and
+    ///    (crucially) the floor file is NOT created, so a crash during the
+    ///    grace restarts it from scratch on the next boot;
+    /// 1. issue the HLC (`Hlc::now()`, strictly monotone);
+    /// 2. cover it in the persisted [`ReportClockFloor`] — write-ahead: a
+    ///    failed fsync skips the WHOLE tick (nothing signed, nothing
+    ///    observed; an unsigned HLC has claimed nothing, so discarding it
+    ///    is safe). Issuing FIRST and covering SECOND is mandatory — a
+    ///    "check the wall clock, then issue" scheme would let the wall
+    ///    clock cross the lease between check and issue;
+    /// 3. compute the digest string exactly ONCE and bind the same bytes
+    ///    into every scope's report of this tick.
     async fn report_frontiers(&mut self) {
-        if let Some(reporter) = &self.frontier_reporter {
-            match reporter.report_frontiers(&mut self.clock) {
-                Ok(frontiers) => {
-                    // Sign outside the certified lock (crypto is CPU-heavy).
-                    let signatures: Vec<Option<FrontierSignature>> = match &self.node_signer {
-                        Some(signer) => {
-                            let keyset_version = self.signing_keyset_version();
-                            frontiers
-                                .iter()
-                                .map(|f| Some(signer.sign_frontier(f, keyset_version.clone())))
-                                .collect()
-                        }
-                        None => frontiers.iter().map(|_| None).collect(),
-                    };
-
-                    // Feed our own signed reports into the equivocation
-                    // index. An honest node can never conflict with itself
-                    // (the HLC is monotone and the digest deterministic), so
-                    // a self-equivocation signals a compromised key or a
-                    // duplicate process sharing this key seed.
-                    if let Some(detector) = &self.equivocation {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let mut evidence_dirty = false;
-                        for (f, sig) in frontiers.iter().zip(signatures.iter()) {
-                            if let Some(sig) = sig
-                                && let ObserveOutcome::Equivocation(ev) =
-                                    detector.observe(f, sig, now_ms)
-                            {
+        if self.frontier_reporter.is_some() && !self.in_report_silence() {
+            match self.clock.now() {
+                Ok(issued) => {
+                    let covered = match &mut self.report_floor {
+                        Some(floor) => match floor.cover(&issued) {
+                            Ok(()) => true,
+                            Err(e) => {
                                 tracing::warn!(
-                                    authority = %ev.authority_id.0,
-                                    key_range = %ev.key_range.prefix,
-                                    digest_first = %ev.first.frontier.digest_hash,
-                                    digest_second = %ev.second.frontier.digest_hash,
-                                    "self-attestation equivocation: possible key compromise or \
-                                     duplicate process sharing this signing key"
+                                    error = %e,
+                                    "failed to persist the frontier report clock floor; \
+                                     skipping this report tick (nothing signed)"
                                 );
-                                self.metrics.record_equivocation_at(now_ms);
                                 self.metrics
-                                    .set_accused_authorities(detector.accused_count());
-                                evidence_dirty = true;
+                                    .frontier_report_skipped_floor_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                false
                             }
-                        }
-                        // Persist exactly like the HTTP receive path does:
-                        // a self-detected equivocation signals a possible
-                        // key compromise, and the operator's likely response
-                        // (a restart) must not wipe the only evidence.
-                        if evidence_dirty {
-                            detector.spawn_persist();
-                        }
+                        },
+                        None => true,
+                    };
+                    if covered {
+                        let digest_hash = self.current_frontier_digest_hash(&issued).await;
+                        let frontiers = self
+                            .frontier_reporter
+                            .as_ref()
+                            .expect("checked is_some above")
+                            .report_frontiers_at(&issued, &digest_hash);
+                        self.sign_apply_and_push_frontiers(frontiers).await;
                     }
-
-                    {
-                        let mut api = self.certified_api.lock().await;
-                        // Self-report exclusion (m-7): when exclusion is
-                        // enabled and THIS node is accused (compromised key
-                        // or duplicate process), its own attestations must
-                        // not feed certificate assembly either — the HTTP
-                        // receive path already excludes them, and without
-                        // this gate the self-report lane would re-insert
-                        // them locally. The frontier itself still advances.
-                        //
-                        // The accusation state is read UNDER the certified
-                        // lock, mirroring the HTTP path's apply-time
-                        // re-check: a concurrent handler that accuses this
-                        // node purges its pooled attestations inside the
-                        // same lock, so either that purge already ran (we
-                        // read accused=true here and skip the inserts) or
-                        // it is serialized after us and removes whatever we
-                        // insert below. Reading the flag before the lock
-                        // would reopen a window in which a fresh
-                        // self-attestation slips in right after the purge
-                        // and can be consumed by a certification tick.
-                        let self_excluded = self.config.exclude_accused_authorities
-                            && self
-                                .equivocation
-                                .as_ref()
-                                .is_some_and(|d| d.is_accused(&self.node_id));
-                        for (f, sig) in frontiers.iter().zip(signatures.iter()) {
-                            match (&self.node_signer, sig) {
-                                (Some(signer), Some(sig)) if !self_excluded => {
-                                    // Own signature: no re-verification needed.
-                                    let att = signer.self_verified(f, sig);
-                                    api.update_frontier_verified(f.clone(), Some(att));
-                                }
-                                _ => {
-                                    api.update_frontier(f.clone());
-                                }
-                            }
-                        }
-                        // Purge attestations pooled BEFORE the accusation
-                        // (m-7). Gated on the accusation state rather than
-                        // on a detection in this very tick, so an
-                        // accusation that lands via the shared detector
-                        // between ticks is also enforced; after the first
-                        // purge this is O(1) per tick.
-                        if self_excluded {
-                            api.purge_accused_attestations(std::slice::from_ref(&self.node_id));
-                        }
-                        let stats = api.attestation_stats();
-                        self.metrics.set_attestation_pool_stats(
-                            stats.scopes,
-                            stats.rejected_unknown_range_total,
-                            stats.rejected_version_window_total,
-                            stats.rejected_scope_cap_total,
-                            stats.rejected_authority_cap_total,
-                            stats.purged_total,
-                        );
-                    }
-
-                    // Attach the split-view gossip sample (evidence pairs
-                    // first, then newest observed heads) to the same push —
-                    // no new protocol, no extra periodic task.
-                    let observed = self
-                        .equivocation
-                        .as_ref()
-                        .map(|d| d.gossip_summaries(GOSSIP_SAMPLE_MAX))
-                        .unwrap_or_default();
-                    self.push_frontiers_to_peers(frontiers, signatures, observed)
-                        .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1826,6 +1968,208 @@ impl NodeRunner {
         // Compute frontier skew: for each scope, find max and min frontier
         // HLC among authorities, and report the maximum skew across all scopes.
         self.update_frontier_skew().await;
+    }
+
+    /// Return `true` while the floorless activation grace suppresses all
+    /// frontier reporting (M-12), clearing the window once it has elapsed.
+    ///
+    /// Silence — not the placeholder format — is what makes a floorless
+    /// boot safe: peers may still retain heads of EITHER format from a
+    /// previous incarnation of this authority, and any signed report at a
+    /// re-issued HLC could pair with one of them. Nothing signed, nothing
+    /// to pair. See [`DIGEST_ACTIVATION_GRACE`].
+    fn in_report_silence(&mut self) -> bool {
+        match self.report_silence_until {
+            None => false,
+            Some(until) if Instant::now() >= until => {
+                self.report_silence_until = None;
+                tracing::info!(
+                    node_id = %self.node_id.0,
+                    "frontier report activation grace elapsed; reporting resumes \
+                     (all pre-restart heads have aged out of peer detectors)"
+                );
+                false
+            }
+            Some(_) => {
+                tracing::debug!(
+                    "frontier report tick suppressed: floorless activation grace running"
+                );
+                true
+            }
+        }
+    }
+
+    /// Resolve the `digest_hash` string for the report tick at `ts`.
+    ///
+    /// Store-digest form (`sd2:<hex root>`) only when ALL of: the config
+    /// enables it, a report clock floor is wired (restart monotonicity),
+    /// and the activation instant has passed. Otherwise the legacy
+    /// placeholder (kill switch off, or no floor path configured — a
+    /// floorless-boot grace never reaches this point, because the whole
+    /// tick is suppressed by [`in_report_silence`](Self::in_report_silence)
+    /// until the activation instant). Cold-cache and no-store situations
+    /// report per-tick constant sentinels — fail-safe in the
+    /// detection-power direction, never in the false-positive direction.
+    async fn current_frontier_digest_hash(&mut self, ts: &HlcTimestamp) -> String {
+        let active = self.config.frontier_store_digest
+            && self.report_floor.is_some()
+            && self
+                .store_digest_active_at
+                .is_some_and(|at| Instant::now() >= at);
+        if !active {
+            return placeholder_digest_hash(&self.node_id, ts);
+        }
+        let Some(eventual) = self.eventual_api.clone() else {
+            return SD_UNAVAILABLE.to_string();
+        };
+        // Best-effort warm-up OFF the store lock (M-7): the run loop must
+        // never pay an O(N) cold rebuild under the lock. Failure is safe —
+        // this tick reports the cold sentinel and the next one retries.
+        let _ = crate::api::digest_warmup::ensure_digest_warm(&eventual).await;
+        // Single lock scope, same pattern as the digest sync handler:
+        // check temperature and read the root under one guard.
+        let mut api = eventual.lock().await;
+        if api.store().digest_is_cold() {
+            tracing::debug!(
+                "store digest cache still cold at report tick; binding the cold sentinel"
+            );
+            self.metrics
+                .frontier_digest_cold_total
+                .fetch_add(1, Ordering::Relaxed);
+            return SD_COLD.to_string();
+        }
+        format_store_digest_hash(&api.store_mut().digest().root)
+    }
+
+    /// Sign (outside the certified lock), self-observe, apply and push one
+    /// tick's frontier reports. Factored out of [`report_frontiers`] so the
+    /// issue/cover/digest preamble stays readable.
+    async fn sign_apply_and_push_frontiers(
+        &mut self,
+        frontiers: Vec<crate::authority::ack_frontier::AckFrontier>,
+    ) {
+        // Sign outside the certified lock (crypto is CPU-heavy).
+        let signatures: Vec<Option<FrontierSignature>> = match &self.node_signer {
+            Some(signer) => {
+                let keyset_version = self.signing_keyset_version();
+                frontiers
+                    .iter()
+                    .map(|f| Some(signer.sign_frontier(f, keyset_version.clone())))
+                    .collect()
+            }
+            None => frontiers.iter().map(|_| None).collect(),
+        };
+
+        // Feed our own signed reports into the equivocation
+        // index. An honest node can never conflict with itself: the
+        // digest is computed exactly once per tick and frozen by the
+        // report signature, and the HLC is strictly monotone — including
+        // across restarts, via the ReportClockFloor write-ahead lease
+        // (a floorless boot signs NOTHING until the activation grace has
+        // fully elapsed) — so the same HLC is never signed twice. A self-equivocation therefore
+        // signals a compromised key or a duplicate process sharing this
+        // key seed — a REAL detection target, not a false positive.
+        if let Some(detector) = &self.equivocation {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let mut evidence_dirty = false;
+            for (f, sig) in frontiers.iter().zip(signatures.iter()) {
+                if let Some(sig) = sig
+                    && let ObserveOutcome::Equivocation(ev) = detector.observe(f, sig, now_ms)
+                {
+                    tracing::warn!(
+                        authority = %ev.authority_id.0,
+                        key_range = %ev.key_range.prefix,
+                        digest_first = %ev.first.frontier.digest_hash,
+                        digest_second = %ev.second.frontier.digest_hash,
+                        "self-attestation equivocation: possible key compromise or \
+                         duplicate process sharing this signing key"
+                    );
+                    self.metrics.record_equivocation_at(now_ms);
+                    self.metrics
+                        .set_accused_authorities(detector.accused_count());
+                    evidence_dirty = true;
+                }
+            }
+            // Persist exactly like the HTTP receive path does:
+            // a self-detected equivocation signals a possible
+            // key compromise, and the operator's likely response
+            // (a restart) must not wipe the only evidence.
+            if evidence_dirty {
+                detector.spawn_persist();
+            }
+        }
+
+        {
+            let mut api = self.certified_api.lock().await;
+            // Self-report exclusion (m-7): when exclusion is
+            // enabled and THIS node is accused (compromised key
+            // or duplicate process), its own attestations must
+            // not feed certificate assembly either — the HTTP
+            // receive path already excludes them, and without
+            // this gate the self-report lane would re-insert
+            // them locally. The frontier itself still advances.
+            //
+            // The accusation state is read UNDER the certified
+            // lock, mirroring the HTTP path's apply-time
+            // re-check: a concurrent handler that accuses this
+            // node purges its pooled attestations inside the
+            // same lock, so either that purge already ran (we
+            // read accused=true here and skip the inserts) or
+            // it is serialized after us and removes whatever we
+            // insert below. Reading the flag before the lock
+            // would reopen a window in which a fresh
+            // self-attestation slips in right after the purge
+            // and can be consumed by a certification tick.
+            let self_excluded = self.config.exclude_accused_authorities
+                && self
+                    .equivocation
+                    .as_ref()
+                    .is_some_and(|d| d.is_accused(&self.node_id));
+            for (f, sig) in frontiers.iter().zip(signatures.iter()) {
+                match (&self.node_signer, sig) {
+                    (Some(signer), Some(sig)) if !self_excluded => {
+                        // Own signature: no re-verification needed.
+                        let att = signer.self_verified(f, sig);
+                        api.update_frontier_verified(f.clone(), Some(att));
+                    }
+                    _ => {
+                        api.update_frontier(f.clone());
+                    }
+                }
+            }
+            // Purge attestations pooled BEFORE the accusation
+            // (m-7). Gated on the accusation state rather than
+            // on a detection in this very tick, so an
+            // accusation that lands via the shared detector
+            // between ticks is also enforced; after the first
+            // purge this is O(1) per tick.
+            if self_excluded {
+                api.purge_accused_attestations(std::slice::from_ref(&self.node_id));
+            }
+            let stats = api.attestation_stats();
+            self.metrics.set_attestation_pool_stats(
+                stats.scopes,
+                stats.rejected_unknown_range_total,
+                stats.rejected_version_window_total,
+                stats.rejected_scope_cap_total,
+                stats.rejected_authority_cap_total,
+                stats.purged_total,
+            );
+        }
+
+        // Attach the split-view gossip sample (evidence pairs
+        // first, then newest observed heads) to the same push —
+        // no new protocol, no extra periodic task.
+        let observed = self
+            .equivocation
+            .as_ref()
+            .map(|d| d.gossip_summaries(GOSSIP_SAMPLE_MAX))
+            .unwrap_or_default();
+        self.push_frontiers_to_peers(frontiers, signatures, observed)
+            .await;
     }
 
     /// Resolve the keyset version to sign under.
@@ -6450,6 +6794,567 @@ mod tests {
             assert!(
                 proof.certificate.is_none(),
                 "unsigned reports must not produce certificates"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M-12: store-digest frontier reports + report clock floor
+    // -----------------------------------------------------------------
+
+    fn eventual_with_keys(node: &str, keys: &[&str]) -> Arc<Mutex<EventualApi>> {
+        let mut api = EventualApi::new(node_id(node));
+        for k in keys {
+            api.eventual_counter_inc(k).unwrap();
+        }
+        Arc::new(Mutex::new(api))
+    }
+
+    /// Config with the store-digest format immediately active: a floor
+    /// path in `dir` (file may be absent) plus a zero activation grace.
+    fn digest_active_config(dir: &std::path::Path) -> NodeRunnerConfig {
+        NodeRunnerConfig {
+            frontier_clock_floor_path: Some(dir.join("frontier_report_clock.json")),
+            frontier_digest_activation_grace: Some(Duration::ZERO),
+            ..NodeRunnerConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn report_frontiers_uses_store_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            digest_active_config(dir.path()),
+            default_metrics(),
+        )
+        .await;
+        let eventual = eventual_with_keys("auth-1", &["user/x", "user/y"]);
+        runner.set_eventual_api(Arc::clone(&eventual));
+
+        runner.report_frontiers().await;
+
+        // The bound digest is exactly the M-7 root digest of the eventual
+        // store, in the sd{scheme}: format.
+        let expected = format_store_digest_hash(&eventual.lock().await.store_mut().digest().root);
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(!frontiers.is_empty());
+        for f in &frontiers {
+            assert_eq!(f.digest_hash, expected);
+        }
+        // The write-ahead floor was persisted for the issued HLC.
+        assert!(dir.path().join("frontier_report_clock.json").exists());
+    }
+
+    #[tokio::test]
+    async fn active_format_without_eventual_api_reports_unavailable_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            digest_active_config(dir.path()),
+            default_metrics(),
+        )
+        .await;
+
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        for f in &api.all_frontiers() {
+            assert_eq!(f.digest_hash, SD_UNAVAILABLE);
+        }
+    }
+
+    /// A cold-cache tick binds the per-tick constant SD_COLD sentinel; the
+    /// next (warm) tick binds the real digest at a LATER HLC — head keys
+    /// differ, so the transition can never produce evidence. The cold tick
+    /// is reproduced through `sign_apply_and_push_frontiers` with a
+    /// properly issued HLC (byte-identical to what a cold tick emits —
+    /// deterministically forcing `ensure_digest_warm` to give up would
+    /// require an in-flight write race, see digest_warmup's injectable
+    /// tests); the warm tick runs the full production path.
+    #[tokio::test]
+    async fn cold_cache_reports_sentinel_then_real_digest_without_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = make_signer("auth-1", 71);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            ..digest_active_config(dir.path())
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+        let eventual = eventual_with_keys("auth-1", &["user/x"]);
+        runner.set_eventual_api(Arc::clone(&eventual));
+
+        // Tick 1 (cold): what report_frontiers emits when the digest
+        // cache is cold — the SD_COLD sentinel at a freshly issued,
+        // floor-covered HLC.
+        let issued = runner.clock.now().unwrap();
+        runner
+            .report_floor
+            .as_mut()
+            .unwrap()
+            .cover(&issued)
+            .unwrap();
+        let cold_frontiers = runner
+            .frontier_reporter
+            .as_ref()
+            .unwrap()
+            .report_frontiers_at(&issued, SD_COLD);
+        runner.sign_apply_and_push_frontiers(cold_frontiers).await;
+
+        // Tick 2 (warm): the full production path with a real digest.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(frontiers.iter().all(|f| f.digest_hash.starts_with("sd2:")));
+        assert!(
+            frontiers.iter().any(|f| f.digest_hash != SD_COLD),
+            "the warm tick must bind a real digest"
+        );
+        drop(api);
+        assert_eq!(
+            detector.accused_count(),
+            0,
+            "sentinel↔digest is no conflict"
+        );
+        assert!(detector.evidence().is_empty());
+    }
+
+    /// The core M-12 false-positive regression: the store legitimately
+    /// mutates between report ticks (replication, local writes, GC), so
+    /// the digest changes every tick — including WITHIN one checkpoint
+    /// bucket. Each tick has a fresh HLC, so the detector never compares
+    /// them: zero evidence, nobody accused.
+    #[tokio::test]
+    async fn no_false_positive_store_mutates_between_report_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = make_signer("auth-1", 72);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let config = NodeRunnerConfig {
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            ..digest_active_config(dir.path())
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+        let eventual = eventual_with_keys("auth-1", &["seed"]);
+        runner.set_eventual_api(Arc::clone(&eventual));
+
+        let mut digests = Vec::new();
+        for i in 0..4 {
+            // Mutate the store between ticks (several ticks land in the
+            // same 1s checkpoint bucket).
+            eventual
+                .lock()
+                .await
+                .eventual_counter_inc(&format!("churn-{i}"))
+                .unwrap();
+            runner.report_frontiers().await;
+            let api = shared_api.lock().await;
+            digests.push(api.all_frontiers()[0].digest_hash.clone());
+            drop(api);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Content binding is live: every tick bound a different digest...
+        for pair in digests.windows(2) {
+            assert_ne!(pair[0], pair[1], "store mutation must change the digest");
+        }
+        // ...and none of it is ever mistaken for an equivocation.
+        assert_eq!(detector.accused_count(), 0);
+        assert!(detector.evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn floor_write_failure_skips_report_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point the floor INTO a regular file so every persist fails.
+        std::fs::write(dir.path().join("blocker"), b"x").unwrap();
+        let signer = make_signer("auth-1", 73);
+        let registry = shared_registry_with(&signer);
+        let detector = Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+            None,
+        ));
+        let metrics = default_metrics();
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let config = NodeRunnerConfig {
+            frontier_clock_floor_path: Some(dir.path().join("blocker/floor.json")),
+            frontier_digest_activation_grace: Some(Duration::ZERO),
+            node_signer: Some(Arc::clone(&signer)),
+            keyset_registry: Some(Arc::clone(&registry)),
+            equivocation: Some(Arc::clone(&detector)),
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            Arc::clone(&metrics),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        runner.report_frontiers().await;
+
+        // Write-ahead: nothing signed, nothing observed, nothing applied.
+        let api = shared_api.lock().await;
+        assert!(
+            api.all_frontiers().is_empty(),
+            "an uncovered HLC must never produce a report"
+        );
+        drop(api);
+        assert!(
+            detector
+                .gossip_summaries(crate::authority::equivocation::GOSSIP_SAMPLE_MAX)
+                .is_empty(),
+            "an uncovered HLC must never be self-observed"
+        );
+        assert_eq!(
+            metrics.snapshot().frontier_report_skipped_floor_total,
+            1,
+            "the skipped tick must be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_with_floor_seeds_clock_strictly_above_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let floor_path = dir.path().join("frontier_report_clock.json");
+        // A lease FAR ahead of the wall clock — equivalent to a restart
+        // whose wall clock rolled back way beyond MAX_CLOCK_SKEW_MS.
+        // `Hlc::update` would reject this with ClockSkew; the seed must
+        // use `seed_recovered` and still hold the floor invariant.
+        let lease = crate::hlc::wall_clock_ms() + 5 * MAX_CLOCK_SKEW_MS;
+        std::fs::write(
+            &floor_path,
+            format!("{{\"version\":1,\"leased_physical_ms\":{lease}}}"),
+        )
+        .unwrap();
+
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(floor_path),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(!frontiers.is_empty(), "seeding must not break reporting");
+        for f in &frontiers {
+            assert!(
+                f.frontier_hlc.physical >= lease,
+                "post-restart report HLC ({}) must sit at/above the persisted \
+                 lease ({lease}) — i.e. strictly above every pre-restart report",
+                f.frontier_hlc.physical
+            );
+            // Floor existed => the store-digest format is active
+            // immediately (no grace needed).
+            assert!(f.digest_hash.starts_with("sd2:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_floor_path_never_activates_store_digest() {
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                // frontier_store_digest defaults to true, but without a
+                // floor path there is no restart-monotonicity guarantee:
+                // the format must stay off even with a zero grace.
+                frontier_clock_floor_path: None,
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        for f in &api.all_frontiers() {
+            assert_eq!(
+                f.digest_hash,
+                placeholder_digest_hash(&node_id("auth-1"), &f.frontier_hlc),
+                "no floor => placeholder format, unconditionally"
+            );
+        }
+    }
+
+    /// A floorless boot must sign NOTHING during the activation grace —
+    /// its previous incarnation's format is unknown, so a placeholder
+    /// report at a rolled-back, re-issued HLC could pair with a retained
+    /// pre-crash `sd2:` head and frame this honest node. Silence is the
+    /// only format-direction-agnostic safe behaviour. The floor file must
+    /// not be created either (see the mid-grace-crash test below).
+    #[tokio::test]
+    async fn activation_grace_suppresses_all_reports_then_sd2() {
+        let dir = tempfile::tempdir().unwrap();
+        let floor_path = dir.path().join("frontier_report_clock.json");
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(floor_path.clone()),
+                // No floor file at startup => the grace applies.
+                frontier_digest_activation_grace: Some(Duration::from_millis(300)),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        // During the grace: no reports of ANY format, and no floor file —
+        // an unsigned tick is the only thing that provably cannot collide
+        // with whatever format the pre-crash incarnation was signing.
+        runner.report_frontiers().await;
+        {
+            let api = shared_api.lock().await;
+            assert!(
+                api.all_frontiers().is_empty(),
+                "a floorless boot must not sign any report during the grace"
+            );
+        }
+        assert!(
+            !floor_path.exists(),
+            "grace ticks must not create the floor file (a mid-grace crash \
+             must restart the grace, not fake full-history coverage)"
+        );
+
+        // After the grace: reporting resumes directly in sd2 format and
+        // the first covered tick creates the floor file.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        runner.report_frontiers().await;
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(!frontiers.is_empty(), "reporting must resume after grace");
+        for f in &frontiers {
+            assert!(
+                f.digest_hash.starts_with("sd2:"),
+                "grace elapsed => sd2 format, got {}",
+                f.digest_hash
+            );
+        }
+        assert!(floor_path.exists(), "post-grace ticks are floor-covered");
+    }
+
+    /// Crash-during-grace regression: the floor file's existence is
+    /// trusted as FULL restart-monotonicity evidence (immediate sd2), so
+    /// it must only ever come into existence via a covered post-grace
+    /// report. A runner that "crashes" mid-grace and is rebuilt on the
+    /// same path must restart the grace from scratch — never activate
+    /// sd2 (or sign anything) off a partially-served grace.
+    #[tokio::test]
+    async fn mid_grace_crash_restarts_grace_from_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let floor_path = dir.path().join("frontier_report_clock.json");
+        let config = NodeRunnerConfig {
+            frontier_clock_floor_path: Some(floor_path.clone()),
+            frontier_digest_activation_grace: Some(Duration::from_secs(3600)),
+            ..NodeRunnerConfig::default()
+        };
+
+        // Boot 1: floorless => grace. Tick a few times "during" it.
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            config.clone(),
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+        runner.report_frontiers().await;
+        runner.report_frontiers().await;
+        assert!(shared_api.lock().await.all_frontiers().is_empty());
+        assert!(!floor_path.exists());
+        drop(runner); // "crash" mid-grace
+
+        // Boot 2 on the same path: the floor is still absent, so the FULL
+        // grace applies again — first tick must stay silent, not report
+        // sd2 (the old bug: boot 2 saw a floor file created by boot 1's
+        // grace ticks and activated sd2 immediately, though the lease
+        // never covered the pre-upgrade / pre-loss report history).
+        let shared_api2 = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner2 = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api2.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+        )
+        .await;
+        runner2.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+        runner2.report_frontiers().await;
+        assert!(
+            shared_api2.lock().await.all_frontiers().is_empty(),
+            "a mid-grace crash must restart the grace, not activate sd2"
+        );
+        assert!(!floor_path.exists());
+    }
+
+    /// Runtime-promotion regression (M-12): a node that becomes an
+    /// authority via membership recalculation (not at construction) must
+    /// run the same floor/activation initialization as the constructors —
+    /// previously report_floor stayed None forever, so the store-digest
+    /// format silently never activated and the report HLCs had no
+    /// write-ahead coverage until the next restart.
+    #[tokio::test]
+    async fn runtime_promotion_initializes_report_floor_and_activates_sd2() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let floor_path = dir.path().join("frontier_report_clock.json");
+
+        // Certified policy with no authority definition yet: the runner
+        // node is NOT an authority at construction time.
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 1).with_certified(true),
+        )
+        .unwrap();
+        let shared_api = wrap_api(CertifiedApi::new(node_id("n1"), wrap_ns(ns)));
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(floor_path.clone()),
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("n1", &["user/x"]));
+        assert!(runner.frontier_reporter.is_none());
+        assert!(runner.report_floor.is_none(), "non-authority: no floor");
+
+        // The node joins the cluster; recalculation promotes it.
+        cluster_nodes
+            .write()
+            .unwrap()
+            .push(crate::node::Node::new(node_id("n1"), NodeMode::Store));
+        runner.detect_membership_changes().await;
+        assert!(
+            runner.frontier_reporter.is_some(),
+            "membership recalculation must promote n1 to authority"
+        );
+        assert!(
+            runner.report_floor.is_some(),
+            "promotion must initialize the report clock floor"
+        );
+        assert!(runner.store_digest_active_at.is_some());
+
+        // The promoted authority reports with full M-12 semantics: sd2
+        // digest (grace zero) and a write-ahead-covered HLC.
+        runner.report_frontiers().await;
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(!frontiers.is_empty(), "promoted authority must report");
+        for f in &frontiers {
+            assert!(
+                f.digest_hash.starts_with("sd2:"),
+                "promoted authority must bind the store digest, got {}",
+                f.digest_hash
+            );
+        }
+        assert!(floor_path.exists(), "reports must be floor-covered");
+        drop(api);
+
+        // Demote/re-promote: the floor survives and the grace is not
+        // re-armed (no second initialization).
+        cluster_nodes.write().unwrap().clear();
+        runner.detect_membership_changes().await;
+        assert!(runner.frontier_reporter.is_none(), "demoted");
+        assert!(
+            runner.report_floor.is_some(),
+            "demotion must keep the floor for a later re-promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_config_restores_placeholder_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                // ASTEROIDB_FRONTIER_STORE_DIGEST=0 lands here (main.rs).
+                frontier_store_digest: false,
+                ..digest_active_config(dir.path())
+            },
+            default_metrics(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        runner.report_frontiers().await;
+
+        let api = shared_api.lock().await;
+        let frontiers = api.all_frontiers();
+        assert!(!frontiers.is_empty());
+        for f in &frontiers {
+            assert_eq!(
+                f.digest_hash,
+                placeholder_digest_hash(&node_id("auth-1"), &f.frontier_hlc)
             );
         }
     }
