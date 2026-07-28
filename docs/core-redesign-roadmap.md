@@ -187,8 +187,8 @@ S6 の未起票欠陥 `decode_response(resp).await.ok()`(`sync.rs:929-936` 確�
 - **Phase 1b(1a と並行可)**: R5 Phase 1(grace 付き GC ピア集合)+ decode_response 修正。両者は gc_gates_passed の左半分/右半分だが純関数の引数供給側のみで衝突しない。受け入れ=実証不足 #2 後半(分断→復帰 e2e)。
 - **Phase 2**: R2 シード降格 / R3 交渉層(並行可)。R3 の受け入れに実証不足 #5 を内包。
 - **Phase 3**: R4 Step1+2(R1 後、v1 ワイヤ凍結のまま着地)→ その後 S4 v2 ワイヤ(R3 後、v3 メッセージとして)。順序理由: v2 ワイヤが入って初めて非ライターノードの record_change HLC が origin 収束し、Step2 の status 回答がクラスタ収束する(D-4)。**Step1 と v2 の同時変更は禁止**(共有の壊すな核への二重変更)。
-- **Phase 4**: R5 Phase 2(epoch replica set、三重ソース統合、decommission API)。R1/R2 で Bootstrap 経路が安定した後。母集合ソース交換時は判定式(min/all)不変。
-- **Phase 5(研究層)**: S3 Step3(FastPay 型値ハッシュ ack — Phase 4 の耐久 NodeId→addr 解決が前提)/ majority-reach GC のゲート式緩和(whitemap §1.2、分母=epoch 集合)/ stability frontier(v2 ワイヤの per-key origin HLC 収束が前提)/ CT gossip(Phase 1b の relay 盲点解消 + R3 + D8 counter が前提)。
+- **Phase 4**: R5 Phase 2(epoch replica set、三重ソース統合、decommission API)。R1/R2 で Bootstrap 経路が安定した後。母集合ソース交換時は判定式(min/all)不変。**設計制約**: `docs/control-plane-scaleout.md` の C1(epoch/所有集合は scope 付きキー)・C3(Raft 投票者静的原則)を設計レビューで必須確認。
+- **Phase 5(研究層)**: S3 Step3(FastPay 型値ハッシュ ack — Phase 4 の耐久 NodeId→addr 解決が前提)/ majority-reach GC のゲート式緩和(whitemap §1.2、分母=epoch 集合)/ stability frontier(v2 ワイヤの per-key origin HLC 収束が前提)/ CT gossip(Phase 1b の relay 盲点解消 + R3 + D8 counter が前提)/ **委譲型制御プレーンの設計スパイク**(`docs/control-plane-scaleout.md` — per-range バージョン列・prefix 委譲・nested consensus。同文書 §4 の中央集権点台帳が入力)。
 
 D2〜D10 起票との整合: D2/D3/D9→Phase 3、D4→Phase 1b、D5/D6/D8/D10→Phase 0、D7 は followup-plan の指示どおり実測(実証不足 #4)で深刻度確定後に判断(本計画では未裁定のまま保留が正しい)。
 
