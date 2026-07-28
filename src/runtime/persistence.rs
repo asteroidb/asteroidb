@@ -182,6 +182,19 @@ fn recover_store(
     recover_truncate: bool,
 ) -> io::Result<(Store, WalWriter, WalReadOutcome)> {
     let started = std::time::Instant::now();
+    // Sweep tmp files left by saves that failed (or crashed) before their
+    // in-line cleanup (m-3). Startup-only: no concurrent save can be in
+    // flight here, so a matching tmp is always stale. Best-effort — a
+    // failed sweep only leaves litter behind, never blocks recovery.
+    if let Err(e) = crate::store::backend::FileBackend::new(snapshot_path).remove_stale_tmp_files()
+    {
+        tracing::warn!(
+            store = label,
+            snapshot = %snapshot_path.display(),
+            error = %e,
+            "failed to sweep stale snapshot tmp files; continuing"
+        );
+    }
     let mut store = Store::load_snapshot_bincode_or_default(snapshot_path).map_err(|e| {
         io::Error::new(
             e.kind(),

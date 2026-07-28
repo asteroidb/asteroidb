@@ -65,7 +65,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::hlc::HlcTimestamp;
-use crate::store::backend::fsync_dir;
+use crate::store::backend::{create_dir_all_durable, fsync_dir};
 use crate::store::kv::{CrdtValue, Store};
 
 /// Segment file magic (8 bytes).
@@ -313,7 +313,18 @@ impl WalWriter {
     /// segments are never appended to, so recovery never needs to repair
     /// or truncate an old file before reuse.
     pub fn open(cfg: WalConfig) -> io::Result<Self> {
-        fs::create_dir_all(&cfg.dir)?;
+        // Create the WAL directory and make the chain itself durable
+        // (m-4): `create_segment` below fsyncs the segment file and the
+        // WAL directory, but on a first boot the WAL directory's own
+        // entry (and its freshly created ancestors') may still sit in
+        // parent page caches — a power loss right after the first acked
+        // write could then drop the entire chain, acked records included.
+        // `wait_durable` acks are only sound once every link this call
+        // created is on disk. Pre-existing ancestors above the creation
+        // point are already durable and only fsynced best-effort, so a
+        // traverse-only (`--x`) ancestor never fail-stops the boot of an
+        // established node.
+        create_dir_all_durable(&cfg.dir)?;
         let next_seq = list_segments(&cfg.dir)?
             .last()
             .map(|(seq, _)| seq + 1)
@@ -648,9 +659,10 @@ fn create_or_reclaim_segment(dir: &Path, seq: u64) -> io::Result<File> {
 /// collide with the next rotation; the ORIGINAL error is returned either
 /// way. Correctness does not depend on the unlink being durable (or on
 /// any unlink→create persistence ordering): whatever survives a crash is
-/// an absent file, a partial header, or a bare header — always at the
-/// maximum sequence number — which recovery already handles as a torn
-/// tail / empty segment, and which a later rotation reclaims in place.
+/// an absent file, a partial header, or a bare header (zero-filled header
+/// included) — always at the maximum sequence number — which recovery
+/// already handles as a torn tail / empty segment, and which a later
+/// rotation reclaims in place.
 fn init_segment(path: &Path, mut file: File, dir: &Path) -> io::Result<File> {
     let mut header = [0u8; SEGMENT_HEADER_LEN];
     header[..8].copy_from_slice(&WAL_MAGIC);
@@ -684,8 +696,9 @@ fn init_segment(path: &Path, mut file: File, dir: &Path) -> io::Result<File> {
 }
 
 /// A file no longer than the segment header cannot contain any frame: it
-/// is a torn create, never acked data. (m-2 will reuse this predicate when
-/// classifying non-final short-header segments on the read side.)
+/// is a torn create, never acked data. Shared predicate between the write
+/// side (`reclaim_orphan_segment`, rotation reclaim) and the read side
+/// (`parse_segment`, zero-filled-header classification).
 fn is_torn_create_len(len: u64) -> bool {
     len <= SEGMENT_HEADER_LEN as u64
 }
@@ -873,23 +886,74 @@ pub fn truncate_to_valid_prefix(dir: &Path, read: &WalReadResult) -> io::Result<
     let Some(stop) = &read.stop else {
         return Ok(());
     };
+    let mut removed_any = false;
     for (seq, path) in list_segments(dir)? {
         if seq > stop.seq {
             fs::remove_file(&path)?;
+            #[cfg(test)]
+            record_truncate_op(TruncateOp::Unlink(seq));
+            removed_any = true;
         }
+    }
+    // Durability barrier (m-1): the unlinks must be on disk BEFORE the
+    // stop segment is cut back. In the reverse order, a crash after the
+    // truncation persisted but before the final directory fsync could
+    // resurrect the unlinked segments behind a truncated stop segment —
+    // the next boot would then replay a log with a gap (records the
+    // caller decided to drop reappear AFTER the cut). Each step is
+    // idempotent, so a crash between any two steps simply re-detects the
+    // same stop point and re-runs the remainder.
+    if removed_any {
+        fsync_dir(dir)?;
+        #[cfg(test)]
+        record_truncate_op(TruncateOp::FsyncDir);
     }
     if stop.valid_len < SEGMENT_HEADER_LEN as u64 {
         // Not even a valid header survives: drop the whole file (a
         // truncated-to-zero or header-only-invalid segment would still
         // read as torn/corrupt).
         fs::remove_file(&stop.path)?;
+        #[cfg(test)]
+        record_truncate_op(TruncateOp::RemoveStop);
     } else {
         let file = OpenOptions::new().write(true).open(&stop.path)?;
         file.set_len(stop.valid_len)?;
         file.sync_all()?;
+        #[cfg(test)]
+        record_truncate_op(TruncateOp::TruncateStop);
     }
     fsync_dir(dir)?;
+    #[cfg(test)]
+    record_truncate_op(TruncateOp::FsyncDir);
     Ok(())
+}
+
+/// Test-only trace of the physical operations `truncate_to_valid_prefix`
+/// performs, in order. Crash-during-recovery cannot be reproduced in
+/// process, so the durability ORDERING (unlinks fsynced before the stop
+/// segment is cut) is asserted on this trace instead.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncateOp {
+    /// `remove_file` of a segment after the stop point.
+    Unlink(u64),
+    /// `fsync_dir` of the WAL directory.
+    FsyncDir,
+    /// `set_len` + `sync_all` of the stop segment.
+    TruncateStop,
+    /// `remove_file` of the stop segment (no valid header survived).
+    RemoveStop,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRUNCATE_OPS: std::cell::RefCell<Vec<TruncateOp>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_truncate_op(op: TruncateOp) {
+    TRUNCATE_OPS.with(|ops| ops.borrow_mut().push(op));
 }
 
 /// Parse one segment, appending parsed records to `out`.
@@ -908,6 +972,16 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
             WalReadOutcome::Corruption
         };
         return (outcome, 0);
+    }
+    // A zero-filled bare header in the LAST segment is the residue of a
+    // segment create that crashed before its header write reached disk
+    // (torn create — the same shape `create_or_reclaim_segment` reclaims
+    // on the write side). It holds no frames, hence no acked data: a
+    // harmless torn tail, not corruption. valid_len = 0 sends it down the
+    // remove path of `truncate_to_valid_prefix`; the next `WalWriter::open`
+    // then re-uses the SAME sequence number (remaining max + 1).
+    if is_last && is_torn_create_len(data.len() as u64) && data.iter().all(|&b| b == 0) {
+        return (WalReadOutcome::TornTail, 0);
     }
     if data[..8] != WAL_MAGIC {
         return (WalReadOutcome::Corruption, 0);
@@ -1390,6 +1464,114 @@ mod tests {
     }
 
     #[test]
+    fn truncate_orders_unlink_fsync_before_stop_truncation() {
+        // Durability ordering (m-1): the unlinks of the segments AFTER the
+        // stop point must be fsynced BEFORE the stop segment is cut back.
+        // In the reverse order, a crash between the truncation and the
+        // final directory fsync can resurrect the unlinked segments while
+        // keeping the truncation — the next boot then replays a log with a
+        // gap in the middle.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("a", 1, 1)).unwrap();
+        wal.rotate().unwrap();
+        wal.append(&upsert("b", 1, 2)).unwrap();
+        drop(wal);
+
+        // Mid-log corruption in the FIRST segment with valid data after it:
+        // recovery under the operator truncate escape hatch both cuts seg 1
+        // and unlinks seg 2.
+        let segments = list_segments(dir.path()).unwrap();
+        let first = segments[0].1.clone();
+        let mut data = fs::read(&first).unwrap();
+        data[SEGMENT_HEADER_LEN + FRAME_HEADER_LEN + 2] ^= 0xFF;
+        fs::write(&first, &data).unwrap();
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Corruption);
+
+        TRUNCATE_OPS.with(|ops| ops.borrow_mut().clear());
+        truncate_to_valid_prefix(dir.path(), &read).unwrap();
+        let ops = TRUNCATE_OPS.with(|ops| ops.borrow().clone());
+
+        let last_unlink = ops
+            .iter()
+            .rposition(|op| matches!(op, TruncateOp::Unlink(_)))
+            .expect("at least one later segment must be unlinked");
+        let first_stop = ops
+            .iter()
+            .position(|op| matches!(op, TruncateOp::TruncateStop | TruncateOp::RemoveStop))
+            .expect("the stop segment must be truncated or removed");
+        assert!(
+            last_unlink < first_stop
+                && ops[last_unlink..first_stop]
+                    .iter()
+                    .any(|op| matches!(op, TruncateOp::FsyncDir)),
+            "unlinks must be fsynced before the stop segment is touched, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn zero_filled_header_in_last_segment_is_a_torn_create() {
+        // A crash between a segment file's creation and its header write
+        // reaching disk can persist a 16-byte zero-filled file at the
+        // maximum sequence number (see `init_segment`). That holds no
+        // acked data, so it must classify as a harmless TornTail — not as
+        // fail-stop Corruption (m-2).
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("a", 1, 1)).unwrap();
+        wal.append(&upsert("b", 1, 2)).unwrap();
+        drop(wal);
+        fs::write(
+            dir.path().join(segment_file_name(2)),
+            [0u8; SEGMENT_HEADER_LEN],
+        )
+        .unwrap();
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(
+            read.outcome,
+            WalReadOutcome::TornTail,
+            "a zero-filled bare header in the LAST segment is a torn create, never corruption"
+        );
+        assert_eq!(read.records.len(), 2, "seg 1 must survive in full");
+        let stop = read.stop.as_ref().expect("stop point expected");
+        assert_eq!(stop.seq, 2);
+        assert_eq!(stop.valid_len, 0, "nothing in the torn create is valid");
+
+        // Full recovery path: truncation drops the zero-header file, the
+        // next open re-uses the SAME sequence number (remaining max + 1),
+        // and everything replays.
+        truncate_to_valid_prefix(dir.path(), &read).unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&upsert("c", 1, 3)).unwrap();
+        drop(wal);
+        assert_eq!(read_keys(dir.path()), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn zero_filled_header_in_non_final_segment_is_corruption() {
+        // The same zero-filled shape in a NON-final segment cannot be a
+        // torn create (torn creates are always the maximum sequence
+        // number): it means acked data was damaged — fail-stop.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(segment_file_name(1)),
+            [0u8; SEGMENT_HEADER_LEN],
+        )
+        .unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap(); // seg 2
+        wal.append(&upsert("a", 1, 1)).unwrap();
+        drop(wal);
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Corruption);
+        assert!(read.records.is_empty(), "parsing stops at the bad segment");
+    }
+
+    #[test]
     fn truncate_to_valid_prefix_deletes_a_segment_with_an_invalid_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_segment(dir.path(), 1);
@@ -1407,6 +1589,52 @@ mod tests {
         );
         let read = read_all_segments(dir.path()).unwrap();
         assert_eq!(read.outcome, WalReadOutcome::Clean);
+    }
+
+    #[test]
+    fn open_creates_and_fsyncs_a_multi_level_wal_directory_chain() {
+        // m-4 smoke test: `open` must create (and fsync — not observable
+        // in-process, guaranteed by review of `create_dir_all_durable`) a
+        // multi-level missing directory chain and stay fully functional.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("a").join("b").join("c").join("wal");
+        let mut wal = WalWriter::open(cfg(&wal_dir)).unwrap();
+        wal.append(&upsert("k", 1, 1)).unwrap();
+        drop(wal);
+
+        let read = read_all_segments(&wal_dir).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        assert_eq!(read.records.len(), 1);
+    }
+
+    /// m-4 availability regression test: an EXISTING node whose WAL dir
+    /// sits under a traverse-only (`--x`) ancestor — fully accessible by
+    /// path but not openable for fsync — must keep booting. Its directory
+    /// entries are already durable; fail-stopping on the unreadable
+    /// ancestor would be a pure availability regression on upgrade.
+    #[cfg(unix)]
+    #[test]
+    fn open_succeeds_under_traverse_only_pre_existing_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        let wal_dir = locked.join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = WalWriter::open(cfg(&wal_dir));
+        // Restore before asserting so tempdir cleanup always works.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut wal =
+            result.expect("a traverse-only pre-existing ancestor must not fail-stop boot");
+        wal.append(&upsert("k", 1, 1)).unwrap();
+        drop(wal);
+
+        let read = read_all_segments(&wal_dir).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        assert_eq!(read.records.len(), 1);
     }
 
     #[test]

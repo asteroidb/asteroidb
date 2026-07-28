@@ -23,10 +23,24 @@
 //!    can never gather majority acks.
 //!
 //! Additionally, a **prevote-lite guard** (the dissertation §4.2.3
-//! "removed server" rule) makes voters ignore RequestVote RPCs — without
+//! "removed server" rule) makes FOLLOWERS ignore RequestVote RPCs — without
 //! updating their term — while they have heard from a live leader within the
-//! minimum election timeout, so nodes returning from a partition cannot
-//! disrupt a healthy leader with inflated terms.
+//! minimum election timeout, so a node returning from a partition with an
+//! inflated term cannot gather votes (or spread its term) through them.
+//!
+//! The guard does NOT shield the leader itself: an inflated term reaching
+//! the leader — via a direct RequestVote, or echoed back in an
+//! AppendEntries/InstallSnapshot response — demotes it under the standard
+//! term rules ([`RaftCore::step_down_to_term`]), and one re-election
+//! follows (bounded: election timeout defaults to min 5s / max 10s, so
+//! recovery is ≈5–10 seconds per partition-return event). This is
+//! deliberate: guarding only the vote path is ineffective (the response
+//! path still demotes the leader within one heartbeat interval), and
+//! guarding the response paths too would strand the returnee on its
+//! inflated term forever (a liveness bug — it could never rejoin).
+//! Fully suppressing the disruption needs a real PreVote RPC (wire
+//! change; future work). Safety is unaffected throughout: the election
+//! restriction ensures only a log-up-to-date node can win the re-election.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -283,11 +297,15 @@ impl RaftCore {
             );
         }
 
-        // Prevote-lite / leader-contact guard: while we have heard from a
-        // live leader within the minimum election timeout, ignore the
-        // request WITHOUT adopting its term. A node returning from a
-        // partition with an inflated term therefore cannot depose a healthy
-        // leader through us.
+        // Prevote-lite / leader-contact guard (followers only): while we
+        // have heard from a live leader within the minimum election
+        // timeout, ignore the request WITHOUT adopting its term. "Through
+        // us" is the precise scope: a node returning from a partition with
+        // an inflated term gets neither our vote nor a term bump out of
+        // us. It does NOT protect the leader itself — a request reaching
+        // the leader directly still demotes it via the term rules below,
+        // costing one bounded re-election (see the module doc; full
+        // PreVote is future work).
         if !self.is_leader()
             && let Some(contact) = self.last_leader_contact
             && now.duration_since(contact) < self.election_timeout_min
@@ -1220,6 +1238,45 @@ mod tests {
             "the guard must not adopt the disruptive term"
         );
         assert!(effects.is_empty());
+    }
+
+    /// Behavior-pinning regression test (m-8): the prevote-lite guard
+    /// protects FOLLOWERS only. The leader itself still adopts an
+    /// inflated term from a partition returnee's RequestVote and steps
+    /// down — one bounded re-election, by design (leader-side
+    /// check-quorum was evaluated and rejected: the vote path alone is
+    /// ineffective because AppendEntries responses echo the term within
+    /// one heartbeat, and guarding the response paths would strand the
+    /// returnee forever — see the module doc).
+    #[test]
+    fn leader_steps_down_on_inflated_term_vote_from_partition_returnee() {
+        let mut core = fresh_core("n1", &["n1", "n2", "n3"]);
+        core.on_election_timeout(now());
+        grant_all_votes(&mut core, &["n2"]);
+        assert!(core.is_leader());
+
+        // A voter-set member returns from a partition with an inflated
+        // term and campaigns. Its empty log loses the election
+        // restriction against our term-1 Noop, so no vote is granted —
+        // but the term IS adopted and the leader demotes.
+        let (resp, _) = core.handle_request_vote(
+            &RequestVoteRequest {
+                term: 99,
+                candidate_id: nid("n3"),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+            now(),
+        );
+        assert!(!resp.vote_granted, "stale log must not win the vote");
+        assert_eq!(
+            core.hard.current_term, 99,
+            "the leader adopts the inflated term (no leader-side guard)"
+        );
+        assert!(
+            !core.is_leader(),
+            "the leader steps down: one bounded re-election is the documented cost"
+        );
     }
 
     // --- Configuration fencing (diverged voter sets) ---

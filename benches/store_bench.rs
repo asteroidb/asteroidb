@@ -197,10 +197,37 @@ fn bench_wal_append_overhead(c: &mut Criterion) {
         group.bench_function(label, |b| {
             let tmp_dir = TempDir::new().expect("create temp dir");
             let wal = WalWriter::open(WalConfig::new(tmp_dir.path(), sync)).unwrap();
+            // Run the REAL group-commit flusher for the Interval policy:
+            // without it the ticker never fires and this case silently
+            // re-measures the sync_off path (m-12). The syncer handle is
+            // taken before the writer moves into the API. (For Off the
+            // flusher returns immediately — harmless.)
+            let syncer = std::sync::Arc::new(wal.syncer());
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build tokio runtime for the WAL flusher");
+            rt.spawn(std::sync::Arc::clone(&syncer).run_flusher());
             let mut api = EventualApi::recovered(node("bench-node"), Store::new(), Some(wal));
             b.iter(|| {
                 api.eventual_counter_inc("cnt").unwrap();
             });
+            // Regression guard (after the measurement, so it cannot skew
+            // the numbers): the flusher must actually have advanced the
+            // durable watermark. Appends are pending at this point, so
+            // the next tick (<= 100ms away) advances it deterministically;
+            // the 2s deadline keeps the guard flake-free.
+            if matches!(sync, SyncPolicy::Interval(_)) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while syncer.durable_watermark() == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "flusher never ran; the sync_interval bench measured the sync_off path"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         });
     }
     // Note: `always` is dominated by fdatasync latency and needs the tokio

@@ -1654,6 +1654,84 @@ mod tests {
         assert_eq!(result.required_count, 2);
     }
 
+    /// verify_proof errors must be the same structured JSON
+    /// (`ErrorResponse` via `ApiError`) as every other API error — not
+    /// plain text (m-6).
+    #[tokio::test]
+    async fn verify_proof_error_is_structured_json() {
+        let state = test_state();
+        let app = router(state);
+
+        // BLS path with mismatched signer/key list lengths: a 400 whose
+        // body must parse as the structured error JSON.
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": [],
+            "total_authorities": 3,
+            "signature_algorithm": "Bls12_381",
+            "bls_aggregate_signature": "00",
+            "bls_signer_ids": ["auth-1", "auth-2"],
+            "bls_public_keys": ["00"]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body)
+            .expect("error body must be structured JSON, not plain text");
+        assert_eq!(err["error_code"], "INVALID_ARGUMENT");
+        assert!(
+            err["message"].as_str().unwrap().contains("same length"),
+            "message must be preserved: {body}"
+        );
+    }
+
+    /// Without a keyset registry the handler must answer a structured 500
+    /// INTERNAL (status unchanged from the pre-m-6 plain-text response).
+    #[tokio::test]
+    async fn verify_proof_without_registry_is_structured_internal_error() {
+        let state = test_state_signing(None, false);
+        let app = router(state);
+
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": [],
+            "total_authorities": 3
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body)
+            .expect("error body must be structured JSON, not plain text");
+        assert_eq!(err["error_code"], "INTERNAL");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("keyset registry not configured"),
+            "message must be preserved: {body}"
+        );
+    }
+
     /// The caller-supplied `total_authorities` must be ignored: shrinking the
     /// denominator must not turn a sub-quorum signature set into a majority.
     #[tokio::test]

@@ -1389,18 +1389,21 @@ pub async fn get_version_history(
 pub async fn verify_proof(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyProofRequest>,
-) -> Result<Json<VerifyProofResponse>, (axum::http::StatusCode, String)> {
+) -> Result<Json<VerifyProofResponse>, ApiError> {
     use crate::api::certified::ProofBundle;
     use crate::authority::certificate::{AuthoritySignature, KeysetVersion, MajorityCertificate};
     use crate::authority::verifier;
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
 
-    // Registry-based verification is required; reject if no registry is configured.
-    let registry_lock = state.keyset_registry.as_ref().ok_or((
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "keyset registry not configured; cannot verify proofs".to_string(),
-    ))?;
+    // Registry-based verification is required; reject if no registry is
+    // configured. `Internal` keeps the pre-existing 500 status while
+    // making the body structured JSON like every other API error (m-6).
+    let registry_lock = state.keyset_registry.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "keyset registry not configured; cannot verify proofs".into(),
+        ))
+    })?;
 
     let key_range = KeyRange {
         prefix: req.key_range_prefix,
@@ -1420,13 +1423,10 @@ pub async fn verify_proof(
     let (total_authorities, authority_members) = {
         let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
         let Some(def) = ns.get_authorities_for_key(&key_range.prefix) else {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "no authority definition covers key range '{}'; cannot determine the authority set",
-                    key_range.prefix
-                ),
-            ));
+            return Err(ApiError(CrdtError::InvalidArgument(format!(
+                "no authority definition covers key range '{}'; cannot determine the authority set",
+                key_range.prefix
+            ))));
         };
         (
             def.authority_nodes.len(),
@@ -1455,10 +1455,9 @@ pub async fn verify_proof(
         use crate::authority::certificate::DualModeCertificate;
 
         if signer_ids.len() != pk_hexes.len() {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
+            return Err(ApiError(CrdtError::InvalidArgument(
                 "bls_signer_ids and bls_public_keys must have the same length".to_string(),
-            ));
+            )));
         }
 
         let keyset_version = KeysetVersion(
@@ -1477,16 +1476,18 @@ pub async fn verify_proof(
             cert.format_version = fv;
         }
 
-        let aggregated = BlsSignature::from_hex(agg_hex).ok_or((
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid hex in bls_aggregate_signature".to_string(),
-        ))?;
+        let aggregated = BlsSignature::from_hex(agg_hex).ok_or_else(|| {
+            ApiError(CrdtError::InvalidArgument(
+                "invalid hex in bls_aggregate_signature".to_string(),
+            ))
+        })?;
         let mut signers = Vec::with_capacity(signer_ids.len());
         for (id, pk_hex) in signer_ids.iter().zip(pk_hexes.iter()) {
-            let pk = BlsPublicKey::from_hex(pk_hex).ok_or((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("invalid hex in bls_public_keys for signer {id}"),
-            ))?;
+            let pk = BlsPublicKey::from_hex(pk_hex).ok_or_else(|| {
+                ApiError(CrdtError::InvalidArgument(format!(
+                    "invalid hex in bls_public_keys for signer {id}"
+                )))
+            })?;
             signers.push((NodeId(id.clone()), pk));
         }
         // Every aggregate signer must belong to the range's authority set;

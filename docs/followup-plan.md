@@ -15,7 +15,7 @@
 2. 可用性・DoS 系(~~M-5~~ 完了, ~~M-4~~ 完了 — 下記「M-4/m-7 クローズ記録」参照)
 3. 効率系(~~M-6~~ 完了 — 下記「M-6 クローズ記録」参照, ~~M-7~~ 完了 — 下記「M-7 クローズ記録」参照)
 4. 検知範囲・整合(~~M-12~~ 完了 — 下記「M-12 クローズ記録」参照, ~~M-14~~ 完了 — 下記「M-14 クローズ記録」参照, ~~M-17~~ 完了 — 下記「M-17 クローズ記録」参照)とテスト(~~M-16~~ 完了 — 下記「M-16 クローズ記録」参照)
-5. minor 一括(m-1〜m-6, m-8 は小規模コード修正でまとめて処理可能、~~m-7~~ 完了、m-9〜m-11 は docs、m-12 は任意)
+5. ~~minor 一括~~ 完了(m-1〜m-6, m-8〜m-12 — 下記「minor 一括クローズ記録」参照。~~m-7~~ は M-4 と同時に完了済み)
 
 ## M-4/m-7 クローズ記録(実装済み)
 
@@ -492,32 +492,82 @@ process::abort)はバグ扱いしない。
 - ~~**M-17**~~ **完了** — 下記「M-17 クローズ記録」参照(observer への committed namespace pull 同期 +
   無音 fence の全段可観測化。fail-stop は不採用)。
 
-## 残 minor
+## minor 一括クローズ記録(m-1〜m-6, m-8〜m-12 実装済み)
 
-- **m-1** `src/store/wal.rs`(truncate_to_valid_prefix): 耐久化順序が逆で、リカバリ中クラッシュにより
-  削除済みセグメントが復活しギャップ付きリプレイ。unlink → fsync_dir → truncate → sync_all に並べ替え。
-- **m-2** `src/store/wal.rs`: 最終セグメントのゼロ埋めヘッダ(torn create)が Corruption 判定になり無害な状態で
-  fail-stop。is_last かつ全ゼロヘッダは TornTail に分類。
-- **m-3** `src/store/backend.rs`(FileBackend::save): write 失敗時の tmp を削除せず起動時掃除も無い。
-  失敗時 remove_file + 起動時 `*.tmp` 掃除。
-- **m-4** `src/store/wal.rs`(open): WAL ディレクトリ連鎖の作成が fsync されず、初回起動直後の電源断で
-  ack 済み書き込みが消える。open 時に親ディレクトリ連鎖を fsync。
-- **m-5** `src/main.rs`(ASTEROIDB_CONTROL_PLANE_NODES 解析): 空エントリ非除去で末尾カンマが phantom voter を作り
-  過半数しきい値を変える。parse_static_peers 同様に空要素スキップ + 警告。
-- **m-6** `src/http/handlers.rs`(verify_proof): エラーを平文 (StatusCode, String) で返し他 API の構造化 JSON と不整合。
-  ApiError 経由に統一。
+- ~~**m-1**~~ **完了** — `truncate_to_valid_prefix` を「後続セグメント unlink 群 →(unlink があった
+  場合のみ)`fsync_dir` バリア → stop セグメントの truncate/remove → 最終 `fsync_dir`」に並べ替え。
+  不変条件「stop の切り詰めが耐久化される時点で後続 unlink は全耐久化済み」を確立し、各ステップ間
+  クラッシュは停止点の再検出で冪等に再実行される。テストは `#[cfg(test)]` の操作トレース
+  (`TRUNCATE_OPS`)で順序を固定(`truncate_orders_unlink_fsync_before_stop_truncation`)。
+  注: 旧順序で実害が出るのは「非最終セグメント Corruption + operator truncate 逃し弁 + 後続
+  セグメント存在」の狭い窓のみ(TornTail は is_last 限定で後続が構造的に無い)。
+- ~~**m-2**~~ **完了** — `parse_segment` で「is_last かつ `is_torn_create_len`(= ちょうど 16B)かつ
+  全ゼロ」を TornTail(valid_len 0)に分類。truncate がファイルを除去した後、次の `WalWriter::open` は
+  残存 max+1 として**同じ seq を再利用**する。非最終セグメントの同形状は従来どおり Corruption
+  (ガードテストあり)。「magic は書けたが version=0」の canonical prefix は意図的に Corruption のまま
+  (安全性無害・可用性のみ、スコープ自制)。`is_torn_create_len` は read/write 両側が共有する述語に
+  doc 更新。
+- ~~**m-3**~~ **完了** — `FileBackend::save` の write/sync/rename/fsync_dir をクロージャ化し、失敗時に
+  自 tmp を best-effort 削除(NotFound 無視、他は warn。元エラーをそのまま返す)。起動時掃除
+  `FileBackend::remove_stale_tmp_files`(`<target>.<数字>.<数字>.tmp` 厳密一致のみ、親不在は Ok(0))を
+  新設し、`recover_store` の snapshot load 前に配線(失敗は warn のみ)。`FileBackend::new` には
+  入れない(並行 save の in-flight tmp 誤爆防止 — 掃除は起動時 1 回限定が安全条件)。
+  `ops/mod.rs::write_atomic` の同種残余はスコープ外。
+- ~~**m-4**~~ **完了** — `WalWriter::open` が新設ヘルパー `create_dir_all_durable`(backend.rs)で
+  ディレクトリを作成しつつ連鎖を fsync。ヘルパーは冒頭で `std::path::absolute` により絶対化
+  (相対パスで連鎖が cwd 手前で途切れる論証欠陥を回避。cwd 解決失敗はエラー伝播 = fail-stop 整合)し、
+  作成前に「最深の既存祖先」を特定。**fail-stop の fsync 対象はこの呼び出しが変更したものだけ**
+  (新規作成ディレクトリ群 + エントリが増えた最深既存祖先)。それより上位の既存祖先は耐久性確立済み
+  なので best-effort(失敗は warn)— traverse-only(`--x`、例: 0711 の home)祖先で `File::open` が
+  EACCES になっても既存ノードの起動を落とさない(可用性リグレッション回避)。電源断はプロセス内
+  再現不能のため主担保は論証レビュー + 完走 smoke テスト + traverse-only 祖先の起動回帰テスト。
+- ~~**m-5**~~ **完了** — 純関数 `parse_control_plane_nodes` に分離: 空エントリは警告付きスキップ
+  (phantom `NodeId("")` voter による majority 分母の歪みと configuration fencing への混入を排除)、
+  未設定・空白のみは従来どおり `[self]`、**設定済みかつ全エントリ空(`","` 等)は fail-stop**
+  (確定的な設定破損。`[self]` フォールバックは lone-default 発散を黙って引き起こすため。
+  設定エラー fail-stop の前例 = election timeout 検証に整合)。単体テスト 4 系列で固定。
+- ~~**m-6**~~ **完了** — `verify_proof` の戻りを `Result<_, ApiError>` に統一。HTTP ステータスは
+  全 5 箇所現状維持(registry 未設定 = `CrdtError::Internal` → 500 INTERNAL、他 4 箇所 =
+  `InvalidArgument` → 400)、メッセージ文字列不変、ボディのみ構造化 JSON 化。
+  ステータスの意味論変更(503 化等)は行っていない。
 - ~~**m-7**~~ **完了** — 上記「M-4/m-7 クローズ記録」参照(apply 時再チェック + 告発時 purge +
   自己報告経路 exclude。証明書の遡及失効のみ将来課題として範囲外)。
-- **m-8** `src/control_plane/raft/core.rs`(prevote-lite): ガードがリーダー自身を保護せず、分断復帰ノードの
-  inflated-term RequestVote が健全リーダーを即降格。リーダー側 check-quorum を追加、最低限コメントを実挙動に合わせる。
-- **m-9**(docs) `docs/architecture.md` / `src/store/digest.rs`: digest sync の設計限界(第 3 段 IBLT/ConflictSync の
-  スコープ外理由、1 キー発散でバケット全体転送、削減率上限、バケット数のスキーム凍結)が未記載 +「発散部分だけ転送」の過大表現。
-- **m-10**(docs) `src/store/backend.rs`(RedbBackend): default feature でビルドされ docs は「Persistent storage via redb」と
-  紹介するが実際はリカバリパスに未配線。wasm-compat.md を訂正し「redb はリカバリパス外」と明記、未使用なら feature 整理。
-- **m-11**(docs) `docs/architecture.md`: 制御プレーン Raft に BFT 化布石(メッセージ帰属署名)が無く、
-  制御プレーン 1 ノード侵害で Authority プレーンの署名投資が迂回可能な非対称が未明記。制約節に追記。
-- **m-12** `benches/store_bench.rs`(bench_wal_append_overhead): "sync_interval" ケースが flusher 未起動で
-  sync_off と同一パスの重複測定。ケース削除か tokio ランタイム + run_flusher を起動して測定。
+- ~~**m-8**~~ **完了(コメント訂正 + 挙動固定テストのみ、check-quorum は不採用)** — 起票の
+  「リーダー側 check-quorum を追加」は実装しないと裁定: (1) vote 経路のみのガードは無効
+  (`handle_append_response` / `handle_snapshot_ack` が inflated term の応答で無条件降格するため
+  heartbeat 1 周期以内に降格する)、(2) 応答経路までガードすると復帰 voter が inflated term から
+  永久に降りられない liveness バグ、(3) 安全性は election restriction により無傷で、中断は分断復帰時
+  1 回・有界(election timeout 既定 min 5s / max 10s → 回復 ≈ 5〜10 秒)。module doc とガード直前
+  コメントを実挙動(ガードは follower 限定)に訂正し、挙動固定テスト
+  `leader_steps_down_on_inflated_term_vote_from_partition_returnee` を追加。
+  **完全な抑止はフル PreVote(新 RPC・ワイヤ変更)が必要 — 将来課題として残す。**
+- ~~**m-9**~~ **完了(docs)** — architecture.md digest 節:「発散している部分だけの転送」を
+  「発散を含むバケット単位(1/256)の転送」に訂正、「粒度の限界」小段落(増幅コスト・削減率上限・
+  第 3 段 IBLT/ConflictSync スコープ外の判断軸)を追加、バケット数 256 に `DIGEST_BUCKET_COUNT`
+  scheme 凍結の参照を明記。`src/store/digest.rs` のモジュール doc は正確なため変更なし。
+- ~~**m-10**~~ **完了(第 1 段 docs のみ)** — wasm-compat.md 3 箇所と `RedbBackend` 型 doc に
+  「experimental / リカバリパス未配線(実永続化は FileBackend スナップショット + WAL)」を明記。
+  **第 2 段(feature 整理 or 配線)は今回見送り・別起票**: 公開 API 削除であり、CI 第 2 マトリクスと
+  CLAUDE.md が `native-storage` を名指しする中で feature キーを空で残す互換策は第 2 マトリクスの
+  指定を無意味化する副作用があるため、「redb を配線するか削除するか」の判断ごと残余タスクとする。
+- ~~**m-11**~~ **完了(docs)** — architecture.md トレードオフ節の「Byzantine 障害耐性なし」を拡張:
+  攻撃経路(共有トークン認証は**設定時のみ**有効・メッセージ帰属署名なし・voter 1 台侵害で正規手続き
+  commit = 過半数侵害不要)、非対称(authority 定義書き換えで Authority プレーンの署名投資が迂回、
+  Byzantine 耐性は最弱 voter 1 台で決まる)、布石(per-node 署名 → BFT 置換、いずれも将来フェーズ)。
+- ~~**m-12**~~ **完了** — `bench_wal_append_overhead` が tokio ランタイムを起こし
+  `WalSyncer::run_flusher` を実起動(案 b)。退行ガードは計測完了後の deadline 2 秒ポーリングで
+  `durable_watermark() > 0` を確認(criterion `--test` の 1 パス実行でも flaky にならない)。
+  `[[bench]] store_bench` に `required-features = ["native-runtime"]` を追加。
+  注: sync_interval の数値は従来の「sync_off と同一パスの重複測定」から Interval 実コスト込みへ
+  変わるため過去数値と非連続。
+
+### minor 一括の残余(別起票)
+
+- **redb の配線 or 削除の判断**(m-10 第 2 段): `native-storage` feature と `RedbBackend` を
+  リカバリパスに配線するか、feature ごと削除するか。CI 第 2 マトリクス(`native-tls,native-storage`)と
+  CLAUDE.md の記述更新を伴うため独立タスク。
+- **フル PreVote**(m-8 残余): 分断復帰ノードによる有界なリーダー中断(1 回の再選出)を完全に
+  抑止するには PreVote RPC の追加(ワイヤ変更)が必要。将来課題。
 
 ## 参照
 

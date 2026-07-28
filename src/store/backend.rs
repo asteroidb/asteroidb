@@ -45,6 +45,82 @@ pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     handle.sync_all()
 }
 
+/// Create `dir` (and any missing ancestors) and make the creation itself
+/// durable. `fs::create_dir_all` alone leaves the new directory ENTRIES in
+/// their parents' page caches: a power loss shortly after can drop the
+/// whole chain — and with it every file fsynced inside it.
+///
+/// The path is absolutized first (`std::path::absolute`): with a relative
+/// path the `parent()` chain would stop at the first component and leave
+/// the outermost created directories — the ones between the cwd and the
+/// root — unsynced. A cwd resolution failure propagates as an error
+/// (fail-stop: we cannot promise durability for a path we cannot resolve).
+///
+/// The mandatory (fail-stop) fsync set is exactly what this call may have
+/// changed: every directory it created plus the deepest PRE-EXISTING
+/// ancestor, whose entry set gained the first new child. Higher
+/// pre-existing ancestors are already durable — their entries were
+/// established before this process ran — so they are fsynced only
+/// best-effort: an ancestor that grants traversal but not read permission
+/// (e.g. a hardened `0711` home directory) fails `File::open` with
+/// `EACCES` even though the target directory is fully accessible, and
+/// failing the boot of an already-durable deployment over that would be a
+/// pure availability regression. Such errors are downgraded to a warning.
+///
+/// The order of the fsyncs does not matter for crash safety, only that
+/// the changed links are covered before the caller acknowledges anything
+/// as durable.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    let abs = std::path::absolute(dir)?;
+
+    // Find the deepest pre-existing ancestor BEFORE creating anything.
+    // Traverse-only ancestors are fine here: `exists()` stats by full
+    // path, which needs only `x` on the ancestors, not `r`.
+    let mut existing = abs.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(p) => existing = p,
+            // No existing ancestor at all (should be unreachable for an
+            // absolute path); let `create_dir_all` produce the error.
+            None => break,
+        }
+    }
+
+    std::fs::create_dir_all(&abs)?;
+
+    // Fail-stop: the directories we just created, plus the pre-existing
+    // parent whose entry set changed. If `dir` already existed this is
+    // just `dir` itself, which must be openable for its owner to use it.
+    let mut cur = abs.as_path();
+    loop {
+        fsync_dir(cur)?;
+        if cur == existing {
+            break;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+
+    // Best-effort: higher pre-existing ancestors (entries unchanged and
+    // already durable). Never fail the boot over these.
+    let mut cur = existing.parent();
+    while let Some(d) = cur {
+        if let Err(e) = fsync_dir(d) {
+            tracing::warn!(
+                dir = %d.display(),
+                error = %e,
+                "skipping fsync of pre-existing ancestor directory \
+                 (entries unchanged; durability already established)"
+            );
+        }
+        cur = d.parent();
+    }
+    Ok(())
+}
+
 /// File-based persistence backend using atomic write + fsync.
 ///
 /// Writes go to a `.tmp` sibling file first, which is fsynced and then
@@ -68,6 +144,72 @@ impl FileBackend {
     /// Return the path this backend writes to.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Delete stale temporary files left next to the target by saves that
+    /// failed (or crashed) before their in-line cleanup could run.
+    /// Returns how many files were removed.
+    ///
+    /// Only file names strictly matching this backend's own tmp pattern —
+    /// `<target_filename>.<pid>.<seq>.tmp` with numeric `<pid>` / `<seq>`
+    /// (see [`FileBackend::save`]) — are touched; anything else (e.g. an
+    /// unrelated `peers.json.tmp`) is left alone.
+    ///
+    /// MUST only be called at startup, BEFORE any concurrent `save` can be
+    /// in flight: a live save's tmp file matches the same pattern and
+    /// deleting it under the writer would fail that save.
+    pub fn remove_stale_tmp_files(&self) -> io::Result<usize> {
+        let parent = match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let prefix = format!(
+            "{}.",
+            self.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(middle) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            // Strictly `<digits>.<digits>` between prefix and suffix.
+            let mut parts = middle.split('.');
+            let is_own_tmp = matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(pid), Some(seq), None)
+                    if !pid.is_empty()
+                        && !seq.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && seq.bytes().all(|b| b.is_ascii_digit())
+            );
+            if !is_own_tmp {
+                continue;
+            }
+            let path = entry.path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "removed a stale snapshot tmp file left by a failed save"
+                    );
+                    removed += 1;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
     }
 }
 
@@ -97,14 +239,34 @@ impl StorageBackend for FileBackend {
             TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         let mut file = File::create(&tmp_path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, &self.path)?;
-        // The rename only becomes durable once the parent directory itself
-        // is flushed; without it a crash can revert to the previous file
-        // (or to nothing, for a first save).
-        if let Some(parent) = self.path.parent() {
-            fsync_dir(parent)?;
+        let result = (|| -> io::Result<()> {
+            file.write_all(data)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &self.path)?;
+            // The rename only becomes durable once the parent directory
+            // itself is flushed; without it a crash can revert to the
+            // previous file (or to nothing, for a first save).
+            if let Some(parent) = self.path.parent() {
+                fsync_dir(parent)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // Best-effort cleanup of our own tmp file so repeated failures
+            // do not litter the data directory (m-3). NotFound is fine —
+            // the rename may already have consumed it. The ORIGINAL error
+            // is what the caller must see either way.
+            if let Err(rm_err) = std::fs::remove_file(&tmp_path)
+                && rm_err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %tmp_path.display(),
+                    error = %rm_err,
+                    "failed to remove the tmp file of a failed save; \
+                     startup cleanup will retry (remove_stale_tmp_files)"
+                );
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -267,6 +429,13 @@ impl KvBackend for InMemoryKvBackend {
 /// Uses a single B+tree table for all key-value pairs. Provides ACID
 /// transactions. Requires the `native-storage` feature (uses libc for
 /// mmap/file I/O, not available on `wasm32-unknown-unknown`).
+///
+/// **Experimental — NOT wired into the recovery path**: the production
+/// persistence pipeline is `FileBackend` snapshots + the WAL
+/// (`kv.rs` save/load via `FileBackend`, `runtime/persistence.rs`).
+/// Whether to wire this backend in or remove the `native-storage`
+/// feature entirely is an open decision — see `docs/followup-plan.md`
+/// (m-10 close record) before building on it.
 pub struct RedbBackend {
     db: redb::Database,
 }
@@ -439,6 +608,103 @@ mod tests {
             !leftover_tmp,
             "no .tmp file should remain after a successful save"
         );
+    }
+
+    #[test]
+    fn failed_save_removes_its_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("snap.bin");
+        // Make the final rename fail deterministically (EISDIR): the
+        // target path is an existing directory.
+        std::fs::create_dir(&target).unwrap();
+        let backend = FileBackend::new(&target);
+
+        backend.save(b"data").unwrap_err();
+
+        let leftover = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            leftover.is_none(),
+            "a failed save must clean up its tmp file, found {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn remove_stale_tmp_files_only_matches_the_own_tmp_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("snapshot.bin");
+        let stale = dir.path().join("snapshot.bin.12345.0.tmp");
+        let bystanders = [
+            dir.path().join("snapshot.bin.tmp"),       // no <pid>.<seq>
+            dir.path().join("other.json.tmp"),         // different target
+            dir.path().join("snapshot.bin.abc.0.tmp"), // non-numeric pid
+            dir.path().join("snapshot.bin.1.2.3.tmp"), // too many parts
+        ];
+        std::fs::write(&stale, b"x").unwrap();
+        for p in &bystanders {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let backend = FileBackend::new(&target);
+        assert_eq!(backend.remove_stale_tmp_files().unwrap(), 1);
+        assert!(!stale.exists(), "the matching stale tmp must be removed");
+        for p in &bystanders {
+            assert!(p.exists(), "{} must be left alone", p.display());
+        }
+
+        // A missing parent directory is a no-op, not an error.
+        let absent = FileBackend::new(dir.path().join("nope").join("s.bin"));
+        assert_eq!(absent.remove_stale_tmp_files().unwrap(), 0);
+    }
+
+    /// A crash cannot be reproduced in process, so the durability effect
+    /// of `create_dir_all_durable` rests on review; this covers that the
+    /// walk completes on deep chains it creates itself, on pre-existing
+    /// chains, on relative paths (which must be absolutized so the walk
+    /// is well-founded), and near the root.
+    #[test]
+    fn create_dir_all_durable_walks_deep_relative_and_root_paths() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Creates the whole missing chain and fsyncs it.
+        let deep = dir.path().join("a").join("b").join("c").join("d");
+        create_dir_all_durable(&deep).unwrap();
+        assert!(deep.is_dir());
+
+        // Fully pre-existing target: a no-op create plus fsyncs.
+        create_dir_all_durable(&deep).unwrap();
+
+        // Relative path: must absolutize (a bare `parent()` walk would
+        // terminate at the first component instead of an ancestor that
+        // is known to pre-exist).
+        create_dir_all_durable(Path::new(".")).unwrap();
+
+        // Near the root.
+        create_dir_all_durable(Path::new("/")).unwrap();
+    }
+
+    /// Regression for the boot availability fix: an ancestor that grants
+    /// only traversal (`--x`) cannot be `File::open`ed for fsync, but a
+    /// pre-existing target below it is already durable — creation must
+    /// succeed instead of fail-stopping the caller.
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_all_durable_tolerates_traverse_only_pre_existing_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        let target = locked.join("data");
+        std::fs::create_dir_all(&target).unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let result = create_dir_all_durable(&target);
+        // Restore before asserting so tempdir cleanup always works.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.expect("a traverse-only pre-existing ancestor must not fail the caller");
     }
 
     /// Concurrent saves to the same target must never install an
