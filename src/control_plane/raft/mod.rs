@@ -16,7 +16,10 @@
 //! Scope decisions (see docs/architecture.md): static membership only
 //! (no joint consensus), single-message snapshot transfer, no linearizable
 //! reads (control-plane GETs stay local), no learner replication to
-//! non-voters.
+//! non-voters — non-voters (observers) instead follow the voters'
+//! committed control-plane state via a periodic out-of-band pull
+//! (`/api/internal/raft/namespace`, M-17) that never touches election
+//! state or quorum accounting.
 
 pub mod core;
 pub mod driver;
@@ -27,4 +30,4 @@ pub mod transport;
 pub mod types;
 
 pub use driver::spawn_raft_driver;
-pub use node::{RaftConfig, RaftNode, RaftStatus};
+pub use node::{AdoptOutcome, RaftConfig, RaftNode, RaftStatus};

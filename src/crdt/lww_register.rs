@@ -68,11 +68,16 @@ impl<T: Clone + Ord> LwwRegister<T> {
     /// When timestamps are equal, the larger value (by `Ord`) wins to
     /// guarantee commutativity: `merge(a, b)` always produces the same
     /// result as `merge(b, a)`.
-    pub fn merge(&mut self, other: &LwwRegister<T>) {
+    ///
+    /// Returns `true` iff the merge changed this register (value and/or
+    /// timestamp); `false` guarantees `pre == post` — the RR-gate
+    /// contract (M-6).
+    pub fn merge(&mut self, other: &LwwRegister<T>) -> bool {
         match other.timestamp.cmp(&self.timestamp) {
             std::cmp::Ordering::Greater => {
                 self.value = other.value.clone();
                 self.timestamp = other.timestamp.clone();
+                true
             }
             std::cmp::Ordering::Equal => {
                 // HlcTimestamp has a total order (physical → logical → node_id),
@@ -89,21 +94,25 @@ impl<T: Clone + Ord> LwwRegister<T> {
                 match (&self.value, &other.value) {
                     (Some(s), Some(o)) if o > s => {
                         self.value = other.value.clone();
+                        true
                     }
                     (None, Some(_)) => {
                         self.value = other.value.clone();
+                        true
                     }
-                    _ => {}
+                    _ => false,
                 }
             }
-            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Less => false,
         }
     }
 
     /// Merge a delta into this register.
     ///
     /// For LwwRegister, `merge_delta` is identical to `merge` because the
-    /// delta is a complete register snapshot (value + timestamp).
+    /// delta is a complete register snapshot (value + timestamp). (The
+    /// `changed` result is deliberately dropped: delta application paths
+    /// do not RR-gate.)
     pub fn merge_delta(&mut self, delta: &LwwRegister<T>) {
         self.merge(delta);
     }
@@ -374,5 +383,57 @@ mod tests {
         via_delta.merge_delta(&reg_b);
 
         assert_eq!(via_merge, via_delta);
+    }
+
+    // ---------------------------------------------------------------
+    // merge `changed` ground truth (M-6, RR gate):
+    // changed == (before != after) for every arm.
+    // ---------------------------------------------------------------
+
+    /// Merge `b` into `a`, asserting the returned flag equals the
+    /// physical (value + timestamp) difference.
+    fn merge_ground_truth(a: &mut LwwRegister<String>, b: &LwwRegister<String>) -> bool {
+        let before = a.clone();
+        let changed = a.merge(b);
+        assert_eq!(
+            changed,
+            *a != before,
+            "changed flag must equal physical pre/post difference"
+        );
+        changed
+    }
+
+    #[test]
+    fn merge_changed_truth_table() {
+        // Greater arm: changed.
+        let mut a = LwwRegister::new();
+        a.set("old".to_string(), ts(100, 0, "node-a"));
+        let mut newer = LwwRegister::new();
+        newer.set("new".to_string(), ts(200, 0, "node-b"));
+        assert!(merge_ground_truth(&mut a, &newer));
+
+        // Less arm: no-op.
+        let mut older = LwwRegister::new();
+        older.set("stale".to_string(), ts(50, 0, "node-c"));
+        assert!(!merge_ground_truth(&mut a, &older));
+
+        // Equal timestamp, equal value (idempotent replay): no-op.
+        let same = a.clone();
+        assert!(!merge_ground_truth(&mut a, &same));
+
+        // Equal timestamp, larger value (tiebreaker): changed.
+        let mut tie = LwwRegister::new();
+        tie.set("zzz".to_string(), ts(200, 0, "node-b"));
+        assert!(merge_ground_truth(&mut a, &tie));
+
+        // Equal timestamp, smaller value: no-op.
+        let mut smaller = LwwRegister::new();
+        smaller.set("new".to_string(), ts(200, 0, "node-b"));
+        assert!(!merge_ground_truth(&mut a, &smaller));
+
+        // Empty registers (both at the zero timestamp): no-op.
+        let mut empty_a: LwwRegister<String> = LwwRegister::new();
+        let empty_b: LwwRegister<String> = LwwRegister::new();
+        assert!(!merge_ground_truth(&mut empty_a, &empty_b));
     }
 }

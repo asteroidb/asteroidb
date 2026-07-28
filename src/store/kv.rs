@@ -5,18 +5,27 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::crdt::MergeEffects;
 use crate::crdt::lww_register::LwwRegister;
-use crate::crdt::or_map::OrMap;
-use crate::crdt::or_set::OrSet;
+use crate::crdt::or_map::{OrMap, OrMapV4Layout};
+use crate::crdt::or_set::{OrSet, OrSetV4Layout};
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::store::backend::FileBackend;
 use crate::store::backend::StorageBackend;
+use crate::store::digest::{DigestCache, DigestColdResults, DigestColdWork, StoreDigest};
 use crate::store::migration;
 
 /// Current persistence format version written by this code.
+///
+/// v5: `OrSet`/`OrMap` gained the `compaction_floor` field (M-8 tombstone
+/// GC convergence). bincode is positional, so every pre-v5 snapshot must
+/// be decoded through the frozen [`CrdtValueV4`] shape (empty floor on
+/// conversion); the WAL has the parallel v1→v2 bump (`store::wal`).
+/// Upgrade is one-way: a v5 snapshot cannot be read by pre-v5 binaries
+/// (same constraint as v3→v4).
 ///
 /// v4: added an end-to-end CRC32 checksum to both snapshot encodings
 /// (bincode: a 4-byte LE checksum between the version prefix and the
@@ -35,7 +44,7 @@ use crate::store::migration;
 /// (bincode is positional — the v3 struct layout is frozen there).
 /// v1/v2 snapshots contain only `data` + `timestamps` and are migrated on
 /// load (JSON via the migration registry, bincode via [`StoreV2Layout`]).
-pub const CURRENT_FORMAT_VERSION: u32 = 4;
+pub const CURRENT_FORMAT_VERSION: u32 = 5;
 
 /// Versioned envelope for persisted store data.
 ///
@@ -58,7 +67,12 @@ struct PersistedStore {
 ///
 /// Wraps all supported CRDT types so the store can hold heterogeneous
 /// values while preserving type-safe merge semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is PHYSICAL equality (all components, including counters,
+/// floors and covered tombstones) — used by the debug no-op oracle in
+/// [`Store::merge_value`], NOT canonical/observable equality (that is the
+/// canonical digest's job).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CrdtValue {
     Counter(PnCounter),
     Set(OrSet<String>),
@@ -216,6 +230,48 @@ pub struct Store {
     /// [`note_applied`]: Self::note_applied
     #[serde(default)]
     recovery_gaps: Vec<RecoveryGap>,
+    /// Accumulated compaction-floor merge diagnostics (never persisted).
+    ///
+    /// [`merge_value`](Self::merge_value) is the chokepoint every remote
+    /// merge path funnels through (push, delta pull via
+    /// `merge_delta_value`'s sibling, digest bucket transfer, full sync,
+    /// WAL replay); the per-merge [`MergeEffects`] are summed here and
+    /// drained by the GC tick into `RuntimeMetrics`
+    /// (`take_floor_effects`).
+    #[serde(skip)]
+    floor_effects: MergeEffects,
+    /// Incremental anti-entropy digest cache (M-7, never persisted —
+    /// `#[serde(skip)]` keeps every snapshot/wire format unchanged and
+    /// deserialization yields the `invalid` default, forcing a full
+    /// rebuild).
+    ///
+    /// # MAINTAINER CONTRACT
+    /// The cache is correct only under these rules:
+    /// - Any method that can mutate `data` — including any accessor that
+    ///   hands out a mutable reference into it — MUST call
+    ///   `digest_cache.note_dirty(key)` for the touched key within the
+    ///   same call. Today the complete mutation surface is `get_mut`,
+    ///   `put`, `put_with_timestamp`, `delete`, `merge_value` and
+    ///   `merge_delta_value` (`data` is private; everything else reads).
+    /// - `merge_value` skips `note_dirty` ONLY for `Ok(false)`, relying
+    ///   on its contract "`Ok(false)` ⟹ the stored value is physically
+    ///   unchanged" (see its doc + debug oracle). Weakening that
+    ///   contract breaks digest correctness, not just RR suppression.
+    /// - Structural wholesale construction (deserialize, the frozen
+    ///   `StoreV*Layout` migrations, `Clone`) must carry a cache that is
+    ///   either `invalid` (default) or cloned together with `data`.
+    /// - Metadata-only mutations (`timestamps`, session origin maps,
+    ///   `merge_failed_keys`, `recovery_gaps`, `floor_effects`) are NOT
+    ///   digest inputs and must not dirty the cache — the M-6 RR gate's
+    ///   "no re-stamp on no-op merge" is what makes the converged steady
+    ///   state hash-free.
+    /// - Push evidence over cached extracts is advanced only under a
+    ///   `digest_generation()` check (see `NodeRunner::try_digest_push`),
+    ///   so even wiring `delete` into a live path would not break digest
+    ///   soundness (the WAL resurrection warning on `delete` is a
+    ///   separate, still-open concern).
+    #[serde(skip)]
+    digest_cache: DigestCache,
 }
 
 /// One recovery gap fence: evidence path A is disabled for `node_id`
@@ -234,13 +290,41 @@ pub struct RecoveryGap {
     pub ceiling: HlcTimestamp,
 }
 
+/// Frozen decode shape of [`CrdtValue`] as persisted before the
+/// `compaction_floor` field was added to `OrSet`/`OrMap` (snapshot
+/// formats v1–v4, WAL format v1). bincode is positional, so every pre-v5
+/// payload embedding CRDT values must decode through this enum and
+/// convert (`From`, empty floor).
+#[derive(Debug, Deserialize)]
+pub(crate) enum CrdtValueV4 {
+    Counter(PnCounter),
+    Set(OrSetV4Layout<String>),
+    Map(OrMapV4Layout<String, String>),
+    Register(LwwRegister<String>),
+}
+
+impl From<CrdtValueV4> for CrdtValue {
+    fn from(old: CrdtValueV4) -> Self {
+        match old {
+            CrdtValueV4::Counter(c) => CrdtValue::Counter(c),
+            CrdtValueV4::Set(s) => CrdtValue::Set(s.into()),
+            CrdtValueV4::Map(m) => CrdtValue::Map(m.into()),
+            CrdtValueV4::Register(r) => CrdtValue::Register(r),
+        }
+    }
+}
+
+fn upgrade_v4_data(data: BTreeMap<String, CrdtValueV4>) -> BTreeMap<String, CrdtValue> {
+    data.into_iter().map(|(k, v)| (k, v.into())).collect()
+}
+
 /// Structural layout of `Store` persisted by format versions 1 and 2
 /// (bincode is positional and non-self-describing, so old snapshots must
 /// be decoded with the exact old field layout — `#[serde(default)]` on
 /// the current struct cannot rescue missing trailing fields).
 #[derive(Debug, Deserialize)]
 struct StoreV2Layout {
-    data: BTreeMap<String, CrdtValue>,
+    data: BTreeMap<String, CrdtValueV4>,
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
 }
@@ -248,13 +332,15 @@ struct StoreV2Layout {
 impl From<StoreV2Layout> for Store {
     fn from(old: StoreV2Layout) -> Self {
         let mut store = Store {
-            data: old.data,
+            data: upgrade_v4_data(old.data),
             timestamps: old.timestamps,
             applied_origins: HashMap::new(),
             merge_failed_keys: HashSet::new(),
             pruned_floor: None,
             visible_origins: HashMap::new(),
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
+            digest_cache: DigestCache::default(),
         };
         store.rebuild_visible_origins();
         store
@@ -265,9 +351,9 @@ impl From<StoreV2Layout> for Store {
 /// v4 appended `recovery_gaps`, and bincode cannot default a missing
 /// trailing field, so v3 snapshots must be decoded with exactly this
 /// layout).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct StoreV3Layout {
-    data: BTreeMap<String, CrdtValue>,
+    data: BTreeMap<String, CrdtValueV4>,
     #[serde(default)]
     timestamps: HashMap<String, HlcTimestamp>,
     #[serde(default)]
@@ -283,13 +369,54 @@ struct StoreV3Layout {
 impl From<StoreV3Layout> for Store {
     fn from(old: StoreV3Layout) -> Self {
         let mut store = Store {
-            data: old.data,
+            data: upgrade_v4_data(old.data),
             timestamps: old.timestamps,
             applied_origins: old.applied_origins,
             merge_failed_keys: old.merge_failed_keys,
             pruned_floor: old.pruned_floor,
             visible_origins: old.visible_origins,
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
+            digest_cache: DigestCache::default(),
+        };
+        store.rebuild_visible_origins();
+        store
+    }
+}
+
+/// Structural layout of `Store` persisted by format version 4 (frozen —
+/// v5 changed the embedded `OrSet`/`OrMap` layouts by appending
+/// `compaction_floor`, so v4 snapshots must decode their CRDT values
+/// through [`CrdtValueV4`]).
+#[derive(Debug, Deserialize)]
+struct StoreV4Layout {
+    data: BTreeMap<String, CrdtValueV4>,
+    #[serde(default)]
+    timestamps: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    applied_origins: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    merge_failed_keys: HashSet<String>,
+    #[serde(default)]
+    pruned_floor: Option<HlcTimestamp>,
+    #[serde(default)]
+    visible_origins: HashMap<String, HlcTimestamp>,
+    #[serde(default)]
+    recovery_gaps: Vec<RecoveryGap>,
+}
+
+impl From<StoreV4Layout> for Store {
+    fn from(old: StoreV4Layout) -> Self {
+        let mut store = Store {
+            data: upgrade_v4_data(old.data),
+            timestamps: old.timestamps,
+            applied_origins: old.applied_origins,
+            merge_failed_keys: old.merge_failed_keys,
+            pruned_floor: old.pruned_floor,
+            visible_origins: old.visible_origins,
+            recovery_gaps: old.recovery_gaps,
+            floor_effects: MergeEffects::default(),
+            digest_cache: DigestCache::default(),
         };
         store.rebuild_visible_origins();
         store
@@ -345,7 +472,22 @@ impl Store {
             pruned_floor: None,
             visible_origins: HashMap::new(),
             recovery_gaps: Vec::new(),
+            floor_effects: MergeEffects::default(),
+            digest_cache: DigestCache::warm_empty(),
         }
+    }
+
+    /// Drain the accumulated compaction-floor merge diagnostics
+    /// (see [`Store::floor_effects`]). Called by the GC tick to feed
+    /// `RuntimeMetrics`.
+    pub fn take_floor_effects(&mut self) -> MergeEffects {
+        std::mem::take(&mut self.floor_effects)
+    }
+
+    /// Peek at the accumulated compaction-floor merge diagnostics without
+    /// draining them (tests / debugging).
+    pub fn floor_effects(&self) -> MergeEffects {
+        self.floor_effects
     }
 
     /// Get a reference to the value associated with `key`.
@@ -354,7 +496,16 @@ impl Store {
     }
 
     /// Get a mutable reference to the value associated with `key`.
+    ///
+    /// Conservatively dirties the digest cache whenever a reference is
+    /// handed out (the caller may mutate through it — e.g. every typed
+    /// eventual write and the GC sweep's floor advancement go through
+    /// here). A read-only `get_mut` merely re-hashes one key on the next
+    /// digest refresh.
     pub fn get_mut(&mut self, key: &str) -> Option<&mut CrdtValue> {
+        if self.data.contains_key(key) {
+            self.digest_cache.note_dirty(key);
+        }
         self.data.get_mut(key)
     }
 
@@ -367,6 +518,7 @@ impl Store {
     /// When no HLC is available, call [`record_change`](Self::record_change)
     /// immediately after this method.
     pub fn put(&mut self, key: String, value: CrdtValue) {
+        self.digest_cache.note_dirty(&key);
         self.data.insert(key, value);
     }
 
@@ -378,6 +530,7 @@ impl Store {
     /// up-to-date after the write, so `delta_sync` will immediately see the
     /// new entry without a separate `record_change` call.
     pub fn put_with_timestamp(&mut self, key: String, value: CrdtValue, hlc: HlcTimestamp) {
+        self.digest_cache.note_dirty(&key);
         self.data.insert(key.clone(), value);
         self.timestamps.insert(key, hlc);
     }
@@ -394,6 +547,8 @@ impl Store {
     /// key). Logical deletion must go through the CRDT tombstone
     /// operations (`OrSet::remove` / `OrMap::delete`) instead.
     pub fn delete(&mut self, key: &str) -> Option<CrdtValue> {
+        // Unconditional (a miss merely over-dirties, which is safe).
+        self.digest_cache.note_dirty(key);
         self.timestamps.remove(key);
         self.data.remove(key)
     }
@@ -610,32 +765,18 @@ impl Store {
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 old.into()
             }
-            // v4+: `[version][crc32][payload]` — verify the payload CRC
-            // BEFORE decoding. Fail-stop on mismatch: a damaged snapshot
-            // must never be loaded (a bit flip that still decodes would
-            // poison every peer via anti-entropy max-merges), same
-            // discipline as a corrupt WAL frame.
+            // v4: checksummed envelope, pre-floor CRDT layouts — decode
+            // through the frozen StoreV4Layout (empty floors).
+            4 => {
+                let payload = Self::verify_checksummed_payload(&bytes)?;
+                let (old, _len): (StoreV4Layout, _) =
+                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                old.into()
+            }
+            // v5+: `[version][crc32][payload]`, current layout.
             _ => {
-                if bytes.len() < 8 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "bincode snapshot too short for v4 header (version + crc32)",
-                    ));
-                }
-                let expected_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                let payload = &bytes[8..];
-                let actual_crc = crc32fast::hash(payload);
-                if actual_crc != expected_crc {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "bincode snapshot checksum mismatch (expected {expected_crc:#010x}, \
-                             got {actual_crc:#010x}): the snapshot is damaged and must not be \
-                             loaded. Restore it from a backup — or, for the eventual store only, \
-                             re-fill from peers via anti-entropy (see docs/ops-guide.md)"
-                        ),
-                    ));
-                }
+                let payload = Self::verify_checksummed_payload(&bytes)?;
                 let (store, _len): (Self, _) =
                     bincode::serde::decode_from_slice(payload, bincode::config::standard())
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -644,6 +785,37 @@ impl Store {
         };
         store.rebuild_visible_origins();
         Ok(store)
+    }
+
+    /// Verify the `[version][crc32][payload]` envelope of a v4+ bincode
+    /// snapshot and return the payload slice.
+    ///
+    /// The CRC is verified BEFORE decoding. Fail-stop on mismatch: a
+    /// damaged snapshot must never be loaded (a bit flip that still
+    /// decodes would poison every peer via anti-entropy max-merges),
+    /// same discipline as a corrupt WAL frame.
+    fn verify_checksummed_payload(bytes: &[u8]) -> io::Result<&[u8]> {
+        if bytes.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bincode snapshot too short for v4+ header (version + crc32)",
+            ));
+        }
+        let expected_crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let payload = &bytes[8..];
+        let actual_crc = crc32fast::hash(payload);
+        if actual_crc != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bincode snapshot checksum mismatch (expected {expected_crc:#010x}, \
+                     got {actual_crc:#010x}): the snapshot is damaged and must not be \
+                     loaded. Restore it from a backup — or, for the eventual store only, \
+                     re-fill from peers via anti-entropy (see docs/ops-guide.md)"
+                ),
+            ));
+        }
+        Ok(payload)
     }
 
     /// Load a store from a versioned JSON snapshot at the given path.
@@ -781,22 +953,40 @@ impl Store {
     ///
     /// If the key does not exist, the value is inserted directly.
     /// If the key exists but the CRDT types differ, returns `CrdtError::TypeMismatch`.
-    pub fn merge_value(&mut self, key: String, value: &CrdtValue) -> Result<(), CrdtError> {
-        if let Some(existing) = self.data.get_mut(&key) {
+    ///
+    /// Returns `Ok(true)` iff the merge strictly inflated local state
+    /// (including the insert of a new key); `Ok(false)` guarantees the
+    /// stored value is physically unchanged. This is the RR-gate signal
+    /// (redundant-relay suppression, M-6) consumed by
+    /// `EventualApi::merge_remote` / `merge_remote_with_hlc`.
+    pub fn merge_value(&mut self, key: String, value: &CrdtValue) -> Result<bool, CrdtError> {
+        // Debug-only no-op oracle: `changed == false` must imply
+        // `pre == post`. One-directional on purpose — non-canonical
+        // deserialized states (e.g. ghost zero counter entries persisted
+        // by older code) can make `pre != post` invisible to a merge
+        // that adopted nothing, but never the reverse.
+        #[cfg(debug_assertions)]
+        let pre = self.data.get(&key).cloned();
+
+        let changed = if let Some(existing) = self.data.get_mut(&key) {
             match (existing, value) {
-                (CrdtValue::Counter(a), CrdtValue::Counter(b)) => {
-                    a.merge(b);
-                }
+                (CrdtValue::Counter(a), CrdtValue::Counter(b)) => a.merge(b),
                 (CrdtValue::Set(a), CrdtValue::Set(b)) => {
-                    a.merge(b);
+                    let fx = a.merge(b);
+                    self.floor_effects.absorb(fx);
+                    fx.changed
                 }
                 (CrdtValue::Map(a), CrdtValue::Map(b)) => {
-                    a.merge(b);
+                    let fx = a.merge(b);
+                    self.floor_effects.absorb(fx);
+                    fx.changed
                 }
-                (CrdtValue::Register(a), CrdtValue::Register(b)) => {
-                    a.merge(b);
-                }
+                (CrdtValue::Register(a), CrdtValue::Register(b)) => a.merge(b),
                 (existing, incoming) => {
+                    // Conservative: a type mismatch never mutates today,
+                    // but Err must stay in the fail-safe (dirty)
+                    // direction should that ever change.
+                    self.digest_cache.note_dirty(&key);
                     return Err(CrdtError::TypeMismatch {
                         expected: existing.type_name().to_string(),
                         actual: incoming.type_name().to_string(),
@@ -804,9 +994,23 @@ impl Store {
                 }
             }
         } else {
-            self.data.insert(key, value.clone());
+            self.data.insert(key.clone(), value.clone());
+            true
+        };
+
+        // `Ok(false)` guarantees a physically unchanged value (contract
+        // above), so the digest cache stays clean — this is what turns
+        // the M-6 RR gate's no-op merges into zero-hash digest cycles.
+        if changed {
+            self.digest_cache.note_dirty(&key);
         }
-        Ok(())
+
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            changed || pre.as_ref() == self.data.get(&key),
+            "merge_value reported no-op but the state changed for key {key}"
+        );
+        Ok(changed)
     }
 
     /// Merge a delta CRDT value into an existing entry.
@@ -814,12 +1018,105 @@ impl Store {
     /// If the key does not exist, the delta is inserted directly (it becomes
     /// the full state). If the key exists, delegates to `CrdtValue::merge_delta`.
     pub fn merge_delta_value(&mut self, key: String, delta: &CrdtValue) -> Result<(), CrdtError> {
+        // Unconditional: `merge_delta` reports no change signal, so the
+        // digest cache must assume mutation (over-dirtying is safe).
+        self.digest_cache.note_dirty(&key);
         if let Some(existing) = self.data.get_mut(&key) {
             existing.merge_delta(delta)
         } else {
             self.data.insert(key, delta.clone());
             Ok(())
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Incremental anti-entropy digest (M-7)
+    // ---------------------------------------------------------------
+
+    /// Current two-level anti-entropy digest of this store.
+    ///
+    /// Always bit-identical to `compute_store_digest(&data)` (debug
+    /// builds assert it on every refresh), but the warm path re-hashes
+    /// only keys dirtied since the last call — the M-6 RR gate makes a
+    /// converged steady state completely hash- and clone-free. TOTAL:
+    /// cold caches pay an inline full rebuild, so callers on hot paths
+    /// should consult [`digest_is_cold`](Self::digest_is_cold) / run the
+    /// warm-up protocol first.
+    pub fn digest(&mut self) -> StoreDigest {
+        self.digest_cache.refresh(&self.data).clone()
+    }
+
+    /// Mutation epoch of the digest cache: bumped by every (potential)
+    /// data mutation. Two equal readings under the store lock prove the
+    /// data — and hence the digest — did not change in between.
+    pub fn digest_generation(&self) -> u64 {
+        self.digest_cache.generation()
+    }
+
+    /// Whether [`digest`](Self::digest) would perform more than the
+    /// inline refresh budget of hashing under the caller's lock.
+    pub fn digest_is_cold(&self) -> bool {
+        self.digest_cache.is_cold()
+    }
+
+    /// Capture off-lock digest warm-up work (pair with
+    /// [`adopt_digest_work`](Self::adopt_digest_work) at the
+    /// [`digest_generation`](Self::digest_generation) read under the
+    /// same lock). Opens a capture window that tracks concurrent
+    /// mutations so the results stay adoptable under writes.
+    pub fn digest_cold_work(&mut self) -> DigestColdWork {
+        self.digest_cache.cold_work(&self.data)
+    }
+
+    /// Adopt off-lock digest work captured at `at_generation`. Returns
+    /// `false` — adopting nothing — if the capture window can no longer
+    /// prove which keys mutated since the capture (overflow/supersede;
+    /// the caller simply retries or falls back to the legacy snapshot
+    /// path). On success, keys mutated during the off-lock hashing stay
+    /// dirty (per-key all-or-nothing, see `DigestCache`).
+    pub fn adopt_digest_work(&mut self, results: DigestColdResults, at_generation: u64) -> bool {
+        self.digest_cache.adopt(results, at_generation)
+    }
+
+    /// Clone the entries (and their change timestamps, where tracked)
+    /// living in `buckets`, using the digest cache's bucket index — no
+    /// key is re-hashed and nothing outside the requested buckets is
+    /// cloned.
+    ///
+    /// Requires a clean cache (call [`digest`](Self::digest) first under
+    /// the same lock): the bucket index is only meaningful for the state
+    /// the last refreshed digest described.
+    pub fn clone_bucket_entries(
+        &self,
+        buckets: &HashSet<u16>,
+    ) -> (HashMap<String, CrdtValue>, HashMap<String, HlcTimestamp>) {
+        debug_assert!(
+            self.digest_cache.is_clean(),
+            "clone_bucket_entries requires a freshly refreshed digest cache"
+        );
+        let mut entries = HashMap::new();
+        let mut timestamps = HashMap::new();
+        for key in self.digest_cache.keys_in_buckets(buckets) {
+            if let Some(value) = self.data.get(key) {
+                entries.insert(key.clone(), value.clone());
+                if let Some(ts) = self.timestamps.get(key) {
+                    timestamps.insert(key.clone(), ts.clone());
+                }
+            }
+        }
+        (entries, timestamps)
+    }
+
+    /// Number of dirty digest-cache keys (test observability).
+    #[doc(hidden)]
+    pub fn digest_cache_dirty_len(&self) -> usize {
+        self.digest_cache.dirty_len()
+    }
+
+    /// Whether the digest cache is invalid (test observability).
+    #[doc(hidden)]
+    pub fn digest_cache_is_invalid(&self) -> bool {
+        self.digest_cache.is_invalid()
     }
 
     // ---------------------------------------------------------------
@@ -2521,29 +2818,72 @@ mod tests {
         assert!(loaded.contains_key("reg"));
     }
 
-    /// Serialisable mirror of the exact struct layout persisted by format
-    /// versions 1 and 2 ({data, timestamps} only), used to craft genuine
-    /// old-format snapshots in tests.
+    /// Serialisable mirrors of the exact PRE-v5 layouts (no
+    /// `compaction_floor` inside `OrSet`/`OrMap`), used to craft genuine
+    /// old-format snapshots in tests. Variant order MUST match
+    /// `CrdtValue` (bincode encodes the variant index).
+    #[derive(serde::Serialize)]
+    struct OldDotV4 {
+        node_id: NodeId,
+        counter: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct OldOrSetV4 {
+        elements: HashMap<String, Vec<OldDotV4>>,
+        counters: HashMap<NodeId, u64>,
+        deferred: Vec<OldDotV4>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[allow(dead_code)] // Map/Register variants exist to pin the indexes
+    enum OldCrdtValueV4 {
+        Counter(PnCounter),
+        Set(OldOrSetV4),
+        Map(()),
+        Register(LwwRegister<String>),
+    }
+
+    /// Old {data, timestamps}-only store layout (formats 1 and 2).
     #[derive(serde::Serialize)]
     struct OldStoreLayoutV2 {
-        data: BTreeMap<String, CrdtValue>,
+        data: BTreeMap<String, OldCrdtValueV4>,
         timestamps: HashMap<String, HlcTimestamp>,
     }
 
-    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
+    fn old_layout_data() -> BTreeMap<String, OldCrdtValueV4> {
         let mut counter = PnCounter::new();
         counter.increment(&node("A"));
         counter.increment(&node("A"));
-        let mut set = OrSet::new();
-        set.add("alice".to_string(), &node("A"));
+        let set = OldOrSetV4 {
+            elements: HashMap::from([(
+                "alice".to_string(),
+                vec![OldDotV4 {
+                    node_id: node("A"),
+                    counter: 1,
+                }],
+            )]),
+            counters: HashMap::from([(node("A"), 2)]),
+            deferred: vec![OldDotV4 {
+                node_id: node("A"),
+                counter: 2,
+            }],
+        };
 
         let mut data = BTreeMap::new();
-        data.insert("hits".to_string(), CrdtValue::Counter(counter));
-        data.insert("users".to_string(), CrdtValue::Set(set));
+        data.insert("hits".to_string(), OldCrdtValueV4::Counter(counter));
+        data.insert("users".to_string(), OldCrdtValueV4::Set(set));
+        data
+    }
+
+    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
         let mut timestamps = HashMap::new();
         timestamps.insert("hits".to_string(), ts(42, 0, "A"));
 
-        let old = OldStoreLayoutV2 { data, timestamps };
+        let old = OldStoreLayoutV2 {
+            data: old_layout_data(),
+            timestamps,
+        };
         let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
             .expect("bincode encode failed");
 
@@ -2551,6 +2891,169 @@ mod tests {
         bytes.extend_from_slice(&version.to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    /// Old v4 store layout (checksummed envelope, pre-floor CRDTs).
+    #[derive(serde::Serialize)]
+    struct OldStoreLayoutV4 {
+        data: BTreeMap<String, OldCrdtValueV4>,
+        timestamps: HashMap<String, HlcTimestamp>,
+        applied_origins: HashMap<String, HlcTimestamp>,
+        merge_failed_keys: HashSet<String>,
+        pruned_floor: Option<HlcTimestamp>,
+        visible_origins: HashMap<String, HlcTimestamp>,
+        recovery_gaps: Vec<RecoveryGap>,
+    }
+
+    fn v4_bincode_snapshot() -> Vec<u8> {
+        let mut timestamps = HashMap::new();
+        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
+        let mut applied = HashMap::new();
+        applied.insert("A".to_string(), ts(42, 0, "A"));
+
+        let old = OldStoreLayoutV4 {
+            data: old_layout_data(),
+            timestamps,
+            applied_origins: applied,
+            merge_failed_keys: HashSet::from(["bad".to_string()]),
+            pruned_floor: None,
+            visible_origins: HashMap::new(),
+            recovery_gaps: vec![RecoveryGap {
+                node_id: "A".to_string(),
+                floor: ts(1, 0, "A"),
+                ceiling: ts(10, 0, "A"),
+            }],
+        };
+        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
+            .expect("bincode encode failed");
+
+        let mut bytes = Vec::with_capacity(8 + payload.len());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    /// A genuine v4 bincode snapshot (checksummed, pre-floor CRDT
+    /// layouts) must load through the frozen `StoreV4Layout` with all
+    /// fields intact and empty compaction floors.
+    #[test]
+    fn bincode_v4_snapshot_migrates_on_load() {
+        use crate::store::backend::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        backend.save(&v4_bincode_snapshot()).unwrap();
+
+        let loaded = Store::load_from_backend_bincode(&backend)
+            .unwrap_or_else(|e| panic!("v4 bincode snapshot should load: {e}"));
+
+        assert_eq!(loaded.len(), 2);
+        match loaded.get("hits") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected Counter, got {:?}", other),
+        }
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert_eq!(s.deferred_len(), 1, "old tombstone must survive");
+                assert!(
+                    s.compaction_floor().is_empty(),
+                    "pre-floor snapshot converts with an empty floor"
+                );
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+        assert_eq!(loaded.timestamp_for("hits"), Some(&ts(42, 0, "A")));
+        assert_eq!(loaded.applied_origin("A"), Some(&ts(42, 0, "A")));
+        assert!(loaded.merge_failed_contains("bad"));
+        assert_eq!(loaded.recovery_gaps().len(), 1);
+    }
+
+    /// A corrupted v4 snapshot still fails the checksum (the v4 decode
+    /// arm shares the fail-stop envelope verification).
+    #[test]
+    fn bincode_v4_snapshot_bit_flip_is_fail_stop() {
+        use crate::store::backend::MemoryBackend;
+
+        let mut bytes = v4_bincode_snapshot();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let backend = MemoryBackend::new();
+        backend.save(&bytes).unwrap();
+
+        let err = Store::load_from_backend_bincode(&backend).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum"));
+    }
+
+    /// v5 round trip preserves the compaction floor (bincode + JSON).
+    #[test]
+    fn snapshot_round_trip_preserves_compaction_floor() {
+        use crate::store::backend::MemoryBackend;
+
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.compact_deferred_certified(&set.deferred_dots(), None);
+        assert_eq!(set.compaction_floor().get(&n), Some(&1));
+
+        let mut store = Store::new();
+        store.put("users".into(), CrdtValue::Set(set));
+
+        for json in [false, true] {
+            let backend = MemoryBackend::new();
+            if json {
+                store.save_to_backend(&backend).unwrap();
+            } else {
+                store.save_to_backend_bincode(&backend).unwrap();
+            }
+            let loaded = if json {
+                Store::load_from_backend(&backend).unwrap()
+            } else {
+                Store::load_from_backend_bincode(&backend).unwrap()
+            };
+            match loaded.get("users") {
+                Some(CrdtValue::Set(s)) => {
+                    assert_eq!(
+                        s.compaction_floor().get(&n),
+                        Some(&1),
+                        "floor must persist (json={json})"
+                    );
+                    assert_eq!(s.deferred_len(), 0);
+                }
+                other => panic!("expected Set, got {:?}", other),
+            }
+        }
+    }
+
+    /// v4 JSON snapshots (no `compaction_floor` field anywhere) load via
+    /// the migration registry with empty floors.
+    #[test]
+    fn json_v4_snapshot_loads_with_default_floor() {
+        let raw = r#"{
+            "format_version": 4,
+            "store": {
+                "data": {
+                    "users": {"Set": {"elements": {"alice": [{"node_id": "A", "counter": 1}]}, "counters": {"A": 2}, "deferred": [{"node_id": "A", "counter": 2}]}}
+                },
+                "timestamps": {},
+                "applied_origins": {},
+                "merge_failed_keys": [],
+                "pruned_floor": null,
+                "visible_origins": {},
+                "recovery_gaps": []
+            }
+        }"#;
+        let loaded = Store::deserialize_snapshot(raw).unwrap();
+        match loaded.get("users") {
+            Some(CrdtValue::Set(s)) => {
+                assert!(s.contains(&"alice".to_string()));
+                assert_eq!(s.deferred_len(), 1);
+                assert!(s.compaction_floor().is_empty());
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
     }
 
     /// v1/v2 bincode snapshots use the old {data, timestamps} layout;
@@ -3045,5 +3548,452 @@ mod tests {
         let loaded = Store::load_snapshot(&path).unwrap();
         assert_eq!(loaded.visible_origins().get("a"), Some(&ts(50, 0, "a")));
         assert_eq!(loaded.visible_origins().get("c"), Some(&ts(70, 0, "c")));
+    }
+
+    // ===============================================================
+    // Digest cache (M-7): invalidation table + cache/recompute
+    // equivalence. Every `store.digest()` call below ALSO runs the
+    // debug-build oracle inside `DigestCache::refresh` (bit-identical
+    // to `compute_store_digest`), so these tests double as equivalence
+    // proofs for every enumerated mutation path.
+    // ===============================================================
+
+    use crate::store::digest::compute_store_digest;
+
+    fn data_of(store: &Store) -> BTreeMap<String, CrdtValue> {
+        store
+            .all_entries()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Assert the cached digest equals a from-scratch recomputation.
+    fn assert_digest_exact(store: &mut Store) {
+        let expected = compute_store_digest(&data_of(store));
+        assert_eq!(store.digest(), expected, "cached digest diverged");
+    }
+
+    fn counter_inc(node_name: &str) -> CrdtValue {
+        let mut c = PnCounter::new();
+        c.increment(&node(node_name));
+        CrdtValue::Counter(c)
+    }
+
+    #[test]
+    fn digest_cache_new_store_is_warm_and_exact() {
+        let mut store = Store::new();
+        assert!(!store.digest_cache_is_invalid());
+        assert!(!store.digest_is_cold());
+        assert_digest_exact(&mut store);
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_put_and_put_with_timestamp() {
+        let mut store = Store::new();
+        let g0 = store.digest_generation();
+
+        store.put("a".into(), counter_inc("n1"));
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        let g1 = store.digest_generation();
+        assert_ne!(g1, g0, "put must bump the generation");
+
+        store.put_with_timestamp("b".into(), counter_inc("n1"), ts(1, 0, "n1"));
+        assert_eq!(store.digest_cache_dirty_len(), 2);
+        assert_ne!(store.digest_generation(), g1);
+
+        assert_digest_exact(&mut store);
+        assert_eq!(store.digest_cache_dirty_len(), 0, "refresh drains dirty");
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_delete_existing_and_missing() {
+        let mut store = Store::new();
+        store.put("a".into(), counter_inc("n1"));
+        let d0 = store.digest();
+
+        let g = store.digest_generation();
+        store.delete("a");
+        assert_ne!(store.digest_generation(), g);
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        let d1 = store.digest();
+        assert_ne!(d0.root, d1.root, "delete must change the digest");
+
+        // A miss over-dirties (safe) but must still refresh exactly.
+        let g = store.digest_generation();
+        store.delete("never-existed");
+        assert_ne!(store.digest_generation(), g, "delete miss still bumps");
+        assert_digest_exact(&mut store);
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_get_mut_some_not_on_none() {
+        let mut store = Store::new();
+        store.put("k".into(), counter_inc("n1"));
+        let _ = store.digest();
+
+        let g = store.digest_generation();
+        assert!(store.get_mut("nope").is_none());
+        assert_eq!(store.digest_generation(), g, "get_mut miss must not bump");
+        assert_eq!(store.digest_cache_dirty_len(), 0);
+
+        if let Some(CrdtValue::Counter(c)) = store.get_mut("k") {
+            c.increment(&node("n1"));
+        } else {
+            panic!("expected counter");
+        }
+        assert_ne!(store.digest_generation(), g, "get_mut hit must bump");
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        assert_digest_exact(&mut store);
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_inflating_merge_value() {
+        let mut store = Store::new();
+        // Insert of a new key.
+        assert!(store.merge_value("k".into(), &counter_inc("n1")).unwrap());
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        let _ = store.digest();
+
+        // Strictly inflating merge into an existing key.
+        let g = store.digest_generation();
+        assert!(store.merge_value("k".into(), &counter_inc("n2")).unwrap());
+        assert_ne!(store.digest_generation(), g);
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        assert_digest_exact(&mut store);
+    }
+
+    /// The M-6 RR-gate synergy: a no-op merge (`Ok(false)`) must NOT
+    /// dirty the cache — converged steady-state digest cycles stay
+    /// hash-free — and the digest must be unchanged.
+    #[test]
+    fn digest_cache_no_dirty_on_noop_merge_value() {
+        let mut store = Store::new();
+        let value = counter_inc("n1");
+        store.merge_value("k".into(), &value).unwrap();
+        let d0 = store.digest();
+        let g = store.digest_generation();
+
+        assert!(
+            !store.merge_value("k".into(), &value).unwrap(),
+            "identical re-merge must be a no-op"
+        );
+        assert_eq!(store.digest_generation(), g, "no-op must not bump");
+        assert_eq!(store.digest_cache_dirty_len(), 0);
+        assert_eq!(store.digest(), d0);
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_merge_value_type_mismatch_err() {
+        let mut store = Store::new();
+        store.put("k".into(), counter_inc("n1"));
+        let _ = store.digest();
+
+        let g = store.digest_generation();
+        let mut set = OrSet::new();
+        set.add("m".to_string(), &node("n1"));
+        assert!(store.merge_value("k".into(), &CrdtValue::Set(set)).is_err());
+        assert_ne!(
+            store.digest_generation(),
+            g,
+            "Err must dirty conservatively"
+        );
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        assert_digest_exact(&mut store);
+    }
+
+    #[test]
+    fn digest_cache_dirty_on_merge_delta_value() {
+        let mut store = Store::new();
+        store
+            .merge_delta_value("k".into(), &counter_inc("n1"))
+            .unwrap();
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        let _ = store.digest();
+
+        let g = store.digest_generation();
+        store
+            .merge_delta_value("k".into(), &counter_inc("n2"))
+            .unwrap();
+        assert_ne!(store.digest_generation(), g);
+        assert_digest_exact(&mut store);
+    }
+
+    /// Metadata-only mutations are NOT digest inputs and must not dirty
+    /// the cache (their exclusion is what keeps per-key HLC re-stamps
+    /// from causing false mismatches — see the module doc of
+    /// `store::digest`).
+    #[test]
+    fn digest_cache_no_dirty_on_timestamps_and_session_meta() {
+        let mut store = Store::new();
+        store.put("k".into(), counter_inc("n1"));
+        store.record_change("k", ts(5, 0, "n1"));
+        let d0 = store.digest();
+        let g = store.digest_generation();
+
+        store.record_change("k", ts(9, 0, "n1"));
+        store.record_change_max("k", ts(11, 0, "n1"));
+        store.note_applied(&ts(12, 0, "n1"));
+        store.note_visible(&ts(13, 0, "n1"));
+        store.note_merge_failed("poisoned");
+        store.merge_applied_origins(&HashMap::from([("o".to_string(), ts(14, 0, "o"))]));
+        store.merge_visible_origins(&HashMap::from([("o".to_string(), ts(15, 0, "o"))]));
+        store.add_recovery_gap("n1".to_string(), ts(1, 0, "n1"), ts(2, 0, "n1"));
+        store.prune_timestamps_before("", &ts(20, 0, "n1"));
+        let _ = store.take_floor_effects();
+
+        assert_eq!(
+            store.digest_generation(),
+            g,
+            "metadata-only mutations must not bump the generation"
+        );
+        assert_eq!(store.digest_cache_dirty_len(), 0);
+        assert_eq!(store.digest(), d0, "digest must ignore metadata");
+    }
+
+    #[test]
+    fn digest_cache_generation_bumps_even_when_already_dirty() {
+        let mut store = Store::new();
+        store.put("k".into(), counter_inc("n1"));
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        let g = store.digest_generation();
+
+        // Same key again: dirty set unchanged, generation MUST move
+        // (the all-or-nothing warm-up check depends on it).
+        store.put("k".into(), counter_inc("n2"));
+        assert_eq!(store.digest_cache_dirty_len(), 1);
+        assert_ne!(store.digest_generation(), g);
+    }
+
+    /// The GC sweep mutates values through `get_mut` +
+    /// `compact_deferred_certified` WITHOUT `record_change` (the floor
+    /// advance is digest-relevant under scheme v2) — the single most
+    /// important non-write-path invalidation.
+    #[test]
+    fn digest_cache_gc_floor_advance_dirties_and_digest_matches() {
+        let mut store = Store::new();
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &node("n1"));
+        set.remove(&"x".to_string());
+        store.put("myset".into(), CrdtValue::Set(set));
+        let d0 = store.digest();
+        let g = store.digest_generation();
+
+        // Sweep exactly like `crdt::gc::run_gc_cycle` does.
+        if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
+            let outcome = s.compact_deferred_certified(&s.deferred_dots(), None);
+            assert!(outcome.collected > 0, "sweep must drop the tombstone");
+        } else {
+            panic!("expected set");
+        }
+
+        assert_ne!(store.digest_generation(), g, "sweep must dirty the key");
+        let d1 = store.digest();
+        assert_ne!(
+            d0.root, d1.root,
+            "a floor advance is digest-visible under scheme v2"
+        );
+        assert_digest_exact(&mut store);
+    }
+
+    /// Randomised op-sequence equivalence: after every step the cached
+    /// digest must equal a from-scratch recompute (the refresh oracle
+    /// re-checks this internally on every call in debug builds).
+    #[test]
+    fn digest_cache_equals_recompute_under_random_op_sequences() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+
+        let mut store = Store::new();
+        for step in 0..400 {
+            let key = format!("key-{}", rng() % 24);
+            match rng() % 8 {
+                0 => {
+                    let _ = store.merge_value(key, &counter_inc("n1"));
+                }
+                1 => {
+                    // Re-merge the current value: an RR-gate no-op.
+                    if let Some(v) = store.get(&key).cloned() {
+                        let _ = store.merge_value(key, &v);
+                    }
+                }
+                2 => {
+                    // Set merge — a type mismatch (Err) on counter keys.
+                    let mut s = OrSet::new();
+                    s.add(format!("m{}", rng() % 4), &node("n2"));
+                    let _ = store.merge_value(key, &CrdtValue::Set(s));
+                }
+                3 => {
+                    store.delete(&key);
+                }
+                4 => {
+                    if let Some(CrdtValue::Set(s)) = store.get_mut(&key) {
+                        s.remove(&format!("m{}", rng() % 4));
+                    }
+                }
+                5 => {
+                    // GC sweep on whatever key comes up.
+                    if let Some(CrdtValue::Set(s)) = store.get_mut(&key) {
+                        s.compact_deferred_certified(&s.deferred_dots(), None);
+                    }
+                }
+                6 => {
+                    let mut r = LwwRegister::new();
+                    r.set(format!("v{step}"), ts(step as u64 + 1, 0, "n1"));
+                    store.put_with_timestamp(
+                        key,
+                        CrdtValue::Register(r),
+                        ts(step as u64 + 1, 0, "n1"),
+                    );
+                }
+                _ => {
+                    // Metadata-only noise.
+                    store.record_change(&key, ts(step as u64 + 1, 0, "n3"));
+                    store.note_applied(&ts(step as u64 + 1, 0, "n3"));
+                }
+            }
+
+            if step % 16 == 0 {
+                assert_digest_exact(&mut store);
+            }
+        }
+        assert_digest_exact(&mut store);
+    }
+
+    /// Memory safety valve: a store whose digest is never read must not
+    /// retain unbounded per-key dirty state — beyond the bound the cache
+    /// collapses to invalid (and stays exact via the full-rebuild path).
+    #[test]
+    fn digest_cache_collapses_to_invalid_beyond_dirty_bound() {
+        use crate::store::digest::DIRTY_COLLAPSE_MAX;
+
+        let mut store = Store::new();
+        for i in 0..(DIRTY_COLLAPSE_MAX + 1) {
+            store.put(format!("churn-{i}"), counter_inc("n1"));
+        }
+        assert!(
+            store.digest_cache_is_invalid(),
+            "the dirty set must collapse instead of growing unboundedly"
+        );
+        assert_eq!(store.digest_cache_dirty_len(), 0, "collapse frees the set");
+
+        // Still correct (and warm again) after the safety-net rebuild.
+        let g = store.digest_generation();
+        store.put("after-collapse".into(), counter_inc("n2"));
+        assert_ne!(store.digest_generation(), g, "generation keeps moving");
+        let expected = compute_store_digest(&data_of(&store));
+        assert_eq!(store.digest(), expected);
+        assert!(!store.digest_cache_is_invalid());
+    }
+
+    #[test]
+    fn digest_cache_store_clone_carries_consistent_cache() {
+        let mut store = Store::new();
+        for i in 0..8 {
+            store.put(format!("k{i}"), counter_inc("n1"));
+        }
+        let _ = store.digest();
+        store.put("dirty-at-clone".into(), counter_inc("n2"));
+
+        let mut cloned = store.clone();
+        // Diverge the original — the clone's cache must track the
+        // clone's data, not the original's.
+        store.delete("k0");
+        assert_digest_exact(&mut cloned);
+        assert_digest_exact(&mut store);
+
+        // Mutations on the clone keep its cache exact.
+        cloned.put("clone-only".into(), counter_inc("n3"));
+        assert_digest_exact(&mut cloned);
+    }
+
+    #[test]
+    fn digest_cache_serde_json_roundtrip_is_invalid_then_exact() {
+        let mut store = Store::new();
+        for i in 0..5 {
+            store.put(format!("k{i}"), counter_inc("n1"));
+        }
+        let d0 = store.digest();
+
+        let json = serde_json::to_string(&store).unwrap();
+        let mut restored: Store = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.digest_cache_is_invalid(),
+            "a deserialized cache must start invalid (serde skip)"
+        );
+        assert!(restored.digest_is_cold());
+        assert_eq!(
+            restored.digest(),
+            d0,
+            "the safety-net inline rebuild must reproduce the digest"
+        );
+        assert!(!restored.digest_cache_is_invalid());
+    }
+
+    #[test]
+    fn digest_cache_bincode_snapshot_roundtrip_then_digest_matches() {
+        let mut store = Store::new();
+        for i in 0..5 {
+            store.put(format!("k{i}"), counter_inc("n1"));
+        }
+        let d0 = store.digest();
+
+        let backend = crate::store::MemoryBackend::new();
+        store.save_to_backend_bincode(&backend).unwrap();
+        let mut restored = Store::load_from_backend_bincode(&backend).unwrap();
+        assert!(restored.digest_cache_is_invalid());
+        assert_eq!(restored.digest(), d0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn digest_cache_wal_replay_then_digest_matches() {
+        use crate::store::wal::{WalRecord, replay_record};
+
+        let mut store = Store::new();
+        for i in 0..4 {
+            replay_record(
+                &mut store,
+                WalRecord::UpsertApplied {
+                    key: format!("k{i}"),
+                    value: counter_inc("n1"),
+                    hlc: ts(i as u64 + 1, 0, "n1"),
+                },
+            );
+        }
+        // Duplicate replay: idempotent no-op merges (RR gate) — the
+        // cache must stay exact either way.
+        replay_record(
+            &mut store,
+            WalRecord::UpsertApplied {
+                key: "k0".into(),
+                value: counter_inc("n1"),
+                hlc: ts(1, 0, "n1"),
+            },
+        );
+        assert_digest_exact(&mut store);
+    }
+
+    #[test]
+    fn digest_cache_migrated_snapshots_are_invalid_then_exact() {
+        // v2 JSON layout (data + timestamps only) → StoreV2Layout.
+        let raw = serde_json::json!({
+            "format_version": 2,
+            "store": {
+                "data": {},
+                "timestamps": { "k": { "physical": 70, "logical": 0, "node_id": "c" } }
+            }
+        })
+        .to_string();
+        let mut migrated = Store::deserialize_snapshot(&raw).unwrap();
+        assert!(
+            migrated.digest_cache_is_invalid(),
+            "migrated stores must start with an invalid cache"
+        );
+        assert_digest_exact(&mut migrated);
     }
 }

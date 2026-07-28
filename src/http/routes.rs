@@ -4,13 +4,14 @@ use axum::Router;
 use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
-    AppState, certified_write, eventual_write, get_authority_definition, get_certification_status,
-    get_certified, get_equivocations, get_eventual, get_internal_frontiers, get_metrics,
-    get_policy, get_raft_status, get_slo, get_topology, get_version_history, healthz,
-    internal_announce, internal_delta_sync, internal_digest_sync, internal_join, internal_keys,
-    internal_leave, internal_ping, internal_sync, list_authorities, list_policies,
-    post_internal_frontiers, raft_append, raft_install_snapshot, raft_vote, remove_policy,
-    set_authority_definition, set_placement_policy, verify_proof,
+    AppState, certified_write, delete_equivocations, eventual_write, get_authority_definition,
+    get_certification_status, get_certified, get_equivocations, get_eventual,
+    get_internal_frontiers, get_metrics, get_policy, get_raft_status, get_slo, get_topology,
+    get_version_history, healthz, internal_announce, internal_delta_sync, internal_digest_sync,
+    internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
+    list_policies, post_internal_frontiers, raft_append, raft_install_snapshot,
+    raft_namespace_snapshot, raft_vote, remove_policy, set_authority_definition,
+    set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -40,7 +41,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // see the ops guide security warning).
         .route("/api/internal/raft/vote", post(raft_vote))
         .route("/api/internal/raft/append", post(raft_append))
-        .route("/api/internal/raft/snapshot", post(raft_install_snapshot));
+        .route("/api/internal/raft/snapshot", post(raft_install_snapshot))
+        .route(
+            "/api/internal/raft/namespace",
+            post(raft_namespace_snapshot),
+        );
 
     // Control-plane mutation routes sub-router (PUT / DELETE).
     // These require internal token auth like the internal routes.
@@ -53,6 +58,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/control-plane/policies/{prefix}",
             delete(remove_policy),
+        )
+        // Equivocation false-positive recovery (M-12): a mutation, so it
+        // rides the token-protected sub-router — unlike the public
+        // read-only GET /api/authority/equivocations.
+        .route(
+            "/api/authority/equivocations/{authority_id}",
+            delete(delete_equivocations),
         );
 
     let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token
@@ -1642,6 +1654,84 @@ mod tests {
         assert_eq!(result.required_count, 2);
     }
 
+    /// verify_proof errors must be the same structured JSON
+    /// (`ErrorResponse` via `ApiError`) as every other API error — not
+    /// plain text (m-6).
+    #[tokio::test]
+    async fn verify_proof_error_is_structured_json() {
+        let state = test_state();
+        let app = router(state);
+
+        // BLS path with mismatched signer/key list lengths: a 400 whose
+        // body must parse as the structured error JSON.
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": [],
+            "total_authorities": 3,
+            "signature_algorithm": "Bls12_381",
+            "bls_aggregate_signature": "00",
+            "bls_signer_ids": ["auth-1", "auth-2"],
+            "bls_public_keys": ["00"]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body)
+            .expect("error body must be structured JSON, not plain text");
+        assert_eq!(err["error_code"], "INVALID_ARGUMENT");
+        assert!(
+            err["message"].as_str().unwrap().contains("same length"),
+            "message must be preserved: {body}"
+        );
+    }
+
+    /// Without a keyset registry the handler must answer a structured 500
+    /// INTERNAL (status unchanged from the pre-m-6 plain-text response).
+    #[tokio::test]
+    async fn verify_proof_without_registry_is_structured_internal_error() {
+        let state = test_state_signing(None, false);
+        let app = router(state);
+
+        let body_json = serde_json::json!({
+            "key_range_prefix": "user/",
+            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "policy_version": 1,
+            "contributing_authorities": [],
+            "total_authorities": 3
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/certified/verify")
+            .header("content-type", "application/json")
+            .body(Body::from(body_json.to_string()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = body_string(resp.into_body()).await;
+        let err: serde_json::Value = serde_json::from_str(&body)
+            .expect("error body must be structured JSON, not plain text");
+        assert_eq!(err["error_code"], "INTERNAL");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("keyset registry not configured"),
+            "message must be preserved: {body}"
+        );
+    }
+
     /// The caller-supplied `total_authorities` must be ignored: shrinking the
     /// denominator must not turn a sub-quorum signature set into a majority.
     #[tokio::test]
@@ -1913,26 +2003,29 @@ mod tests {
         use crate::network::frontier_sync::FrontierPushResponse;
 
         let state = test_state();
+        let pv = current_pv(&state).0;
         let app = router(state);
 
-        let frontier_json = r#"{
+        let frontier_json = format!(
+            r#"{{
             "frontiers": [
-                {
+                {{
                     "authority_id": "auth-1",
-                    "frontier_hlc": {"physical": 100, "logical": 0, "node_id": "auth-1"},
-                    "key_range": {"prefix": ""},
-                    "policy_version": 1,
+                    "frontier_hlc": {{"physical": 100, "logical": 0, "node_id": "auth-1"}},
+                    "key_range": {{"prefix": ""}},
+                    "policy_version": {pv},
                     "digest_hash": "h1"
-                }
+                }}
             ]
-        }"#;
+        }}"#
+        );
 
         // First push: frontier is new, accepted should be 1.
         let req = Request::builder()
             .method("POST")
             .uri("/api/internal/frontiers")
             .header("content-type", "application/json")
-            .body(Body::from(frontier_json))
+            .body(Body::from(frontier_json.clone()))
             .unwrap();
 
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1961,17 +2054,19 @@ mod tests {
         );
 
         // Third push: newer frontier, accepted should be 1.
-        let newer_json = r#"{
+        let newer_json = format!(
+            r#"{{
             "frontiers": [
-                {
+                {{
                     "authority_id": "auth-1",
-                    "frontier_hlc": {"physical": 200, "logical": 0, "node_id": "auth-1"},
-                    "key_range": {"prefix": ""},
-                    "policy_version": 1,
+                    "frontier_hlc": {{"physical": 200, "logical": 0, "node_id": "auth-1"}},
+                    "key_range": {{"prefix": ""}},
+                    "policy_version": {pv},
                     "digest_hash": "h2"
-                }
+                }}
             ]
-        }"#;
+        }}"#
+        );
 
         let req = Request::builder()
             .method("POST")
@@ -2386,6 +2481,7 @@ mod tests {
             "/api/internal/raft/vote",
             "/api/internal/raft/append",
             "/api/internal/raft/snapshot",
+            "/api/internal/raft/namespace",
         ] {
             let req = Request::builder()
                 .method("POST")
@@ -2512,6 +2608,22 @@ mod tests {
         registry
     }
 
+    /// Current placement-policy version of the catch-all "" range.
+    ///
+    /// The single-node Raft bootstrap re-proposes seeded policies and
+    /// re-assigns their versions in commit order, so tests must report
+    /// frontiers under the LIVE version — admission (M-4) rejects reports
+    /// outside the current version's window.
+    fn current_pv(state: &Arc<AppState>) -> PolicyVersion {
+        state
+            .namespace
+            .read()
+            .unwrap()
+            .get_placement_policy("")
+            .expect("test namespace seeds a catch-all policy")
+            .version
+    }
+
     fn signed_push_body(signers: &[&NodeSigner], physical: u64) -> FrontierPushRequest {
         signed_push_body_with_pv(signers, physical, PolicyVersion(1))
     }
@@ -2565,9 +2677,10 @@ mod tests {
         let s1 = signing_test_signer("auth-1", 61);
         let s2 = signing_test_signer("auth-2", 62);
         let state = test_state_signing(Some(signing_registry(&[&s1, &s2])), false);
+        let pv = current_pv(&state);
         let app = router(state);
 
-        let body = signed_push_body(&[&s1, &s2], 10_500);
+        let body = signed_push_body_with_pv(&[&s1, &s2], 10_500, pv);
         let result = push_frontiers(&app, &body).await;
         assert_eq!(
             result.accepted, 2,
@@ -2609,8 +2722,9 @@ mod tests {
 
         // Lenient (default): unsigned frontiers are accepted.
         let state = test_state_signing(Some(signing_registry(&[&s1])), false);
+        let pv = current_pv(&state);
         let app = router(state);
-        let mut body = signed_push_body(&[&s1], 10_500);
+        let mut body = signed_push_body_with_pv(&[&s1], 10_500, pv);
         body.signatures = vec![None];
         let result = push_frontiers(&app, &body).await;
         assert_eq!(
@@ -2631,8 +2745,9 @@ mod tests {
         // payloads carrying (unverifiable) signatures.
         let s1 = signing_test_signer("auth-1", 67);
         let state = test_state_signing(None, false);
+        let pv = current_pv(&state);
         let app = router(state);
-        let body = signed_push_body(&[&s1], 10_500);
+        let body = signed_push_body_with_pv(&[&s1], 10_500, pv);
         let result = push_frontiers(&app, &body).await;
         assert_eq!(result.accepted, 1);
     }
@@ -2686,7 +2801,7 @@ mod tests {
         }
         let app = router(Arc::clone(&state));
 
-        let make_body = |prefix: &str| {
+        let make_body = |prefix: &str, pv: PolicyVersion| {
             let frontier = crate::authority::ack_frontier::AckFrontier {
                 authority_id: s1.node_id().clone(),
                 frontier_hlc: HlcTimestamp {
@@ -2697,7 +2812,7 @@ mod tests {
                 key_range: KeyRange {
                     prefix: prefix.into(),
                 },
-                policy_version: PolicyVersion(1),
+                policy_version: pv,
                 digest_hash: format!("{}-10500", s1.node_id().0),
             };
             let sig = s1.sign_frontier(&frontier, KeysetVersion(1));
@@ -2710,14 +2825,14 @@ mod tests {
 
         // Frontier for order/ (owned by auth-b1..b3): rejected despite the
         // valid signature.
-        let result = push_frontiers(&app, &make_body("order/")).await;
+        let result = push_frontiers(&app, &make_body("order/", PolicyVersion(1))).await;
         assert_eq!(
             result.accepted, 0,
             "registered authority outside the range's authority set must be rejected"
         );
 
         // Frontier for the catch-all range (auth-1 IS a member): accepted.
-        let result = push_frontiers(&app, &make_body("")).await;
+        let result = push_frontiers(&app, &make_body("", current_pv(&state))).await;
         assert_eq!(result.accepted, 1);
     }
 

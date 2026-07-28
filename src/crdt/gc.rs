@@ -3,93 +3,158 @@
 //! The `deferred` (tombstone) sets in [`crate::crdt::or_set::OrSet`] and
 //! [`crate::crdt::or_map::OrMap`] grow unboundedly over time because every
 //! remove operation appends dots. This module provides a `TombstoneGc`
-//! that periodically reclaims tombstones that are provably safe to
-//! discard.
+//! that periodically compacts tombstones into the per-value, per-node
+//! **compaction floor** (`compaction_floor` on each CRDT), the M-8 fix
+//! for the tombstone-GC livelock.
+//!
+//! # Why a floor instead of plain deletion
+//!
+//! The pre-floor sweep physically deleted tombstone dots without leaving
+//! a trace. Deletion is one-sided, but the anti-entropy digest compares
+//! full CRDT states: after an asymmetric sweep the states genuinely
+//! differ, the mismatched bucket is transferred, and the old `merge`
+//! union-extended the peer's stale tombstones straight back — every
+//! transfer ROLLED THE GC BACK, and under sustained digest fallback the
+//! cluster never converged (livelock; "sweep destroys information, merge
+//! undoes the destruction").
+//!
+//! The certified sweep instead performs an information-EQUIVALENT
+//! compression: after the gates pass it folds the marked tombstones into
+//! a contiguous per-node floor (`floor[n] = c` ⟹ the fate of every dot
+//! `(n, c' <= c)` is decided — live if present in the live sets, removed
+//! otherwise), then drops the covered tombstones. The floor joins by
+//! pointwise max on merge (irrevocable), rejects stale tombstones and
+//! stale live dots, and kills live dots a lagging replica should have
+//! removed. The same bucket transfer that used to roll GC back now
+//! CARRIES the floor — one round trip heals the asymmetry.
 //!
 //! # Safety criterion
 //!
-//! A tombstone dot `(node_id, counter)` is safe to GC when:
-//! 1. All known replicas have already incorporated it (they can never
-//!    again offer the removed dot as live state in a merge), AND
-//! 2. The dot is not referenced by any live element in the CRDT, AND
-//! 3. The dot is locally dominated (`counter < max_counter` for its
-//!    node), so no future dot can collide with it.
-//!
-//! Criterion (1) is what a purely local check can NEVER establish: a
+//! A tombstone dot `(node_id, counter)` may be folded into the floor when
+//! all known replicas have already incorporated the remove (they can
+//! never again offer the removed dot as live state that would survive a
+//! merge). That is what a purely local check can NEVER establish: a
 //! replica partitioned away for longer than any wall-clock retention
-//! window still holds the pre-remove state, and merging it after the
-//! tombstone is gone permanently resurrects the removed element.
+//! window still holds the pre-remove state. Hence the gated
+//! mark-and-sweep below. (Post-floor, a late stale live dot is killed by
+//! the floor anyway — the floor closes the previously documented
+//! unknown-replica residual — but the gate is still what authorises the
+//! IRREVOCABLE floor advance for the marked dots.)
 //!
 //! # Gated mark-and-sweep
 //!
-//! [`TombstoneGc::mark_and_sweep`] therefore runs in two passes:
+//! [`TombstoneGc::mark_and_sweep`] runs in two passes:
 //!
 //! - **Mark**: snapshot the current deferred dots (per store key) and
 //!   record the mark's wall-clock time `mark_ms`.
 //! - **Sweep** (a later pass, at least `retention_period` after the
 //!   mark): the CALLER evaluates its replica-synchronisation gates
 //!   against `mark_ms` (see `NodeRunner::run_gc`: every authority's ack
-//!   frontier AND every registered peer's push evidence — the local
-//!   wall-clock time of the last fully-successful push — must have
-//!   passed `mark_ms`) and passes the verdict in. Only when the gates
-//!   pass are the MARKED dots collected (still subject to criteria 2
-//!   and 3); dots that appeared after the mark wait for the next cycle.
+//!   frontier AND every registered peer's push evidence must have passed
+//!   `mark_ms`) and passes the verdict in. Only when the gates pass are
+//!   the MARKED dots folded into the floor and physically dropped; dots
+//!   that appeared after the mark wait for the next cycle
+//!   (origin-retention — see `OrSet::compact_deferred_certified`).
 //!
-//! "Collected dots existed at mark time, and every known replica has
-//! provably synchronised past the mark" is what makes the sweep safe: a
-//! replica that has consumed state as of `mark_ms` has consumed the
-//! post-remove state, so it can never re-offer the removed dots. When
-//! the gates fail (partition, lagging authority, dead peer still in the
-//! registry) the mark is simply KEPT and nothing is collected —
+//! When the gates fail (partition, lagging authority, dead peer still in
+//! the registry) the mark is simply KEPT and nothing is collected —
 //! tombstones accumulate until the cluster heals (fail-closed).
 //!
-//! The legacy per-node **version floor** machinery
-//! (`compact_deferred_with_floor`) is retained for callers that obtain
-//! genuine cross-replica dot-counter floors out of band; the runtime GC
-//! does not use it (no protocol currently transports per-key dot
-//! counters — see P1-10 for why HLC frontiers must never be used as
-//! counter floors).
+//! # Legacy holes and Stage 2 hole-jump
+//!
+//! Dots deleted by the pre-floor sweep are *holes*: at or below
+//! `counters[n]`, neither live nor deferred. The floor walk stops at a
+//! hole (Stage 1, fail-closed; observable via
+//! `gc_floor_stalled_hole_dots`).
+//! If any replica still holds the tombstone, a bucket transfer re-offers
+//! it (it is uncovered, so it IS adopted), the hole fills, and the next
+//! cycle collects it — self-healing. If the whole cluster swept it, the
+//! floor for that (key, node) stalls permanently under Stage 1; Stage 2
+//! (`allow_hole_jump`, `ASTEROIDB_GC_HOLE_JUMP=1`) lets the walk cross
+//! holes once the caller's additional INBOUND gate holds: this node has
+//! merged every registry peer's complete state since the mark, so a dot
+//! that is still a hole is live on no known replica — i.e. removed.
+//!
+//! That argument only covers dots that were ALREADY holes at mark time:
+//! an inbound partial delta can mint a NEW hole after the mark (counters
+//! ride every delta in full, but an entry whose origin timestamp sits at
+//! or below the requested frontier is filtered out — the receiver gains
+//! the writer counter without the live dot), and the "complete pull
+//! since the mark" evidence says nothing about such a dot, which may be
+//! live on the pushing peer. The mark therefore snapshots each value's
+//! per-node counters alongside the candidates, and the Stage 2 walk only
+//! jumps holes at or below that snapshot (a dot that was live or
+//! deferred at mark time can never become an above-floor hole, so a hole
+//! at or below the snapshot provably existed at mark time — see
+//! `advance_compaction_floor`). Post-mark holes stall the walk even
+//! under Stage 2 and wait for the next mark.
+//!
+//! # HLC floors are forbidden (P1-10)
+//!
+//! The floor lives in DOT-COUNTER space and advances only through the
+//! certified contiguous walk and merge inheritance. Never derive a floor
+//! from HLC timestamps or frontier physicals: dot counters are small
+//! per-writer integers (~10^0..10^6) while HLC physicals are Unix
+//! milliseconds (~10^12), so an HLC-scale "floor" covers every dot and
+//! bulk-deletes all tombstones (the original P1-10 bug). The legacy
+//! `version_floor` / `global_floor` APIs that made this mistake
+//! expressible were removed together with the pre-floor sweep.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use crate::crdt::SweepOutcome;
 use crate::store::kv::{CrdtValue, Store};
 use crate::types::NodeId;
+
+/// Aggregated result of one [`TombstoneGc::mark_and_sweep`] pass across
+/// the whole store (sum of the per-value [`SweepOutcome`]s).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepStats {
+    /// Whether a sweep actually executed this pass (mark old enough AND
+    /// gates passed). Mark-only and blocked passes return `false` with
+    /// zeroed tallies; callers publishing "at the latest sweep" gauges
+    /// (`gc_floor_stalled_*`) must skip those passes or a persistent
+    /// stall would read as zero on every non-sweep tick.
+    pub swept: bool,
+    /// Tombstone dots physically removed (now represented by the floor).
+    pub collected: u64,
+    /// Floor walks stalled on a legacy hole (Stage 2 hole-jump resolves).
+    pub stalled_holes: u64,
+    /// Floor walks stalled on a post-mark tombstone (next cycle covers).
+    pub stalled_uncandidated: u64,
+}
+
+/// Per-key mark snapshot: the tombstone candidates the next sweep may
+/// collect, plus the per-node counters at mark time — the Stage 2
+/// hole-jump ceilings (only holes that already existed at mark time may
+/// be crossed; see the module docs).
+#[derive(Debug, Clone)]
+struct MarkSnapshot {
+    candidates: HashSet<(NodeId, u64)>,
+    counters_at_mark: HashMap<NodeId, u64>,
+}
 
 /// Configuration and state for tombstone garbage collection.
 #[derive(Debug, Clone)]
 pub struct TombstoneGc {
-    /// Per-node minimum known version across all replicas.
-    ///
-    /// A dot `(node_id, counter)` with `counter < version_floor[node_id]`
-    /// is safe to garbage-collect (assuming it is not in any live element).
-    version_floor: HashMap<NodeId, u64>,
-    /// Global version floor applied to ALL writer nodes, in **dot-counter units**.
-    ///
-    /// When set, a dot `(node_id, counter)` with `counter < global_floor` is
-    /// considered safe to GC regardless of the per-node floor entries.
-    ///
-    /// **Units**: this must be a dot counter value (a small monotonic integer),
-    /// NOT an HLC physical timestamp (Unix milliseconds, ~10^12). Passing an
-    /// HLC-scale value causes every dot counter to appear below the floor and
-    /// bulk-GCs all tombstones. See `set_global_floor` for a guard.
-    global_floor: Option<u64>,
     /// Configurable interval between GC runs.
     pub gc_interval: Duration,
     /// Minimum time tombstones must be retained after creation.
     ///
-    /// Even if a dot is below the version floor, it is kept until at least
-    /// `retention_period` has elapsed since the last GC run. This gives
-    /// slow replicas extra time to merge.
+    /// Even when the gates pass, a mark must be at least this old before
+    /// its sweep may collect. This gives slow replicas extra time to merge.
     pub retention_period: Duration,
     /// Wall-clock millisecond timestamp of the last GC run.
     last_gc_ms: u64,
     /// Cumulative count of tombstones removed across all GC runs.
     total_collected: u64,
-    /// Mark-and-sweep state: deferred dots snapshotted per store key at
-    /// [`marked_at_ms`](Self::pending_mark_ms). Only these candidates may
-    /// be collected by the next sweep.
-    marked: HashMap<String, HashSet<(NodeId, u64)>>,
+    /// Mark-and-sweep state: deferred dots and per-node counters
+    /// snapshotted per store key at
+    /// [`marked_at_ms`](Self::pending_mark_ms). Only the candidate dots
+    /// may be collected by the next sweep, and Stage 2 may only jump
+    /// holes at or below the counter snapshot.
+    marked: HashMap<String, MarkSnapshot>,
     /// Wall-clock time of the pending mark; `None` when no mark is
     /// outstanding (the next pass will mark, not sweep).
     marked_at_ms: Option<u64>,
@@ -98,8 +163,6 @@ pub struct TombstoneGc {
 impl Default for TombstoneGc {
     fn default() -> Self {
         Self {
-            version_floor: HashMap::new(),
-            global_floor: None,
             gc_interval: Duration::from_secs(60),
             retention_period: Duration::from_secs(300),
             last_gc_ms: 0,
@@ -114,8 +177,6 @@ impl TombstoneGc {
     /// Create a new `TombstoneGc` with the given interval and retention period.
     pub fn new(gc_interval: Duration, retention_period: Duration) -> Self {
         Self {
-            version_floor: HashMap::new(),
-            global_floor: None,
             gc_interval,
             retention_period,
             last_gc_ms: 0,
@@ -123,49 +184,6 @@ impl TombstoneGc {
             marked: HashMap::new(),
             marked_at_ms: None,
         }
-    }
-
-    /// Update the version floor for a specific node.
-    ///
-    /// The floor is set to the minimum of the current floor and the provided
-    /// version. Call this with each replica's known counter for the node to
-    /// build the global minimum.
-    pub fn update_floor(&mut self, node_id: &NodeId, version: u64) {
-        let entry = self.version_floor.entry(node_id.clone()).or_insert(version);
-        if version < *entry {
-            *entry = version;
-        }
-    }
-
-    /// Set the version floor for a node to an exact value (replacing any
-    /// previous value). Useful for bulk-setting floors from authority data.
-    pub fn set_floor(&mut self, node_id: &NodeId, version: u64) {
-        self.version_floor.insert(node_id.clone(), version);
-    }
-
-    /// Return the current version floor for a node, if known.
-    pub fn floor_for(&self, node_id: &NodeId) -> Option<u64> {
-        self.version_floor.get(node_id).copied()
-    }
-
-    /// Set the global version floor (in dot-counter units) for ALL writer nodes.
-    ///
-    /// `floor` must be a **dot counter** value — a small monotonic integer
-    /// incremented once per write operation per node. It must NOT be an HLC
-    /// physical timestamp (Unix milliseconds, ~10^12): dot counters are always
-    /// smaller than HLC timestamps, so an HLC-scale floor would mark every
-    /// tombstone as below the floor and bulk-GC them all.
-    pub fn set_global_floor(&mut self, floor: u64) {
-        assert!(
-            floor < 1_000_000_000_000,
-            "global_floor must be in dot-counter units (small int), not HLC ms (~10^12); got {floor}"
-        );
-        self.global_floor = Some(floor);
-    }
-
-    /// Return the current global version floor, if set.
-    pub fn global_floor(&self) -> Option<u64> {
-        self.global_floor
     }
 
     /// Return the wall-clock timestamp (ms) of the last GC run.
@@ -218,58 +236,81 @@ impl TombstoneGc {
     /// - With an outstanding mark that is at least `retention_period`
     ///   old AND `gates_passed == true` (the caller verified every known
     ///   replica synchronised past [`pending_mark_ms`](Self::pending_mark_ms)),
-    ///   this pass SWEEPS: marked dots that are not live and are locally
-    ///   dominated are removed, then a fresh mark is taken.
+    ///   this pass SWEEPS: each value's certified sweep folds the marked
+    ///   dots into its compaction floor and drops the covered tombstones
+    ///   (see `OrSet::compact_deferred_certified`), then a fresh mark is
+    ///   taken.
     /// - Otherwise (mark too young, or gates failed) nothing happens:
     ///   the mark is KEPT so the same `mark_ms` keeps being re-evaluated
     ///   — a partition or a lagging replica stalls collection entirely
     ///   (fail-closed) and it resumes automatically once the gates pass.
     ///
-    /// The two-pass structure is what makes collection safe against
-    /// resurrection: every collected dot existed at mark time, and the
-    /// gates prove every known replica consumed post-remove state from
-    /// AFTER the mark — so no known replica can re-offer the dot as live
-    /// state. A purely wall-clock retention (the previous design) could
-    /// not exclude a replica partitioned for longer than the retention
-    /// window.
+    /// `allow_hole_jump` (Stage 2) lets the floor walk cross legacy holes
+    /// — restricted to holes at or below the counters snapshotted at
+    /// mark time, so holes minted by inbound merges AFTER the mark stall
+    /// regardless (see the module docs) — and is only sound under the
+    /// caller's ADDITIONAL inbound gate (all registry peers' complete
+    /// states merged since the mark); pass `false` otherwise
+    /// (fail-closed).
     ///
-    /// Returns the number of tombstones removed in this pass.
-    pub fn mark_and_sweep(&mut self, store: &mut Store, now_ms: u64, gates_passed: bool) -> u64 {
-        let mut collected = 0u64;
+    /// The two-pass structure is what makes the irrevocable floor advance
+    /// safe against resurrection: every folded dot existed at mark time,
+    /// and the gates prove every known replica consumed post-remove state
+    /// from AFTER the mark — so no known replica can re-offer the dot as
+    /// live state that a merge would accept. A purely wall-clock
+    /// retention (the original design) could not exclude a replica
+    /// partitioned for longer than the retention window.
+    ///
+    /// Returns the aggregated [`SweepStats`] for this pass
+    /// (`swept == false` with zeroed tallies for a mark-only or blocked
+    /// pass — callers must not publish those zeros as "latest sweep"
+    /// observations).
+    pub fn mark_and_sweep(
+        &mut self,
+        store: &mut Store,
+        now_ms: u64,
+        gates_passed: bool,
+        allow_hole_jump: bool,
+    ) -> SweepStats {
+        let mut stats = SweepStats::default();
         let retention_ms = self.retention_period.as_millis() as u64;
         let sweep_ready = self
             .marked_at_ms
             .is_some_and(|mark| now_ms.saturating_sub(mark) >= retention_ms);
 
         if sweep_ready && gates_passed {
+            stats.swept = true;
             for key in store.keys().into_iter().cloned().collect::<Vec<_>>() {
-                let Some(candidates) = self.marked.get(&key) else {
+                let Some(snapshot) = self.marked.get(&key) else {
                     continue;
                 };
+                // Stage 2 may only jump holes that existed at mark time:
+                // the mark-time counters bound the jumpable range.
+                let ceilings = allow_hole_jump.then_some(&snapshot.counters_at_mark);
                 if let Some(value) = store.get_mut(&key) {
-                    match value {
+                    let outcome = match value {
                         CrdtValue::Set(set) => {
-                            let before = set.deferred_len();
-                            set.compact_deferred_marked(candidates);
-                            collected += before.saturating_sub(set.deferred_len()) as u64;
+                            set.compact_deferred_certified(&snapshot.candidates, ceilings)
                         }
                         CrdtValue::Map(map) => {
-                            let before = map.deferred_len();
-                            map.compact_deferred_marked(candidates);
-                            collected += before.saturating_sub(map.deferred_len()) as u64;
+                            map.compact_deferred_certified(&snapshot.candidates, ceilings)
                         }
                         CrdtValue::Counter(_) | CrdtValue::Register(_) => {
                             // No tombstones for counters or registers.
+                            SweepOutcome::default()
                         }
-                    }
+                    };
+                    stats.collected += outcome.collected;
+                    stats.stalled_holes += outcome.stalled_holes;
+                    stats.stalled_uncandidated += outcome.stalled_uncandidated;
                 }
             }
             // The mark is consumed regardless of how much was collected;
             // a fresh mark is taken below for the next cycle.
             self.marked.clear();
             self.marked_at_ms = None;
-            if collected > 0 {
-                self.total_collected += collected;
+            if stats.collected > 0 {
+                self.total_collected += stats.collected;
                 self.last_gc_ms = now_ms;
             }
         }
@@ -279,22 +320,28 @@ impl TombstoneGc {
         // would slide mark_ms forward and a cluster that heals more
         // slowly than the attempt cadence could never collect.
         if self.marked_at_ms.is_none() {
-            let mut marked: HashMap<String, HashSet<(NodeId, u64)>> = HashMap::new();
+            let mut marked: HashMap<String, MarkSnapshot> = HashMap::new();
             for (key, value) in store.all_entries() {
-                let dots = match value {
-                    CrdtValue::Set(set) => set.deferred_dots(),
-                    CrdtValue::Map(map) => map.deferred_dots(),
+                let (dots, counters) = match value {
+                    CrdtValue::Set(set) => (set.deferred_dots(), set.counters().clone()),
+                    CrdtValue::Map(map) => (map.deferred_dots(), map.counters().clone()),
                     CrdtValue::Counter(_) | CrdtValue::Register(_) => continue,
                 };
                 if !dots.is_empty() {
-                    marked.insert(key.clone(), dots);
+                    marked.insert(
+                        key.clone(),
+                        MarkSnapshot {
+                            candidates: dots,
+                            counters_at_mark: counters,
+                        },
+                    );
                 }
             }
             self.marked = marked;
             self.marked_at_ms = Some(now_ms);
         }
 
-        collected
+        stats
     }
 }
 
@@ -363,44 +410,25 @@ mod tests {
         assert!(gc.should_run(61_000));
     }
 
-    #[test]
-    fn update_floor_takes_minimum() {
-        let mut gc = TombstoneGc::default();
-        let n = node("A");
-        gc.update_floor(&n, 10);
-        assert_eq!(gc.floor_for(&n), Some(10));
-
-        gc.update_floor(&n, 5);
-        assert_eq!(gc.floor_for(&n), Some(5));
-
-        // Higher value should not raise the floor.
-        gc.update_floor(&n, 20);
-        assert_eq!(gc.floor_for(&n), Some(5));
-    }
-
-    #[test]
-    fn set_floor_replaces_value() {
-        let mut gc = TombstoneGc::default();
-        let n = node("A");
-        gc.set_floor(&n, 5);
-        assert_eq!(gc.floor_for(&n), Some(5));
-
-        gc.set_floor(&n, 20);
-        assert_eq!(gc.floor_for(&n), Some(20));
-    }
-
-    /// Build a store with one OrSet holding a locally-dominated tombstone
-    /// dot (A,1): add x → remove x → add y (counter advances past 1).
+    /// Build a store with one OrSet holding a tombstone dot (A,1):
+    /// add x → remove x → add y (counter advances past 1).
     fn store_with_set_tombstone() -> Store {
         let n = node("A");
         let mut set = OrSet::new();
         set.add("x".to_string(), &n); // counter=1
         set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2, dominance
+        set.add("y".to_string(), &n); // counter=2
         assert_eq!(set.deferred_len(), 1);
         let mut store = Store::new();
         store.put("myset".into(), CrdtValue::Set(set));
         store
+    }
+
+    fn set_floor_for<'a>(store: &'a Store, key: &str, n: &NodeId) -> Option<&'a u64> {
+        match store.get(key) {
+            Some(CrdtValue::Set(s)) => s.compaction_floor().get(n),
+            other => panic!("expected Set, got {other:?}"),
+        }
     }
 
     const RET: u64 = 300_000; // 300s retention in ms
@@ -411,19 +439,21 @@ mod tests {
         let mut store = store_with_set_tombstone();
 
         // Pass 1: marks only — nothing is collected even with gates open.
-        let collected = gc.mark_and_sweep(&mut store, 1_000, true);
-        assert_eq!(collected, 0, "first pass only marks");
+        let stats = gc.mark_and_sweep(&mut store, 1_000, true, false);
+        assert_eq!(stats.collected, 0, "first pass only marks");
         assert_eq!(gc.pending_mark_ms(), Some(1_000));
 
-        // Pass 2 after retention with gates passed: sweep collects.
-        let collected = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
-        assert_eq!(collected, 1);
+        // Pass 2 after retention with gates passed: sweep collects and
+        // advances the floor over the tombstone and the live dot.
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        assert_eq!(stats.collected, 1);
         assert_eq!(gc.total_collected(), 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
         } else {
             panic!("expected Set");
         }
+        assert_eq!(set_floor_for(&store, "myset", &node("A")), Some(&2));
         // A fresh mark was taken for the next cycle.
         assert_eq!(gc.pending_mark_ms(), Some(1_000 + RET));
     }
@@ -441,11 +471,15 @@ mod tests {
         assert!(map.deferred_len() > 0);
         store.put("mymap".into(), CrdtValue::Map(map));
 
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
-        let collected = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
-        assert!(collected > 0);
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
+            0
+        );
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        assert!(stats.collected > 0);
         if let Some(CrdtValue::Map(m)) = store.get("mymap") {
             assert_eq!(m.deferred_len(), 0);
+            assert_eq!(m.compaction_floor().get(&n), Some(&2));
         } else {
             panic!("expected Map");
         }
@@ -464,8 +498,17 @@ mod tests {
         reg.set("hello".to_string(), ts(100, 0, "A"));
         store.put("reg".into(), CrdtValue::Register(reg));
 
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 0);
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
+            0
+        );
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false),
+            SweepStats {
+                swept: true,
+                ..SweepStats::default()
+            }
+        );
     }
 
     /// The sweep may only run once the mark is at least `retention_period`
@@ -475,22 +518,33 @@ mod tests {
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = store_with_set_tombstone();
 
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0); // mark
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
+            0
+        ); // mark
         // Too young: even with gates open nothing is collected and the
         // mark is retained.
-        assert_eq!(gc.mark_and_sweep(&mut store, 2_000, true), 0);
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 2_000, true, false).collected,
+            0
+        );
         assert_eq!(gc.pending_mark_ms(), Some(1_000), "young mark is kept");
         // Old enough: collect.
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 1);
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false)
+                .collected,
+            1
+        );
     }
 
     /// C-2 regression (resurrection prevention): while any known replica
     /// has NOT synchronised past the mark (gates fail — e.g. a network
     /// partition longer than the retention window), the sweep must not
-    /// collect. A lagging replica's stale state can then still be merged
-    /// WITHOUT resurrecting the removed element; under the old
-    /// wall-clock-only design the tombstone would already be gone and the
-    /// remove would silently undo itself cluster-wide.
+    /// collect and the floor must not advance. A lagging replica's stale
+    /// state can then still be merged WITHOUT resurrecting the removed
+    /// element; under the old wall-clock-only design the tombstone would
+    /// already be gone and the remove would silently undo itself
+    /// cluster-wide.
     #[test]
     fn blocked_gates_prevent_resurrection_after_long_partition() {
         let n = node("A");
@@ -501,20 +555,25 @@ mod tests {
         let lagging_replica: OrSet<String> = local.clone();
 
         // Local removes x during the partition (tombstone A,1) and keeps
-        // writing (dominance).
+        // writing.
         local.remove(&"x".to_string());
         local.add("y".to_string(), &n); // dot (A,2)
         let mut store = Store::new();
         store.put("myset".into(), CrdtValue::Set(local));
 
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, false), 0); // mark
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, false, false).collected,
+            0
+        ); // mark
 
         // The partition outlives the retention window: gates still fail,
         // so NOTHING is collected — no matter how much wall-clock time
-        // has passed.
+        // has passed — and the floor does not advance (the advance is
+        // irrevocable, so it must be gate-authorised).
         assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000 + 10 * RET, false),
+            gc.mark_and_sweep(&mut store, 1_000 + 10 * RET, false, false)
+                .collected,
             0,
             "gates must stall collection through arbitrarily long partitions"
         );
@@ -522,6 +581,11 @@ mod tests {
             gc.pending_mark_ms(),
             Some(1_000),
             "the blocked mark is kept, not re-taken"
+        );
+        assert_eq!(
+            set_floor_for(&store, "myset", &n),
+            None,
+            "a blocked sweep must not advance the floor"
         );
 
         // Partition heals: the lagging replica pushes its STALE state.
@@ -538,43 +602,53 @@ mod tests {
 
         // The replica has now provably synchronised past the mark: gates
         // pass and the ORIGINAL mark is finally swept.
-        let collected = gc.mark_and_sweep(&mut store, 1_000 + 11 * RET, true);
-        assert_eq!(collected, 1, "healing the cluster resumes collection");
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 11 * RET, true, false);
+        assert_eq!(stats.collected, 1, "healing the cluster resumes collection");
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
             assert!(!s.contains(&"x".to_string()));
+            assert_eq!(s.compaction_floor().get(&n), Some(&2));
         }
     }
 
     /// The sweep only collects dots that existed at mark time: tombstones
-    /// created after the mark survive and wait for the next cycle (whose
-    /// gate will cover them).
+    /// created after the mark survive (the floor walk stalls on them) and
+    /// wait for the next cycle, whose gate will cover them.
     #[test]
     fn sweep_only_collects_marked_dots() {
         let n = node("A");
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = store_with_set_tombstone(); // tombstone (A,1)
 
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0); // marks (A,1)
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
+            0
+        ); // marks (A,1)
 
-        // A remove AFTER the mark: dot (A,2) enters deferred, dominated
-        // by a later add (A,3).
+        // A remove AFTER the mark: dot (A,2) enters deferred, followed by
+        // a later add (A,3).
         if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
             s.remove(&"y".to_string());
             s.add("z".to_string(), &n);
             assert_eq!(s.deferred_len(), 2);
         }
 
-        // Sweep collects only the marked (A,1); the younger (A,2) stays.
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 1);
+        // Sweep collects only the marked (A,1); the younger (A,2) stalls
+        // the floor walk and stays.
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        assert_eq!(stats.collected, 1);
+        assert_eq!(stats.stalled_uncandidated, 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 1, "post-mark tombstone must survive");
+            assert_eq!(s.compaction_floor().get(&n), Some(&1));
         }
 
         // The re-mark taken at sweep time covers it for the next cycle.
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true), 1);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, false);
+        assert_eq!(stats.collected, 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
+            assert_eq!(s.compaction_floor().get(&n), Some(&3));
         }
     }
 
@@ -598,8 +672,15 @@ mod tests {
         store.put("s1".into(), CrdtValue::Set(set1));
         store.put("s2".into(), CrdtValue::Set(set2));
 
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true), 0);
-        assert_eq!(gc.mark_and_sweep(&mut store, 1_000 + RET, true), 2);
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
+            0
+        );
+        assert_eq!(
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false)
+                .collected,
+            2
+        );
         assert_eq!(gc.total_collected(), 2);
     }
 
@@ -611,187 +692,157 @@ mod tests {
         let mut store = store_with_set_tombstone();
 
         assert_eq!(gc.last_gc_ms(), 0);
-        gc.mark_and_sweep(&mut store, 5_000, true); // mark
+        gc.mark_and_sweep(&mut store, 5_000, true, false); // mark
         assert_eq!(gc.last_gc_ms(), 0, "marking must not advance last_gc_ms");
 
-        gc.mark_and_sweep(&mut store, 5_000 + RET, false); // blocked sweep
+        gc.mark_and_sweep(&mut store, 5_000 + RET, false, false); // blocked sweep
         assert_eq!(gc.last_gc_ms(), 0, "blocked sweep must not advance");
 
-        let collected = gc.mark_and_sweep(&mut store, 5_000 + 2 * RET, true);
-        assert_eq!(collected, 1);
+        let stats = gc.mark_and_sweep(&mut store, 5_000 + 2 * RET, true, false);
+        assert_eq!(stats.collected, 1);
         assert_eq!(gc.last_gc_ms(), 5_000 + 2 * RET);
     }
 
+    /// Stage 2 hole-jump: a legacy hole (dot deleted by the pre-floor
+    /// sweep) stalls the floor under Stage 1 and is crossed under Stage 2,
+    /// unblocking collection of later tombstones for the same writer.
     #[test]
-    fn set_global_floor_rejects_hlc_scale_values() {
-        // set_global_floor must panic when given an HLC physical timestamp
-        // (~10^12 ms) instead of a dot-counter value (small int). Without this
-        // guard, an HLC-scale floor would mark every tombstone as below the
-        // floor and bulk-GC them all.
-        let result = std::panic::catch_unwind(|| {
-            let mut gc = TombstoneGc::default();
-            gc.set_global_floor(1_700_000_000_000u64); // ~2023 in ms (HLC scale)
-        });
-        assert!(
-            result.is_err(),
-            "set_global_floor should panic on HLC-scale values"
+    fn hole_jump_unblocks_legacy_holes_only_when_allowed() {
+        let n = node("A");
+        // Legacy state: counters A=2, live (A,2); (A,1) is a hole.
+        let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
+        let mut set: OrSet<String> = serde_json::from_str(json).unwrap();
+        // A new remove creates a tombstone above the hole.
+        set.remove(&"y".to_string()); // tombstone (A,2)
+        let mut store = Store::new();
+        store.put("myset".into(), CrdtValue::Set(set));
+
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        gc.mark_and_sweep(&mut store, 1_000, true, false); // mark (A,2)
+
+        // Stage 1: the hole stalls the walk; nothing is collected
+        // (fail-closed) and the stall is observable.
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        assert_eq!(stats.collected, 0);
+        assert_eq!(stats.stalled_holes, 1);
+        assert_eq!(set_floor_for(&store, "myset", &n), None);
+
+        // Stage 2 (inbound gate passed): the hole is jumped, the floor
+        // reaches the tombstone and collection proceeds — but never past
+        // counters[n].
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, true);
+        assert_eq!(stats.collected, 1);
+        assert_eq!(stats.stalled_holes, 0);
+        assert_eq!(set_floor_for(&store, "myset", &n), Some(&2));
+        if let Some(CrdtValue::Set(s)) = store.get("myset") {
+            assert_eq!(s.deferred_len(), 0);
+        }
+    }
+
+    /// `swept` is set ONLY on a pass that actually executed a sweep:
+    /// mark-only and gate-blocked passes report `swept == false` (with
+    /// zeroed tallies), so callers publishing "latest sweep" stall gauges
+    /// can skip them — otherwise a persistent hole stall would read as 0
+    /// on every non-sweep tick (ops-guide 3.7's Stage 2 signal).
+    #[test]
+    fn swept_flag_marks_executed_sweeps_only() {
+        let n = node("A");
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        // Legacy hole state (A,1) + tombstone (A,2): the sweep stalls on
+        // the hole under Stage 1, so stall tallies stay non-trivial.
+        let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
+        let mut set: OrSet<String> = serde_json::from_str(json).unwrap();
+        set.remove(&"y".to_string());
+        let mut store = Store::new();
+        store.put("myset".into(), CrdtValue::Set(set));
+
+        // Mark-only pass: no sweep executed.
+        let stats = gc.mark_and_sweep(&mut store, 1_000, true, false);
+        assert!(!stats.swept, "mark-only pass must not report a sweep");
+
+        // Retention not reached: no sweep executed.
+        let stats = gc.mark_and_sweep(&mut store, 2_000, true, false);
+        assert!(!stats.swept, "pre-retention pass must not report a sweep");
+
+        // Gates blocked: no sweep executed.
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, false, false);
+        assert!(!stats.swept, "blocked pass must not report a sweep");
+
+        // Gates pass after retention: the sweep runs (and stalls on the
+        // legacy hole — the stall is part of an EXECUTED sweep's stats).
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, false);
+        assert!(stats.swept);
+        assert_eq!(stats.stalled_holes, 1);
+        assert_eq!(set_floor_for(&store, "myset", &n), None);
+    }
+
+    /// Stage 2 must not jump holes minted AFTER the mark: the mark
+    /// snapshots per-node counters and the sweep only jumps holes at or
+    /// below that snapshot, even when the caller's inbound gate allowed
+    /// hole-jumping (the gate's pull evidence predates the new hole).
+    #[test]
+    fn hole_jump_is_bounded_by_mark_time_counters() {
+        let n = node("A");
+        let mut store = store_with_set_tombstone(); // tombstone (A,1), live (A,2)
+        let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
+        gc.mark_and_sweep(&mut store, 1_000, true, true); // mark: counters {A:2}
+
+        // AFTER the mark, an inbound partial delta mints holes: counters
+        // jump to A=5 with no live/deferred dots for (A,3)..(A,5) — any
+        // of them may be live on the pushing peer.
+        if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
+            let counters_only: OrSet<String> = serde_json::from_str(
+                r#"{"elements":{},"counters":{"A":5},"deferred":[],"compaction_floor":{}}"#,
+            )
+            .unwrap();
+            s.merge(&counters_only);
+        }
+
+        // Stage 2 sweep: collects the marked tombstone, walks over the
+        // mark-time range, and stalls at the first post-mark hole (A,3)
+        // instead of jumping to A=5.
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, true);
+        assert!(stats.swept);
+        assert_eq!(stats.collected, 1);
+        assert_eq!(stats.stalled_holes, 1, "post-mark hole must stall");
+        assert_eq!(
+            set_floor_for(&store, "myset", &n),
+            Some(&2),
+            "the floor must stop at the mark-time counter snapshot"
         );
     }
 
+    /// Crash-shaped floor regression: a snapshot taken before a sweep
+    /// "loses" the floor advance. Recovery is conservative (tombstones
+    /// re-appear, floor is lower), a peer merge restores the floor via
+    /// pointwise max, and re-sweeping is harmless.
     #[test]
-    fn set_global_floor_accepts_dot_counter_values() {
-        let mut gc = TombstoneGc::default();
-        gc.set_global_floor(42); // small monotonic integer, OK
-        assert_eq!(gc.global_floor(), Some(42));
-    }
-
-    /// P1-10 regression: using HLC physical timestamps (huge ms values) as
-    /// the global_floor for compact_deferred_with_floor causes all tombstones
-    /// to be removed because dot counters (small integers) are always below
-    /// the HLC-scale floor. This test demonstrates the bug: a removed element
-    /// resurrects after GC if HLC timestamps are used as counter floors.
-    #[test]
-    fn hlc_as_floor_causes_premature_tombstone_gc() {
+    fn floor_regression_recovers_via_peer_merge_and_resweep() {
         let n = node("A");
         let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        set.add("y".to_string(), &n); // counter=2
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.add("y".to_string(), &n);
 
-        assert_eq!(set.deferred_len(), 1);
+        let pre_sweep = set.clone(); // "snapshot" before the sweep
+        set.compact_deferred_certified(&set.deferred_dots(), None);
+        let post_sweep = set.clone(); // peer state after the sweep
 
-        // Simulate the old buggy code: use HLC physical timestamp (~10^12)
-        // as global_floor. Since dot counter (1) < floor (1_700_000_000_000),
-        // the tombstone would be removed even though a lagging replica might
-        // not have seen it yet.
-        let hlc_floor = 1_700_000_000_000u64; // ~2023 in ms
-        let empty_floor = std::collections::HashMap::new();
-        set.compact_deferred_with_floor(&empty_floor, Some(hlc_floor));
+        // Crash: revert to the pre-sweep snapshot (floor lost — the
+        // fail-safe direction: tombstones are back, nothing was over-GCed).
+        let mut recovered = pre_sweep;
+        assert!(recovered.compaction_floor().is_empty());
+        assert_eq!(recovered.deferred_len(), 1);
 
-        // BUG: the tombstone was removed because counter < hlc_floor
-        // This would allow "x" to resurrect on a lagging replica.
-        assert_eq!(
-            set.deferred_len(),
-            0,
-            "with HLC-scale floor, tombstone is incorrectly removed"
-        );
+        // Peer merge restores the floor (max) and absorbs the tombstone.
+        recovered.merge(&post_sweep);
+        assert_eq!(recovered.compaction_floor().get(&n), Some(&2));
+        assert_eq!(recovered.deferred_len(), 0);
 
-        // Now demonstrate that without the HLC floor, compact_deferred
-        // correctly uses counter-based dominance and removes the tombstone
-        // only because counter < max_counter for the node (1 < 2).
-        let mut set2 = OrSet::new();
-        set2.add("x".to_string(), &n);
-        set2.remove(&"x".to_string());
-        set2.add("y".to_string(), &n);
-        assert_eq!(set2.deferred_len(), 1);
-
-        // compact_deferred() uses counter dominance only — safe.
-        set2.compact_deferred();
-        assert_eq!(
-            set2.deferred_len(),
-            0,
-            "counter-based GC should remove tombstone when counter < max"
-        );
-    }
-
-    /// Verify that compact_deferred_with_floor removes a tombstone via the
-    /// floor-only path: locally_dominated=false (no newer add), but
-    /// dot counter < global_floor (below_floor=true).
-    /// This exercises the OR-semantics new criterion 2 added by this PR.
-    #[test]
-    fn compact_deferred_with_floor_removes_tombstone_via_floor_only_path() {
-        let n = node("A");
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1 for A
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        // No further adds — max counter for A is still 1, so locally_dominated=false.
-
-        assert_eq!(set.deferred_len(), 1);
-
-        // Set global_floor=2 > dot counter(1). floor-only path should remove it.
-        let empty_floor = std::collections::HashMap::new();
-        set.compact_deferred_with_floor(&empty_floor, Some(2));
-
-        assert_eq!(
-            set.deferred_len(),
-            0,
-            "floor-only path must remove tombstone when dot counter < global_floor"
-        );
-    }
-
-    /// Verify that compact_deferred_with_floor uses global_floor as a fallback
-    /// for nodes that are absent from version_floor.
-    ///
-    /// Semantic: global_floor represents the minimum version confirmed by ALL
-    /// known replicas for ALL writer nodes. A dot (X, counter) from a node X
-    /// that is absent from version_floor should still be GC'd if counter <
-    /// global_floor, because global_floor already covers X.
-    ///
-    /// The tombstone must NOT be locally dominated (no subsequent add after remove),
-    /// so removal is driven solely by global_floor — this distinguishes the new
-    /// "either criterion" logic from the old "both required" logic.
-    #[test]
-    fn compact_deferred_with_floor_uses_global_floor_for_absent_node() {
-        let n = node("A"); // node "A" will be absent from version_floor
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1 for A
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        // No further adds — counters["A"]=1, so locally_dominated=(1<1)=false.
-        // Removal must be driven by global_floor alone.
-
-        assert_eq!(set.deferred_len(), 1);
-
-        // version_floor has no entry for node "A" (absent); global_floor=2 should apply.
-        let empty_version_floor = std::collections::HashMap::new();
-        set.compact_deferred_with_floor(&empty_version_floor, Some(2));
-
-        assert_eq!(
-            set.deferred_len(),
-            0,
-            "global_floor must GC dots from nodes absent from version_floor even when not locally dominated"
-        );
-    }
-
-    /// Verify that compact_deferred_with_floor retains tombstones from absent
-    /// nodes when global_floor does not cover them.
-    #[test]
-    fn compact_deferred_with_floor_retains_dot_above_global_floor_for_absent_node() {
-        let n = node("A");
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1 for A
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        // No further adds — locally_dominated=false (max counter still 1)
-
-        assert_eq!(set.deferred_len(), 1);
-
-        // global_floor=1 does NOT cover dot counter=1 (strictly less-than check)
-        let empty_version_floor = std::collections::HashMap::new();
-        set.compact_deferred_with_floor(&empty_version_floor, Some(1));
-
-        assert_eq!(
-            set.deferred_len(),
-            1,
-            "tombstone must be retained when dot.counter >= global_floor"
-        );
-    }
-
-    /// Verify that compact_deferred without floor doesn't remove tombstones
-    /// when the counter hasn't been superseded (no newer dots from that node).
-    #[test]
-    fn compact_deferred_retains_unsuperseded_tombstone() {
-        let n = node("A");
-        let mut set = OrSet::new();
-        set.add("x".to_string(), &n); // counter=1
-        set.remove(&"x".to_string()); // dot (A,1) in deferred
-        // No further adds — max counter for A is still 1.
-
-        assert_eq!(set.deferred_len(), 1);
-        set.compact_deferred();
-        // Tombstone should be retained because counter (1) is NOT < max_counter (1).
-        assert_eq!(
-            set.deferred_len(),
-            1,
-            "tombstone must be retained when counter is not superseded"
-        );
+        // A second sweep over the recovered state is a no-op.
+        let outcome = recovered.compact_deferred_certified(&recovered.deferred_dots(), None);
+        assert_eq!(outcome, crate::crdt::SweepOutcome::default());
+        assert!(!recovered.contains(&"x".to_string()));
+        assert!(recovered.contains(&"y".to_string()));
     }
 }

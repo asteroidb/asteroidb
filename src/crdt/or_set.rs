@@ -10,6 +10,7 @@ use std::hash::Hash;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::crdt::{MergeEffects, SweepOutcome, covered};
 use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
@@ -29,7 +30,7 @@ pub struct Dot {
 /// A causal context (`deferred` set) tracks all dots that have been removed.
 /// During merge, dots present in the remote's deferred set are discarded,
 /// ensuring that a remove on one replica propagates correctly to others.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrSet<T: Eq + Hash> {
     /// Maps each element to the set of dots that justify its presence.
     elements: HashMap<T, HashSet<Dot>>,
@@ -39,6 +40,54 @@ pub struct OrSet<T: Eq + Hash> {
     /// Needed so merge can distinguish "this dot was removed" from "never seen".
     #[serde(default)]
     deferred: HashSet<Dot>,
+    /// Per-node GC floor: the fate of every dot `(n, c)` with
+    /// `c <= compaction_floor[n]` is DECIDED — live if it is in the live
+    /// dot sets, removed otherwise. Tombstones at or below the floor are
+    /// therefore redundant (a compressed tombstone) and can be physically
+    /// dropped, while stale live dots at or below the floor can be killed
+    /// on merge exactly like a tombstone would.
+    ///
+    /// INV-FLOOR: the floor advances ONLY through (i) the gated certified
+    /// sweep's contiguous walk ([`compact_deferred_certified`]) and
+    /// (ii) pointwise-max inheritance on [`merge`]. It is NEVER derived
+    /// from counters or HLC timestamps (the P1-10 unit-mismatch bug is
+    /// structurally excluded).
+    ///
+    /// INV-W (wire invariant): a payload carrying a non-empty floor must
+    /// contain the value's COMPLETE live dot set. Full states and
+    /// [`delta_since`] (a full clone) keep the floor; the partial
+    /// [`delta_from`] payload ships an empty floor.
+    ///
+    /// [`compact_deferred_certified`]: Self::compact_deferred_certified
+    /// [`merge`]: Self::merge
+    /// [`delta_since`]: Self::delta_since
+    /// [`delta_from`]: Self::delta_from
+    #[serde(default)]
+    compaction_floor: HashMap<NodeId, u64>,
+}
+
+/// Frozen structural layout of [`OrSet`] as persisted before the
+/// `compaction_floor` field existed (snapshot formats v1–v4, WAL format
+/// v1). bincode is positional and non-self-describing, so old payloads
+/// must be decoded with exactly this layout and converted (`From`) with
+/// an empty floor.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OrSetV4Layout<T: Eq + Hash> {
+    elements: HashMap<T, HashSet<Dot>>,
+    counters: HashMap<NodeId, u64>,
+    #[serde(default)]
+    deferred: HashSet<Dot>,
+}
+
+impl<T: Eq + Hash> From<OrSetV4Layout<T>> for OrSet<T> {
+    fn from(old: OrSetV4Layout<T>) -> Self {
+        OrSet {
+            elements: old.elements,
+            counters: old.counters,
+            deferred: old.deferred,
+            compaction_floor: HashMap::new(),
+        }
+    }
 }
 
 impl<T> OrSet<T>
@@ -51,6 +100,7 @@ where
             elements: HashMap::new(),
             counters: HashMap::new(),
             deferred: HashSet::new(),
+            compaction_floor: HashMap::new(),
         }
     }
 
@@ -109,80 +159,230 @@ where
         self.len() == 0
     }
 
-    /// Merges another OR-Set into this one.
+    /// Merges another OR-Set into this one, returning floor diagnostics.
     ///
     /// For each element:
-    /// - Dots from the other side are added only if NOT in our deferred set.
-    /// - Dots on our side are removed if they ARE in the other's deferred set.
+    /// - Dots from the other side are added only if NOT in our deferred
+    ///   set AND not stale — a dot covered by our pre-merge floor that we
+    ///   do not already hold live is a certified-removed dot and is
+    ///   rejected (the floor acts as a compressed tombstone).
+    /// - Dots on our side are removed if they ARE in the other's deferred
+    ///   set, OR are covered by the other's floor while absent from the
+    ///   other's live set for the element (floor kill; sound only because
+    ///   of INV-W — a non-empty floor rides complete live sets only).
     ///
     /// This gives correct observed-remove semantics: a remove on one
-    /// replica propagates via its deferred set, while a concurrent add
-    /// (with a fresh dot not in anyone's deferred set) survives — giving
-    /// add-wins behaviour.
+    /// replica propagates via its deferred set (or, once compacted, via
+    /// its floor), while a concurrent add (with a fresh dot above every
+    /// floor and in no deferred set) survives — add-wins behaviour.
     ///
-    /// Node counters are merged by taking the maximum.
-    /// Deferred (tombstone) sets are merged as a union.
-    pub fn merge(&mut self, other: &OrSet<T>) {
+    /// Node counters and compaction floors are merged by pointwise max
+    /// (the floor is a join-semilattice: inheritance is irrevocable).
+    /// Deferred (tombstone) sets are merged as a union MINUS the dots
+    /// covered by the merged floor, with one origin-retention exception:
+    /// our own tombstones that were ALREADY covered by our pre-merge
+    /// floor (fresh removes below the floor) are kept until our own gated
+    /// sweep discards them — old (pre-floor) peers learn removes from
+    /// tombstones only, and the C-2 gate discipline requires the physical
+    /// discard to happen strictly after every registry peer acked the
+    /// post-remove state.
+    pub fn merge(&mut self, other: &OrSet<T>) -> MergeEffects {
+        let mut fx = MergeEffects::default();
+        let floor_pre = self.compaction_floor.clone();
         let other_has_tombstones = !other.deferred.is_empty();
+        let other_has_floor = !other.compaction_floor.is_empty();
+
+        // `fx.changed` is set at EVERY site that mutates physical state
+        // (dot adopted/dropped, counter/floor raised, tombstone
+        // adopted/dropped) and nowhere else, so `changed == false`
+        // guarantees `pre == post` — the RR-gate contract (M-6). The
+        // rejection sites (`rejected_stale_live`,
+        // `rejected_covered_deferred`) adopt nothing and must not flag.
 
         // Process elements present in the other replica.
         for (elem, other_dots) in &other.elements {
             if let Some(dots) = self.elements.get_mut(elem) {
                 // Element exists in both — merge dots in place without cloning the key.
                 for dot in other_dots {
-                    if !self.deferred.contains(dot) {
-                        dots.insert(dot.clone());
+                    if self.deferred.contains(dot) || dots.contains(dot) {
+                        continue;
                     }
+                    if covered(&floor_pre, &dot.node_id, dot.counter) {
+                        // Fate decided by our floor and we do not hold it
+                        // live: a stale re-offer of a removed dot.
+                        fx.rejected_stale_live += 1;
+                        continue;
+                    }
+                    dots.insert(dot.clone());
+                    fx.changed = true;
                 }
-                // Remove our dots that the other has tombstoned.
-                if other_has_tombstones {
-                    dots.retain(|dot| !other.deferred.contains(dot));
+                // Remove our dots that the other has tombstoned or
+                // floor-compacted away.
+                if other_has_tombstones || other_has_floor {
+                    dots.retain(|dot| {
+                        if other.deferred.contains(dot) {
+                            fx.changed = true;
+                            return false;
+                        }
+                        if covered(&other.compaction_floor, &dot.node_id, dot.counter)
+                            && !other_dots.contains(dot)
+                        {
+                            fx.killed_by_floor += 1;
+                            fx.changed = true;
+                            return false;
+                        }
+                        true
+                    });
                 }
             } else {
                 // Element only in other — filter and insert directly.
-                let filtered: HashSet<Dot> = if self.deferred.is_empty() {
-                    other_dots.clone()
-                } else {
-                    other_dots
-                        .iter()
-                        .filter(|dot| !self.deferred.contains(dot))
-                        .cloned()
-                        .collect()
-                };
+                let mut filtered: HashSet<Dot> = HashSet::new();
+                for dot in other_dots {
+                    if self.deferred.contains(dot) {
+                        continue;
+                    }
+                    if covered(&floor_pre, &dot.node_id, dot.counter) {
+                        fx.rejected_stale_live += 1;
+                        continue;
+                    }
+                    filtered.insert(dot.clone());
+                }
                 if !filtered.is_empty() {
                     self.elements.insert(elem.clone(), filtered);
+                    fx.changed = true;
                 }
             }
         }
 
-        // Apply other's tombstones to self-only elements (not in other.elements).
-        if other_has_tombstones {
+        // Apply other's tombstones and floor to self-only elements (not in
+        // other.elements — their dots are trivially absent from the
+        // other's live set, so the floor clause applies unconditionally).
+        if other_has_tombstones || other_has_floor {
             for (elem, dots) in &mut self.elements {
                 if !other.elements.contains_key(elem) {
-                    dots.retain(|dot| !other.deferred.contains(dot));
+                    dots.retain(|dot| {
+                        if other.deferred.contains(dot) {
+                            fx.changed = true;
+                            return false;
+                        }
+                        if covered(&other.compaction_floor, &dot.node_id, dot.counter) {
+                            fx.killed_by_floor += 1;
+                            fx.changed = true;
+                            return false;
+                        }
+                        true
+                    });
                 }
             }
         }
 
-        // Remove entries with no remaining dots.
+        // Remove entries with no remaining dots. (Not a `changed` site:
+        // an entry can only become empty through a dot-dropping retain
+        // above, which already flagged.)
         self.elements.retain(|_, dots| !dots.is_empty());
 
-        // Merge counters so future dots stay globally unique.
+        // Merge counters so future dots stay globally unique. Only an
+        // actual raise mutates state; in particular an absent entry is
+        // NOT materialised for `other_counter == 0` (a ghost zero entry
+        // would be a physical change invisible to `changed`, breaking
+        // the `changed == false ⇒ pre == post` contract).
         for (node_id, &other_counter) in &other.counters {
-            let counter = self.counters.entry(node_id.clone()).or_insert(0);
-            *counter = (*counter).max(other_counter);
+            match self.counters.get_mut(node_id) {
+                Some(counter) => {
+                    if other_counter > *counter {
+                        *counter = other_counter;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if other_counter > 0 {
+                        self.counters.insert(node_id.clone(), other_counter);
+                        fx.changed = true;
+                    }
+                }
+            }
         }
 
-        // Merge deferred (tombstone) sets.
-        self.deferred.extend(other.deferred.iter().cloned());
+        // Merge the compaction floor by pointwise max (irrevocable), then
+        // defensively clamp counters to the floor (INV-CTR: a corrupted
+        // payload with floor > counters must not let a future add reuse a
+        // fate-decided counter value). Same no-ghost-entry discipline as
+        // the counters above.
+        for (node_id, &f) in &other.compaction_floor {
+            match self.compaction_floor.get_mut(node_id) {
+                Some(entry) => {
+                    if f > *entry {
+                        *entry = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    if f > 0 {
+                        self.compaction_floor.insert(node_id.clone(), f);
+                        fx.changed = true;
+                    }
+                }
+            }
+        }
+        for (node_id, &f) in &self.compaction_floor {
+            if f == 0 {
+                continue;
+            }
+            match self.counters.get_mut(node_id) {
+                Some(counter) => {
+                    if *counter < f {
+                        *counter = f;
+                        fx.changed = true;
+                    }
+                }
+                None => {
+                    self.counters.insert(node_id.clone(), f);
+                    fx.changed = true;
+                }
+            }
+        }
+
+        // Merge deferred (tombstone) sets under the merged floor.
+        // Origin-retention: keep our own tombstones that were already
+        // covered by our PRE-merge floor (fresh removes below the floor —
+        // they wait for our own gated sweep); drop the ones newly covered
+        // by the inherited floor (their remove is certified cluster-wide).
+        let floor_merged = &self.compaction_floor;
+        self.deferred.retain(|d| {
+            let keep = !covered(floor_merged, &d.node_id, d.counter)
+                || covered(&floor_pre, &d.node_id, d.counter);
+            if !keep {
+                fx.changed = true;
+            }
+            keep
+        });
+        // Incoming tombstones covered by the merged floor are redundant
+        // ("floor + absence" already encodes the remove) — never adopted.
+        // This is the closure of the M-8 reinjection path: a lagging
+        // peer's stale tombstone can no longer roll our GC back.
+        for d in &other.deferred {
+            if covered(&self.compaction_floor, &d.node_id, d.counter) {
+                if !self.deferred.contains(d) {
+                    fx.rejected_covered_deferred += 1;
+                }
+            } else if self.deferred.insert(d.clone()) {
+                fx.changed = true;
+            }
+        }
+
+        debug_assert!(
+            fx.killed_by_floor == 0 || fx.changed,
+            "a floor kill always removes a dot, so it must imply changed"
+        );
+        fx
     }
 
     /// Merge a delta into this set.
     ///
     /// For OrSet, `merge_delta` is identical to `merge` because the delta
     /// is the same type (a subset of elements and deferred entries).
-    pub fn merge_delta(&mut self, delta: &OrSet<T>) {
-        self.merge(delta);
+    pub fn merge_delta(&mut self, delta: &OrSet<T>) -> MergeEffects {
+        self.merge(delta)
     }
 
     /// Extract changes since the given frontier timestamp.
@@ -205,12 +405,19 @@ where
     /// - Deferred (tombstone) dots NOT present in `old`
     /// - Updated counters
     ///
+    /// The `compaction_floor` is deliberately EMPTY (INV-W): this payload
+    /// carries an incomplete live set, and a receiver applying the floor
+    /// kill rule against it would destroy live dots that simply were not
+    /// part of the delta. The floor travels on complete states only.
+    ///
     /// Returns `None` if there are no changes.
     pub fn delta_from(&self, old: &OrSet<T>) -> Option<Self> {
         let mut delta = OrSet {
             elements: HashMap::new(),
             counters: HashMap::new(),
             deferred: HashSet::new(),
+            // INV-W: partial payload — never ship the floor.
+            compaction_floor: HashMap::new(),
         };
         let mut has_changes = false;
 
@@ -257,35 +464,25 @@ where
         self.deferred.len()
     }
 
-    /// Remove tombstone dots from `deferred` that are already absent from
-    /// all element dot sets AND whose counter is dominated by the known
-    /// counter for that node.
-    ///
-    /// Call this periodically (e.g., after a full sync round completes) to
-    /// bound the growth of the deferred set. A dot `(node_id, counter)` is
-    /// safe to remove when no element references it AND `counter` is below
-    /// the maximum counter we track for that node — meaning any future dot
-    /// for that node will have a strictly higher counter and cannot collide.
-    ///
-    /// **Do not** call this in the middle of a partial sync round; wait
-    /// until all replicas have exchanged state to avoid prematurely
-    /// discarding tombstones that a not-yet-merged replica still needs.
-    pub fn compact_deferred(&mut self) {
-        let live_dots: HashSet<&Dot> = self
-            .elements
-            .values()
-            .flat_map(|dots| dots.iter())
-            .collect();
-        self.deferred.retain(|d| {
-            if live_dots.contains(d) {
-                return true;
-            }
-            // Only remove if counter is dominated by the known max for this node.
-            match self.counters.get(&d.node_id) {
-                Some(&max_counter) => d.counter >= max_counter,
-                None => true, // unknown node — keep to be safe
-            }
-        });
+    /// Return the number of deferred dots NOT covered by the compaction
+    /// floor — the canonical tombstone count (what the digest sees).
+    pub fn uncovered_deferred_len(&self) -> usize {
+        self.deferred
+            .iter()
+            .filter(|d| !covered(&self.compaction_floor, &d.node_id, d.counter))
+            .count()
+    }
+
+    /// The per-node compaction floor (see the field docs for semantics).
+    pub fn compaction_floor(&self) -> &HashMap<NodeId, u64> {
+        &self.compaction_floor
+    }
+
+    /// The per-node add counters (highest dot counter ever allocated per
+    /// writer). The tombstone-GC mark phase snapshots these as the Stage 2
+    /// hole-jump ceilings (see [`Self::compact_deferred_certified`]).
+    pub fn counters(&self) -> &HashMap<NodeId, u64> {
+        &self.counters
     }
 
     /// Snapshot the deferred (tombstone) dots as `(node_id, counter)`
@@ -298,128 +495,113 @@ where
             .collect()
     }
 
-    /// Remove tombstone dots restricted to a MARKED candidate set — the
-    /// SWEEP phase of the gated mark-and-sweep tombstone GC.
+    /// Certified sweep: fold the MARKED tombstones into a contiguous
+    /// advance of the per-node compaction floor, then physically drop the
+    /// tombstones the floor now covers (candidates only).
     ///
-    /// A dot is removed only when ALL of:
-    /// 1. it is in `candidates` (it existed at mark time, so the caller's
-    ///    replica-synchronisation gate covers it — every known replica
-    ///    has merged the post-remove state from after the mark);
-    /// 2. it is not referenced by any live element;
-    /// 3. it is locally dominated (`counter < max_counter` for its node,
-    ///    the same criterion as [`compact_deferred`](Self::compact_deferred)).
+    /// MUST only be called after the caller's replica-synchronisation
+    /// gates passed against the mark that produced `candidates` (see
+    /// [`crate::crdt::gc::TombstoneGc::mark_and_sweep`]): every dot folded
+    /// into the floor becomes irrevocably "removed unless live".
     ///
-    /// Dots added AFTER the mark are never touched: they wait for the
-    /// next mark/sweep cycle, whose gate will cover them.
-    pub fn compact_deferred_marked(&mut self, candidates: &HashSet<(NodeId, u64)>) {
-        let live_dots: HashSet<&Dot> = self
-            .elements
-            .values()
-            .flat_map(|dots| dots.iter())
-            .collect();
-        self.deferred.retain(|d| {
-            if !candidates.contains(&(d.node_id.clone(), d.counter)) {
-                return true;
-            }
-            if live_dots.contains(d) {
-                return true;
-            }
-            match self.counters.get(&d.node_id) {
-                Some(&max_counter) => d.counter >= max_counter,
-                None => true, // unknown node — keep to be safe
-            }
-        });
-    }
-
-    /// Remove tombstone dots from `deferred` that are safe to garbage-collect
-    /// according to local counter dominance or a cross-replica version floor.
+    /// The walk for node `n` starts at `floor[n] + 1` and advances while
+    /// the dot is live (fate: live), or a MARKED tombstone (fate: removed
+    /// — this is the compression), stopping at:
+    /// - an UNMARKED tombstone (created after the mark; the next cycle's
+    ///   gate covers it) → `stalled_uncandidated`;
+    /// - a hole (neither live nor deferred: a dot discarded by the legacy
+    ///   pre-floor sweep) → `stalled_holes`, unless the hole is covered
+    ///   by `hole_jump_ceilings` (Stage 2): the node's counters AS
+    ///   SNAPSHOTTED AT MARK TIME. Hole-jump additionally requires the
+    ///   caller's INBOUND gate: having merged every registry peer's
+    ///   complete state since the mark proves a MARK-TIME hole dot is
+    ///   live nowhere, i.e. removed. Holes above the mark-time counters
+    ///   were minted after the mark (e.g. by an inbound partial delta
+    ///   whose counters arrived without their entry) and stall the walk
+    ///   even under Stage 2 — the inbound evidence says nothing about
+    ///   them. Pass `None` for Stage 1 (fail-closed on every hole).
     ///
-    /// A dot `(node_id, counter)` is removed when it is not referenced by any
-    /// live element AND **at least one** of the following holds:
+    /// Hole spans are crossed as intervals between consecutive known
+    /// dots (`O(state·log state)`, independent of the node's lifetime
+    /// add count — see [`crate::crdt::advance_compaction_floor`]).
     ///
-    /// 1. **Locally dominated**: `counter < max_counter` for that node.
-    ///    Any future dot for the node will have a strictly higher counter,
-    ///    so the old tombstone can never collide with a new add.  This
-    ///    matches the criterion used by [`compact_deferred`].
-    ///
-    /// 2. **Below the version floor**: `counter < floor` where `floor` is
-    ///    the per-node entry from `version_floor`, falling back to
-    ///    `global_floor`.  The floor is the minimum version confirmed by all
-    ///    known replicas, so every replica has already incorporated the
-    ///    tombstone and it no longer needs to be retained for propagation.
-    ///    This allows GC of non-dominated tombstones that have been
-    ///    universally acknowledged.
-    ///
-    /// When neither condition holds the dot is retained.  Callers that do
-    /// not yet have reliable floor data should use [`compact_deferred`]
-    /// instead, which applies only criterion (1).
-    ///
-    /// # Warning
-    /// The `floor` criterion alone can delete tombstones that have not yet
-    /// reached all replicas. Ensure the floor value only reflects versions
-    /// confirmed by all known replicas. Do not call during partial sync rounds.
-    ///
-    /// `global_floor` (and per-node floor values) must be in **dot-counter
-    /// units** (small monotonic integers), NOT HLC physical timestamps
-    /// (~10^12 ms). A floor larger than any dot counter would remove all
-    /// tombstones, including dots from nodes absent from `version_floor`.
-    pub fn compact_deferred_with_floor(
+    /// Dots of nodes absent from `counters` keep a floor of 0 and their
+    /// tombstones are retained (unknown writer — keep, same conservatism
+    /// as the legacy sweep). Physical deletion is candidate-gated: a
+    /// covered but UNMARKED tombstone (a fresh remove below the floor) is
+    /// retained until a later gated sweep — origin-retention, the C-2
+    /// discipline that old peers learn removes from tombstones only.
+    pub fn compact_deferred_certified(
         &mut self,
-        version_floor: &std::collections::HashMap<NodeId, u64>,
-        global_floor: Option<u64>,
-    ) {
-        let live_dots: HashSet<&Dot> = self
+        candidates: &HashSet<(NodeId, u64)>,
+        hole_jump_ceilings: Option<&HashMap<NodeId, u64>>,
+    ) -> SweepOutcome {
+        let live_dots: HashSet<(&NodeId, u64)> = self
             .elements
             .values()
             .flat_map(|dots| dots.iter())
+            .map(|d| (&d.node_id, d.counter))
             .collect();
+        let deferred_dots: HashSet<(&NodeId, u64)> = self
+            .deferred
+            .iter()
+            .map(|d| (&d.node_id, d.counter))
+            .collect();
+
+        let mut outcome = crate::crdt::advance_compaction_floor(
+            &live_dots,
+            &deferred_dots,
+            &self.counters,
+            &mut self.compaction_floor,
+            candidates,
+            hole_jump_ceilings,
+        );
+
+        // Physical deletion is candidate-gated (origin-retention).
+        let before = self.deferred.len();
+        let floor = &self.compaction_floor;
         self.deferred.retain(|d| {
-            if live_dots.contains(d) {
-                return true;
-            }
-            // Criterion 1: locally dominated — a newer dot has been issued for
-            // this node, so the tombstone can never collide with a future add.
-            let locally_dominated = match self.counters.get(&d.node_id) {
-                Some(&max_counter) => d.counter < max_counter,
-                None => false,
-            };
-            // Criterion 2: below the cross-replica version floor — all replicas
-            // have confirmed they have processed at least this version for the
-            // node, so the tombstone no longer needs to be kept for propagation.
-            let effective_floor = version_floor.get(&d.node_id).copied().or(global_floor);
-            let below_floor = match effective_floor {
-                Some(floor) => d.counter < floor,
-                None => false,
-            };
-            // Remove if either criterion is satisfied; keep otherwise.
-            !(locally_dominated || below_floor)
+            !(covered(floor, &d.node_id, d.counter)
+                && candidates.contains(&(d.node_id.clone(), d.counter)))
         });
+        outcome.collected = (before - self.deferred.len()) as u64;
+        outcome
     }
 }
 
 impl OrSet<String> {
     /// Feed this set's canonical byte representation into `hasher`
-    /// (digest-based anti-entropy).
+    /// (digest-based anti-entropy, scheme v2).
     ///
     /// Stream: `0x03` ‖ live elements (byte order) with their dots (dot
-    /// order) ‖ counters (node-id order) ‖ deferred dots (dot order).
-    /// Elements whose dot set is empty are skipped: they are semantically
-    /// equivalent to absent entries (`merge` normally retains them away,
-    /// but the normalisation is specified defensively so representation
+    /// order) ‖ counters (node-id order) ‖ compaction floor (node-id
+    /// order) ‖ UNCOVERED deferred dots (dot order). Elements whose dot
+    /// set is empty are skipped: they are semantically equivalent to
+    /// absent entries (`merge` normally retains them away, but the
+    /// normalisation is specified defensively so representation
     /// differences never cause false digest mismatches).
     ///
-    /// The `deferred` (tombstone) set IS part of the digest: this makes
-    /// "digest matched" mean full CRDT-state equality, which is what lets
-    /// the sync layer adopt session claims on a match. The cost is a
-    /// false mismatch after asymmetric tombstone GC — bandwidth only,
-    /// never a correctness issue (false-negative direction).
+    /// Deferred dots covered by the floor are EXCLUDED (canonical form):
+    /// an origin-retained fresh tombstone below the floor is
+    /// information-equivalent to "floor + absence", and including it
+    /// would produce a false mismatch on every remove until the origin's
+    /// gated sweep. With the exclusion, "digest matched" ⟺ canonical
+    /// state equality ⟺ merging either way is a no-op on observable
+    /// state — which is what keeps session-claim adoption on a match
+    /// sound. The floor itself and the uncovered deferred dots ARE
+    /// digested: replicas differing there are semantically different and
+    /// must exchange state (the bucket transfer then propagates the
+    /// floor — the self-healing round trip).
     ///
     /// # MAINTAINER CONTRACT
     /// Adding a field to `OrSet`/`Dot` REQUIRES updating this method and
     /// bumping `crate::store::digest::DIGEST_SCHEME_VERSION` — otherwise
     /// replicas that differ only in the new field report "digest matched"
-    /// and session-guarantee claims become unsound. Instantiating `OrSet`
-    /// for a new element type in `CrdtValue` requires defining that type's
+    /// and session-guarantee claims become unsound. "Digest matched" is
+    /// defined as CANONICAL state equality: any new field must either be
+    /// digested or be provably redundant with the digested fields (as the
+    /// covered deferred dots are). Instantiating `OrSet` for a new
+    /// element type in `CrdtValue` requires defining that type's
     /// canonical byte encoding here, plus a scheme version bump.
     pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
         use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
@@ -441,10 +623,12 @@ impl OrSet<String> {
             );
         }
         write_counters(hasher, &self.counters);
+        write_counters(hasher, &self.compaction_floor);
         write_dots(
             hasher,
             self.deferred
                 .iter()
+                .filter(|d| !covered(&self.compaction_floor, &d.node_id, d.counter))
                 .map(|d| (d.node_id.0.as_str(), d.counter)),
         );
     }
@@ -1100,5 +1284,606 @@ mod tests {
         via_delta.merge_delta(&set_b);
 
         assert_eq!(via_merge.elements(), via_delta.elements());
+    }
+
+    // ---------------------------------------------------------------
+    // Certified sweep + compaction floor (M-8)
+    // ---------------------------------------------------------------
+
+    fn digest_of(set: &OrSet<String>) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        set.digest_into(&mut hasher);
+        hasher.finalize().into()
+    }
+
+    /// M-8 livelock reproduction (red-first against the old code): A and
+    /// B share a removed element's tombstone; A sweeps it. Under the old
+    /// implementation, `merge` union-extended `other.deferred` back into
+    /// A — every bucket transfer rolled the GC back and the cluster never
+    /// converged under sustained digest fallback. With the floor, the
+    /// stale tombstone is rejected, B self-heals in one round trip, and
+    /// repeated sweep/merge cycles reach a fixed point.
+    #[test]
+    fn livelock_swept_tombstone_is_not_reinjected_and_cluster_converges() {
+        let n = node("A");
+        let mut set_a = OrSet::new();
+        set_a.add("x".to_string(), &n); // dot (A,1)
+        set_a.remove(&"x".to_string()); // tombstone (A,1)
+        let mut set_b = set_a.clone(); // identical replicas
+
+        // A marks (candidates = current tombstones) and certified-sweeps.
+        let candidates = set_a.deferred_dots();
+        let outcome = set_a.compact_deferred_certified(&candidates, None);
+        assert_eq!(outcome.collected, 1);
+        assert_eq!(set_a.deferred_len(), 0);
+        assert_eq!(set_a.compaction_floor().get(&n), Some(&1));
+
+        // Bucket transfer B -> A: the stale tombstone must NOT re-enter
+        // (this assert fails on the pre-floor implementation).
+        let fx = set_a.merge(&set_b);
+        assert_eq!(
+            set_a.deferred_len(),
+            0,
+            "merge must not reinject a swept tombstone (M-8 livelock)"
+        );
+        assert_eq!(fx.rejected_covered_deferred, 1);
+
+        // Bucket transfer A -> B: B inherits the floor and drops its
+        // now-absorbed tombstone (one-round-trip self-heal).
+        set_b.merge(&set_a);
+        assert_eq!(set_b.deferred_len(), 0);
+        assert_eq!(set_b.compaction_floor().get(&n), Some(&1));
+        assert_eq!(digest_of(&set_a), digest_of(&set_b), "digests must match");
+
+        // Fixed point: further sweep/merge rounds change nothing.
+        for _ in 0..3 {
+            set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+            set_b.compact_deferred_certified(&set_b.deferred_dots().clone(), None);
+            let snap_a = set_a.clone();
+            set_a.merge(&set_b);
+            set_b.merge(&snap_a);
+            assert_eq!(set_a.deferred_len(), 0);
+            assert_eq!(set_b.deferred_len(), 0);
+            assert_eq!(digest_of(&set_a), digest_of(&set_b));
+        }
+    }
+
+    /// Floor inheritance is pointwise max and never regresses.
+    #[test]
+    fn floor_merge_is_monotone_pointwise_max() {
+        let na = node("A");
+        let nb = node("B");
+        let mut set_a = OrSet::new();
+        set_a.add("x".to_string(), &na);
+        set_a.remove(&"x".to_string());
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        assert_eq!(set_a.compaction_floor().get(&na), Some(&1));
+
+        let mut set_b = OrSet::new();
+        set_b.add("y".to_string(), &nb);
+        set_b.add("z".to_string(), &nb);
+        set_b.remove(&"y".to_string());
+        set_b.remove(&"z".to_string());
+        set_b.compact_deferred_certified(&set_b.deferred_dots().clone(), None);
+        assert_eq!(set_b.compaction_floor().get(&nb), Some(&2));
+
+        set_a.merge(&set_b);
+        assert_eq!(set_a.compaction_floor().get(&na), Some(&1));
+        assert_eq!(set_a.compaction_floor().get(&nb), Some(&2));
+
+        // Merging an empty-floor peer must not lower anything.
+        let empty: OrSet<String> = OrSet::new();
+        set_a.merge(&empty);
+        assert_eq!(set_a.compaction_floor().get(&na), Some(&1));
+        assert_eq!(set_a.compaction_floor().get(&nb), Some(&2));
+    }
+
+    /// Floor kill: a replica partitioned across the remove+sweep learns
+    /// the remove from the floor alone (scalar-floor counterexample
+    /// fixed: the in-flight stale live dot cannot resurrect either).
+    #[test]
+    fn floor_kills_live_dot_of_replica_that_missed_the_remove() {
+        let n = node("A");
+        let mut set_a = OrSet::new();
+        set_a.add("x".to_string(), &n); // dot (A,1)
+        let mut lagging = set_a.clone(); // holds (A,1) live
+
+        set_a.remove(&"x".to_string());
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        assert_eq!(set_a.deferred_len(), 0, "tombstone gone — floor only");
+
+        // Lagging <- A: floor kills the stale live dot.
+        let fx = lagging.merge(&set_a);
+        assert!(!lagging.contains(&"x".to_string()), "floor must kill");
+        assert_eq!(fx.killed_by_floor, 1);
+
+        // A <- lagging (stale live dot in flight AFTER the tombstone left
+        // the cluster): rejected as stale — no permanent resurrection.
+        let mut stale_sender = OrSet::new();
+        stale_sender.add("x".to_string(), &n); // reconstruct (A,1) live
+        let fx = set_a.merge(&stale_sender);
+        assert!(
+            !set_a.contains(&"x".to_string()),
+            "floor must reject the in-flight stale dot (C-2 residual hole)"
+        );
+        assert_eq!(fx.rejected_stale_live, 1);
+    }
+
+    /// A re-add after the floor advanced generates a fresh dot above the
+    /// floor and survives merges in both directions.
+    #[test]
+    fn re_add_after_floor_survives() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+
+        set.add("x".to_string(), &n); // dot (A,2) > floor 1
+        assert!(set.contains(&"x".to_string()));
+        let clone = set.clone();
+        set.merge(&clone);
+        assert!(set.contains(&"x".to_string()));
+    }
+
+    /// The walk stops at a hole unless hole-jump is allowed, and stops at
+    /// an unmarked tombstone; unknown-writer dots are kept.
+    #[test]
+    fn certified_sweep_stall_and_hole_jump_behaviour() {
+        let n = node("A");
+        // Legacy-hole state: counters A=2, live (A,2), neither live nor
+        // deferred holds (A,1) — the shape a pre-floor sweep left behind.
+        let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
+        let mut set: OrSet<String> = serde_json::from_str(json).unwrap();
+
+        let outcome = set.compact_deferred_certified(&HashSet::new(), None);
+        assert_eq!(outcome.stalled_holes, 1, "hole must stall Stage 1");
+        assert!(set.compaction_floor().is_empty(), "floor must not advance");
+
+        // Stage 2: the hole is jumped (it is at or below the mark-time
+        // counter ceiling), and the walk never exceeds the node's counter.
+        let ceilings: HashMap<NodeId, u64> = set.counters().clone();
+        let outcome = set.compact_deferred_certified(&HashSet::new(), Some(&ceilings));
+        assert_eq!(outcome.stalled_holes, 0);
+        assert_eq!(set.compaction_floor().get(&n), Some(&2));
+
+        // Unmarked tombstone stalls; unknown-writer dot is kept.
+        let mut set2 = OrSet::new();
+        set2.add("x".to_string(), &n);
+        set2.remove(&"x".to_string()); // unmarked tombstone (A,1)
+        let unknown = Dot {
+            node_id: node("GHOST"),
+            counter: 7,
+        };
+        set2.deferred.insert(unknown.clone());
+        let outcome = set2.compact_deferred_certified(&HashSet::new(), None);
+        assert_eq!(outcome.collected, 0);
+        assert_eq!(outcome.stalled_uncandidated, 1);
+        assert!(set2.deferred.contains(&unknown), "unknown node dot kept");
+        assert_eq!(set2.deferred_len(), 2);
+    }
+
+    /// Stage 2 must not jump a hole minted AFTER the mark: the inbound
+    /// "complete pull since the mark" evidence proves nothing about a dot
+    /// whose counter arrived later (e.g. counters riding a partial delta
+    /// whose old-origin-timestamp entry was filtered out — the dot may be
+    /// LIVE on the pushing peer). The mark-time counter ceilings bound
+    /// the jump; the post-mark hole stalls the walk (fail-closed) and the
+    /// floor never crosses it.
+    #[test]
+    fn hole_jump_never_crosses_post_mark_holes() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // dot (A,1)
+        set.remove(&"x".to_string()); // tombstone (A,1)
+
+        // Mark time: candidates {(A,1)}, counters snapshot {A:1}.
+        let candidates = set.deferred_dots();
+        let ceilings = set.counters().clone();
+        assert_eq!(ceilings.get(&n), Some(&1));
+
+        // AFTER the mark an inbound partial delta mints holes: counters
+        // jump to A=3 while neither (A,2) nor (A,3) arrives as a live or
+        // deferred dot ((A,2) may be live on the pushing peer).
+        let counters_only: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{},"counters":{"A":3},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+        set.merge(&counters_only);
+        assert_eq!(set.counters().get(&n), Some(&3));
+
+        // Stage 2 sweep with the MARK-TIME ceilings: the marked tombstone
+        // is collected, but the walk stalls at the post-mark hole (A,2)
+        // instead of jumping to A=3.
+        let outcome = set.compact_deferred_certified(&candidates, Some(&ceilings));
+        assert_eq!(outcome.collected, 1);
+        assert_eq!(outcome.stalled_holes, 1, "post-mark hole must stall");
+        assert_eq!(
+            set.compaction_floor().get(&n),
+            Some(&1),
+            "the floor must never cross a hole the mark did not witness"
+        );
+    }
+
+    /// The dominance rule is gone: the TOP tombstone (counter == max) is
+    /// collected by the certified sweep. New adds cannot collide because
+    /// counters never fall below the floor (INV-CTR).
+    #[test]
+    fn top_tombstone_is_collected() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n); // dot (A,1) — the highest dot
+        set.remove(&"x".to_string());
+
+        let outcome = set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+        assert_eq!(
+            outcome.collected, 1,
+            "the non-dominated top tombstone must be collected (behaviour change vs the legacy sweep)"
+        );
+        assert_eq!(set.compaction_floor().get(&n), Some(&1));
+
+        // The next add is (A,2) — above the floor.
+        set.add("x".to_string(), &n);
+        assert!(set.contains(&"x".to_string()));
+    }
+
+    /// INV-CTR: merging a payload whose floor exceeds its counters clamps
+    /// the counters up so a future local add cannot reuse a fate-decided
+    /// counter value.
+    #[test]
+    fn counters_are_clamped_to_the_floor() {
+        let n = node("A");
+        let mut broken: OrSet<String> = OrSet::new();
+        broken.compaction_floor.insert(n.clone(), 5);
+        // counters deliberately left empty (corrupted / adversarial payload)
+
+        let mut set: OrSet<String> = OrSet::new();
+        set.merge(&broken);
+        assert_eq!(set.counters.get(&n), Some(&5), "INV-CTR clamp");
+        set.add("x".to_string(), &n);
+        // Fresh dot must be (A,6) — above the inherited floor.
+        assert!(!set.elements.values().flatten().any(|d| d.counter <= 5));
+    }
+
+    /// Fresh-remove-below-floor suite (origin-retention): after the first
+    /// GC nearly all live dots sit below the floor. A later remove
+    /// produces a tombstone that is covered at birth; it must be kept
+    /// across merges (old peers learn the remove from it), shipped in
+    /// deltas, invisible to the canonical digest, and reclaimed only by
+    /// the origin's own gated sweep.
+    #[test]
+    fn fresh_remove_below_floor_is_origin_retained() {
+        let n = node("A");
+        let mut set_a = OrSet::new();
+        set_a.add("keep".to_string(), &n); // (A,1)
+        set_a.add("x".to_string(), &n); // (A,2)
+        set_a.add("pad".to_string(), &n); // (A,3)
+        set_a.remove(&"pad".to_string());
+        // First GC: floor walks over live (A,1), (A,2) and tombstone (A,3).
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        assert_eq!(set_a.compaction_floor().get(&n), Some(&3));
+        let mut set_b = set_a.clone();
+
+        // Fresh remove of a live dot BELOW the floor.
+        let old = set_a.clone();
+        set_a.remove(&"x".to_string()); // tombstone (A,2), covered at birth
+        assert_eq!(set_a.deferred_len(), 1);
+        assert_eq!(
+            set_a.uncovered_deferred_len(),
+            0,
+            "fresh tombstone below the floor is canonical-invisible"
+        );
+
+        // (1) Inbound merges must NOT strip it before the gate.
+        set_a.merge(&set_b);
+        assert_eq!(
+            set_a.deferred_len(),
+            1,
+            "origin-retention: a peer merge must not strip the pre-gate tombstone"
+        );
+        assert!(!set_a.contains(&"x".to_string()));
+
+        // (2) It ships in the incremental delta and kills the dot at B.
+        let delta = set_a.delta_from(&old).expect("remove must produce a delta");
+        assert!(delta.compaction_floor.is_empty(), "INV-W");
+        assert_eq!(delta.deferred.len(), 1);
+        set_b.merge_delta(&delta);
+        assert!(!set_b.contains(&"x".to_string()), "remove propagates");
+
+        // (3) Canonical digest: A (covered own tombstone) and B (killed,
+        // tombstone rejected as covered) must already match.
+        assert_eq!(digest_of(&set_a), digest_of(&set_b));
+
+        // (4) The origin's next gated sweep reclaims it.
+        let outcome = set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        assert_eq!(outcome.collected, 1);
+        assert_eq!(set_a.deferred_len(), 0);
+        assert_eq!(digest_of(&set_a), digest_of(&set_b));
+    }
+
+    /// `OrSet::delta_since` is a full clone and keeps the floor;
+    /// `OrSet::delta_from` is partial and ships an empty floor; replaying
+    /// a tombstone-bearing delta into its producer is a no-op.
+    #[test]
+    fn delta_floor_wire_invariants() {
+        let n = node("A");
+        let mut set = OrSet::new();
+        set.add("x".to_string(), &n);
+        set.remove(&"x".to_string());
+        set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+        set.add("y".to_string(), &n);
+
+        let since = set.delta_since(&frontier(0)).unwrap();
+        assert_eq!(
+            since.compaction_floor, set.compaction_floor,
+            "delta_since is a full clone — floor preserved (INV-W satisfied)"
+        );
+
+        let old = set.clone();
+        set.remove(&"y".to_string());
+        let from = set.delta_from(&old).unwrap();
+        assert!(from.compaction_floor.is_empty(), "INV-W: partial payload");
+
+        // Delta reinjection is a no-op on the producer.
+        let snapshot = set.clone();
+        set.merge_delta(&from);
+        assert_eq!(set.elements(), snapshot.elements());
+        assert_eq!(set.deferred_len(), snapshot.deferred_len());
+        assert_eq!(set.compaction_floor, snapshot.compaction_floor);
+    }
+
+    /// Old serialized format without `compaction_floor` still loads
+    /// (mixed-version JSON compatibility).
+    #[test]
+    fn serde_backward_compat_missing_floor() {
+        let json =
+            r#"{"elements":{"a":[{"node_id":"A","counter":1}]},"counters":{"A":1},"deferred":[]}"#;
+        let set: OrSet<String> = serde_json::from_str(json).unwrap();
+        assert!(set.contains(&"a".to_string()));
+        assert!(set.compaction_floor().is_empty());
+    }
+
+    /// Mixed-version simulation: a v1 node (JSON round trip with the
+    /// floor stripped) merging with a floor-bearing v2 node must neither
+    /// resurrect removed elements nor roll the v2 node's GC back; the v1
+    /// node does not gain a floor from the stripped payload.
+    #[test]
+    fn mixed_version_merge_is_safe() {
+        let n = node("A");
+        let mut v2 = OrSet::new();
+        v2.add("x".to_string(), &n);
+        v2.add("keep".to_string(), &n);
+        v2.remove(&"x".to_string());
+        let pre_sweep = v2.clone(); // what the v1 node holds
+        v2.compact_deferred_certified(&v2.deferred_dots().clone(), None);
+
+        // Strip the floor via JSON surgery (a v1 node's view of v2 state).
+        let mut json = serde_json::to_value(&v2).unwrap();
+        json.as_object_mut().unwrap().remove("compaction_floor");
+        let stripped: OrSet<String> = serde_json::from_value(json).unwrap();
+        assert!(stripped.compaction_floor().is_empty());
+
+        // v1 node = pre-sweep state merged with the stripped v2 state.
+        let mut v1 = pre_sweep;
+        v1.merge(&stripped);
+        assert!(!v1.contains(&"x".to_string()), "no resurrection on v1");
+        assert!(v1.compaction_floor().is_empty(), "floor not fabricated");
+
+        // v2 <- v1 (stale tombstone): GC must not roll back.
+        v2.merge(&v1);
+        assert_eq!(v2.deferred_len(), 0, "v1 tombstone must not reinject");
+        assert!(!v2.contains(&"x".to_string()));
+        assert!(v2.contains(&"keep".to_string()));
+    }
+
+    /// Canonical digest rules: covered own tombstones are invisible;
+    /// uncovered tombstone differences and floor differences are visible.
+    #[test]
+    fn digest_canonical_form_rules() {
+        let n = node("A");
+        let mut base = OrSet::new();
+        base.add("keep".to_string(), &n); // (A,1)
+        base.add("x".to_string(), &n); // (A,2)
+        base.remove(&"x".to_string());
+        base.compact_deferred_certified(&base.deferred_dots().clone(), None);
+
+        // Covered own tombstone only difference -> digests match.
+        let mut with_fresh = base.clone();
+        with_fresh.remove(&"keep".to_string()); // covered tombstone (A,1)
+        let mut without = base.clone();
+        without.merge(&with_fresh); // learns the kill, rejects the tombstone
+        assert_eq!(with_fresh.deferred_len(), 1);
+        assert_eq!(without.deferred_len(), 0);
+        assert_eq!(
+            digest_of(&with_fresh),
+            digest_of(&without),
+            "covered own tombstone must be canonical-invisible"
+        );
+
+        // Uncovered tombstone difference -> digests differ.
+        let mut uncovered = base.clone();
+        uncovered.add("z".to_string(), &n);
+        uncovered.remove(&"z".to_string()); // (A,3) above floor
+        assert_ne!(digest_of(&base), digest_of(&uncovered));
+
+        // Floor-only difference -> digests differ (v2 includes the floor).
+        // `floored` is a swept remove (floor {A:1}, no tombstone);
+        // `holed` is the same observable state WITHOUT the floor (the
+        // legacy-hole shape) — they differ only in the floor map and the
+        // digest must distinguish them so the transfer propagates it.
+        let mut floored = OrSet::new();
+        floored.add("x".to_string(), &n);
+        floored.remove(&"x".to_string());
+        floored.compact_deferred_certified(&floored.deferred_dots().clone(), None);
+        let holed: OrSet<String> =
+            serde_json::from_str(r#"{"elements":{},"counters":{"A":1},"deferred":[]}"#).unwrap();
+        assert_eq!(floored.elements(), holed.elements());
+        assert_eq!(floored.deferred_len(), holed.deferred_len());
+        assert_ne!(
+            digest_of(&floored),
+            digest_of(&holed),
+            "a floor advance is a semantic difference and must mismatch"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // MergeEffects::changed ground truth (M-6, RR gate)
+    //
+    // Contract: `changed == (a != a_before)` over the PHYSICAL state.
+    // The bidirectional form holds for canonically-constructed states
+    // (the production debug oracle only checks the `changed == false ⇒
+    // pre == post` direction, but tests pin both).
+    // ---------------------------------------------------------------
+
+    /// Merge `b` into `a`, asserting the changed flag equals the physical
+    /// state difference, and return the effects.
+    fn merge_ground_truth(a: &mut OrSet<String>, b: &OrSet<String>) -> MergeEffects {
+        let before = a.clone();
+        let fx = a.merge(b);
+        assert_eq!(
+            fx.changed,
+            *a != before,
+            "changed flag must equal physical pre/post difference"
+        );
+        fx
+    }
+
+    #[test]
+    fn merge_changed_identical_state_is_noop() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        a.add("y".to_string(), &n);
+        a.remove(&"y".to_string());
+        let b = a.clone();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "identical states must merge as a no-op");
+    }
+
+    #[test]
+    fn merge_changed_subset_is_noop() {
+        let n = node("A");
+        let mut b = OrSet::new();
+        b.add("x".to_string(), &n);
+        let mut a = b.clone();
+        a.add("y".to_string(), &n); // a ⊋ b
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "merging a dominated subset must be a no-op");
+    }
+
+    #[test]
+    fn merge_changed_new_dot_and_tombstone() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        let mut b = a.clone();
+
+        // New dot on b.
+        b.add("x".to_string(), &n);
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(fx.changed, "a new dot must report changed");
+
+        // Tombstone-only difference.
+        let mut b2 = a.clone();
+        b2.remove(&"x".to_string());
+        let fx = merge_ground_truth(&mut a, &b2);
+        assert!(fx.changed, "a new tombstone must report changed");
+
+        // And the echo back is a no-op again.
+        let snapshot = a.clone();
+        let fx = merge_ground_truth(&mut a, &snapshot);
+        assert!(!fx.changed, "self-echo must be a no-op");
+    }
+
+    #[test]
+    fn merge_changed_counter_only_advance() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n); // counters {A:1}
+        let b: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{},"counters":{"A":3},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(fx.changed, "a counter-only advance must report changed");
+        // The advance must keep propagating: a second merge is a no-op.
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed);
+    }
+
+    #[test]
+    fn merge_changed_floor_only_advance_and_floor_kill() {
+        let n = node("A");
+        let mut swept = OrSet::new();
+        swept.add("x".to_string(), &n);
+        swept.remove(&"x".to_string());
+        swept.compact_deferred_certified(&swept.deferred_dots().clone(), None);
+        assert_eq!(swept.compaction_floor().get(&n), Some(&1));
+
+        // Floor kill: the lagging replica still holds (A,1) live.
+        let mut lagging = OrSet::new();
+        lagging.add("x".to_string(), &n);
+        let fx = merge_ground_truth(&mut lagging, &swept);
+        assert!(fx.changed, "a floor kill must report changed");
+        assert_eq!(fx.killed_by_floor, 1);
+
+        // Floor-only advance: receiver has neither the element nor the
+        // floor (counters get clamped up too — both are real changes).
+        let mut empty: OrSet<String> = OrSet::new();
+        let fx = merge_ground_truth(&mut empty, &swept);
+        assert!(fx.changed, "a floor-only advance must report changed");
+    }
+
+    #[test]
+    fn merge_changed_stale_reoffers_are_noops() {
+        let n = node("A");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &n);
+        a.remove(&"x".to_string());
+        let pre_sweep = a.clone(); // holds tombstone (A,1)
+        a.compact_deferred_certified(&a.deferred_dots().clone(), None);
+
+        // (viii) stale live re-offer: rejected, no state change.
+        let mut stale_live = OrSet::new();
+        stale_live.add("x".to_string(), &n); // reconstructs (A,1) live
+        let fx = merge_ground_truth(&mut a, &stale_live);
+        assert_eq!(fx.rejected_stale_live, 1);
+        assert!(
+            !fx.changed,
+            "a rejected stale live dot must NOT report changed (would re-dirty forever)"
+        );
+
+        // (ix) covered deferred re-offer: rejected, no state change.
+        let fx = merge_ground_truth(&mut a, &pre_sweep);
+        assert_eq!(fx.rejected_covered_deferred, 1);
+        assert!(
+            !fx.changed,
+            "a rejected covered tombstone must NOT report changed"
+        );
+    }
+
+    #[test]
+    fn merge_changed_zero_counter_creates_no_ghost_entry() {
+        let na = node("A");
+        let nb = node("B");
+        let mut a = OrSet::new();
+        a.add("x".to_string(), &na);
+        // Adversarial/legacy payload: an explicit zero counter for a node
+        // we have never seen.
+        let b: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{},"counters":{"B":0},"deferred":[],"compaction_floor":{}}"#,
+        )
+        .unwrap();
+
+        let fx = merge_ground_truth(&mut a, &b);
+        assert!(!fx.changed, "a zero counter carries no information");
+        assert!(
+            !a.counters.contains_key(&nb),
+            "no ghost zero entry may be materialised (it would break the no-op oracle)"
+        );
     }
 }

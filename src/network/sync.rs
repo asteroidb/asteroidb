@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::authority::equivocation::ObservedAttestation;
 use crate::hlc::HlcTimestamp;
 use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 use crate::network::peer::PeerRegistry;
@@ -97,6 +98,18 @@ pub struct DeltaSyncRequest {
     /// The requester's known frontier for the remote peer.
     /// Entries strictly after this timestamp will be returned.
     pub frontier: HlcTimestamp,
+    /// Split-view gossip lane (CT-gossip Protocol 2), piggybacked on the
+    /// delta sync request (M-14): signed attestations the sender observed,
+    /// relayed for cross-checking. Evidence only — never applied to
+    /// frontier or store state, and never reflected in the response.
+    ///
+    /// Old-format payloads without this field: JSON decodes to empty via
+    /// `serde(default)`; an old-shape bincode body fails positional decode
+    /// and is rescued by the sender's JSON retry. Deliberately NOT
+    /// `skip_serializing_if`: bincode is positional (append-only rule,
+    /// see the maintainers NOTE on `DeltaSyncResponse`).
+    #[serde(default)]
+    pub observed: Vec<ObservedAttestation>,
 }
 
 /// Response for delta-based sync.
@@ -145,14 +158,25 @@ pub struct DeltaSyncResponse {
     /// diverge permanently. The full-dump path (`GET /api/internal/keys`)
     /// has always compensated; this closes the same gap on the delta
     /// path. The receiver merges these without an HLC (`merge_remote`),
-    /// re-stamping them locally — which also makes them delta-visible on
-    /// the receiver from then on.
+    /// re-stamping them locally when the merge inflates its state or the
+    /// key is untracked there too — which makes a genuinely new key
+    /// delta-visible on the receiver from then on, while a redundant
+    /// echo of an already-tracked converged key is absorbed by the RR
+    /// gate (M-6) without dirtying the receiver's change log.
     ///
     /// NOTE for maintainers: bincode is positional — new fields may only
     /// be appended at the end with `#[serde(default)]` and never
     /// `skip_serializing_if` (same rule as `KeyDumpResponse`). Old
     /// senders omit this field (JSON retry path defaults it to empty);
     /// their migrated untracked keys still converge only via full sync.
+    ///
+    /// The same rule applies to fields INSIDE `CrdtValue` payloads:
+    /// `OrSet`/`OrMap` appended `compaction_floor` (`#[serde(default)]`,
+    /// M-8). Mixed-version note: old→new decodes with an empty floor
+    /// (JSON) and new→old rides the existing `send_with_json_fallback`
+    /// path (bincode positional decode fails on the old side, the JSON
+    /// retry drops the unknown field) — same rolling-upgrade mechanics
+    /// as the `deferred` field addition.
     #[serde(default)]
     pub untracked_entries: HashMap<String, CrdtValue>,
 }
@@ -199,10 +223,27 @@ pub struct DigestSyncRequest {
     /// `false` (push probe): the responder returns only the mismatched
     /// bucket indexes, and the requester pushes its own keys for them.
     pub include_entries: bool,
+    /// Split-view gossip lane (CT-gossip Protocol 2), piggybacked on the
+    /// digest sync request (M-14): signed attestations the sender observed,
+    /// relayed for cross-checking. Evidence only — never applied to
+    /// frontier or store state, and never reflected in the response
+    /// (processed even when the responder answers `scheme_ok = false`;
+    /// observation relay is orthogonal to the digest scheme).
+    ///
+    /// Old-format payloads without this field: JSON decodes to empty via
+    /// `serde(default)`; an old-shape bincode body fails positional decode
+    /// and is rescued by the sender's JSON retry. Deliberately NOT
+    /// `skip_serializing_if`: bincode is positional (append-only rule,
+    /// see the maintainers NOTE on `DeltaSyncResponse`).
+    #[serde(default)]
+    pub observed: Vec<ObservedAttestation>,
 }
 
 impl DigestSyncRequest {
     /// Build a request from a locally computed [`StoreDigest`].
+    ///
+    /// `observed` starts empty; the caller assigns the split-view relay
+    /// sample when it elects this request as the cycle's carrier (M-14).
     pub fn from_digest(sender: &str, digest: &StoreDigest, include_entries: bool) -> Self {
         Self {
             sender: sender.to_string(),
@@ -216,6 +257,7 @@ impl DigestSyncRequest {
                 })
                 .collect(),
             include_entries,
+            observed: Vec::new(),
         }
     }
 }
@@ -1063,6 +1105,11 @@ impl SyncClient {
     /// Sends `POST /api/internal/sync/delta` with the local frontier.
     /// The peer returns entries modified after that frontier.
     ///
+    /// `observed` piggybacks the split-view relay sample (M-14); pass an
+    /// empty vector when this request is not the cycle's carrier. The
+    /// response-decode JSON retry below re-sends the SAME `req`, so an
+    /// attached sample automatically rides the retry too.
+    ///
     /// Returns a [`PullDeltaResult`] that distinguishes network errors
     /// from deserialization errors, allowing the caller to skip straight
     /// to full sync when the payload was corrupted (e.g. by jitter).
@@ -1071,11 +1118,13 @@ impl SyncClient {
         peer_addr: &str,
         sender: &str,
         frontier: &HlcTimestamp,
+        observed: Vec<ObservedAttestation>,
     ) -> PullDeltaResult {
         let url = format!("http://{peer_addr}/api/internal/sync/delta");
         let req = DeltaSyncRequest {
             sender: sender.to_string(),
             frontier: frontier.clone(),
+            observed,
         };
 
         match self.send_with_json_fallback(&url, &req).await {
@@ -1441,6 +1490,7 @@ mod tests {
         let req = DeltaSyncRequest {
             sender: "node-1".to_string(),
             frontier: hlc(100, 0, "node-1"),
+            observed: vec![],
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -1550,7 +1600,7 @@ mod tests {
         let client = SyncClient::with_client(registry, http_client);
 
         let result = client
-            .pull_delta("127.0.0.1:1", "node-1", &hlc(0, 0, ""))
+            .pull_delta("127.0.0.1:1", "node-1", &hlc(0, 0, ""), Vec::new())
             .await;
         assert!(matches!(result, PullDeltaResult::NetworkError));
     }
@@ -1890,12 +1940,16 @@ mod tests {
                 digest: vec![9u8; 32],
             }],
             include_entries: true,
+            observed: vec![],
         };
         let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
         let (back, _): (DigestSyncRequest, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(back.sender, "node-1");
-        assert_eq!(back.scheme_version, 1);
+        assert_eq!(
+            back.scheme_version,
+            crate::store::digest::DIGEST_SCHEME_VERSION
+        );
         assert_eq!(back.root, vec![7u8; 32]);
         assert_eq!(back.buckets.len(), 1);
         assert_eq!(back.buckets[0].index, 12);
@@ -1971,5 +2025,277 @@ mod tests {
         let req = DigestSyncRequest::from_digest("node-1", &digest, true);
         let result = client.digest_sync("127.0.0.1:1", &req).await;
         assert!(matches!(result, DigestSyncResult::Failed));
+    }
+
+    // ---------------------------------------------------------------
+    // Observed relay lane wire compatibility (M-14)
+    // ---------------------------------------------------------------
+
+    /// Byte-layout mirror of the PRE-M-14 `DeltaSyncRequest` (no
+    /// `observed` field) — stands in for an old node's decoder.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyDeltaSyncRequest {
+        sender: String,
+        frontier: HlcTimestamp,
+    }
+
+    /// Byte-layout mirror of the PRE-M-14 `DigestSyncRequest`.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyDigestSyncRequest {
+        sender: String,
+        scheme_version: u32,
+        root: Vec<u8>,
+        buckets: Vec<BucketDigestEntry>,
+        include_entries: bool,
+    }
+
+    /// One signature-verified sample observation for relay tests.
+    fn sample_observation() -> ObservedAttestation {
+        use crate::authority::ack_frontier::AckFrontier;
+        use crate::authority::certificate::KeysetVersion;
+        use crate::authority::frontier_sig::NodeSigner;
+        use crate::types::{KeyRange, PolicyVersion};
+
+        let seed = [3u8; 32];
+        #[cfg(feature = "native-crypto")]
+        let signer = NodeSigner::from_seed(nid("auth-1"), &seed, false);
+        #[cfg(not(feature = "native-crypto"))]
+        let signer = NodeSigner::from_seed(nid("auth-1"), &seed);
+        let frontier = AckFrontier {
+            authority_id: nid("auth-1"),
+            frontier_hlc: hlc(5_000, 0, "auth-1"),
+            key_range: KeyRange {
+                prefix: "user/".into(),
+            },
+            policy_version: PolicyVersion(1),
+            digest_hash: "sd2:relay-test".into(),
+        };
+        let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+        ObservedAttestation {
+            frontier,
+            signature,
+        }
+    }
+
+    fn new_delta_request(observed: Vec<ObservedAttestation>) -> DeltaSyncRequest {
+        DeltaSyncRequest {
+            sender: "node-1".to_string(),
+            frontier: hlc(100, 2, "node-1"),
+            observed,
+        }
+    }
+
+    fn new_digest_request(observed: Vec<ObservedAttestation>) -> DigestSyncRequest {
+        DigestSyncRequest {
+            sender: "node-1".to_string(),
+            scheme_version: DIGEST_SCHEME_VERSION,
+            root: vec![7u8; DIGEST_LEN],
+            buckets: vec![BucketDigestEntry {
+                index: 12,
+                digest: vec![9u8; DIGEST_LEN],
+            }],
+            include_entries: true,
+            observed,
+        }
+    }
+
+    /// New→old bincode: an old decoder reads the positional prefix and
+    /// silently ignores the trailing `observed` bytes — this pins the
+    /// `decode_from_slice` residue-non-validation the rolling-upgrade
+    /// story depends on (same production path as `deserialize_internal`,
+    /// which never checks the consumed length either).
+    #[test]
+    fn new_bincode_requests_decode_on_legacy_mirrors_ignoring_trailing_observed() {
+        for observed in [vec![], vec![sample_observation()]] {
+            let bytes = bincode::serde::encode_to_vec(
+                new_delta_request(observed.clone()),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            let (legacy, consumed): (LegacyDeltaSyncRequest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(legacy.sender, "node-1");
+            assert_eq!(legacy.frontier, hlc(100, 2, "node-1"));
+            assert!(
+                consumed <= bytes.len(),
+                "legacy decode must stop at its own prefix"
+            );
+            if !observed.is_empty() {
+                assert!(
+                    consumed < bytes.len(),
+                    "a non-empty observed lane must be trailing residue for old nodes"
+                );
+            }
+
+            let bytes = bincode::serde::encode_to_vec(
+                new_digest_request(observed.clone()),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            let (legacy, consumed): (LegacyDigestSyncRequest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(legacy.sender, "node-1");
+            assert_eq!(legacy.scheme_version, DIGEST_SCHEME_VERSION);
+            assert!(legacy.include_entries);
+            if !observed.is_empty() {
+                assert!(consumed < bytes.len());
+            }
+        }
+    }
+
+    /// Old→new bincode: the positional decode fails (missing trailing
+    /// field), which surfaces as HTTP 400 on the receiver and triggers
+    /// the sender's built-in JSON retry — whose payload decodes with
+    /// `observed` defaulting to empty.
+    #[test]
+    fn legacy_bincode_fails_into_new_but_legacy_json_defaults_observed() {
+        let legacy_delta = LegacyDeltaSyncRequest {
+            sender: "old-node".into(),
+            frontier: hlc(42, 0, "old-node"),
+        };
+        let bytes =
+            bincode::serde::encode_to_vec(&legacy_delta, bincode::config::standard()).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<DeltaSyncRequest, _>(
+                &bytes,
+                bincode::config::standard()
+            )
+            .is_err(),
+            "old-shape bincode must fail positional decode into the new layout"
+        );
+        let json = serde_json::to_string(&legacy_delta).unwrap();
+        let back: DeltaSyncRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sender, "old-node");
+        assert!(back.observed.is_empty(), "missing observed defaults empty");
+
+        let legacy_digest = LegacyDigestSyncRequest {
+            sender: "old-node".into(),
+            scheme_version: DIGEST_SCHEME_VERSION,
+            root: vec![1u8; DIGEST_LEN],
+            buckets: vec![],
+            include_entries: false,
+        };
+        let bytes =
+            bincode::serde::encode_to_vec(&legacy_digest, bincode::config::standard()).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<DigestSyncRequest, _>(
+                &bytes,
+                bincode::config::standard()
+            )
+            .is_err()
+        );
+        let json = serde_json::to_string(&legacy_digest).unwrap();
+        let back: DigestSyncRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sender, "old-node");
+        assert!(back.observed.is_empty());
+    }
+
+    /// JSON and bincode round trips with and without observations (fixes
+    /// the "no skip_serializing_if" invariant: bincode is positional, so
+    /// the field must always encode).
+    #[test]
+    fn sync_requests_roundtrip_with_observed() {
+        for observed in [vec![], vec![sample_observation()]] {
+            let req = new_delta_request(observed.clone());
+            let json = serde_json::to_string(&req).unwrap();
+            let back: DeltaSyncRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.observed, observed);
+            let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+            let (back, _): (DeltaSyncRequest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(back.observed, observed);
+
+            let req = new_digest_request(observed.clone());
+            let json = serde_json::to_string(&req).unwrap();
+            let back: DigestSyncRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.observed, observed);
+            let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+            let (back, _): (DigestSyncRequest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(back.observed, observed);
+        }
+    }
+
+    /// The response-decode JSON retry in `pull_delta` re-sends the SAME
+    /// request object, so an attached observed sample rides the retry
+    /// automatically (M-14 carrier durability across mixed versions).
+    #[tokio::test]
+    async fn pull_delta_response_json_retry_resends_observed() {
+        use axum::response::IntoResponse;
+
+        type Captured = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+        let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/api/internal/sync/delta",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let cap = Arc::clone(&cap);
+                    async move {
+                        let ct = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let n = {
+                            let mut guard = cap.lock().unwrap();
+                            guard.push((ct, body.to_vec()));
+                            guard.len()
+                        };
+                        if n == 1 {
+                            // 2xx with an undecodable body: forces the
+                            // client's JSON response retry.
+                            (
+                                [(axum::http::header::CONTENT_TYPE, CONTENT_TYPE_BINCODE)],
+                                vec![0xFFu8; 8],
+                            )
+                                .into_response()
+                        } else {
+                            axum::Json(DeltaSyncResponse {
+                                entries: vec![],
+                                sender_frontier: None,
+                                applied_origins: HashMap::new(),
+                                merge_failed_keys: vec![],
+                                pruned_floor: None,
+                                visible_origins: HashMap::new(),
+                                untracked_entries: HashMap::new(),
+                            })
+                            .into_response()
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = SyncClient::new(shared_registry(vec![]));
+        let obs = sample_observation();
+        let result = client
+            .pull_delta(
+                &addr.to_string(),
+                "node-1",
+                &hlc(0, 0, ""),
+                vec![obs.clone()],
+            )
+            .await;
+        assert!(matches!(result, PullDeltaResult::Ok(_)));
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2, "initial bincode + JSON retry");
+        // The initial request carried the sample in bincode...
+        assert_eq!(captured[0].0, CONTENT_TYPE_BINCODE);
+        let (first, _): (DeltaSyncRequest, usize) =
+            bincode::serde::decode_from_slice(&captured[0].1, bincode::config::standard()).unwrap();
+        assert_eq!(first.observed, vec![obs.clone()]);
+        // ...and the JSON retry carried the SAME sample again.
+        assert!(captured[1].0.starts_with("application/json"));
+        let second: DeltaSyncRequest = serde_json::from_slice(&captured[1].1).unwrap();
+        assert_eq!(second.observed, vec![obs]);
+        drop(captured);
+        server.abort();
     }
 }

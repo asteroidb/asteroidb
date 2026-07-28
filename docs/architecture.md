@@ -171,7 +171,19 @@ Raft の適用パスはこれらを直接呼ばない（二重実行の防止）
   分岐初期状態解決のためスコープ内に含めた、当初計画からの明示的な逸脱）。
 - 線形化 read — 制御プレーンの GET はローカル読み（leader lease は高クロック
   スキュー環境で安全性根拠にできないため不採用）。
-- 非投票ノードへの learner 複製 — voter 以外のノードはポリシーを GET API 経由で参照。
+- 非投票ノードへの learner 複製（AppendEntries/InstallSnapshot の push）—
+  voter 以外のノード（observer）は **committed 済み制御プレーン状態を internal
+  RPC（`POST /api/internal/raft/namespace`）で定期 pull して追随**する（M-17。
+  従来の「GET API 経由で参照」方針の実装形）。pull は observer 起点の
+  out-of-band 読み取りで、選挙状態・commit 集計・定足数計算には一切関与しない。
+  採用は `(version_counter, last_applied_index)` の辞書式単調ガードで保護され
+  （再起動時は apply marker に記録した「保持された永続 namespace ビュー」の対を
+  ガードの下限にするため、コンパクション snapshot まで巻き戻った in-memory 基準を
+  突いた古い pull がビューをロールバックさせることもない）、
+  適用は InstallSnapshot 受信と同一の install 経路（永続化込み）を共用する——
+  以後の fence / unfence / authority 再計算は voter と同じ
+  `detect_version_changes` 連鎖が行う。observer authority の署名有効性はこの
+  pull の鮮度に依存する（運用は ops-guide §14.8、分断時の設計判断も同節）。
 - データプレーンへの Raft 適用 — Eventual/CRDT 経路の可用性がデータプレーンの責務。
 - 「制御プレーンの制御プレーン」問題（非単一 quorum 制御プレーン、Scatter 型分割）は
   research 上も未解決の白地であり、本実装は単一固定 quorum で進める。
@@ -212,6 +224,16 @@ sequenceDiagram
 - 書き込みはローカル受理後すぐにレスポンスを返却（低レイテンシ）。
 - Delta sync は定期的に実行され、失敗時は指数バックオフが適用。
 - CRDT マージは可換・結合・冪等であり、順序は問わない。
+- **no-op マージは change log を汚さない（RR: redundant relay 抑止、M-6）**:
+  受信 merge がローカル状態を厳密に inflate した時（または per-key HLC 未登録の
+  untracked キーを初めて delta 可視化する時、キーごと高々 1 回）に限り
+  ローカル HLC で再スタンプする。例外として WAL 追記失敗で poison されたキーは
+  no-op でも再スタンプ + WAL 再追記する（メモリ上の状態に対する data record が
+  WAL に欠けているため、送信側リトライを吸収すると耐久性修復が失われる）。
+  収束済みキーのエコーは受信側で吸収され、
+  書き込み静止後の再送は格子の高さで有界（旧実装は無条件再スタンプにより
+  収束済みキーがフル CRDT 状態で恒久ピンポンしていた）。スキップ件数は
+  `sync_redundant_merge_skips_total` で観測できる。
 
 ### Certified Write
 
@@ -337,18 +359,24 @@ digest 段階 diff は以下のすべてのフルシンク誘因を吸収しま�
 push 側の高変更率（`full_sync_threshold` 超過）とペイロードサイズ超過、
 pull 側の claims 不成立（送信側の change-log prune を含む）・デコード失敗・
 連続ネットワーク障害。長期分断後の再接続や高変更率環境で毎回フルダンプに
-近づいていた帯域消費を、実際に発散している部分だけの転送に置き換えます
-（衛星リンク等の高遅延・低帯域リンクが想定ユースケース）。
+近づいていた帯域消費を、発散を含む**バケット単位**（キー空間の 1/256）の
+転送に置き換えます（衛星リンク等の高遅延・低帯域リンクが想定ユースケース。
+削減単位はキーではなくバケットである — 下記「粒度の限界」参照）。
 
-#### 2 層キー範囲 digest（DIGEST_SCHEME_VERSION = 1）
+#### 2 層キー範囲 digest（DIGEST_SCHEME_VERSION = 2）
 
 `src/store/digest.rs` が定義する固定深さ 2 層の digest:
 
 - **per-key digest**: `D(k) = SHA256( str(k) ‖ CRDT 正準ストリーム )`。
   CRDT 正準ストリームは各 CRDT 型（`src/crdt/*.rs` の `digest_into`）が
   型タグ（0x01 Register / 0x02 Counter / 0x03 Set / 0x04 Map）付きで生成する。
-- **バケット割当**: `bucket(k) = SHA256(k)[0]`（256 バケット固定）。
-  レプリカ・挿入順に依存しない決定的な割当。
+  scheme v2（M-8）で OrSet/OrMap のストリームは
+  `live 要素 ‖ counters ‖ compaction_floor ‖ uncovered deferred`
+  （floor に覆われた deferred dot は除外）の**正準形**になった。
+- **バケット割当**: `bucket(k) = SHA256(k)[0]`（`DIGEST_BUCKET_COUNT` =
+  256 バケット固定。scheme 凍結の一部 — 変更は `DIGEST_SCHEME_VERSION` の
+  bump と本節の更新を要する、下記保守契約参照）。レプリカ・挿入順に
+  依存しない決定的な割当。
 - **バケット digest**: `B_i = SHA256( D(k_1) ‖ D(k_2) ‖ … )`
   （バケット i 所属キーの辞書順）。空バケットは全ゼロ 32 バイトで、
   wire 上には載せない（不在 = 空）。
@@ -365,20 +393,56 @@ pull 側の claims 不成立（送信側の change-log prune を含む）・デ�
 digest の材料に関する設計判断:
 
 - **`Store::timestamps`（per-key HLC）は含めない**: push 経路の merge は
-  ローカル clock で再スタンプし、prune は片側だけでエントリを消すため、
-  per-key HLC はレプリカ間で収束せず、恒常的な偽不一致を生む。
-- **deferred tombstone / counters は含める**: これにより
-  「digest 一致 ⟺ CRDT 状態の完全一致（SHA-256 衝突を除く）」が成立し、
-  一致時のセッション claims 採用がフルダンプと同等の健全性を持つ。
-  また pending の remove（tombstone 差のみの発散）も digest 経路で伝播する。
-  代償は tombstone GC がレプリカ間で非対称に走った直後の偽不一致で、
-  影響は帯域のみ（false-negative 方向で安全）。両側の GC 完了後は一致に戻る。
+  **状態を inflate した時のみ**ローカル clock で再スタンプし（RR、M-6。
+  no-op merge はスタンプしない）、prune は片側だけでエントリを消すため、
+  per-key HLC は依然レプリカ間で収束せず、含めると恒常的な偽不一致を生む
+  （スタンプがローカル採番である事実は RR 後も不変で、除外の結論は変わらない）。
+- **counters / compaction floor / uncovered deferred は含める（正準形、
+  scheme v2）**: digest は live・counters・floor・**uncovered** deferred の
+  正準形を含む。「digest 一致 ⟺ 正準状態一致（= 意味論的完全一致、SHA-256
+  衝突を除く）⟺ 双方向マージが可観測状態に対し no-op」が成立し、一致時の
+  セッション claims 採用はフルダンプと同等に健全。pending の remove
+  （uncovered tombstone 差のみの発散）も digest 経路で伝播する。
+  floor に**覆われた** deferred dot（floor 未達の origin が gated sweep まで
+  保持する fresh tombstone）は「floor + 不在」と情報等価なので正準化で
+  除外する — 含めると remove のたびに origin のゲート通過まで偽不一致が
+  続くため。deferred / floor は単調格子（union / pointwise max）に載る。
+  **v1 の教訓（M-8）**: v1 は全 deferred を digest に含める一方 GC が
+  tombstone を無痕跡に物理削除したため、GC 非対称 → 真の不一致 → バケット
+  転送 → 旧 merge が stale tombstone を union で再注入 → GC 巻き戻し、の
+  ライブロックがあった。v2 では sweep が情報等価な圧縮（floor への畳み込み）
+  になり、同じバケット転送が floor を運んで 1 往復で自己治癒する。
+
+digest の利用箇所は anti-entropy 同期に加えてもう一つある:
+**frontier attestation の内容束縛（M-12）**。authority ノードの frontier
+報告は `digest_hash` として eventual store の root digest
+（`sd2:<hex64>` 形式）を署名対象に含める。frontier は certified レーンの
+主張だが digest は eventual store の内容を束縛する——equivocation 検知は
+同一 authority の自己主張同士の比較（同一 frontier HLC・異 digest）で
+あってノード間比較ではないため、このレーン差は健全性に影響しない
+（詳細は ops-guide「Equivocation / split-view 検知」と
+`src/runtime/report_clock.rs` の設計コメント）。
+
+観測（`ObservedAttestation`）の中継レーンは 2 本ある（M-14）:
+authority 発の frontier push への相乗り（従来）に加え、**全ノード共通の
+anti-entropy 同期リクエスト（delta / digest）にも同じ gossip サンプルが
+相乗りする**。frontier push レーンだけでは、authority が非 authority
+ノードだけを狙って矛盾ヘッドを配った場合（非 authority は frontier
+reporter を持たず観測を送出しない）に矛盾ヘッドが出会わなかった——
+sync レーンは全ノードが周期実行するため、この盲点を閉じる。中継は
+1 サイクル・ピアごとに最大 1 リクエストへの添付で、未変化サンプルは
+送出抑止（定常時 0 バイト。ただし配達済み記録は保持窓 120 秒で失効し、
+1 窓 1 回は再送——受信側の観測索引はメモリのみのため）、受信側は
+既存の検知プール上限
+（scope あたり 128 + overflow 32、リクエストあたり 64 件）で有界。
 
 **保守契約**: CRDT 型へのフィールド追加・正準エンコーディングの変更は
 `DIGEST_SCHEME_VERSION` の bump と golden テストの更新を必須とする
 （怠ると「一致」が嘘になり claims が不健全化する）。バージョン不一致の
 ピアは `scheme_ok = false` を返し、要求側は従来フルシンクへフォールバック
-する。
+する。bump 記録: v1 → v2（M-8）で OrSet/OrMap に `compaction_floor` を
+追加し、正準形（floor 包含 + covered deferred 除外）へ改版、golden を
+再生成した。
 
 #### プロトコル（往復数を固定）
 
@@ -406,6 +470,64 @@ digest の材料に関する設計判断:
 `apply_complete_state` を共用し、意味論の分岐を構造的に防ぐ）。
 digest 交換が失敗した場合は何も採用しない（fail-closed、false success なし）。
 
+#### 増分 digest キャッシュ（M-7）
+
+M-7 以前は digest 交換のたびに（発信側 pull/push、応答側とも）ストア全体を
+ロック保持のままディープクローンし、全キーを SHA-256 再計算していた
+（サイクル毎・ピア毎・双方向で O(N)、クラスタ全体では実質 O(N²) 級）。
+現在は `Store` が増分 digest キャッシュ（`store::digest::DigestCache`、
+`#[serde(skip)]` なので永続化形式・wire 形式は不変）を内蔵する:
+
+- **dirty 追跡（INV-1）**: `data` を変異させ得る Store メソッド全 6 個
+  （`get_mut` / `put` / `put_with_timestamp` / `delete` / `merge_value` /
+  `merge_delta_value`）が同一呼び出し内で `note_dirty` を呼ぶ。
+  `merge_value` の `Ok(false)`（no-op マージ）だけは「物理不変」契約に
+  基づき dirty にしない — M-6 の RR ゲート（収束済みキーは再スタンプ
+  されない）と合わせて、**収束済み定常状態の digest 交換はクラスタ全体で
+  クローン 0・ハッシュ 0** になる。GC sweep の floor 前進（scheme v2 の
+  digest 対象）も `get_mut` 経由で一点被覆される。
+- **増分 refresh**: `Store::digest()` は dirty キーの値だけを再ハッシュし、
+  影響バケットをキャッシュ済み per-key digest（32B）から再結合して root を
+  再計算する。結果は常に `compute_store_digest` とビット同一（debug ビルド
+  は毎 refresh でアサート、golden テストはキャッシュ経由でも凍結値を検証）。
+- **mutation generation（INV-2/INV-5）**: すべての `note_dirty` は世代
+  カウンタを無条件にインクリメントする。「ロック下で読んだ世代が後の
+  ロック下でも不変」⟺「その間 data は物理不変」。ロック外で計算した
+  結果は「キー単位の全か無か」で採用する: 世代一致なら全採用、不一致でも
+  capture window（取得時に開き、以降に変異した**全キー**を invalid 中も
+  追跡する窓）が完全なら取得時点の結果を採用して窓内キーだけを dirty の
+  まま残す（非 dirty キーの meta は常に最新 = 偽一致ゼロは不変）。窓が
+  溢れた場合（`DIRTY_COLLAPSE_MAX` 超の churn）や別 capture に置換された
+  場合は**全破棄**。push の不一致バケット抽出の証拠前進は従来どおり
+  世代完全一致のみ。
+- **warm-up プロトコル**: デシリアライズ直後（キャッシュ invalid）や
+  inline 予算（`REFRESH_INLINE_MAX = 512` dirty キー）超過時は、sync
+  サイクル冒頭の `ensure_digest_warm` がロック外 `spawn_blocking` で
+  ハッシュし上記の窓検証付きで採用する（最大 2 試行）。継続書き込み下の
+  大ストア再起動でも窓採用により通常 1 試行で warm 化し、捨てフルクローン
+  +フルハッシュを毎サイクル払い続けることはない。失敗時（極端な churn
+  のみ）は従来どおりのスナップショット経路にフォールバック — 挙動・
+  digest 値とも M-7 以前と同一。
+- **push 再ロック時の cold ガード**: probe RTT 窓中に inline 予算超の
+  書き込みバーストが入った場合、push の再ロック `digest()` はロック内
+  大量ハッシュになり得るため実行せず、そのサイクルの subset push を
+  スキップする（cold 化は世代移動を含意するので証拠はどのみち進められ
+  ない — 安全方向、次サイクルの warm-up 後に再試行）。
+- **push 証拠の意味論**: probe は T0 digest を比較するため、
+  `push_frontiers` / `push_acked_wall_ms`（tombstone GC のピアゲート証拠）
+  は「送った内容が T0 そのものだと証明できた場合」のみ (frontier_T0,
+  wall0) に前進する。warm 経路で probe と抽出の間に書き込みが入った場合、
+  新しいデータは送る（CRDT マージは常に無害）が証拠は据え置く（安全方向:
+  GC ゲートが遅れるだけで、静穏後の root 一致 probe が前進させる）。
+- **応答側**: handler も warm なら単一ロックスコープで応答し、root 一致は
+  O(1)（クローン 0・timestamps 構築 0）、不一致は該当バケットのみ
+  `clone_bucket_entries` で抽出する。cold（再起動直後など）は従来経路の
+  ままで応答はビット同一。
+
+常駐コストは per-key メタ（キー 1 重複製 + 33B/キー）。効果の実測は
+`benches/digest_bench.rs`（legacy クローン+全ハッシュ vs cached d=0 /
+d∈{1,64,1024}）を参照。
+
 #### ローリングアップグレード安全性
 
 旧ノードは `/api/internal/sync/digest` に 404 を返す。要求側はこれを
@@ -414,6 +536,23 @@ digest 交換が失敗した場合は何も採用しない（fail-closed、false
 アップグレード済みピアを自動検出する。混在期間中は削減効果がないだけで
 正しさは不変。`digest_sync_enabled = false`（`ASTEROIDB_DIGEST_SYNC_DISABLED=1`）
 で機能全体を無効化できる（ops キルスイッチ）。
+
+#### 粒度の限界（バケット単位 diff の設計限界）
+
+digest 段階 diff の削減単位は**バケット**（キー空間の 1/256）であって
+キーではない。これは意図した設計限界である:
+
+- **増幅コスト**: 1 キーだけの発散でも、そのキーが属するバケットの全キー
+  （期待値 N/256）が転送される。
+- **削減率の上限**: 削減率はおおよそ「一致バケット数 / 256」で頭打ちする。
+  発散が 256 バケット全てに散るワークロード（広範な一様書き込みを挟む
+  長期分断など）では digest 段の転送量はフルシンク帯域に漸近する
+  （正しさと固定往復数は不変のまま、削減効果だけが消える）。
+- **第 3 段（IBLT / rateless set reconciliation 等）はスコープ外**:
+  キー単位の diff まで削るには set reconciliation 系（IBLT、ConflictSync
+  等）が必要だが、確率的デコードの失敗時フォールバック段数が増える複雑性
+  は、バケット増幅が問題になる規模までは見合わない。固定 2 RTT を優先して
+  MST の逐次降下を不採用とした判断（上記「プロトコル」節）と同じ判断軸。
 
 digest 段は信頼済みクラスタ内の帯域削減が目的であり、Merkle「証明」や
 Byzantine 耐性はスコープ外（敵対的キー注入によるバケット偏りは BFT 拡張時に
@@ -480,6 +619,7 @@ wasm32 ビルドはファイルシステムを持たないため対象外（純�
 ├── system_namespace.json                  (既存)
 ├── peer_registry.json                     (既存)
 ├── equivocation_evidence.json             (既存)
+├── frontier_report_clock.json             (M-12: frontier 報告 HLC の write-ahead floor)
 ├── eventual.snapshot.bin                  (bincode v3 スナップショット)
 ├── certified.snapshot.bin
 └── wal/
@@ -552,7 +692,10 @@ shutdown 時に実行する。順序規律は **rotate → clone → save → de
 だけ）。スナップショット失敗時はセグメントを一切削除しない——WAL は次回
 成功まで伸び続けるため、ディスク使用量の監視対象になる。compaction /
 tombstone GC の効果は WAL に載せず、次回スナップショットで捕捉する
-（クラッシュで GC 前状態に戻っても再 GC されるだけ）。
+（クラッシュで GC 前状態に戻っても再 GC されるだけ）。GC の compaction
+floor も同じ論法で安全: クラッシュで floor がスナップショット時点へ戻る
+のは低い側 = 保守的（tombstone が復活するだけで over-collect は起きない）
+で、再 sweep か peer からのマージ（pointwise max）で回復する。
 
 ### リカバリと破損判定
 
@@ -606,6 +749,24 @@ Certified は決して返さない。attestation の再収集で回復する）�
   アプリケーションは Certified パスを使用する必要があり、レイテンシが増加。
 - **Byzantine 障害耐性なし**: MVP はクラッシュ故障のみを想定。悪意のある
   Authority ノードは certificate を偽造可能。BFT は将来フェーズで計画。
+  特に**制御プレーン Raft がシステム全体の Byzantine 耐性の実質的下限を
+  決める非対称**があることに注意:
+  - **攻撃経路**: 制御プレーン Raft RPC の認証は共有
+    `ASTEROIDB_INTERNAL_TOKEN` のみで、この共有トークン認証も**設定時のみ**
+    有効（未設定および空文字列は unset 扱い = 認証なし）。設定時であっても
+    メッセージ単位のノード帰属署名は存在しない。したがって voter 1 台の
+    侵害（またはトークンの漏洩）により、攻撃者は正規の Raft 手続きに乗せて
+    任意の authority 定義・placement policy 変更を propose・commit できる
+    （followers は正当なリーダー提案として複製するため、**過半数の侵害は
+    不要**）。
+  - **非対称**: authority 定義そのものを書き換えられる攻撃者に対しては、
+    Authority プレーンへの署名投資（署名検証・BLS PoP・equivocation 検知）
+    は実効的に迂回される — 自らの鍵を authority set に登録すれば certified
+    write を正規手続きで偽造できる。つまりシステム全体の Byzantine 耐性は
+    **制御プレーンの最弱 voter 1 台**で決まる。
+  - **BFT 化への布石**: 第一歩は Raft RPC への per-node 署名（メッセージ
+    帰属の確立）、その先に BFT 合意プロトコルへの置換。いずれも未実装の
+    将来フェーズ。
 - **単一ライター Certified パス**: Certified write は現在 1 ノードが ack を
   収集して開始。真の分散コミットプロトコルはより高い耐障害性を提供するが、
   複雑さも増加。

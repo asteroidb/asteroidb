@@ -135,6 +135,60 @@
    key (see `key-rotation.md`) and redistribute
    `ASTEROIDB_AUTHORITY_KEYS`.
 
+### False positive recovery (M-12)
+
+Since M-12 the `digest_hash` binds real store content, so the
+no-false-positive guarantee rests on the report clock floor
+(`frontier_report_clock.json`) and the floorless-boot activation grace
+(during which the node signs no frontier reports at all). Within the
+documented operating contract — clock rollbacks bounded by the 60s
+cluster skew assumption, and the floor file never restored from a backup
+— these protections leave no false-positive path. They can still be
+defeated out-of-contract, e.g. by restoring a STALE
+`frontier_report_clock.json` from a backup (its lease does not cover the
+reports signed after the backup was taken — always delete the file when
+restoring a data dir, see the ops guide's data-recovery table) or by a
+clock rollback beyond the 60s skew assumption. In such a case a
+legitimate authority can end up accused. Recovery path:
+
+1. **Diagnose before purging.** Fetch the evidence
+   (`GET /api/authority/equivocations`) and correlate both halves' HLCs
+   and `detected_at_ms` with the accused authority's restart/clock
+   events: a floor-skip signal (`frontier_report_skipped_floor_total`),
+   the activation-grace WARN log
+   (`frontier report clock floor absent`), a recent data-dir restore
+   from backup (was `frontier_report_clock.json` restored instead of
+   deleted?), NTP step events. A genuine split view has no such
+   correlated operational event.
+2. **If genuine doubt remains, do NOT purge.** The evidence pair is a
+   non-repudiable signed artifact; treat it as real until positively
+   explained by an operational fault.
+3. Purge on **every node** (evidence travels the gossip lane — a single
+   purge gets re-infected by the next exchange; observed heads age out
+   of peer memory within ~2 minutes, so after a cluster-wide purge the
+   re-accusation stops within that window; repeat if a straggler
+   re-delivers):
+
+   ```bash
+   for node in node-1:3000 node-2:3000 node-3:3000; do
+     curl -X DELETE "http://$node/api/authority/equivocations/<authority_id>" \
+       -H "Authorization: Bearer $ASTEROIDB_INTERNAL_TOKEN"
+   done
+   ```
+
+   The response reports `evidence_removed` / `heads_removed` /
+   `accused_remaining`; the purge is persisted to
+   `equivocation_evidence.json` (a restart does not resurrect it).
+4. Under `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1`, verify recovery is
+   complete: the `equivocation_accused_authorities` gauge returns to 0
+   and certification resumes (the purged authority's attestations pool
+   again).
+5. Prevent recurrence: confirm the floor file exists and is writable
+   (`frontier_report_skipped_floor_total` must stay 0), never restore
+   `frontier_report_clock.json` from a backup (delete it on any data-dir
+   restore so the activation grace applies), and configure NTP to slew
+   rather than step where possible.
+
 ### Limitations to keep in mind
 
 - Detection is **reactive**, not preventive: conflicting reports may have

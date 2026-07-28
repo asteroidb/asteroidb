@@ -19,13 +19,18 @@
 //!   comparison key is `digest_hash` only, never the signature bytes or
 //!   `keyset_version`.
 //!
-//! The current digest is a deterministic function of `(node_id, hlc)`
-//! (`frontier_reporter`), so an honest authority can never produce two
-//! digests for one `frontier_hlc`. If the digest is ever changed to a
-//! Merkle root over real data, the invariant "same `(authority,
-//! frontier_hlc)` implies same digest" must be preserved for this
-//! definition to stay false-positive-free; the detection pipeline itself
-//! does not depend on digest semantics.
+//! Since M-12 the digest binds real store content (the M-7 root digest,
+//! `sd2:<hex>` — see `frontier_reporter::format_store_digest_hash`), so it
+//! is no longer a deterministic function of the HLC. The invariant "same
+//! `(authority, frontier_hlc)` implies same digest" is instead maintained
+//! by the reporting side: the digest is computed exactly once per report
+//! tick and frozen by the report signature, the HLC is strictly monotone
+//! in-process, and restarts are covered by the persisted
+//! `runtime::report_clock::ReportClockFloor` write-ahead lease (a boot
+//! without a floor file signs NOTHING until an activation grace longer
+//! than the peers' head-retention window has elapsed). The detection
+//! pipeline itself does not depend on digest semantics — it only compares
+//! digest strings for equality.
 //!
 //! Detection is **cheap and passive** (CT-gossip Protocol 2 style summaries
 //! piggyback on the existing frontier push); *enforcement* is intentionally
@@ -132,6 +137,41 @@ pub struct ObservedAttestation {
     pub signature: FrontierSignature,
 }
 
+impl ObservedAttestation {
+    /// Copy of this attestation as it travels on the gossip/relay lanes
+    /// (the frontier push `observed` lane and the M-14 sync piggyback).
+    ///
+    /// Builds WITHOUT `native-crypto` carry the optional BLS fields as
+    /// unvalidated hex strings (stub types) and `verify_frontier_signature`
+    /// ignores the BLS lane entirely, so a stub node can index an
+    /// attestation whose Ed25519 lane verified but whose BLS fields are
+    /// attacker-controlled garbage. Native builds hard-validate those
+    /// fields inside `Deserialize` (bincode AND JSON), so relaying such a
+    /// field would make the ENTIRE carrier request undecodable on a
+    /// native peer — one poisoned observation would disable the whole
+    /// delta/digest sync path between a stub sender and a native
+    /// receiver. A build therefore never relays BLS material it could
+    /// not have validated: on stub builds the BLS lane is stripped from
+    /// the relayed copy. This costs nothing semantically — receivers
+    /// re-verify via the registry key and the Ed25519 lane alone fully
+    /// determines evidence admissibility on every build (`(None, None)`
+    /// is an accepted shape). Native builds relay the lane unchanged:
+    /// their parsed key/signature types are wire-safe by construction.
+    pub fn for_wire_relay(&self) -> Self {
+        #[cfg(feature = "native-crypto")]
+        {
+            self.clone()
+        }
+        #[cfg(not(feature = "native-crypto"))]
+        {
+            let mut copy = self.clone();
+            copy.signature.bls_public_key = None;
+            copy.signature.bls_cert_signature = None;
+            copy
+        }
+    }
+}
+
 /// Non-repudiable equivocation evidence: both conflicting signed messages
 /// are stored verbatim, so the pair can be presented to a third party and
 /// re-verified against the registry key (proof of misbehaviour).
@@ -151,6 +191,15 @@ pub struct EquivocationEvidence {
     pub second: ObservedAttestation,
     /// Wall-clock time (ms since epoch) when the conflict was detected.
     pub detected_at_ms: u64,
+}
+
+/// Result of [`EquivocationDetector::purge_authority`]: what was removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PurgeStats {
+    /// Stored evidence pairs removed for the authority.
+    pub evidence_removed: usize,
+    /// Observed heads (main window + overflow, across all scopes) removed.
+    pub heads_removed: usize,
 }
 
 /// Outcome of feeding one verified attestation into the detector.
@@ -649,6 +698,12 @@ impl EquivocationDetector {
     /// — frontier HLCs are monotone append heads, so newer heads subsume
     /// older ones and the gossip state does not grow linearly. Any budget
     /// left after the heads is topped up with further evidence halves.
+    ///
+    /// Every sampled attestation is copied through
+    /// [`ObservedAttestation::for_wire_relay`]: this is THE producer of
+    /// relay material for both wire lanes, so wire-safety (stripping the
+    /// unvalidatable BLS lane on non-`native-crypto` builds) is enforced
+    /// here once instead of at every attach site.
     pub fn gossip_summaries(&self, max: usize) -> Vec<ObservedAttestation> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *state;
@@ -664,7 +719,7 @@ impl EquivocationDetector {
                 obs.frontier.digest_hash.clone(),
             );
             if seen.insert(key) {
-                out.push(obs.clone());
+                out.push(obs.for_wire_relay());
             }
         };
 
@@ -744,6 +799,50 @@ impl EquivocationDetector {
             }
         }
         out
+    }
+
+    /// Remove every trace of `authority` from the detector: stored
+    /// evidence, the accused flag, and all observed heads (main windows,
+    /// overflow FIFOs and the scope index entries) — operator recovery
+    /// path for a confirmed FALSE POSITIVE
+    /// (`DELETE /api/authority/equivocations/{authority_id}`).
+    ///
+    /// Removing the observed heads too is deliberate: a retained head
+    /// could immediately re-detect against the next legitimate report and
+    /// re-accuse the authority the operator just cleared. It does NOT
+    /// forget anything gossip can restore — peers that still hold the
+    /// evidence will re-deliver it (which is why the runbook says to purge
+    /// on ALL nodes), and genuinely new equivocations are re-detected from
+    /// scratch.
+    ///
+    /// The caller is responsible for persisting the shrunken store
+    /// (`spawn_persist`) and refreshing the accused gauge.
+    pub fn purge_authority(&self, authority: &NodeId) -> PurgeStats {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let evidence_removed = state
+            .evidence
+            .remove(authority)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        state.accused.remove(authority);
+        let victim_scopes: Vec<ObsScope> = state
+            .observed
+            .keys()
+            .filter(|s| s.authority_id == *authority)
+            .cloned()
+            .collect();
+        let mut heads_removed = 0;
+        for scope in victim_scopes {
+            if let Some(scope_state) = state.observed.remove(&scope) {
+                heads_removed += scope_state.heads.len() + scope_state.overflow.len();
+            }
+        }
+        // The rotating gossip cursor may now be past the shrunken evidence
+        // list; it is re-modulo'd on the next sample, so no reset needed.
+        PurgeStats {
+            evidence_removed,
+            heads_removed,
+        }
     }
 
     /// Serialize the evidence store for persistence.
@@ -1228,6 +1327,96 @@ mod tests {
         assert!(det.is_known_exact(&new));
     }
 
+    /// Stub builds carry BLS fields as unvalidated strings and never check
+    /// them at verification time, so attacker garbage can be indexed. It
+    /// must NOT travel: native receivers hard-validate BLS fields inside
+    /// `Deserialize` (bincode and JSON alike), so one relayed garbage field
+    /// would make the whole carrier request undecodable on a native peer.
+    /// `gossip_summaries` therefore strips the BLS lane on stub builds; the
+    /// stripped copy stays fully admissible via the Ed25519 lane.
+    #[cfg(not(feature = "native-crypto"))]
+    #[test]
+    fn gossip_sample_strips_unvalidated_bls_lane_on_stub_builds() {
+        use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
+
+        let signer = make_signer("auth-1", 66);
+        let det = EquivocationDetector::new(None);
+
+        // Attacker-poisoned attestation: valid Ed25519 lane, garbage BLS
+        // fields (the stub verification path ignores them, so it indexes).
+        let f = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let (f, mut s) = signed(&signer, &f);
+        s.bls_public_key = Some(BlsPublicKey("zz-not-hex".into()));
+        s.bls_cert_signature = Some(BlsSignature("also-garbage".into()));
+        det.observe(&f, &s, NOW_MS);
+
+        // Half-populated pair on a second scope: stripped the same way.
+        let f2 = make_frontier("auth-1", "order/", 1, 4_100, 0, "digest-b");
+        let (f2, mut s2) = signed(&signer, &f2);
+        s2.bls_public_key = Some(BlsPublicKey("half-populated".into()));
+        det.observe(&f2, &s2, NOW_MS);
+
+        let sample = det.gossip_summaries(GOSSIP_SAMPLE_MAX);
+        assert_eq!(sample.len(), 2);
+        for obs in &sample {
+            assert!(
+                obs.signature.bls_public_key.is_none()
+                    && obs.signature.bls_cert_signature.is_none(),
+                "a stub build must never relay BLS material it could not validate"
+            );
+        }
+
+        // The stripped copy remains fully admissible as evidence: the
+        // Ed25519 lane alone passes registry verification.
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(node("auth-1"), signer.verifying_key())],
+            )
+            .unwrap();
+        for obs in &sample {
+            verify_frontier_signature(
+                &obs.frontier,
+                &obs.signature,
+                &registry,
+                0,
+                &EpochConfig::default(),
+            )
+            .expect("stripped relay copies must still verify via Ed25519");
+        }
+
+        // The detector's own stored state is untouched (the strip happens
+        // on the relayed copy only): the poisoned original is still the
+        // indexed head.
+        assert!(det.is_known_exact(&f));
+    }
+
+    /// Native builds hold parsed (wire-safe by construction) BLS values,
+    /// so the relay copy keeps the BLS lane intact.
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn gossip_sample_preserves_bls_lane_on_native_builds() {
+        let mut seed = [0u8; 32];
+        seed[0] = 67;
+        let signer = NodeSigner::from_seed(node("auth-1"), &seed, true);
+        let det = EquivocationDetector::new(None);
+
+        let f = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let (f, s) = signed(&signer, &f);
+        assert!(s.bls_public_key.is_some(), "test setup: BLS lane populated");
+        det.observe(&f, &s, NOW_MS);
+
+        let sample = det.gossip_summaries(GOSSIP_SAMPLE_MAX);
+        assert_eq!(sample.len(), 1);
+        assert!(
+            sample[0].signature.bls_public_key.is_some()
+                && sample[0].signature.bls_cert_signature.is_some(),
+            "validated BLS material must relay unchanged on native builds"
+        );
+    }
+
     #[test]
     fn gossip_summaries_prioritize_evidence_and_cap() {
         let signer = make_signer("auth-1", 6);
@@ -1505,6 +1694,98 @@ mod tests {
             2 * MAX_EVIDENCE_PER_AUTHORITY,
             "every evidence pair must propagate across successive samples"
         );
+    }
+
+    #[test]
+    fn purge_authority_clears_evidence_accusation_and_heads() {
+        let signer = make_signer("auth-1", 21);
+        let bystander = make_signer("auth-2", 22);
+        // Persist path configured: the test must prove the purge shrinks
+        // the ACTUAL serialized payload (what the endpoint writes back to
+        // equivocation_evidence.json), not just the in-memory view.
+        let dir = tempfile::tempdir().unwrap();
+        let det = EquivocationDetector::new(Some(dir.path().join("equivocation_evidence.json")));
+
+        // Accuse auth-1 (evidence + heads in two scopes) and index an
+        // unrelated head for auth-2.
+        let f_a = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-a");
+        let f_b = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-b");
+        let f_c = make_frontier("auth-1", "order/", 1, 4_100, 0, "digest-c");
+        let f_other = make_frontier("auth-2", "user/", 1, 4_000, 0, "digest-x");
+        for (signer, f) in [
+            (&signer, &f_a),
+            (&signer, &f_b),
+            (&signer, &f_c),
+            (&bystander, &f_other),
+        ] {
+            let (f, s) = signed(signer, f);
+            det.observe(&f, &s, NOW_MS);
+        }
+        assert!(det.is_accused(&node("auth-1")));
+        // Pre-purge, the serialized snapshot names auth-1 (guards against
+        // this assertion pair going vacuous).
+        let (_, bytes) = det.persist_payload().expect("persist path configured");
+        let pre: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            pre["accused"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "auth-1")
+                && !pre["evidence"].as_array().unwrap().is_empty(),
+            "precondition: persisted payload must carry auth-1 before the purge"
+        );
+
+        let stats = det.purge_authority(&node("auth-1"));
+        assert_eq!(stats.evidence_removed, 1);
+        // user/ head (digest-a; digest-b lives only in the evidence pair)
+        // + order/ head.
+        assert_eq!(stats.heads_removed, 2);
+
+        // Accusation, evidence and heads are gone...
+        assert!(!det.is_accused(&node("auth-1")));
+        assert!(det.evidence().is_empty());
+        assert!(!det.is_known_exact(&f_a));
+        assert!(!det.is_known_exact(&f_b));
+        assert!(!det.is_known_exact(&f_c));
+        // ...the persisted payload of THIS detector shrinks accordingly —
+        // a restart replaying equivocation_evidence.json must not
+        // resurrect the purged accusation...
+        let (_, bytes) = det.persist_payload().expect("persist path configured");
+        let post: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            post["evidence"].as_array().unwrap().is_empty(),
+            "purged evidence must not survive in the serialized snapshot"
+        );
+        assert!(
+            post["accused"].as_array().unwrap().is_empty(),
+            "purged accusation must not survive in the serialized snapshot"
+        );
+        // ...and other authorities' observations are untouched.
+        assert!(det.is_known_exact(&f_other));
+
+        // No residual head: the next legitimate report at the same HLC is
+        // FirstSeen, not an instant re-accusation.
+        let f_retry = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-new");
+        let (f, s) = signed(&signer, &f_retry);
+        assert!(matches!(
+            det.observe(&f, &s, NOW_MS),
+            ObserveOutcome::FirstSeen
+        ));
+        assert!(!det.is_accused(&node("auth-1")));
+
+        // A genuinely NEW equivocation after the purge is still detected.
+        let f_again = make_frontier("auth-1", "user/", 1, 4_000, 0, "digest-newer");
+        let (f, s) = signed(&signer, &f_again);
+        assert!(matches!(
+            det.observe(&f, &s, NOW_MS),
+            ObserveOutcome::Equivocation(_)
+        ));
+
+        // Purging an unknown authority is a no-op.
+        let stats = det.purge_authority(&node("auth-9"));
+        assert_eq!(stats.evidence_removed, 0);
+        assert_eq!(stats.heads_removed, 0);
     }
 
     #[cfg(feature = "native-runtime")]

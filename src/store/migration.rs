@@ -178,12 +178,38 @@ impl Migration for V3ToV4 {
     }
 }
 
+/// Migration from v4 to v5: the `compaction_floor` field was added to
+/// `OrSet`/`OrMap` (M-8 tombstone GC convergence).
+///
+/// A JSON no-op: the field carries `#[serde(default)]` and old snapshots
+/// simply omit it (empty floor). (The bincode path uses the frozen
+/// `StoreV4Layout` / `CrdtValueV4` decode types instead — see
+/// `Store::load_from_backend_bincode`; the WAL has the parallel v1→v2
+/// bump with `WalRecordV1`.)
+pub struct V4ToV5;
+
+impl Migration for V4ToV5 {
+    fn source_version(&self) -> u32 {
+        4
+    }
+
+    fn target_version(&self) -> u32 {
+        5
+    }
+
+    fn migrate(&self, data: serde_json::Value) -> Result<serde_json::Value, CrdtError> {
+        // No-op for JSON: added fields default via serde.
+        Ok(data)
+    }
+}
+
 /// Build the default migration registry with all known migrations.
 pub fn default_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
     registry.register(Box::new(V1ToV2));
     registry.register(Box::new(V2ToV3));
     registry.register(Box::new(V3ToV4));
+    registry.register(Box::new(V4ToV5));
     registry
 }
 

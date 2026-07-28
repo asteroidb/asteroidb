@@ -45,6 +45,12 @@ pub struct EventualApi {
     /// false session success (the invariant on `WalRecord::MergeFailed`).
     #[cfg(not(target_arch = "wasm32"))]
     pending_poison: Vec<String>,
+    /// Remote merges skipped by the RR gate (redundant-relay suppression,
+    /// M-6): the merge did not inflate local state and the key was
+    /// already delta-visible, so no re-stamp / change-log / WAL write
+    /// happened. In-memory observability only — never persisted, never on
+    /// the wire (mirrored into `RuntimeMetrics` by the runner).
+    redundant_merge_skips: u64,
 }
 
 impl EventualApi {
@@ -61,6 +67,7 @@ impl EventualApi {
             last_wal_pos: None,
             #[cfg(not(target_arch = "wasm32"))]
             pending_poison: Vec::new(),
+            redundant_merge_skips: 0,
         }
     }
 
@@ -82,6 +89,7 @@ impl EventualApi {
             wal,
             last_wal_pos: None,
             pending_poison: Vec::new(),
+            redundant_merge_skips: 0,
         }
     }
 
@@ -553,17 +561,52 @@ impl EventualApi {
     ///
     /// Delegates to `Store::merge_value`, which handles type checking
     /// and CRDT-specific merge semantics. Records the HLC timestamp
-    /// for delta sync tracking.
+    /// for delta sync tracking — but only when the merge actually
+    /// inflated local state (or the key was untracked): see the RR gate
+    /// below.
     pub fn merge_remote(&mut self, key: String, remote_value: &CrdtValue) -> Result<(), CrdtError> {
-        if let Err(e) = self.store.merge_value(key.clone(), remote_value) {
-            // Poison the key for session checks: a remote contribution was
-            // dropped, so the applied_origins invariant no longer holds
-            // for this key (the frontier may advance via other keys).
-            self.store.note_merge_failed(&key);
-            // Persist the poison too: losing it while a later snapshot /
-            // claims record keeps the frontier would fake session success.
-            self.wal_log_merge_failed(&key);
-            return Err(e);
+        let changed = match self.store.merge_value(key.clone(), remote_value) {
+            Ok(changed) => changed,
+            Err(e) => {
+                // Poison the key for session checks: a remote contribution was
+                // dropped, so the applied_origins invariant no longer holds
+                // for this key (the frontier may advance via other keys).
+                self.store.note_merge_failed(&key);
+                // Persist the poison too: losing it while a later snapshot /
+                // claims record keeps the frontier would fake session success.
+                self.wal_log_merge_failed(&key);
+                return Err(e);
+            }
+        };
+        // RR gate (redundant-relay suppression, M-6): a merge that did
+        // not inflate local state carries no new information, and
+        // re-stamping it with a fresh local HLC would only re-inject the
+        // key into every peer's delta scan — the ping-pong that kept
+        // converged keys retransmitting full CRDT state forever. Skip
+        // the re-stamp when the key is already delta-visible. An
+        // UNTRACKED key (no per-key HLC — v1/v2-migrated stores, direct
+        // store puts) is still stamped so it becomes delta-visible; that
+        // happens at most once per key, so boundedness is preserved.
+        //
+        // POISONED keys must bypass the gate: a key poisoned by a
+        // transient WAL-append failure holds merged state in memory whose
+        // data record never reached the WAL, so the sender's retry of the
+        // same value arrives as a no-op here — swallowing it would ack
+        // data the WAL does not carry (the sender advances its push
+        // frontier past it) and defer the durability repair from the next
+        // sync round to a post-crash digest anti-entropy cycle. Letting
+        // the retry through re-runs record_change + wal_log_applied and
+        // restores the data record. This cannot resurrect the ping-pong
+        // in healthy operation: the poison set is empty unless a WAL
+        // append already failed, and each bypass re-stamps only the
+        // receiver, whose echo is absorbed by unpoisoned peers.
+        if !changed
+            && self.store.timestamp_for(&key).is_some()
+            && !self.store.merge_failed_contains(&key)
+        {
+            self.redundant_merge_skips += 1;
+            tracing::trace!(key = %key, "redundant remote merge skipped (RR)");
+            return Ok(());
         }
         let ts = self.clock.now()?;
         self.store.record_change(&key, ts.clone());
@@ -618,19 +661,48 @@ impl EventualApi {
         // errors, so skipped entries are never re-requested. The clock update is
         // advisory (ordering only); CRDT correctness does not depend on it.
         let _ = self.clock.update(&hlc);
-        if let Err(e) = self.store.merge_value(key.clone(), remote_value) {
-            // Poison the key for session checks (see merge_remote).
-            self.store.note_merge_failed(&key);
-            self.wal_log_merge_failed(&key);
-            return Err(e);
-        }
+        let changed = match self.store.merge_value(key.clone(), remote_value) {
+            Ok(changed) => changed,
+            Err(e) => {
+                // Poison the key for session checks (see merge_remote).
+                self.store.note_merge_failed(&key);
+                self.wal_log_merge_failed(&key);
+                return Err(e);
+            }
+        };
         // The merged contribution is now visible; response tokens must
-        // cover it even though no applied claim is made.
+        // cover it even though no applied claim is made. Advanced
+        // UNCONDITIONALLY — even for the RR-skipped no-op merges below —
+        // because the invariant is "response tokens cover everything a
+        // reader can observe here", and the no-op contribution is
+        // observable (it was already dominated by local state).
         self.store.note_visible(&hlc);
-        // Always record the change using the maximum of the incoming HLC
-        // and any existing timestamp for this key. This ensures that
-        // merges are never silently dropped from the change log, which
-        // would cause delta-sync peers to miss updates.
+        // RR gate (redundant-relay suppression, M-6; see merge_remote):
+        // a no-op merge on an already delta-visible key must not touch
+        // the change log or the WAL — the pre-merge state is already
+        // durable and already dominates the received contribution, so
+        // skipping the UpsertVisible record cannot lose data. The
+        // per-key timestamp is left where local changes put it, so
+        // converged keys drop out of delta scans instead of ping-ponging.
+        //
+        // POISONED keys bypass the gate (see merge_remote): after a
+        // transient WAL-append failure the merged state is in memory but
+        // its data record is not in the WAL; the "pre-merge state is
+        // already durable" premise above does not hold, so a re-offer of
+        // the same entry must re-attempt the UpsertVisible append instead
+        // of being swallowed.
+        if !changed
+            && self.store.timestamp_for(&key).is_some()
+            && !self.store.merge_failed_contains(&key)
+        {
+            self.redundant_merge_skips += 1;
+            tracing::trace!(key = %key, "redundant remote merge skipped (RR)");
+            return Ok(());
+        }
+        // Record the change using the maximum of the incoming HLC and any
+        // existing timestamp for this key. This ensures that merges are
+        // never silently dropped from the change log, which would cause
+        // delta-sync peers to miss updates.
         self.store.record_change_max(&key, hlc.clone());
         if let Err(e) = self.wal_log_visible(&key, &hlc) {
             // Same as merge_remote: the entry is merged in memory but its
@@ -716,6 +788,15 @@ impl EventualApi {
     /// `EventualApi` mutation methods (or `adopt_session_claims`) instead.
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
+    }
+
+    /// Cumulative count of remote merges skipped by the RR gate
+    /// (redundant-relay suppression, M-6): the merge did not inflate
+    /// local state and the key was already delta-visible. In-memory
+    /// observability only (resets on restart); the runner mirrors it
+    /// into `RuntimeMetrics::sync_redundant_merge_skips_total`.
+    pub fn redundant_merge_skips(&self) -> u64 {
+        self.redundant_merge_skips
     }
 }
 
@@ -1498,5 +1579,261 @@ mod tests {
         api.merge_remote("k".into(), &CrdtValue::Set(OrSet::new()))
             .unwrap_err();
         assert!(api.store().merge_failed_contains("k"));
+    }
+
+    // ---------------------------------------------------------------
+    // RR gate: redundant-relay suppression (M-6)
+    // ---------------------------------------------------------------
+
+    /// The core M-6 regression (RED before the RR gate): merging a value
+    /// the local state already dominates must not re-stamp the key. The
+    /// old code called `record_change` with a fresh local HLC on EVERY
+    /// push merge, so a converged key re-entered every peer's delta scan
+    /// forever (permanent ping-pong of full CRDT state).
+    #[test]
+    fn redundant_merge_does_not_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let mut api = EventualApi::recovered(node("node-b"), Store::new(), Some(wal));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        let value = CrdtValue::Counter(remote);
+
+        // First merge inflates state: stamped, applied, WAL-logged.
+        api.merge_remote("k".into(), &value).unwrap();
+        let ts_after_first = api.store().timestamp_for("k").cloned().unwrap();
+        let applied_after_first = api.store().applied_origin("node-b").cloned().unwrap();
+        let wal_pos_after_first = api.last_wal_pos();
+        assert!(wal_pos_after_first.is_some());
+        assert_eq!(api.redundant_merge_skips(), 0);
+
+        // Second merge of the SAME value is a no-op on a tracked key:
+        // per-key timestamp, applied frontier and WAL position must all
+        // stay put, and the skip counter must tick.
+        api.merge_remote("k".into(), &value).unwrap();
+        assert_eq!(
+            api.store().timestamp_for("k"),
+            Some(&ts_after_first),
+            "a redundant merge must not re-stamp the key"
+        );
+        assert_eq!(
+            api.store().applied_origin("node-b"),
+            Some(&applied_after_first),
+            "a redundant merge must not advance the applied frontier"
+        );
+        assert_eq!(
+            api.last_wal_pos(),
+            wal_pos_after_first,
+            "a redundant merge must not append to the WAL"
+        );
+        assert_eq!(api.redundant_merge_skips(), 1);
+    }
+
+    /// An UNTRACKED key (no per-key HLC — v1/v2-migrated stores, direct
+    /// store puts) is stamped exactly once by the RR gate: the first
+    /// no-op merge makes it delta-visible, the second is skipped.
+    #[test]
+    fn untracked_key_is_stamped_exactly_once() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        let mut migrated = PnCounter::new();
+        migrated.increment(&node("old-writer"));
+        let value = CrdtValue::Counter(migrated);
+        // Direct put without record_change: the v1/v2 migration shape.
+        api.store_mut().put("k".into(), value.clone());
+        assert!(api.store().timestamp_for("k").is_none());
+
+        // Identical value: the merge is a no-op, but the key is
+        // untracked, so it is stamped (delta-visible from now on).
+        api.merge_remote("k".into(), &value).unwrap();
+        assert!(
+            api.store().timestamp_for("k").is_some(),
+            "first merge must track the untracked key"
+        );
+        assert_eq!(api.redundant_merge_skips(), 0);
+        let ts_first = api.store().timestamp_for("k").cloned().unwrap();
+
+        // Now tracked: the same echo is skipped.
+        api.merge_remote("k".into(), &value).unwrap();
+        assert_eq!(api.store().timestamp_for("k"), Some(&ts_first));
+        assert_eq!(api.redundant_merge_skips(), 1);
+    }
+
+    /// Pull-path RR: a no-op `merge_remote_with_hlc` must skip the change
+    /// log (`record_change_max`) and the WAL, but STILL advance the
+    /// visible frontier — response tokens must cover everything a reader
+    /// can observe, no-op contributions included.
+    #[test]
+    fn redundant_merge_with_hlc_skips_change_log_but_advances_visible() {
+        let mut api = EventualApi::new(node("node-b"));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        let value = CrdtValue::Counter(remote);
+        let h1 = hlc_ts(100, 0, "node-a");
+        api.merge_remote_with_hlc("k".into(), &value, h1.clone())
+            .unwrap();
+        assert_eq!(api.store().timestamp_for("k"), Some(&h1));
+
+        // Same value re-offered at a later origin HLC: no state change,
+        // tracked key → change log untouched, visible frontier advanced.
+        let h2 = hlc_ts(200, 0, "node-a");
+        api.merge_remote_with_hlc("k".into(), &value, h2.clone())
+            .unwrap();
+        assert_eq!(
+            api.store().timestamp_for("k"),
+            Some(&h1),
+            "a redundant pull merge must not advance the per-key timestamp"
+        );
+        assert_eq!(
+            api.store().visible_origins().get("node-a"),
+            Some(&h2),
+            "the visible frontier must cover the no-op contribution"
+        );
+        assert_eq!(api.redundant_merge_skips(), 1);
+    }
+
+    /// Counter-example guard: floor-only and counter-only progress IS a
+    /// state change and must keep re-stamping (propagation must not
+    /// stall), while a stale re-offer below the floor is skipped.
+    #[test]
+    fn floor_and_counter_progress_restamps_stale_reoffer_skips() {
+        let n = node("node-a");
+        let mut api = EventualApi::new(node("node-b"));
+
+        // Baseline: a live set element.
+        let mut base = OrSet::new();
+        base.add("x".to_string(), &n);
+        api.merge_remote("k".into(), &CrdtValue::Set(base.clone()))
+            .unwrap();
+        let ts0 = api.store().timestamp_for("k").cloned().unwrap();
+
+        // Floor-bearing state (remove + certified sweep on the sender):
+        // the floor kill is a real change → re-stamped.
+        let mut swept = base.clone();
+        swept.remove(&"x".to_string());
+        swept.compact_deferred_certified(&swept.deferred_dots().clone(), None);
+        api.merge_remote("k".into(), &CrdtValue::Set(swept.clone()))
+            .unwrap();
+        let ts1 = api.store().timestamp_for("k").cloned().unwrap();
+        assert!(ts1 > ts0, "floor progress must re-stamp");
+        assert_eq!(api.redundant_merge_skips(), 0);
+
+        // Stale re-offer of the pre-sweep state (live dot below the
+        // inherited floor): rejected → skipped, timestamp frozen.
+        api.merge_remote("k".into(), &CrdtValue::Set(base)).unwrap();
+        assert_eq!(api.store().timestamp_for("k"), Some(&ts1));
+        assert_eq!(api.redundant_merge_skips(), 1);
+
+        // Counter-only progress: a genuinely newer add counter → re-stamped.
+        let mut advanced = swept.clone();
+        advanced.add("y".to_string(), &n);
+        api.merge_remote("k".into(), &CrdtValue::Set(advanced))
+            .unwrap();
+        let ts2 = api.store().timestamp_for("k").cloned().unwrap();
+        assert!(ts2 > ts1, "real progress must keep re-stamping");
+        assert_eq!(api.redundant_merge_skips(), 1);
+    }
+
+    /// A key poisoned by a TRANSIENT WAL-append failure must bypass the
+    /// RR gate. The failed merge left the inflated state in memory
+    /// without its data record in the WAL; the sender's retry of the
+    /// same value arrives as a state no-op, and swallowing it would
+    /// acknowledge data the WAL does not carry (the sender advances its
+    /// push frontier past it) — deferring the durability repair from
+    /// the next sync round to a post-crash digest anti-entropy cycle.
+    #[test]
+    fn wal_poisoned_key_bypasses_rr_gate_and_repairs_data_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let mut api = EventualApi::recovered(node("node-b"), Store::new(), Some(wal));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        api.merge_remote("k".into(), &CrdtValue::Counter(remote.clone()))
+            .unwrap();
+
+        // The sender pushes an inflating update; the data-record append
+        // fails transiently (I/O error without process fail-stop). The
+        // state IS merged in memory, the key is poisoned, and the error
+        // propagates — the sender does not advance its push frontier.
+        remote.increment(&node("node-a"));
+        let v2 = CrdtValue::Counter(remote);
+        api.wal.as_mut().unwrap().inject_append_failures(1);
+        api.merge_remote("k".into(), &v2).unwrap_err();
+        assert!(api.store().merge_failed_contains("k"));
+        // Only ONE failure was injected: the MergeFailed poison record
+        // itself reached the WAL, so last_wal_pos is the poison record.
+        let pos_after_poison = api.last_wal_pos().unwrap();
+        let ts_after_failure = api.store().timestamp_for("k").cloned().unwrap();
+
+        // The sender re-pushes the same value next round: a state no-op
+        // on a tracked key, but poisoned — the RR gate must NOT swallow
+        // it. The retry re-stamps and re-appends the data record.
+        api.merge_remote("k".into(), &v2).unwrap();
+        assert_eq!(
+            api.redundant_merge_skips(),
+            0,
+            "a poisoned key must never be RR-skipped"
+        );
+        assert!(
+            api.last_wal_pos().unwrap() > pos_after_poison,
+            "the retry must append the missing data record"
+        );
+        assert!(
+            api.store().timestamp_for("k").unwrap() > &ts_after_failure,
+            "the retry must re-stamp the key"
+        );
+    }
+
+    /// Pull-path twin of the test above: a no-op `merge_remote_with_hlc`
+    /// on a WAL-poisoned key must re-attempt the UpsertVisible append
+    /// instead of being swallowed by the RR gate.
+    #[test]
+    fn wal_poisoned_key_bypasses_rr_gate_on_pull_path_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let mut api = EventualApi::recovered(node("node-b"), Store::new(), Some(wal));
+
+        let mut remote = PnCounter::new();
+        remote.increment(&node("node-a"));
+        api.merge_remote_with_hlc(
+            "k".into(),
+            &CrdtValue::Counter(remote.clone()),
+            hlc_ts(100, 0, "node-a"),
+        )
+        .unwrap();
+
+        remote.increment(&node("node-a"));
+        let v2 = CrdtValue::Counter(remote);
+        let h2 = hlc_ts(200, 0, "node-a");
+        api.wal.as_mut().unwrap().inject_append_failures(1);
+        api.merge_remote_with_hlc("k".into(), &v2, h2.clone())
+            .unwrap_err();
+        assert!(api.store().merge_failed_contains("k"));
+        let pos_after_poison = api.last_wal_pos().unwrap();
+
+        // Re-offer of the same entry (the peer frontier was not advanced
+        // past the failed batch): no-op merge, tracked key, poisoned —
+        // the gate must let the WAL repair through.
+        api.merge_remote_with_hlc("k".into(), &v2, h2).unwrap();
+        assert_eq!(api.redundant_merge_skips(), 0);
+        assert!(
+            api.last_wal_pos().unwrap() > pos_after_poison,
+            "the retry must append the missing UpsertVisible record"
+        );
     }
 }

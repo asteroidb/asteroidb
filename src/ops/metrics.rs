@@ -319,6 +319,47 @@ pub struct RuntimeMetrics {
     /// relative to the legacy full dump.
     pub digest_sync_keys_skipped_total: AtomicU64,
 
+    /// Gauge: per-node dot-floor walks stalled on a LEGACY HOLE at the
+    /// latest EXECUTED tombstone-GC sweep (a dot the pre-floor sweep
+    /// physically deleted cluster-wide). Mark-only and gate-blocked GC
+    /// ticks do NOT overwrite this gauge (they run ~4 ticks out of 5
+    /// under the default interval/retention and would flap a persistent
+    /// stall to 0); the value holds until the next sweep actually runs.
+    /// A persistent non-zero value is the signal to enable Stage 2
+    /// hole-jump (`ASTEROIDB_GC_HOLE_JUMP=1`) after a Stage 1 soak — see
+    /// docs/ops-guide.md.
+    pub gc_floor_stalled_hole_dots: AtomicU64,
+
+    /// Gauge: floor walks stalled on a post-mark tombstone at the latest
+    /// EXECUTED sweep (transient — the next gated cycle covers them).
+    /// Like `gc_floor_stalled_hole_dots`, only updated by passes that
+    /// actually swept.
+    pub gc_floor_stalled_uncandidated_dots: AtomicU64,
+
+    /// Cumulative incoming tombstones REJECTED because the merged
+    /// compaction floor already covers them (redundant with
+    /// "floor + absence"). Sustained growth during a rolling upgrade
+    /// means v1 peers are still re-offering stale tombstones — the
+    /// completion signal for the upgrade.
+    pub gc_floor_rejected_dots_total: AtomicU64,
+
+    /// Cumulative stale live dots suppressed by the compaction floor on
+    /// merge (local dots killed via a peer's floor + incoming stale dots
+    /// rejected by ours): removes learned from the floor alone, e.g.
+    /// from replicas that missed the tombstone (unknown replicas,
+    /// delayed pushes).
+    pub gc_floor_killed_by_floor_total: AtomicU64,
+
+    /// Cumulative remote merges skipped by the RR gate (redundant-relay
+    /// suppression, M-6): the received value did not inflate local state
+    /// and the key was already delta-visible, so no local re-stamp /
+    /// change-log / WAL write happened. Mirrored from
+    /// `EventualApi::redundant_merge_skips` on each GC tick. A steadily
+    /// growing value in an idle cluster is HEALTHY (converged keys'
+    /// echoes being absorbed); a value stuck at 0 under bidirectional
+    /// sync of a converged store indicates the ping-pong regression.
+    pub sync_redundant_merge_skips_total: AtomicU64,
+
     /// Cumulative number of digest push probes (before a full-state push).
     pub digest_push_probe_total: AtomicU64,
 
@@ -370,8 +411,76 @@ pub struct RuntimeMetrics {
     pub equivocation_accused_authorities: AtomicU64,
 
     /// Cumulative count of relayed attestations verified and cross-checked
-    /// via the split-view gossip lane.
+    /// via the split-view gossip lane (both lanes: frontier push and, since
+    /// M-14, the delta/digest sync piggyback — continuity metric).
     pub split_view_observations_total: AtomicU64,
+
+    /// Delta/digest sync requests whose piggybacked observation lane was
+    /// non-empty and processed (M-14; registry-less nodes drop the lane
+    /// without counting).
+    pub observed_relay_sync_requests_total: AtomicU64,
+
+    /// Relayed attestations that passed signature verification and were
+    /// fed to the equivocation detector via the sync piggyback lane (M-14).
+    /// Known-exact echoes and range non-members are not counted.
+    pub observed_relay_sync_accepted_total: AtomicU64,
+
+    /// Attestations rejected at pool admission: unknown range, non-member
+    /// signer, or missing placement policy (zero under honest load).
+    pub attestation_rejected_unknown_range_total: AtomicU64,
+
+    /// Attestations rejected at pool admission: policy version outside the
+    /// accepted window around the current version (zero under honest load).
+    pub attestation_rejected_version_window_total: AtomicU64,
+
+    /// Frontier reports admitted with a policy version BEHIND the range's
+    /// current version (M-17). Sustained growth means some authority's
+    /// namespace is lagging the control plane (frozen observer, minority
+    /// partition voter) — its certification contribution disappears once
+    /// the stale version is fenced. Zero in steady state.
+    pub attestation_stale_version_total: AtomicU64,
+
+    /// Frontier reports dropped because their (range, version) scope was
+    /// fenced (M-17): confirmation that a lagging authority has stopped
+    /// contributing to certification for that scope. Zero in steady state.
+    pub attestation_rejected_fenced_total: AtomicU64,
+
+    /// Attestation inserts rejected by the pool's global scope cap.
+    pub attestation_rejected_scope_cap_total: AtomicU64,
+
+    /// Attestation inserts rejected by the pool's per-authority scope cap.
+    pub attestation_rejected_authority_cap_total: AtomicU64,
+
+    /// Gauge: number of scopes currently tracked by the attestation pool.
+    pub attestation_pool_scopes: AtomicU64,
+
+    /// Cumulative attestations removed by accused-authority purges (m-7).
+    pub attestation_purged_total: AtomicU64,
+
+    /// Frontier report ticks whose `digest_hash` fell back to the cold
+    /// sentinel because the store digest cache was not warm (M-12).
+    /// Occasional after restarts/bursts; sustained growth means warm-up
+    /// never converges and reports carry no content binding.
+    pub frontier_digest_cold_total: AtomicU64,
+
+    /// Frontier report ticks skipped entirely because the report clock
+    /// floor could not be persisted (M-12). Zero in healthy operation; any
+    /// growth means the data dir is not writable and this authority has
+    /// stopped reporting (certification liveness impact).
+    pub frontier_report_skipped_floor_total: AtomicU64,
+
+    /// Frontier reports ACCEPTED from remote authorities whose
+    /// `digest_hash` does not bind store content (not `sd<v>:<64 hex>` —
+    /// legacy placeholders, `sd2:cold`/`sd2:unavailable` sentinels, or
+    /// arbitrary strings). Receive-side observability (M-12): content
+    /// binding is enforced only by the reporter's own honest code path, so
+    /// a malicious authority can permanently opt out of it without ever
+    /// producing detectable misbehaviour; sustained growth attributable to
+    /// one authority (see the per-report debug log / GET
+    /// /api/internal/frontiers) is the only signal of that opt-out.
+    /// Transient non-zero values are normal during rolling upgrades
+    /// (placeholder-era peers) and cold-cache windows.
+    pub frontier_nonbinding_digest_total: AtomicU64,
 
     /// Per-key write operation counts for accurate per-range compaction tracking.
     ///
@@ -410,6 +519,11 @@ impl Default for RuntimeMetrics {
             digest_sync_failed_total: AtomicU64::default(),
             digest_sync_keys_transferred_total: AtomicU64::default(),
             digest_sync_keys_skipped_total: AtomicU64::default(),
+            gc_floor_stalled_hole_dots: AtomicU64::default(),
+            gc_floor_stalled_uncandidated_dots: AtomicU64::default(),
+            gc_floor_rejected_dots_total: AtomicU64::default(),
+            gc_floor_killed_by_floor_total: AtomicU64::default(),
+            sync_redundant_merge_skips_total: AtomicU64::default(),
             digest_push_probe_total: AtomicU64::default(),
             digest_push_match_total: AtomicU64::default(),
             digest_push_keys_pushed_total: AtomicU64::default(),
@@ -426,6 +540,19 @@ impl Default for RuntimeMetrics {
             equivocation_last_detected_ms: AtomicU64::default(),
             equivocation_accused_authorities: AtomicU64::default(),
             split_view_observations_total: AtomicU64::default(),
+            observed_relay_sync_requests_total: AtomicU64::default(),
+            observed_relay_sync_accepted_total: AtomicU64::default(),
+            attestation_rejected_unknown_range_total: AtomicU64::default(),
+            attestation_rejected_version_window_total: AtomicU64::default(),
+            attestation_stale_version_total: AtomicU64::default(),
+            attestation_rejected_fenced_total: AtomicU64::default(),
+            attestation_rejected_scope_cap_total: AtomicU64::default(),
+            attestation_rejected_authority_cap_total: AtomicU64::default(),
+            attestation_pool_scopes: AtomicU64::default(),
+            attestation_purged_total: AtomicU64::default(),
+            frontier_digest_cold_total: AtomicU64::default(),
+            frontier_report_skipped_floor_total: AtomicU64::default(),
+            frontier_nonbinding_digest_total: AtomicU64::default(),
             write_ops_by_key: Mutex::new(HashMap::new()),
             peer_sync_stats: Mutex::new(HashMap::new()),
             certification_latency_window: Mutex::new(CertificationLatencyWindow::default()),
@@ -613,6 +740,55 @@ impl RuntimeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one sync request (delta/digest) that carried a non-empty
+    /// piggybacked observation lane (M-14).
+    pub fn record_observed_relay_sync_request(&self) {
+        self.observed_relay_sync_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one relayed attestation accepted (verified and fed to the
+    /// detector) via the sync piggyback lane (M-14).
+    pub fn record_observed_relay_sync_accepted(&self) {
+        self.observed_relay_sync_accepted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sync the attestation pool gauges/counters from a
+    /// `CertifiedApi::attestation_stats()` snapshot (event-driven: called
+    /// after frontier applies and self-reports). The stats are owned by the
+    /// `CertifiedApi` (they survive inside its lock), so the metrics side
+    /// stores absolute values rather than deltas.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_attestation_pool_stats(
+        &self,
+        scopes: u64,
+        rejected_unknown_range: u64,
+        rejected_version_window: u64,
+        stale_version: u64,
+        rejected_fenced: u64,
+        rejected_scope_cap: u64,
+        rejected_authority_cap: u64,
+        purged: u64,
+    ) {
+        self.attestation_pool_scopes
+            .store(scopes, Ordering::Relaxed);
+        self.attestation_rejected_unknown_range_total
+            .store(rejected_unknown_range, Ordering::Relaxed);
+        self.attestation_rejected_version_window_total
+            .store(rejected_version_window, Ordering::Relaxed);
+        self.attestation_stale_version_total
+            .store(stale_version, Ordering::Relaxed);
+        self.attestation_rejected_fenced_total
+            .store(rejected_fenced, Ordering::Relaxed);
+        self.attestation_rejected_scope_cap_total
+            .store(rejected_scope_cap, Ordering::Relaxed);
+        self.attestation_rejected_authority_cap_total
+            .store(rejected_authority_cap, Ordering::Relaxed);
+        self.attestation_purged_total
+            .store(purged, Ordering::Relaxed);
+    }
+
     /// Record the completion of a rebalance operation.
     pub fn record_rebalance_complete(&self, _key_range: &str, duration: Duration) {
         self.rebalance_complete_total
@@ -681,6 +857,39 @@ impl RuntimeMetrics {
             split_view_observations_total: self
                 .split_view_observations_total
                 .load(Ordering::Relaxed),
+            observed_relay_sync_requests_total: self
+                .observed_relay_sync_requests_total
+                .load(Ordering::Relaxed),
+            observed_relay_sync_accepted_total: self
+                .observed_relay_sync_accepted_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_unknown_range_total: self
+                .attestation_rejected_unknown_range_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_version_window_total: self
+                .attestation_rejected_version_window_total
+                .load(Ordering::Relaxed),
+            attestation_stale_version_total: self
+                .attestation_stale_version_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_fenced_total: self
+                .attestation_rejected_fenced_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_scope_cap_total: self
+                .attestation_rejected_scope_cap_total
+                .load(Ordering::Relaxed),
+            attestation_rejected_authority_cap_total: self
+                .attestation_rejected_authority_cap_total
+                .load(Ordering::Relaxed),
+            attestation_pool_scopes: self.attestation_pool_scopes.load(Ordering::Relaxed),
+            attestation_purged_total: self.attestation_purged_total.load(Ordering::Relaxed),
+            frontier_digest_cold_total: self.frontier_digest_cold_total.load(Ordering::Relaxed),
+            frontier_report_skipped_floor_total: self
+                .frontier_report_skipped_floor_total
+                .load(Ordering::Relaxed),
+            frontier_nonbinding_digest_total: self
+                .frontier_nonbinding_digest_total
+                .load(Ordering::Relaxed),
             delta_sync_count: self.delta_sync_count.load(Ordering::Relaxed),
             full_sync_fallback_count: self.full_sync_fallback_count.load(Ordering::Relaxed),
             full_sync_fallback_ratio: self.full_sync_fallback_ratio(),
@@ -701,6 +910,17 @@ impl RuntimeMetrics {
             digest_push_match_total: self.digest_push_match_total.load(Ordering::Relaxed),
             digest_push_keys_pushed_total: self
                 .digest_push_keys_pushed_total
+                .load(Ordering::Relaxed),
+            gc_floor_stalled_hole_dots: self.gc_floor_stalled_hole_dots.load(Ordering::Relaxed),
+            gc_floor_stalled_uncandidated_dots: self
+                .gc_floor_stalled_uncandidated_dots
+                .load(Ordering::Relaxed),
+            gc_floor_rejected_dots_total: self.gc_floor_rejected_dots_total.load(Ordering::Relaxed),
+            gc_floor_killed_by_floor_total: self
+                .gc_floor_killed_by_floor_total
+                .load(Ordering::Relaxed),
+            sync_redundant_merge_skips_total: self
+                .sync_redundant_merge_skips_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -777,6 +997,41 @@ pub struct MetricsSnapshot {
     pub equivocation_accused_authorities: u64,
     /// Cumulative relayed attestations processed via the split-view gossip lane.
     pub split_view_observations_total: u64,
+    /// Sync requests (delta/digest) whose piggybacked observation lane was
+    /// non-empty and processed (M-14).
+    pub observed_relay_sync_requests_total: u64,
+    /// Relayed attestations verified and fed to the detector via the sync
+    /// piggyback lane (M-14).
+    pub observed_relay_sync_accepted_total: u64,
+    /// Attestations rejected at pool admission (unknown range / non-member
+    /// signer / missing policy). Zero under honest load; growth signals a
+    /// flood or a misconfigured authority.
+    pub attestation_rejected_unknown_range_total: u64,
+    /// Attestations rejected at pool admission (policy version outside the
+    /// accepted window). Zero under honest load.
+    pub attestation_rejected_version_window_total: u64,
+    /// Frontier reports admitted with a policy version behind the current
+    /// one (M-17: lagging authority namespace — the earliest silent-fence
+    /// symptom, fires from the first bump). Zero in steady state.
+    pub attestation_stale_version_total: u64,
+    /// Frontier reports dropped because their (range, version) scope was
+    /// fenced (M-17: the lagging authority has stopped contributing).
+    pub attestation_rejected_fenced_total: u64,
+    /// Attestation inserts rejected by the pool's global scope cap.
+    pub attestation_rejected_scope_cap_total: u64,
+    /// Attestation inserts rejected by the pool's per-authority scope cap.
+    pub attestation_rejected_authority_cap_total: u64,
+    /// Gauge: scopes currently tracked by the attestation pool.
+    pub attestation_pool_scopes: u64,
+    /// Cumulative attestations removed by accused-authority purges.
+    pub attestation_purged_total: u64,
+    /// Frontier report ticks that fell back to the cold digest sentinel.
+    pub frontier_digest_cold_total: u64,
+    /// Frontier report ticks skipped because the clock floor fsync failed.
+    pub frontier_report_skipped_floor_total: u64,
+    /// Accepted remote frontier reports whose digest binds no store
+    /// content (placeholder / sentinel / malformed format).
+    pub frontier_nonbinding_digest_total: u64,
     /// Cumulative number of delta syncs performed (push phase).
     pub delta_sync_count: u64,
     /// Cumulative number of full sync fallbacks triggered by high change rate.
@@ -804,6 +1059,20 @@ pub struct MetricsSnapshot {
     pub digest_push_match_total: u64,
     /// Keys pushed via digest subset pushes (instead of the full store).
     pub digest_push_keys_pushed_total: u64,
+    /// Gauge: floor walks stalled on legacy holes at the latest GC sweep
+    /// (Stage 2 hole-jump resolves; see docs/ops-guide.md).
+    pub gc_floor_stalled_hole_dots: u64,
+    /// Gauge: floor walks stalled on post-mark tombstones at the latest
+    /// GC sweep (transient).
+    pub gc_floor_stalled_uncandidated_dots: u64,
+    /// Cumulative incoming tombstones rejected as floor-covered (v1
+    /// re-injection pressure during rolling upgrades).
+    pub gc_floor_rejected_dots_total: u64,
+    /// Cumulative stale live dots suppressed by the compaction floor.
+    pub gc_floor_killed_by_floor_total: u64,
+    /// Cumulative remote merges skipped by the RR gate (no-op merge on an
+    /// already delta-visible key; M-6).
+    pub sync_redundant_merge_skips_total: u64,
 }
 
 #[cfg(test)]
@@ -829,6 +1098,41 @@ mod tests {
         assert_eq!(snap.equivocation_last_detected_ms, 5_678);
         assert_eq!(snap.equivocation_accused_authorities, 2);
         assert_eq!(snap.split_view_observations_total, 1);
+    }
+
+    #[test]
+    fn attestation_pool_metrics_default_zero_and_set() {
+        let metrics = RuntimeMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_rejected_unknown_range_total, 0);
+        assert_eq!(snap.attestation_rejected_version_window_total, 0);
+        assert_eq!(snap.attestation_stale_version_total, 0);
+        assert_eq!(snap.attestation_rejected_fenced_total, 0);
+        assert_eq!(snap.attestation_rejected_scope_cap_total, 0);
+        assert_eq!(snap.attestation_rejected_authority_cap_total, 0);
+        assert_eq!(snap.attestation_pool_scopes, 0);
+        assert_eq!(snap.attestation_purged_total, 0);
+
+        metrics.set_attestation_pool_stats(4, 1, 2, 7, 8, 3, 5, 6);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_pool_scopes, 4);
+        assert_eq!(snap.attestation_rejected_unknown_range_total, 1);
+        assert_eq!(snap.attestation_rejected_version_window_total, 2);
+        assert_eq!(snap.attestation_stale_version_total, 7);
+        assert_eq!(snap.attestation_rejected_fenced_total, 8);
+        assert_eq!(snap.attestation_rejected_scope_cap_total, 3);
+        assert_eq!(snap.attestation_rejected_authority_cap_total, 5);
+        assert_eq!(snap.attestation_purged_total, 6);
+
+        // Absolute-value semantics: a later sync overwrites, never adds.
+        metrics.set_attestation_pool_stats(1, 1, 2, 7, 8, 3, 5, 6);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.attestation_pool_scopes, 1);
+
+        // Snapshot serialization carries the new fields.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["attestation_pool_scopes"], 1);
+        assert_eq!(json["attestation_purged_total"], 6);
     }
 
     #[test]

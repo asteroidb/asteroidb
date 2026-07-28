@@ -89,6 +89,9 @@ harness = false
 [[bench]]
 name = "store_bench"
 harness = false
+# The WAL benches drive the real group-commit flusher (WalWriter::syncer /
+# WalSyncer::run_flusher), which is native-runtime-gated.
+required-features = ["native-runtime"]
 
 [[bench]]
 name = "certified_bench"
@@ -105,4 +108,8 @@ harness = false
 
 [[bench]]
 name = "compaction_bench"
+harness = false
+
+[[bench]]
+name = "digest_bench"
 harness = false

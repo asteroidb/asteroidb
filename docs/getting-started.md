@@ -186,6 +186,7 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `POST` | `/api/internal/raft/vote` | Control plane Raft: RequestVote RPC |
 | `POST` | `/api/internal/raft/append` | Control plane Raft: AppendEntries RPC（ハートビート兼ログ複製） |
 | `POST` | `/api/internal/raft/snapshot` | Control plane Raft: InstallSnapshot RPC（単一メッセージ） |
+| `POST` | `/api/internal/raft/namespace` | Control plane Raft: observer による namespace snapshot の pull 取得 |
 
 #### Control Plane API
 
@@ -208,6 +209,7 @@ ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 | `GET` | `/api/slo` | SLO ステータス取得 |
 | `GET` | `/api/topology` | クラスタトポロジービュー取得 |
 | `GET` | `/api/authority/equivocations` | Authority equivocation 証拠取得（第三者検証可能な署名付きペア） |
+| `DELETE` | `/api/authority/equivocations/{authority_id}` | 指定 Authority の equivocation 証拠を purge（誤検知からの復旧用。mutation のため internal token 認証が必要） |
 
 ### 3.1 Eventual Read/Write
 

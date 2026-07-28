@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -39,8 +40,8 @@ use super::storage::RaftStorage;
 use super::transport::RaftTransport;
 use super::types::{
     AppendEntriesRequest, AppendEntriesResponse, ApplyOutcome, AuthoritySpec, ControlPlaneCommand,
-    ControlPlaneState, InstallSnapshotRequest, InstallSnapshotResponse, PolicySpec,
-    RequestVoteRequest, RequestVoteResponse,
+    ControlPlaneState, InstallSnapshotRequest, InstallSnapshotResponse, NamespaceSnapshotRequest,
+    NamespaceSnapshotResponse, PolicySpec, RequestVoteRequest, RequestVoteResponse,
 };
 
 /// Tuning knobs. Defaults are conservative, sized for high-latency links
@@ -55,6 +56,13 @@ pub struct RaftConfig {
     /// Compact the log (fold applied entries into the snapshot) once the
     /// tail exceeds this many entries.
     pub log_max: usize,
+    /// Non-voter (observer) namespace pull interval (M-17): how often an
+    /// observer fetches a voter's committed control-plane state so its
+    /// namespace projection — and therefore the policy version its
+    /// authority signatures carry — keeps following policy bumps.
+    /// `Duration::ZERO` disables the pull loop (test/repro use only:
+    /// a disabled pull re-freezes the observer namespace).
+    pub observer_pull_interval: Duration,
 }
 
 impl Default for RaftConfig {
@@ -65,6 +73,7 @@ impl Default for RaftConfig {
             heartbeat_interval: Duration::from_millis(1_000),
             propose_timeout: Duration::from_millis(30_000),
             log_max: 4096,
+            observer_pull_interval: Duration::from_millis(5_000),
         }
     }
 }
@@ -81,9 +90,45 @@ pub struct RaftStatus {
     pub last_applied: u64,
     pub last_log_index: u64,
     pub voters: Vec<String>,
+    /// Cumulative successful observer namespace pulls (M-17; 0 on voters).
+    pub observer_ns_pull_success_total: u64,
+    /// Cumulative failed observer namespace pulls (M-17; 0 on voters).
+    pub observer_ns_pull_failure_total: u64,
+    /// Wall-clock ms of the last successful pull (0 = never pulled).
+    pub observer_ns_last_pull_unix_ms: u64,
+    /// The replicated version counter of the local control-plane state —
+    /// on an observer, compare against a voter's to gauge namespace lag.
+    pub observer_ns_version_counter: u64,
 }
 
 type Waiter = (u64, oneshot::Sender<Result<ApplyOutcome, CrdtError>>);
+
+/// Outcome of an adoption attempt on a pulled committed snapshot (M-17).
+///
+/// The distinction matters for the pull metrics: `Adopted` and `NotNewer`
+/// are HEALTHY rounds (they prove a voter was reached and answered with
+/// its committed state — counted as success, refreshing the pull-age
+/// freshness signal), while `RejectedResponder` is a misconfiguration
+/// that leaves the namespace frozen and must therefore count as a FAILED
+/// pull — otherwise `observer_ns_last_pull_unix_ms` would stay green while
+/// the observer silently re-freezes (the exact posture M-17 removes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// Strictly newer committed state was installed (and persisted).
+    Adopted,
+    /// Healthy no-op: the pulled state is not newer than the local view
+    /// (the steady state between policy changes).
+    NotNewer,
+    /// Defensive no-op: this node is a voter — voters only ingest state
+    /// via regular Raft replication (the pull loop never runs on voters,
+    /// so this is unreachable in practice).
+    VoterRefusal,
+    /// The responder is not in the local voter set: address
+    /// mis-resolution or a zombie removed from the env. Nothing was
+    /// adopted and nothing ever will be until the operator fixes the
+    /// address mapping.
+    RejectedResponder,
+}
 
 /// Sidecar marker persisted next to `system_namespace.json` after every
 /// successful namespace persist: the raft log index whose apply produced
@@ -96,6 +141,15 @@ type Waiter = (u64, oneshot::Sender<Result<ApplyOutcome, CrdtError>>);
 struct NamespaceApplyMarker {
     applied_index: u64,
     ns_version: u64,
+    /// Replicated `ControlPlaneState::version_counter` at the apply that
+    /// produced this JSON. Together with `applied_index` it gives the
+    /// observer pull guard a floor covering the KEPT persisted namespace
+    /// view, which can be ahead of the compaction snapshot the in-memory
+    /// state is restored from (see `adopt_pulled_snapshot`). `None` in
+    /// markers written before this field existed — those fall back to the
+    /// snapshot pair (the previous, conservative behaviour).
+    #[serde(default)]
+    version_counter: Option<u64>,
 }
 
 /// `<ns_path>.applied` (e.g. `system_namespace.json.applied`).
@@ -120,6 +174,17 @@ struct Inner {
     /// Replicated state at `core.snapshot_meta` (what `log.json` and
     /// InstallSnapshot carry). Always in sync with `core.snapshot_meta`.
     snapshot_state: ControlPlaneState,
+    /// Observer pull-adoption floor (M-17): the `(version_counter,
+    /// applied_index)` pair the persisted namespace view was proven to be
+    /// at when startup KEPT it instead of installing the compaction
+    /// snapshot. `state`/`last_applied` are restored from the snapshot,
+    /// which can trail the kept view by up to `log_max` applies (a voter
+    /// persists the namespace on every apply but compacts rarely); without
+    /// this floor a demoted ex-voter observer would adopt a pulled
+    /// snapshot that is newer than its compaction snapshot yet OLDER than
+    /// its persisted namespace — durably rolling the namespace (and the
+    /// policy version its authority signatures carry) back.
+    adopt_floor: (u64, u64),
     /// Proposal waiters keyed by log index, holding the term the entry was
     /// proposed in: a waiter succeeds only if the entry that eventually
     /// commits at that index still carries that term.
@@ -159,6 +224,11 @@ pub struct RaftNode {
     voters: BTreeSet<NodeId>,
     /// Notifies the driver to reset its randomized election timer.
     election_reset: tokio::sync::Notify,
+    /// Observer namespace pull counters (M-17). Only the observer pull
+    /// loop writes them; they stay 0 on voters.
+    observer_pull_success: AtomicU64,
+    observer_pull_failure: AtomicU64,
+    observer_last_pull_ms: AtomicU64,
 }
 
 impl RaftNode {
@@ -217,19 +287,26 @@ impl RaftNode {
         // versions are assigned from the replicated counter, so re-applies
         // are idempotent upserts. When no compaction has happened yet
         // (index 0) the namespace always keeps its locally persisted view.
+        let marker = namespace_persist_path
+            .as_deref()
+            .and_then(load_apply_marker);
+        // A marker only speaks for the CURRENT JSON incarnation.
+        let marker_matches_ns = marker.as_ref().is_some_and(|m| {
+            m.ns_version
+                == namespace
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .version()
+                    .0
+        });
+        // Whether the locally persisted namespace view survives startup
+        // (as opposed to being overwritten by the compaction snapshot).
+        let mut kept_persisted_view = true;
         if snapshot_meta.last_included_index > 0 {
-            let ns_at_or_beyond = namespace_persist_path
-                .as_deref()
-                .and_then(load_apply_marker)
-                .is_some_and(|marker| {
-                    marker.applied_index >= snapshot_meta.last_included_index
-                        && marker.ns_version
-                            == namespace
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .version()
-                                .0
-                });
+            let ns_at_or_beyond = marker_matches_ns
+                && marker
+                    .as_ref()
+                    .is_some_and(|m| m.applied_index >= snapshot_meta.last_included_index);
             if ns_at_or_beyond {
                 tracing::info!(
                     snapshot_index = snapshot_meta.last_included_index,
@@ -237,9 +314,31 @@ impl RaftNode {
                      raft snapshot); committed entries replay over it"
                 );
             } else {
+                kept_persisted_view = false;
                 let mut ns = namespace.write().unwrap_or_else(|e| e.into_inner());
                 state_machine::install(&snapshot_state, &mut ns);
             }
+        }
+
+        // Observer pull-adoption floor: when the (possibly newer) persisted
+        // namespace view was kept, the marker's pair is the freshest state
+        // this node has durably exposed — a pulled snapshot must beat it,
+        // not merely the compaction snapshot, or the pull would durably
+        // roll the kept view back (see the `Inner::adopt_floor` docs).
+        // Markers without the counter (pre-existing format) fall back to
+        // the snapshot pair. A disaster-recovery Bootstrap re-floors the
+        // counter and increments it per imported policy, so its (higher
+        // counter, low index) states still clear this lexicographic floor.
+        let mut adopt_floor = (
+            snapshot_state.version_counter,
+            snapshot_meta.last_included_index,
+        );
+        if kept_persisted_view
+            && marker_matches_ns
+            && let Some(m) = &marker
+            && let Some(counter) = m.version_counter
+        {
+            adopt_floor = adopt_floor.max((counter, m.applied_index));
         }
 
         let node = Arc::new(Self {
@@ -247,6 +346,7 @@ impl RaftNode {
                 core,
                 state: snapshot_state.clone(),
                 snapshot_state,
+                adopt_floor,
                 waiters: HashMap::new(),
                 hard_dirty: false,
                 log_dirty: false,
@@ -259,6 +359,9 @@ impl RaftNode {
             self_id: self_id.clone(),
             voters: voters.clone(),
             election_reset: tokio::sync::Notify::new(),
+            observer_pull_success: AtomicU64::new(0),
+            observer_pull_failure: AtomicU64::new(0),
+            observer_last_pull_ms: AtomicU64::new(0),
         });
 
         if voters.len() == 1 && voters.contains(&self_id) {
@@ -279,8 +382,18 @@ impl RaftNode {
         self.voters.contains(&self.self_id)
     }
 
+    pub fn self_id(&self) -> &NodeId {
+        &self.self_id
+    }
+
     pub fn voters(&self) -> &BTreeSet<NodeId> {
         &self.voters
+    }
+
+    /// Wall-clock ms of the last successful observer namespace pull
+    /// (0 = never). Used by the driver's pull-age staleness warning.
+    pub fn observer_last_pull_unix_ms(&self) -> u64 {
+        self.observer_last_pull_ms.load(Ordering::Relaxed)
     }
 
     /// Await-able election timer reset signal (driver).
@@ -329,6 +442,10 @@ impl RaftNode {
             last_applied: inner.core.last_applied,
             last_log_index: inner.core.last_log_index(),
             voters: self.voters.iter().map(|v| v.0.clone()).collect(),
+            observer_ns_pull_success_total: self.observer_pull_success.load(Ordering::Relaxed),
+            observer_ns_pull_failure_total: self.observer_pull_failure.load(Ordering::Relaxed),
+            observer_ns_last_pull_unix_ms: self.observer_last_pull_ms.load(Ordering::Relaxed),
+            observer_ns_version_counter: inner.state.version_counter,
         }
     }
 
@@ -379,22 +496,264 @@ impl RaftNode {
             req.last_included_term,
             Instant::now(),
         );
+        let mut installed_counter = 0;
         if install {
-            inner.snapshot_state = req.state.clone();
-            inner.state = req.state;
-            inner.core.last_applied = last_included;
-            {
-                let mut ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
-                state_machine::install(&inner.state, &mut ns);
-            }
+            self.install_state(&mut inner, req.state, last_included);
+            installed_counter = inner.state.version_counter;
         }
         let outbound = self.run_effects(&mut inner, effects)?;
         drop(inner);
         if install {
-            self.persist_namespace_best_effort(last_included);
+            self.persist_namespace_best_effort(last_included, installed_counter);
         }
         self.dispatch(outbound);
         Ok(resp)
+    }
+
+    /// Install a full replicated state at `last_included_index` into the
+    /// in-memory state and the namespace projection. Shared by the push
+    /// path (`handle_install_snapshot`) and the observer pull path
+    /// (`adopt_pulled_snapshot`) so both leave identical in-memory state;
+    /// the caller is responsible for snapshot-meta/log bookkeeping,
+    /// persistence, and `persist_namespace_best_effort`.
+    fn install_state(&self, inner: &mut Inner, state: ControlPlaneState, last_included_index: u64) {
+        inner.snapshot_state = state.clone();
+        inner.state = state;
+        inner.core.last_applied = last_included_index;
+        let mut ns = self.namespace.write().unwrap_or_else(|e| e.into_inner());
+        state_machine::install(&inner.state, &mut ns);
+    }
+
+    // -----------------------------------------------------------
+    // Observer namespace pull (M-17)
+    // -----------------------------------------------------------
+
+    /// Serve the committed control-plane state (any node; leader not
+    /// required). The state machine only applies committed entries, so
+    /// `inner.state` at `last_applied` is always a committed prefix.
+    pub fn committed_snapshot(&self) -> NamespaceSnapshotResponse {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let last_applied = inner.core.last_applied;
+        // `last_applied` is at-or-beyond the snapshot boundary and within
+        // the retained log, so `term_at` only misses when the log was
+        // damaged; fall back to the snapshot term (conservative).
+        let last_applied_term = inner
+            .core
+            .term_at(last_applied)
+            .unwrap_or(inner.core.snapshot_meta.last_included_term);
+        NamespaceSnapshotResponse {
+            node_id: self.self_id.clone(),
+            term: inner.core.hard.current_term,
+            last_applied_index: last_applied,
+            last_applied_term,
+            state: inner.state.clone(),
+        }
+    }
+
+    /// One observer pull round: fetch `target`'s committed state and adopt
+    /// it when it is strictly newer. Returns whether a snapshot was
+    /// adopted.
+    ///
+    /// Metric contract (what the ops guide's alerts are built on): a round
+    /// counts as SUCCESS — refreshing `observer_ns_last_pull_unix_ms` —
+    /// only when a voter's committed state was actually obtained
+    /// (`Adopted` / `NotNewer` / the defensive voter self-refusal).
+    /// Everything else counts in `observer_ns_pull_failure_total` and
+    /// leaves the freshness timestamp alone: transport errors, responses
+    /// from outside the voter set (address misconfiguration — the fetch
+    /// "succeeds" every round but the namespace stays frozen), and local
+    /// adoption/persistence failures (full or read-only disk).
+    pub async fn pull_namespace_once(self: &Arc<Self>, target: &NodeId) -> Result<bool, CrdtError> {
+        let req = NamespaceSnapshotRequest {
+            requester: self.self_id.clone(),
+        };
+        let resp = match self
+            .transport
+            .fetch_namespace_snapshot(target.clone(), req)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.observer_pull_failure.fetch_add(1, Ordering::Relaxed);
+                return Err(CrdtError::Internal(format!(
+                    "observer namespace pull from {} failed: {e}",
+                    target.0
+                )));
+            }
+        };
+        let responder = resp.node_id.clone();
+        match self.adopt_pulled_snapshot(resp) {
+            Ok(
+                outcome @ (AdoptOutcome::Adopted
+                | AdoptOutcome::NotNewer
+                | AdoptOutcome::VoterRefusal),
+            ) => {
+                self.observer_pull_success.fetch_add(1, Ordering::Relaxed);
+                self.observer_last_pull_ms
+                    .store(crate::hlc::wall_clock_ms(), Ordering::Relaxed);
+                Ok(outcome == AdoptOutcome::Adopted)
+            }
+            Ok(AdoptOutcome::RejectedResponder) => {
+                self.observer_pull_failure.fetch_add(1, Ordering::Relaxed);
+                Err(CrdtError::Internal(format!(
+                    "observer namespace pull from {} rejected: responder {} is \
+                     not in the local voter set — the pulled state was NOT \
+                     adopted (check the ASTEROIDB_RAFT_PEERS / \
+                     ASTEROIDB_CONTROL_PLANE_NODES address mapping)",
+                    target.0, responder.0
+                )))
+            }
+            Err(e) => {
+                // Local adoption/persistence failure: the fetch worked but
+                // nothing durable came of it — a failed round.
+                self.observer_pull_failure.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Adopt a pulled committed snapshot after guarding (M-17).
+    ///
+    /// Guards, in order:
+    /// 1. Voters never adopt (their only ingestion path is regular Raft
+    ///    replication).
+    /// 2. The responder must be in the local voter set (defence against
+    ///    address mis-resolution and zombies removed from the env, same
+    ///    posture as the receiver-side config fencing in `core`).
+    /// 3. Monotonicity: adopt only when
+    ///    `(version_counter, last_applied_index)` is LEXICOGRAPHICALLY
+    ///    greater than the local pair. `Bootstrap` floors the counter and
+    ///    then increments it once per imported policy, and every policy
+    ///    upsert increments it, so within any legal history the pair is
+    ///    monotone; authority-only updates advance the index at an equal
+    ///    counter. An OR-combination over the two components would let a
+    ///    zombie voter (high index, low counter) roll the observer back.
+    ///    The local pair is the max of the LIVE pair and the startup
+    ///    `adopt_floor`: after a restart the live pair is restored from
+    ///    the compaction snapshot, which can trail the kept persisted
+    ///    namespace view by up to `log_max` applies (typical for a voter
+    ///    demoted to observer) — without the floor, a pull from a lagging
+    ///    voter landing in that gap would durably roll the namespace back.
+    ///
+    /// The responder's term is deliberately ignored and hard state
+    /// (`currentTerm` / `votedFor`) is never touched: pulls are unrelated
+    /// to elections, which is what makes a later voter promotion (env
+    /// change + restart) behave exactly like a follower that had received
+    /// an InstallSnapshot.
+    pub fn adopt_pulled_snapshot(
+        &self,
+        resp: NamespaceSnapshotResponse,
+    ) -> Result<AdoptOutcome, CrdtError> {
+        if self.is_voter() {
+            tracing::warn!(
+                from = %resp.node_id.0,
+                "refusing to adopt a pulled namespace snapshot on a voter \
+                 (voters follow the leader's log replication only)"
+            );
+            return Ok(AdoptOutcome::VoterRefusal);
+        }
+        if !self.voters.contains(&resp.node_id) {
+            tracing::warn!(
+                from = %resp.node_id.0,
+                voters = ?self.voters.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
+                "refusing pulled namespace snapshot from a node outside the \
+                 local voter set; check ASTEROIDB_CONTROL_PLANE_NODES / \
+                 ASTEROIDB_RAFT_PEERS address mapping"
+            );
+            return Ok(AdoptOutcome::RejectedResponder);
+        }
+
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let local = (inner.state.version_counter, inner.core.last_applied).max(inner.adopt_floor);
+        let remote = (resp.state.version_counter, resp.last_applied_index);
+        if remote <= local {
+            tracing::debug!(
+                from = %resp.node_id.0,
+                remote_counter = remote.0,
+                remote_index = remote.1,
+                local_counter = local.0,
+                local_index = local.1,
+                "pulled namespace snapshot is not newer; keeping local state"
+            );
+            return Ok(AdoptOutcome::NotNewer);
+        }
+
+        // Flush any previously failed persistence first (same fail-stop
+        // discipline as run_effects: never layer new state over an
+        // unpersisted mutation).
+        self.flush_dirty(&mut inner)?;
+
+        // Snapshot-meta / log bookkeeping, mirroring
+        // `handle_install_snapshot_meta` minus the term/leader handling:
+        // keep a log suffix only when it is consistent with the boundary.
+        let suffix_consistent = matches!(
+            inner.core.term_at(resp.last_applied_index),
+            Some(t) if t == resp.last_applied_term
+        );
+        if suffix_consistent {
+            inner.core.drop_log_through(resp.last_applied_index);
+        } else {
+            inner.core.log.clear();
+        }
+        inner.core.snapshot_meta = SnapshotMeta {
+            last_included_index: resp.last_applied_index,
+            last_included_term: resp.last_applied_term,
+        };
+        inner.core.commit_index = inner.core.commit_index.max(resp.last_applied_index);
+        self.install_state(&mut inner, resp.state, resp.last_applied_index);
+
+        // Term floor: the durable-state invariant requires
+        // `current_term >= max log term` (the storage loader fail-stops
+        // on a violation), so adopting a snapshot boundary at a newer
+        // term must raise our term to at least that boundary — exactly
+        // what a follower does when it receives an InstallSnapshot.
+        // `voted_for` is cleared only on a raise (entering a strictly
+        // newer term with no vote cast — never a double-vote risk). The
+        // RESPONDER's current term (`resp.term`) is still deliberately
+        // unused: only the adopted boundary's own term matters.
+        if resp.last_applied_term > inner.core.hard.current_term {
+            inner.core.hard.current_term = resp.last_applied_term;
+            inner.core.hard.voted_for = None;
+        }
+
+        // Persist the hard state BEFORE the log. An observer never votes,
+        // so `hard_state.json` may not exist yet — and the storage layer
+        // deliberately fail-stops on "log without hard state" at load
+        // (double-vote protection). Without this write, the FIRST restart
+        // after an adoption would refuse to boot. (Design-review finding
+        // during implementation; the push install path never hits this
+        // because InstallSnapshot's term handling persists hard state.)
+        inner.hard_dirty = true;
+        self.storage
+            .save_hard_state(&inner.core.hard)
+            .map_err(|e| CrdtError::Storage(format!("raft hard state: {e}")))?;
+        inner.hard_dirty = false;
+
+        // Persist snapshot + log exactly like the install path (the
+        // Effect::PersistLog arm), so a restart — possibly followed by a
+        // voter promotion — sees the same durable state as a follower
+        // that received this content via InstallSnapshot.
+        inner.log_dirty = true;
+        self.storage
+            .save_log(
+                &inner.core.snapshot_meta,
+                &inner.snapshot_state,
+                &inner.core.log,
+            )
+            .map_err(|e| CrdtError::Storage(format!("raft log: {e}")))?;
+        inner.log_dirty = false;
+
+        let last_included = resp.last_applied_index;
+        let version_counter = inner.state.version_counter;
+        drop(inner);
+        self.persist_namespace_best_effort(last_included, version_counter);
+        tracing::info!(
+            from = %resp.node_id.0,
+            last_applied_index = last_included,
+            version_counter,
+            "adopted pulled control-plane namespace snapshot (observer sync)"
+        );
+        Ok(AdoptOutcome::Adopted)
     }
 
     // -----------------------------------------------------------
@@ -679,7 +1038,10 @@ impl RaftNode {
         }
 
         if applied_any {
-            self.persist_namespace_best_effort(inner.core.last_applied);
+            self.persist_namespace_best_effort(
+                inner.core.last_applied,
+                inner.state.version_counter,
+            );
         }
         Ok(())
     }
@@ -723,10 +1085,12 @@ impl RaftNode {
     /// are logged, not fatal (matches `persist_namespace`'s posture).
     ///
     /// `applied_index` is the raft log index whose apply produced this
-    /// namespace state; it is recorded in the sidecar marker (written only
+    /// namespace state and `version_counter` the replicated counter at
+    /// that point; both are recorded in the sidecar marker (written only
     /// after the namespace write succeeded) so the next startup can prove
-    /// the JSON view is at-or-beyond the compacted snapshot.
-    fn persist_namespace_best_effort(&self, applied_index: u64) {
+    /// the JSON view is at-or-beyond the compacted snapshot and floor the
+    /// observer pull-adoption guard accordingly.
+    fn persist_namespace_best_effort(&self, applied_index: u64, version_counter: u64) {
         let Some(path) = &self.namespace_persist_path else {
             return;
         };
@@ -750,6 +1114,7 @@ impl RaftNode {
         let marker = NamespaceApplyMarker {
             applied_index,
             ns_version,
+            version_counter: Some(version_counter),
         };
         match serde_json::to_vec(&marker) {
             Ok(bytes) => {

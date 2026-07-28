@@ -305,11 +305,11 @@ fn bench_gc_tombstones(c: &mut Criterion) {
                     }
                     let mut gc = gc;
                     // Take the mark in setup; the measured pass is the sweep.
-                    gc.mark_and_sweep(&mut store, 0, true);
+                    gc.mark_and_sweep(&mut store, 0, true, false);
                     (gc, store)
                 },
                 |(mut gc, mut store)| {
-                    let collected = gc.mark_and_sweep(&mut store, 1_000, true);
+                    let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
                     std::hint::black_box(collected);
                 },
                 criterion::BatchSize::SmallInput,
@@ -345,11 +345,11 @@ fn bench_gc_mixed_store(c: &mut Criterion) {
 
                 let mut gc = gc;
                 // Take the mark in setup; the measured pass is the sweep.
-                gc.mark_and_sweep(&mut store, 0, true);
+                gc.mark_and_sweep(&mut store, 0, true, false);
                 (gc, store)
             },
             |(mut gc, mut store)| {
-                let collected = gc.mark_and_sweep(&mut store, 1_000, true);
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,
@@ -378,8 +378,8 @@ fn bench_gc_full_cycle(c: &mut Criterion) {
             },
             |(mut gc, mut store)| {
                 // Full cycle: mark pass + gated sweep pass.
-                gc.mark_and_sweep(&mut store, 0, true);
-                let collected = gc.mark_and_sweep(&mut store, 1_000, true);
+                gc.mark_and_sweep(&mut store, 0, true, false);
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,

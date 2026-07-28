@@ -241,6 +241,36 @@ pub struct InstallSnapshotResponse {
     pub term: u64,
 }
 
+/// `POST /api/internal/raft/namespace` request (M-17): a non-voter
+/// (observer) asks a voter for its committed control-plane state. The
+/// requester ID is carried for logging/diagnostics only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceSnapshotRequest {
+    pub requester: NodeId,
+}
+
+/// `POST /api/internal/raft/namespace` response (M-17).
+///
+/// The state machine only ever applies committed entries, so `state` is a
+/// committed prefix regardless of the responder's role — any voter can
+/// serve this without a linearizable read (the observer only needs
+/// eventual, monotone catch-up, guarded by the puller's adoption check).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceSnapshotResponse {
+    /// The responding node (verified against the puller's voter set).
+    pub node_id: NodeId,
+    /// The responder's current term. Informational only: pulls never touch
+    /// election state (`currentTerm` / `votedFor`).
+    pub term: u64,
+    /// The raft log index `state` corresponds to.
+    pub last_applied_index: u64,
+    /// Term of the entry at `last_applied_index` (snapshot-meta input on
+    /// the adopting side).
+    pub last_applied_term: u64,
+    /// The committed replicated control-plane core.
+    pub state: ControlPlaneState,
+}
+
 /// Result of applying one committed log entry to the state machine.
 #[derive(Debug, Clone)]
 pub enum ApplyOutcome {
@@ -403,6 +433,20 @@ mod tests {
 
         let snap_resp = InstallSnapshotResponse { term: 3 };
         assert_eq!(bincode_roundtrip(&snap_resp), snap_resp);
+
+        let ns_req = NamespaceSnapshotRequest {
+            requester: NodeId("obs-1".into()),
+        };
+        assert_eq!(bincode_roundtrip(&ns_req), ns_req);
+
+        let ns_resp = NamespaceSnapshotResponse {
+            node_id: NodeId("cp-1".into()),
+            term: 3,
+            last_applied_index: 8,
+            last_applied_term: 2,
+            state,
+        };
+        assert_eq!(bincode_roundtrip(&ns_resp), ns_resp);
     }
 
     /// JSON fallback must also round-trip (rolling upgrade path).

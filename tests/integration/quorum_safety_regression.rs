@@ -333,6 +333,7 @@ mod control_plane_raft_quorum {
             heartbeat_interval: Duration::from_millis(30),
             propose_timeout: Duration::from_millis(1_500),
             log_max: 4096,
+            ..RaftConfig::default()
         }
     }
 

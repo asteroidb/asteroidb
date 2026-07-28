@@ -51,10 +51,10 @@ use crate::session::SessionToken;
 use super::types::{
     AnnounceRequest, AnnounceResponse, ApiError, AuthorityDefinitionResponse,
     CertifiedReadResponse, CertifiedWriteRequest, CertifiedWriteResponse, CrdtValueJson,
-    EquivocationReport, EventualReadQuery, EventualReadResponse, EventualWriteQuery,
-    EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse, LeaveRequest, LeaveResponse,
-    PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse, ProofBundleJson,
-    RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
+    EquivocationPurgeResponse, EquivocationReport, EventualReadQuery, EventualReadResponse,
+    EventualWriteQuery, EventualWriteRequest, FrontierJson, JoinRequest, JoinResponse,
+    LeaveRequest, LeaveResponse, PeerInfo, PingRequest, PingResponse, PlacementPolicyResponse,
+    ProofBundleJson, RaftStatusResponse, RemovePolicyRequest, SetAuthorityDefinitionRequest,
     SetPlacementPolicyRequest, StatusResponse, VerifyProofRequest, VerifyProofResponse,
     VersionHistoryResponse, WriteResponse,
 };
@@ -526,6 +526,11 @@ pub async fn post_internal_frontiers(
     // Set when new equivocation evidence was recorded, so the evidence store
     // is re-persisted after all sync guards are released.
     let mut evidence_dirty = false;
+    // Authorities newly accused during THIS request (deduplicated). When
+    // exclusion is enabled, their previously pooled attestations are purged
+    // after the apply loop (m-7) — attestations pooled before the accusation
+    // must not feed later certificate assembly.
+    let mut newly_accused: Vec<NodeId> = Vec::new();
 
     // Verify signatures BEFORE taking the certified lock — signature
     // verification is CPU-heavy and must not serialize with other handlers.
@@ -539,8 +544,11 @@ pub async fn post_internal_frontiers(
         // Authority-set membership gate (FR-008): the sender must be one of
         // the authorities defined for the frontier's key range. Signature
         // verification only proves *who* signed, not that the signer owns
-        // the range. Ranges without an authority definition cannot certify
-        // writes anyway, so they are accepted for backwards compatibility.
+        // the range. Ranges without an authority definition pass this gate
+        // (longest-prefix match, lenient) but are dropped by the certified
+        // API's admission check (M-4): frontier tracking and the
+        // attestation pool only accept scopes that exactly match a defined
+        // range with a placement policy.
         let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
         let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
             match ns.get_authorities_for_key(&frontier.key_range.prefix) {
@@ -615,6 +623,11 @@ pub async fn post_internal_frontiers(
                                         state.equivocation.accused_count(),
                                     );
                                     evidence_dirty = true;
+                                    if state.exclude_accused_authorities
+                                        && !newly_accused.contains(&ev.authority_id)
+                                    {
+                                        newly_accused.push(ev.authority_id.clone());
+                                    }
                                 }
                                 // Optional exclusion from certificate assembly
                                 // (detect-only by default): the frontier value
@@ -656,63 +669,25 @@ pub async fn post_internal_frontiers(
                         }
                     }
                 }
-
-                // Split-view lane (CT-gossip Protocol 2): attestations the
-                // sender observed elsewhere, relayed for cross-checking.
-                // Evidence only — never applied to frontier state. Each
-                // relayed pair is re-verified against the registry before it
-                // is allowed to become evidence, so a malicious relayer
-                // cannot frame an honest authority; a failed verification is
-                // *not* an accusation either, because the relayer of a
-                // forged pair cannot be identified from the payload.
-                for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
-                    if !is_range_authority(&obs.frontier) {
-                        continue;
-                    }
-                    // Byte-equivalent echoes skip re-verification (CPU DoS
-                    // mitigation): the exact (scope, hlc, digest) is already
-                    // indexed and would compare Consistent anyway.
-                    if state.equivocation.is_known_exact(&obs.frontier) {
-                        continue;
-                    }
-                    match verify_frontier_signature(
-                        &obs.frontier,
-                        &obs.signature,
-                        &registry,
-                        current_epoch,
-                        &state.epoch_config,
-                    ) {
-                        Ok(_) => {
-                            state.metrics.record_split_view_observation();
-                            if let ObserveOutcome::Equivocation(ev) =
-                                state
-                                    .equivocation
-                                    .observe(&obs.frontier, &obs.signature, now_ms)
-                            {
-                                warn_equivocation(&ev);
-                                state.metrics.record_equivocation_at(now_ms);
-                                state
-                                    .metrics
-                                    .set_accused_authorities(state.equivocation.accused_count());
-                                evidence_dirty = true;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                "ignoring relayed observation with invalid signature"
-                            );
-                        }
-                    }
-                }
             }
+        }
+    }
+
+    // Split-view lane (CT-gossip Protocol 2): attestations the sender
+    // observed elsewhere, relayed for cross-checking. Shared with the
+    // delta/digest sync piggyback lane since M-14 — see
+    // `ingest_relayed_observations` for the gate order and rationale.
+    for id in ingest_relayed_observations(&state, observed, now_ms, RelayLane::Frontier) {
+        if !newly_accused.contains(&id) {
+            newly_accused.push(id);
         }
     }
 
     // Persist new evidence after every sync guard is released; the write
     // itself happens on a blocking thread (never inside the detector lock)
     // and concurrent writers are serialized inside `spawn_persist` so an
-    // older snapshot can never overwrite a newer one.
+    // older snapshot can never overwrite a newer one. (Evidence recorded
+    // from the relayed observations above is persisted inside the helper.)
     if evidence_dirty {
         state.equivocation.spawn_persist();
     }
@@ -720,10 +695,68 @@ pub async fn post_internal_frontiers(
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for (frontier, attestation) in to_apply {
+        // Receive-side observability (M-12): content binding is enforced
+        // only by the reporter's own honest code path — a compromised
+        // authority can permanently opt out by signing placeholder- or
+        // sentinel-shaped digests forever, and the detector (which
+        // deliberately compares digests as opaque strings) will never
+        // flag that as misbehaviour. Count every accepted non-binding
+        // report so the opt-out is at least visible to operators; this is
+        // never a rejection path (rolling upgrades and cold-cache ticks
+        // legitimately produce non-binding digests).
+        if !crate::authority::frontier_reporter::is_binding_store_digest(&frontier.digest_hash) {
+            state
+                .metrics
+                .frontier_nonbinding_digest_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                authority = %frontier.authority_id.0,
+                digest_hash = %frontier.digest_hash,
+                "accepted frontier report binds no store content \
+                 (placeholder/sentinel/unknown digest format)"
+            );
+        }
+        // Re-check the accusation set at APPLY time (m-7): an attestation
+        // batched ahead of the equivocating pair in this request — or
+        // applied concurrently with an accusation from another request —
+        // passed the verification-time gate before the accusation landed.
+        // The frontier itself still advances (monotone max, low-poison).
+        let attestation = if state.exclude_accused_authorities
+            && attestation.is_some()
+            && state.equivocation.is_accused(&frontier.authority_id)
+        {
+            None
+        } else {
+            attestation
+        };
         if api.update_frontier_verified(frontier, attestation) {
             accepted += 1;
         }
     }
+    // Purge AFTER the apply loop, in the same critical section: nothing of
+    // an accused authority applied above can survive, and a concurrent
+    // request cannot interleave an accused attestation between the apply
+    // and the purge. Gated on the exclusion flag — the detect-only default
+    // must not enforce anything.
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
+    let stats = api.attestation_stats();
+    state.metrics.set_attestation_pool_stats(
+        stats.scopes,
+        stats.rejected_unknown_range_total,
+        stats.rejected_version_window_total,
+        stats.stale_version_total,
+        stats.rejected_fenced_total,
+        stats.rejected_scope_cap_total,
+        stats.rejected_authority_cap_total,
+        stats.purged_total,
+    );
     let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
     internal_response(&resp, accept)
 }
@@ -740,6 +773,133 @@ fn warn_equivocation(ev: &crate::authority::equivocation::EquivocationEvidence) 
         digest_second = %ev.second.frontier.digest_hash,
         "EQUIVOCATION DETECTED: authority signed conflicting frontier attestations; evidence stored"
     );
+}
+
+/// Which receive lane delivered a batch of relayed split-view observations
+/// (metrics attribution only — the ingest gates are identical).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayLane {
+    /// The frontier push lane (`POST /api/internal/frontiers`).
+    Frontier,
+    /// The delta/digest sync piggyback lane (M-14).
+    Sync,
+}
+
+/// Ingest relayed split-view observations (CT-gossip Protocol 2).
+///
+/// Shared by the frontier push lane and, since M-14, the delta/digest sync
+/// piggyback lane — every node runs the sync loop, so observations relayed
+/// here meet even when a split view targets only non-authority nodes.
+/// Evidence only: nothing here touches frontier or store state.
+///
+/// Each relayed pair is re-verified against the registry before it is
+/// allowed to become evidence, so a malicious relayer cannot frame an
+/// honest authority; a failed verification is *not* an accusation either,
+/// because the relayer of a forged pair cannot be identified from the
+/// payload. Without a keyset registry the whole batch is dropped —
+/// unverifiable pairs must never become evidence.
+///
+/// Not async and never holds a lock across I/O: the namespace/registry
+/// read locks live only for the in-memory verification loop (same scope
+/// discipline as `post_internal_frontiers`), and evidence persistence is
+/// spawned after every guard is released.
+///
+/// Returns the authorities newly accused by THIS batch (deduplicated,
+/// non-empty only when `exclude_accused_authorities` is set) so the caller
+/// can purge their pooled attestations under the certified lock.
+pub(crate) fn ingest_relayed_observations(
+    state: &AppState,
+    observed: Vec<crate::authority::equivocation::ObservedAttestation>,
+    now_ms: u64,
+    lane: RelayLane,
+) -> Vec<NodeId> {
+    use crate::authority::frontier_sig::verify_frontier_signature;
+
+    if observed.is_empty() {
+        return Vec::new();
+    }
+    // Without a registry, relayed observations cannot be verified — and
+    // unverifiable pairs must never become evidence (they could frame an
+    // honest authority).
+    let Some(registry_lock) = &state.keyset_registry else {
+        return Vec::new();
+    };
+    if lane == RelayLane::Sync {
+        state.metrics.record_observed_relay_sync_request();
+    }
+    let mut evidence_dirty = false;
+    let mut newly_accused: Vec<NodeId> = Vec::new();
+    {
+        let registry = registry_lock.read().unwrap_or_else(|e| e.into_inner());
+        let current_epoch = state
+            .current_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Authority-set membership gate (FR-008), same as the primary
+        // frontier lane: observations about non-members of the range's
+        // authority set are ignored outright.
+        let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
+        let is_range_authority = |frontier: &crate::authority::ack_frontier::AckFrontier| -> bool {
+            match ns.get_authorities_for_key(&frontier.key_range.prefix) {
+                Some(def) => def.authority_nodes.contains(&frontier.authority_id),
+                None => true,
+            }
+        };
+        for obs in observed.into_iter().take(MAX_OBSERVED_PER_REQUEST) {
+            if !is_range_authority(&obs.frontier) {
+                continue;
+            }
+            // Byte-equivalent echoes skip re-verification (CPU DoS
+            // mitigation): the exact (scope, hlc, digest) is already
+            // indexed and would compare Consistent anyway.
+            if state.equivocation.is_known_exact(&obs.frontier) {
+                continue;
+            }
+            match verify_frontier_signature(
+                &obs.frontier,
+                &obs.signature,
+                &registry,
+                current_epoch,
+                &state.epoch_config,
+            ) {
+                Ok(_) => {
+                    state.metrics.record_split_view_observation();
+                    if lane == RelayLane::Sync {
+                        state.metrics.record_observed_relay_sync_accepted();
+                    }
+                    if let ObserveOutcome::Equivocation(ev) =
+                        state
+                            .equivocation
+                            .observe(&obs.frontier, &obs.signature, now_ms)
+                    {
+                        warn_equivocation(&ev);
+                        state.metrics.record_equivocation_at(now_ms);
+                        state
+                            .metrics
+                            .set_accused_authorities(state.equivocation.accused_count());
+                        evidence_dirty = true;
+                        if state.exclude_accused_authorities
+                            && !newly_accused.contains(&ev.authority_id)
+                        {
+                            newly_accused.push(ev.authority_id.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "ignoring relayed observation with invalid signature"
+                    );
+                }
+            }
+        }
+    }
+    // Persist new evidence after every guard is released; the write itself
+    // happens on a blocking thread and concurrent writers are serialized
+    // inside `spawn_persist`.
+    if evidence_dirty {
+        state.equivocation.spawn_persist();
+    }
+    newly_accused
 }
 
 /// `GET /api/authority/equivocations`
@@ -760,6 +920,45 @@ pub async fn get_equivocations(State(state): State<Arc<AppState>>) -> Json<Equiv
         evidence_count: evidence.len(),
         evidence_overflow_total: state.equivocation.evidence_overflow_total(),
         evidence,
+    })
+}
+
+/// `DELETE /api/authority/equivocations/{authority_id}`
+///
+/// Operator recovery path for a confirmed FALSE-POSITIVE accusation
+/// (M-12): removes the authority's stored evidence, its accused flag and
+/// its observed heads from THIS node's detector, persists the shrunken
+/// store, and refreshes the accused gauge. Protected by the internal
+/// bearer token (mutation, unlike the public read-only GET).
+///
+/// Scope caveats (mirrored in the runbook):
+/// - evidence gossips: purge EVERY node, or a peer re-delivers the pair
+///   and this node re-accuses within a report tick;
+/// - purging is NOT exoneration of a genuine equivocation — the signed
+///   pair remains valid proof wherever a copy survives. Use only after
+///   the diagnosis steps confirm a false positive.
+pub async fn delete_equivocations(
+    State(state): State<Arc<AppState>>,
+    Path(authority_id): Path<String>,
+) -> Json<EquivocationPurgeResponse> {
+    let authority = NodeId(authority_id.clone());
+    let stats = state.equivocation.purge_authority(&authority);
+    // Persist the shrunken store (blocking pool, writers serialized) so a
+    // restart does not resurrect the purged accusation from disk.
+    state.equivocation.spawn_persist();
+    let accused_remaining = state.equivocation.accused_count();
+    state.metrics.set_accused_authorities(accused_remaining);
+    tracing::warn!(
+        authority = %authority.0,
+        evidence_removed = stats.evidence_removed,
+        heads_removed = stats.heads_removed,
+        "operator purged equivocation state for authority (false-positive recovery)"
+    );
+    Json(EquivocationPurgeResponse {
+        authority_id,
+        evidence_removed: stats.evidence_removed,
+        heads_removed: stats.heads_removed,
+        accused_remaining,
     })
 }
 
@@ -795,6 +994,7 @@ pub async fn list_authorities(
         .map(|def| AuthorityDefinitionResponse {
             key_range_prefix: def.key_range.prefix.clone(),
             authority_nodes: def.authority_nodes.iter().map(|n| n.0.clone()).collect(),
+            warnings: Vec::new(),
         })
         .collect();
     Json(defs)
@@ -816,6 +1016,7 @@ pub async fn get_authority_definition(
     Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: def.key_range.prefix.clone(),
         authority_nodes: def.authority_nodes.iter().map(|n| n.0.clone()).collect(),
+        warnings: Vec::new(),
     }))
 }
 
@@ -845,11 +1046,40 @@ pub async fn set_authority_definition(
     // awaiting the proposal, so a slow commit never serializes unrelated
     // requests behind it.
     let consensus = state.consensus.lock().await.clone();
+
+    // Non-voter authority advisory (M-17): a non-voter authority is a
+    // LEGITIMATE configuration — its namespace follows the voters via the
+    // observer pull — but its certification contribution depends on that
+    // pull staying fresh, so the proposal is accepted (200) with an
+    // explicit warning rather than rejected.
+    let warnings: Vec<String> = match consensus.raft_handle() {
+        Some(node) => spec
+            .authority_nodes
+            .iter()
+            .filter(|n| !node.voters().contains(n))
+            .map(|n| {
+                format!(
+                    "authority node {} is not a control-plane voter; its \
+                     certification contribution depends on observer namespace \
+                     pull freshness (M-17) — monitor its \
+                     observer_ns_last_pull_unix_ms via GET \
+                     /api/control-plane/raft/status",
+                    n.0
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    for warning in &warnings {
+        tracing::warn!(prefix = %spec.prefix, "{warning}");
+    }
+
     let def = consensus.propose_authority_update(spec).await?;
 
     Ok(Json(AuthorityDefinitionResponse {
         key_range_prefix: def.key_range.prefix,
         authority_nodes: def.authority_nodes.into_iter().map(|n| n.0).collect(),
+        warnings,
     }))
 }
 
@@ -1000,6 +1230,10 @@ pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftSta
             last_applied: status.last_applied,
             last_log_index: status.last_log_index,
             voters: status.voters,
+            observer_ns_pull_success_total: status.observer_ns_pull_success_total,
+            observer_ns_pull_failure_total: status.observer_ns_pull_failure_total,
+            observer_ns_last_pull_unix_ms: status.observer_ns_last_pull_unix_ms,
+            observer_ns_version_counter: status.observer_ns_version_counter,
         },
         None => RaftStatusResponse {
             node_id: state
@@ -1015,6 +1249,10 @@ pub async fn get_raft_status(State(state): State<Arc<AppState>>) -> Json<RaftSta
             last_applied: 0,
             last_log_index: 0,
             voters: Vec::new(),
+            observer_ns_pull_success_total: 0,
+            observer_ns_pull_failure_total: 0,
+            observer_ns_last_pull_unix_ms: 0,
+            observer_ns_version_counter: 0,
         },
     };
     Json(resp)
@@ -1092,6 +1330,35 @@ pub async fn raft_install_snapshot(
     internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
 }
 
+/// `POST /api/internal/raft/namespace`
+///
+/// Committed control-plane state pull (M-17): serves this node's applied
+/// `ControlPlaneState` to a non-voter (observer) so its namespace
+/// projection keeps following policy bumps. The state machine only ever
+/// applies committed entries, so any voter can serve this — no leadership
+/// or linearizable read required (the puller's adoption guard enforces
+/// monotonicity).
+pub async fn raft_namespace_snapshot(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+    let req: crate::control_plane::raft::types::NamespaceSnapshotRequest =
+        deserialize_internal(&body, content_type)
+            .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
+    let node = raft_node_or_unavailable(&state).await?;
+    let resp = node.committed_snapshot();
+    tracing::debug!(
+        requester = %req.requester.0,
+        last_applied_index = resp.last_applied_index,
+        version_counter = resp.state.version_counter,
+        "served committed namespace snapshot to observer"
+    );
+    internal_response(&resp, accept).map_err(|e| ApiError(CrdtError::Internal(e.to_string())))
+}
+
 /// `GET /api/control-plane/versions`
 ///
 /// Returns the version history of the system namespace.
@@ -1122,18 +1389,21 @@ pub async fn get_version_history(
 pub async fn verify_proof(
     State(state): State<Arc<AppState>>,
     Json(req): Json<VerifyProofRequest>,
-) -> Result<Json<VerifyProofResponse>, (axum::http::StatusCode, String)> {
+) -> Result<Json<VerifyProofResponse>, ApiError> {
     use crate::api::certified::ProofBundle;
     use crate::authority::certificate::{AuthoritySignature, KeysetVersion, MajorityCertificate};
     use crate::authority::verifier;
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
 
-    // Registry-based verification is required; reject if no registry is configured.
-    let registry_lock = state.keyset_registry.as_ref().ok_or((
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "keyset registry not configured; cannot verify proofs".to_string(),
-    ))?;
+    // Registry-based verification is required; reject if no registry is
+    // configured. `Internal` keeps the pre-existing 500 status while
+    // making the body structured JSON like every other API error (m-6).
+    let registry_lock = state.keyset_registry.as_ref().ok_or_else(|| {
+        ApiError(CrdtError::Internal(
+            "keyset registry not configured; cannot verify proofs".into(),
+        ))
+    })?;
 
     let key_range = KeyRange {
         prefix: req.key_range_prefix,
@@ -1153,13 +1423,10 @@ pub async fn verify_proof(
     let (total_authorities, authority_members) = {
         let ns = state.namespace.read().unwrap_or_else(|e| e.into_inner());
         let Some(def) = ns.get_authorities_for_key(&key_range.prefix) else {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "no authority definition covers key range '{}'; cannot determine the authority set",
-                    key_range.prefix
-                ),
-            ));
+            return Err(ApiError(CrdtError::InvalidArgument(format!(
+                "no authority definition covers key range '{}'; cannot determine the authority set",
+                key_range.prefix
+            ))));
         };
         (
             def.authority_nodes.len(),
@@ -1188,10 +1455,9 @@ pub async fn verify_proof(
         use crate::authority::certificate::DualModeCertificate;
 
         if signer_ids.len() != pk_hexes.len() {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
+            return Err(ApiError(CrdtError::InvalidArgument(
                 "bls_signer_ids and bls_public_keys must have the same length".to_string(),
-            ));
+            )));
         }
 
         let keyset_version = KeysetVersion(
@@ -1210,16 +1476,18 @@ pub async fn verify_proof(
             cert.format_version = fv;
         }
 
-        let aggregated = BlsSignature::from_hex(agg_hex).ok_or((
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid hex in bls_aggregate_signature".to_string(),
-        ))?;
+        let aggregated = BlsSignature::from_hex(agg_hex).ok_or_else(|| {
+            ApiError(CrdtError::InvalidArgument(
+                "invalid hex in bls_aggregate_signature".to_string(),
+            ))
+        })?;
         let mut signers = Vec::with_capacity(signer_ids.len());
         for (id, pk_hex) in signer_ids.iter().zip(pk_hexes.iter()) {
-            let pk = BlsPublicKey::from_hex(pk_hex).ok_or((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("invalid hex in bls_public_keys for signer {id}"),
-            ))?;
+            let pk = BlsPublicKey::from_hex(pk_hex).ok_or_else(|| {
+                ApiError(CrdtError::InvalidArgument(format!(
+                    "invalid hex in bls_public_keys for signer {id}"
+                )))
+            })?;
             signers.push((NodeId(id.clone()), pk));
         }
         // Every aggregate signer must belong to the range's authority set;
@@ -1479,7 +1747,27 @@ pub async fn internal_delta_sync(
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
-    let req: DeltaSyncRequest = deserialize_internal(&body, content_type)?;
+    let mut req: DeltaSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Split-view relay lane (M-14), processed BEFORE the store lock is
+    // taken (the Ed25519 verification CPU must not serialize with other
+    // store users) and with NO effect on the response below.
+    let observed = std::mem::take(&mut req.observed);
+    let newly_accused = ingest_relayed_observations(
+        &state,
+        observed,
+        crate::hlc::wall_clock_ms(),
+        RelayLane::Sync,
+    );
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let mut api = state.certified.lock().await;
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
 
     let api = state.eventual.lock().await;
     let store = api.store();
@@ -1566,7 +1854,28 @@ pub async fn internal_digest_sync(
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
-    let req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+    let mut req: DigestSyncRequest = deserialize_internal(&body, content_type)?;
+
+    // Split-view relay lane (M-14), processed BEFORE the scheme check and
+    // the store lock: observation relay is orthogonal to the digest scheme
+    // (a `scheme_ok = false` answer still ingests the sample) and never
+    // affects the response.
+    let observed = std::mem::take(&mut req.observed);
+    let newly_accused = ingest_relayed_observations(
+        &state,
+        observed,
+        crate::hlc::wall_clock_ms(),
+        RelayLane::Sync,
+    );
+    if state.exclude_accused_authorities && !newly_accused.is_empty() {
+        let mut api = state.certified.lock().await;
+        let purged = api.purge_accused_attestations(&newly_accused);
+        tracing::warn!(
+            count = newly_accused.len(),
+            purged,
+            "purged pooled attestations of newly accused authorities"
+        );
+    }
 
     // Scheme validation: a version or shape mismatch is NOT an error —
     // answer 200 with `scheme_ok = false` so the requester falls back to
@@ -1586,8 +1895,91 @@ pub async fn internal_digest_sync(
         return internal_response(&DigestSyncResponse::default(), accept);
     }
 
-    // Single-lock-scope snapshot: digest material, entries, frontier and
-    // session claims must all describe exactly the same state T0.
+    // Warm path (M-7): the store's incremental digest cache answers in
+    // ONE lock scope with no data clone, no timestamps rebuild and no
+    // O(N) hashing — a root match is O(1). The single-lock-scope
+    // invariant is preserved verbatim: digest, frontier, session claims
+    // (and, on mismatch, the transferred bucket entries) all describe
+    // exactly the same state T0, which is what makes the requester's
+    // adoption of `applied_origins` sound.
+    {
+        let mut api = state.eventual.lock().await;
+        if !api.store().digest_is_cold() {
+            let local = api.store_mut().digest();
+            let store = api.store();
+            let total_keys = local.total_keys;
+            let frontier = store.current_frontier();
+            let applied_origins = store.applied_origins().clone();
+            let merge_failed_keys: Vec<String> =
+                store.merge_failed_keys().iter().cloned().collect();
+            let visible_origins = store.visible_origins().clone();
+
+            if req.root.as_slice() == local.root {
+                drop(api);
+                return internal_response(
+                    &DigestSyncResponse {
+                        scheme_ok: true,
+                        root_matched: true,
+                        frontier,
+                        applied_origins,
+                        visible_origins,
+                        merge_failed_keys,
+                        total_keys,
+                        ..DigestSyncResponse::default()
+                    },
+                    accept,
+                );
+            }
+
+            let remote: Vec<(u16, [u8; DIGEST_LEN])> = req
+                .buckets
+                .iter()
+                .map(|b| {
+                    let mut digest = [0u8; DIGEST_LEN];
+                    digest.copy_from_slice(&b.digest);
+                    (b.index, digest)
+                })
+                .collect();
+            let mismatched = mismatched_buckets(&local, &remote);
+
+            let (entries, timestamps) = if req.include_entries {
+                let mismatched_set: std::collections::HashSet<u16> =
+                    mismatched.iter().copied().collect();
+                // Bucket-subset clone via the cache's bucket index (the
+                // cache is clean right after `digest()` above): only the
+                // transferred keys are cloned, no key is re-hashed.
+                store.clone_bucket_entries(&mismatched_set)
+            } else {
+                (
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            };
+            drop(api);
+
+            return internal_response(
+                &DigestSyncResponse {
+                    scheme_ok: true,
+                    root_matched: false,
+                    mismatched_buckets: mismatched,
+                    entries,
+                    timestamps,
+                    frontier,
+                    applied_origins,
+                    visible_origins,
+                    merge_failed_keys,
+                    total_keys,
+                },
+                accept,
+            );
+        }
+    }
+
+    // Cold cache (fresh deserialize before the first sync-cycle warm-up,
+    // or a dirty burst beyond the inline budget): the pre-M-7 legacy
+    // path, bit-identical responses. Single-lock-scope snapshot: digest
+    // material, entries, frontier and session claims must all describe
+    // exactly the same state T0.
     let api = state.eventual.lock().await;
     let store = api.store();
     let data: std::collections::BTreeMap<String, CrdtValue> = store

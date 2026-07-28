@@ -24,7 +24,7 @@ cargo check --target wasm32-unknown-unknown \
 |---------|---------|-------------|
 | `native-crypto` | yes | BLS12-381 signatures via `blst` (C library) |
 | `native-tls` | yes | System TLS via OpenSSL for `reqwest` |
-| `native-storage` | yes | Persistent storage via `redb` (libc mmap) |
+| `native-storage` | yes | `RedbBackend` — experimental KV backend (`redb` / libc mmap). **Not wired into the recovery path**: production persistence is `FileBackend` snapshots + the WAL (plain `std::fs`, no feature needed) |
 | `native-runtime` | yes | Tokio runtime, Axum HTTP server, reqwest HTTP client, clap CLI, tracing-subscriber |
 | `wasm` | no | Enables `getrandom/js` for WASM entropy; excludes all native features |
 
@@ -97,7 +97,10 @@ on WASM instead.
 
 ### Requires `native-storage`
 
-- `store/backend::RedbBackend` -- persistent KV backend (uses `redb` / libc mmap)
+- `store/backend::RedbBackend` -- experimental KV backend (uses `redb` /
+  libc mmap). Not wired into the recovery path; production persistence is
+  `FileBackend` snapshots + the WAL. Whether to wire it in or drop the
+  feature is an open follow-up (see `docs/followup-plan.md`, m-10)
 - Use `InMemoryKvBackend` on WASM instead
 
 ## Binaries
@@ -115,7 +118,7 @@ Both binaries require `native-runtime`:
 |-------|-------------|-------------|
 | `blst 0.3` | `native-crypto` | BLS12-381 via C/assembly |
 | `openssl-sys 0.9` | `native-tls` | System OpenSSL (via reqwest) |
-| `redb 2` | `native-storage` | Persistent KV via libc mmap |
+| `redb 2` | `native-storage` | Experimental KV via libc mmap (unused by the default recovery path) |
 
 ### Runtime Crates (isolated behind `native-runtime`)
 

@@ -18,6 +18,7 @@ use asteroidb_poc::authority::certificate::{EpochConfig, KeysetRegistry, KeysetV
 use asteroidb_poc::authority::equivocation::{
     EquivocationDetector, GOSSIP_SAMPLE_MAX, MAX_OBSERVED_PER_REQUEST, ObservedAttestation,
 };
+use asteroidb_poc::authority::frontier_reporter::format_store_digest_hash;
 use asteroidb_poc::authority::frontier_sig::{
     FrontierSignature, NodeSigner, verify_frontier_signature,
 };
@@ -145,6 +146,10 @@ async fn spawn_node(name: &str, opts: NodeOpts) -> (Arc<AppState>, SocketAddr, J
 }
 
 fn make_frontier(authority: &str, physical: u64, digest: &str) -> AckFrontier {
+    make_frontier_v(authority, physical, digest, 1)
+}
+
+fn make_frontier_v(authority: &str, physical: u64, digest: &str, version: u64) -> AckFrontier {
     AckFrontier {
         authority_id: node_id(authority),
         frontier_hlc: HlcTimestamp {
@@ -155,7 +160,7 @@ fn make_frontier(authority: &str, physical: u64, digest: &str) -> AckFrontier {
         key_range: KeyRange {
             prefix: String::new(),
         },
-        policy_version: PolicyVersion(1),
+        policy_version: PolicyVersion(version),
         digest_hash: digest.into(),
     }
 }
@@ -818,6 +823,713 @@ async fn exclusion_flag_drops_accused_attestations_from_certificates() {
     );
 }
 
+/// Reversed-order exclusion scenario (m-7): the accused authority's NORMAL
+/// attestation is pooled FIRST, and only afterwards does the equivocation
+/// arrive. Without the accusation-time purge, the pre-pooled attestation
+/// (up to 128 checkpoints of history) would still be consumed by
+/// certificate assembly despite the exclusion flag.
+async fn run_pre_pooled_exclusion_scenario(exclude: bool) -> (CertificationStatus, bool) {
+    let s1 = make_signer("auth-1", 54);
+    let s2 = make_signer("auth-2", 55);
+    let s3 = make_signer("auth-3", 56);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1, &s2, &s3])),
+            exclude_accused: exclude,
+            persist_path: None,
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // A pending certified write.
+    let write_ts = {
+        let mut api = state.certified.lock().await;
+        let mut counter = PnCounter::new();
+        counter.increment(&node_id("writer"));
+        api.certified_write(
+            "user/dave".into(),
+            CrdtValue::Counter(counter),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        api.pending_writes()[0].timestamp.physical
+    };
+
+    // BOTH authorities report past the write's checkpoint first: auth-1's
+    // attestation is now pooled (it is not accused yet).
+    let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+    for signer in [&s1, &s2] {
+        let f = make_frontier(&signer.node_id().0, report_ts, "digest-ok");
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(signer, &f))],
+            )
+            .await
+            .unwrap();
+    }
+
+    // Only NOW does auth-1 equivocate (at an old checkpoint).
+    let old_hlc = (write_ts / 1000) * 1000 - 5_000;
+    for digest in ["digest-a", "digest-b"] {
+        let f = make_frontier("auth-1", old_hlc, digest);
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(&s1, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+
+    let (status, has_certificate) = {
+        let mut api = state.certified.lock().await;
+        api.process_certifications();
+        let read = api.get_certified("user/dave");
+        let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
+        (read.status, has_cert)
+    };
+    handle.abort();
+    (status, has_certificate)
+}
+
+#[tokio::test]
+async fn accusation_purges_pre_pooled_attestations_from_certificates() {
+    // exclude=1: the attestation auth-1 pooled BEFORE its accusation must
+    // be purged at accusation time, leaving 1 of 3 attestations — no
+    // certificate. The write still certifies via frontier majority.
+    let (status, has_certificate) = run_pre_pooled_exclusion_scenario(true).await;
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        !has_certificate,
+        "attestations pooled before the accusation must not feed certificates"
+    );
+}
+
+#[tokio::test]
+async fn detect_only_default_keeps_pre_pooled_attestations() {
+    // exclude=0 (default): detection never enforces — the pre-pooled
+    // attestation still contributes and the certificate assembles.
+    let (status, has_certificate) = run_pre_pooled_exclusion_scenario(false).await;
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        has_certificate,
+        "detect-only default must not purge pooled attestations"
+    );
+}
+
+/// Same-batch race (m-7): a request carries the accused authority's normal
+/// attestation BEFORE the equivocating pair. The verification-time gate
+/// sees an unaccused authority; the apply-time re-check and the post-apply
+/// purge must still keep every attestation of the (now accused) authority
+/// out of the pool.
+#[tokio::test]
+async fn same_batch_equivocation_excludes_earlier_attestations() {
+    let s1 = make_signer("auth-1", 57);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1])),
+            exclude_accused: true,
+            persist_path: None,
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    let base = wall_ms();
+    let normal = make_frontier("auth-1", base, "digest-ok");
+    let f_a = make_frontier("auth-1", base - 5_000, "digest-a");
+    let f_b = make_frontier("auth-1", base - 5_000, "digest-b");
+    let signatures = vec![
+        Some(sign(&s1, &normal)),
+        Some(sign(&s1, &f_a)),
+        Some(sign(&s1, &f_b)),
+    ];
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![normal.clone(), f_a, f_b],
+            signatures,
+        )
+        .await
+        .unwrap();
+
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let api = state.certified.lock().await;
+    let stats = api.attestation_stats();
+    assert_eq!(
+        stats.scopes, 0,
+        "no attestation of the in-batch accused authority may survive"
+    );
+    // The frontier itself still advanced (detection never blocks it).
+    assert!(!api.all_frontiers().is_empty());
+    drop(api);
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------
+// M-4: version-rotation flood via HTTP stays memory-bounded
+// ---------------------------------------------------------------
+
+/// A single registered authority pushes full-size requests that rotate
+/// `policy_version` on every frontier. The admission window must reject
+/// them all (bounded pool, counters moving) while honest certification
+/// keeps working throughout.
+#[tokio::test]
+async fn version_rotation_flood_is_bounded_and_certification_survives() {
+    let s1 = make_signer("auth-1", 58);
+    let s2 = make_signer("auth-2", 59);
+    let s3 = make_signer("auth-3", 60);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts::with_registry(full_registry(&[&s1, &s2, &s3])),
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // A pending certified write issued before the flood.
+    let write_ts = {
+        let mut api = state.certified.lock().await;
+        let mut counter = PnCounter::new();
+        counter.increment(&node_id("writer"));
+        api.certified_write(
+            "user/erin".into(),
+            CrdtValue::Counter(counter),
+            OnTimeout::Pending,
+        )
+        .unwrap();
+        api.pending_writes()[0].timestamp.physical
+    };
+
+    // Flood: batched requests of validly signed frontiers rotating the
+    // policy version far outside the admission window. 64 per request keeps
+    // the per-request Ed25519 verification time well inside the client
+    // timeout on unoptimized builds; the handler-side per-request cap
+    // (MAX_FRONTIERS_PER_REQUEST) is exercised by dedicated tests.
+    let base = wall_ms();
+    let mut rotation = 0u64;
+    for _ in 0..4 {
+        let mut frontiers = Vec::with_capacity(64);
+        let mut signatures = Vec::with_capacity(64);
+        for _ in 0..64 {
+            rotation += 1;
+            let f = make_frontier_v(
+                "auth-1",
+                base - rotation, // distinct HLCs, all in the past
+                &format!("rot-{rotation}"),
+                1_000 + rotation, // far outside cur(1) - 2 ..= cur(1) + 1
+            );
+            signatures.push(Some(sign(&s1, &f)));
+            frontiers.push(f);
+        }
+        client
+            .push_signed_frontiers(&addr.to_string(), frontiers, signatures)
+            .await
+            .expect("flood requests are processed, not refused");
+    }
+
+    // The pool stayed bounded: nothing rotated was pooled, and the
+    // admission counter recorded the whole flood.
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(
+        metrics["attestation_rejected_version_window_total"]
+            .as_u64()
+            .unwrap(),
+        rotation
+    );
+    assert!(
+        metrics["attestation_pool_scopes"].as_u64().unwrap() <= 4,
+        "pool scopes must stay within the namespace-derived set"
+    );
+    // The frontier set stayed bounded too (M-4): it is uncapped and
+    // persisted, so admission must stop rotated scopes from ever being
+    // tracked — not merely from being pooled.
+    {
+        let api = state.certified.lock().await;
+        assert!(
+            api.frontier_count() <= 4,
+            "frontier scopes must stay within the namespace-derived set, got {}",
+            api.frontier_count()
+        );
+    }
+
+    // Honest majority certification (with a certificate) still works.
+    let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+    for signer in [&s1, &s2] {
+        let f = make_frontier(&signer.node_id().0, report_ts, "digest-ok");
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(signer, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    let (status, has_certificate) = {
+        let mut api = state.certified.lock().await;
+        api.process_certifications();
+        let read = api.get_certified("user/erin");
+        let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
+        (read.status, has_cert)
+    };
+    assert_eq!(status, CertificationStatus::Certified);
+    assert!(
+        has_certificate,
+        "honest 2-of-3 must still assemble a certificate during/after the flood"
+    );
+
+    handle.abort();
+}
+
+// ---------------------------------------------------------------
+// M-12: real store digests in frontier reports
+// ---------------------------------------------------------------
+
+/// The M-12 headline scenario: one authority claims two DIFFERENT store
+/// contents for the same checkpoint HLC to two lanes. With `digest_hash`
+/// bound to the real M-7 root digest, the conflicting pair becomes
+/// non-repudiable evidence — exactly what the placeholder could never
+/// detect. Both digests are computed from real `Store::digest()` roots.
+#[tokio::test]
+async fn split_view_with_real_store_digests_produces_evidence() {
+    let s1 = make_signer("auth-1", 91);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // Two real stores whose contents genuinely differ (the split view the
+    // authority is trying to sell to two halves of the cluster).
+    let digest_view_a = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/balance").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let digest_view_b = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/balance").unwrap();
+        api.eventual_counter_inc("user/balance").unwrap(); // divergent content
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    assert_ne!(digest_view_a, digest_view_b);
+    assert!(digest_view_a.starts_with("sd2:") && digest_view_a.len() == 4 + 64);
+
+    // Same authority, same (scope, policy_version, frontier_hlc).
+    let hlc = wall_ms();
+    let f_a = make_frontier("auth-1", hlc, &digest_view_a);
+    let f_b = make_frontier("auth-1", hlc, &digest_view_b);
+
+    // View A arrives on the direct push lane...
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s1, &f_a))],
+        )
+        .await
+        .unwrap();
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+
+    // ...view B arrives as a relayed observation (gossip lane, as a peer
+    // that was told view B would relay it).
+    let obs = ObservedAttestation {
+        signature: sign(&s1, &f_b),
+        frontier: f_b.clone(),
+    };
+    client
+        .push_frontiers_with_observations(&addr.to_string(), vec![], vec![], vec![obs])
+        .await
+        .unwrap();
+
+    // The data-content split view IS detected, and the evidence binds the
+    // two real store roots.
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let report = get_json(&addr, "/api/authority/equivocations").await;
+    assert_eq!(report["evidence_count"], 1);
+    let ev = &report["evidence"][0];
+    let recorded: Vec<&str> = ["first", "second"]
+        .iter()
+        .map(|side| ev[side]["frontier"]["digest_hash"].as_str().unwrap())
+        .collect();
+    assert!(recorded.contains(&digest_view_a.as_str()));
+    assert!(recorded.contains(&digest_view_b.as_str()));
+
+    // And the pair remains third-party verifiable (report signature binds
+    // the sd2 digest bytes like any other digest string).
+    let registry = full_registry(&[&s1]);
+    for side in ["first", "second"] {
+        let obs: ObservedAttestation = serde_json::from_value(ev[side].clone()).unwrap();
+        verify_frontier_signature(
+            &obs.frontier,
+            &obs.signature,
+            &registry,
+            0,
+            &EpochConfig::default(),
+        )
+        .expect("sd2 evidence must be third-party verifiable");
+    }
+
+    handle.abort();
+}
+
+/// Legitimate redelivery of the SAME signed sd2 report (push retry, relay
+/// echo) is `Consistent` — byte-identical digest strings can never become
+/// evidence, no matter how often they are re-sent.
+#[tokio::test]
+async fn same_signed_report_resubmit_is_consistent() {
+    let s1 = make_signer("auth-1", 92);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    let digest = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/x").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let f = make_frontier("auth-1", wall_ms(), &digest);
+    let sig = sign(&s1, &f);
+
+    // Direct-lane retries and a gossip-lane echo of the same bytes.
+    for _ in 0..3 {
+        client
+            .push_signed_frontiers(&addr.to_string(), vec![f.clone()], vec![Some(sig.clone())])
+            .await
+            .unwrap();
+    }
+    let echo = ObservedAttestation {
+        frontier: f.clone(),
+        signature: sig,
+    };
+    client
+        .push_frontiers_with_observations(&addr.to_string(), vec![], vec![], vec![echo])
+        .await
+        .unwrap();
+
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    handle.abort();
+}
+
+/// Mixed-format regression (rolling upgrade): a pre-M-12 placeholder head
+/// and a post-upgrade sd2 report from the SAME authority coexist without
+/// evidence — restart freshness (floor / grace) guarantees they never
+/// share a frontier HLC, and at different HLCs the detector never
+/// compares them. Old-node behaviour against sd2 strings is also pinned:
+/// verification and equality comparison treat the digest as an opaque
+/// string, so an old node still detects an sd2-vs-sd2 conflict.
+#[tokio::test]
+async fn old_placeholder_head_and_new_sd2_report_different_hlc_no_evidence() {
+    let s1 = make_signer("auth-1", 93);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // Pre-upgrade tick: placeholder-format digest at HLC t.
+    let t = wall_ms();
+    let placeholder = format!("auth-1-{t}-0");
+    let f_old = make_frontier("auth-1", t, &placeholder);
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_old.clone()],
+            vec![Some(sign(&s1, &f_old))],
+        )
+        .await
+        .unwrap();
+
+    // Post-upgrade tick: sd2 format at the NEXT HLC (the floor/grace
+    // machinery guarantees a fresh HLC across the restart).
+    let digest = {
+        let mut api = EventualApi::new(node_id("auth-1"));
+        api.eventual_counter_inc("user/x").unwrap();
+        format_store_digest_hash(&api.store_mut().digest().root)
+    };
+    let f_new = make_frontier("auth-1", t + 1, &digest);
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_new.clone()],
+            vec![Some(sign(&s1, &f_new))],
+        )
+        .await
+        .unwrap();
+
+    // Both formats are tracked, neither conflicts.
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    assert!(state.equivocation.is_known_exact(&f_old));
+    assert!(state.equivocation.is_known_exact(&f_new));
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    // A resend of the old-format head stays consistent too (the receiver
+    // compares strings, never parses formats).
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_old.clone()],
+            vec![Some(sign(&s1, &f_old))],
+        )
+        .await
+        .unwrap();
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    handle.abort();
+}
+
+/// Restart false-positive regression: an authority restarts (fresh clock,
+/// same signing key, floor file present) while a peer still holds its
+/// pre-restart observed heads, and the store content — hence the digest —
+/// differs after the restart. The persisted floor forces every
+/// post-restart report HLC above every pre-restart head, so the peer
+/// records ZERO evidence. (Store snapshot/WAL recovery itself is covered
+/// by tests/crash_recovery.rs; the subject here is the report clock
+/// floor's cross-restart guarantee through the real report/push loop.)
+#[tokio::test]
+async fn restart_with_recovery_reissues_reports_without_evidence() {
+    use std::time::Duration;
+
+    use asteroidb_poc::compaction::CompactionEngine;
+    use asteroidb_poc::network::sync::SyncClient;
+    use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+    use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
+
+    let s1 = make_signer("auth-1", 94);
+    let dir = tempfile::tempdir().unwrap();
+    let floor_path = dir.path().join("frontier_report_clock.json");
+
+    // Peer node that will retain the pre-restart heads in its detector
+    // (retention is 120s, far beyond this test's lifetime).
+    let (state2, addr2, h2) =
+        spawn_node("node-2", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+
+    let run_phase = |phase: u64| {
+        let floor_path = floor_path.clone();
+        let addr2 = addr2.to_string();
+        let signer = make_signer("auth-1", 94);
+        async move {
+            let namespace = Arc::new(RwLock::new(default_namespace()));
+            let certified = Arc::new(Mutex::new(CertifiedApi::new(
+                node_id("auth-1"),
+                Arc::clone(&namespace),
+            )));
+            // "Recovered" store: contents differ between phases — the
+            // digest of the first post-restart report differs from every
+            // pre-restart digest.
+            let eventual = {
+                let mut api = EventualApi::new(node_id("auth-1"));
+                for i in 0..=phase {
+                    api.eventual_counter_inc(&format!("phase-{i}")).unwrap();
+                }
+                Arc::new(Mutex::new(api))
+            };
+            let peer_registry = PeerRegistry::new(
+                node_id("auth-1"),
+                vec![PeerConfig {
+                    node_id: node_id("node-2"),
+                    addr: addr2,
+                }],
+            )
+            .unwrap();
+            let sync_client =
+                SyncClient::with_token(Arc::new(Mutex::new(peer_registry)), TOKEN.to_string());
+            let mut registry = KeysetRegistry::new();
+            registry
+                .register_keyset(
+                    KeysetVersion(1),
+                    0,
+                    vec![(signer.node_id().clone(), signer.verifying_key())],
+                )
+                .unwrap();
+            let config = NodeRunnerConfig {
+                certification_interval: Duration::from_millis(50),
+                frontier_report_interval: Duration::from_millis(25),
+                sync_interval: None,
+                ping_interval: None,
+                node_signer: Some(Arc::new(signer)),
+                keyset_registry: Some(Arc::new(std::sync::RwLock::new(registry))),
+                internal_token: Some(TOKEN.to_string()),
+                equivocation: Some(Arc::new(EquivocationDetector::new(None))),
+                frontier_clock_floor_path: Some(floor_path),
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            };
+            let mut runner = NodeRunner::with_sync(
+                node_id("auth-1"),
+                certified,
+                CompactionEngine::with_defaults(),
+                config,
+                sync_client,
+                eventual,
+                Arc::new(RuntimeMetrics::default()),
+            )
+            .await;
+            let shutdown = runner.shutdown_handle();
+            let handle = tokio::spawn(async move { runner.run().await });
+            (shutdown, handle)
+        }
+    };
+
+    // Phase 1: run until the peer has indexed at least one signed sd2
+    // head from auth-1.
+    let (shutdown1, handle1) = run_phase(0).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let heads = state2
+            .equivocation
+            .gossip_summaries(GOSSIP_SAMPLE_MAX)
+            .into_iter()
+            .filter(|o| {
+                o.frontier.authority_id == node_id("auth-1")
+                    && o.frontier.digest_hash.starts_with("sd2:")
+            })
+            .count();
+        if heads > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer never observed a pre-restart sd2 head"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = shutdown1.send(true);
+    let _ = handle1.await;
+
+    // Phase 2: "restart" — fresh clock, fresh detector, same floor file,
+    // different store content. Run several report ticks against the peer
+    // that still holds every phase-1 head.
+    let (shutdown2, handle2) = run_phase(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = shutdown2.send(true);
+    let _ = handle2.await;
+
+    assert_eq!(
+        state2.equivocation.accused_count(),
+        0,
+        "a floored restart must never read as an equivocation on peers"
+    );
+    assert!(state2.equivocation.evidence().is_empty());
+    let metrics = get_json(&addr2, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+
+    h2.abort();
+}
+
+// ---------------------------------------------------------------
+// M-12: false-positive recovery endpoint
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn purge_endpoint_clears_accused_and_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("equivocation_evidence.json");
+
+    let s1 = make_signer("auth-1", 95);
+    let s2 = make_signer("auth-2", 96);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1, &s2])),
+            exclude_accused: true,
+            persist_path: Some(path.clone()),
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+    let http = reqwest::Client::new();
+
+    // Accuse auth-1 with a conflicting signed pair.
+    let hlc = wall_ms();
+    for digest in ["digest-a", "digest-b"] {
+        let f = make_frontier("auth-1", hlc, digest);
+        client
+            .push_signed_frontiers(
+                &addr.to_string(),
+                vec![f.clone()],
+                vec![Some(sign(&s1, &f))],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_accused_authorities"], 1);
+
+    // The endpoint is a mutation: without the internal token it is 401.
+    let resp = http
+        .delete(format!("http://{addr}/api/authority/equivocations/auth-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+
+    // Authorized purge clears the accusation and reports what it removed.
+    let resp = http
+        .delete(format!("http://{addr}/api/authority/equivocations/auth-1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["authority_id"], "auth-1");
+    assert_eq!(body["evidence_removed"], 1);
+    assert!(body["heads_removed"].as_u64().unwrap() >= 1);
+    assert_eq!(body["accused_remaining"], 0);
+
+    // Local state, operator endpoint and gauge all reflect the purge.
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    let report = get_json(&addr, "/api/authority/equivocations").await;
+    assert_eq!(report["evidence_count"], 0);
+    assert!(report["accused_authorities"].as_array().unwrap().is_empty());
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_accused_authorities"], 0);
+
+    // The purge is persisted: a restarted detector must NOT resurrect the
+    // accusation from disk (poll — persistence runs on the blocking pool).
+    let mut cleared = false;
+    for _ in 0..1_500 {
+        let restored = EquivocationDetector::new(Some(path.clone()));
+        if !restored.is_accused(&node_id("auth-1")) && restored.evidence().is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cleared, "purge must be persisted to the evidence file");
+
+    // With exclusion enabled, the purged authority's attestations feed
+    // certificate assembly again (recovery is complete, not cosmetic).
+    let f = make_frontier("auth-1", wall_ms() + 1_000, "digest-after-recovery");
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f.clone()],
+            vec![Some(sign(&s1, &f))],
+        )
+        .await
+        .unwrap();
+    let api = state.certified.lock().await;
+    assert!(
+        api.attestation_stats().scopes >= 1,
+        "post-purge attestations must pool again"
+    );
+    drop(api);
+
+    handle.abort();
+}
+
 // ---------------------------------------------------------------
 // Evidence persistence across restarts
 // ---------------------------------------------------------------
@@ -886,4 +1598,635 @@ async fn evidence_survives_detector_restart() {
         )
         .expect("restored evidence must verify");
     }
+}
+
+// ---------------------------------------------------------------
+// M-14: observed relay piggybacked on the delta/digest sync lane
+// ---------------------------------------------------------------
+
+use asteroidb_poc::network::sync::{DeltaSyncRequest, DigestSyncRequest};
+
+/// A full node for sync-lane relay tests: HTTP server + `NodeRunner` sync
+/// loop sharing the same eventual/certified stores and equivocation
+/// detector (exactly the production wiring in `main.rs`).
+struct SyncNode {
+    state: Arc<AppState>,
+    addr: SocketAddr,
+    peer_registry: Arc<Mutex<asteroidb_poc::network::PeerRegistry>>,
+    http: JoinHandle<()>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    runner: JoinHandle<()>,
+}
+
+impl SyncNode {
+    async fn stop(self) {
+        let _ = self.shutdown.send(true);
+        let _ = self.runner.await;
+        self.http.abort();
+    }
+}
+
+/// Spawn a NON-authority node (its name is outside the authority set, so
+/// no frontier reporter ever runs) with a fast anti-entropy sync loop.
+async fn spawn_sync_node(
+    name: &str,
+    registry: KeysetRegistry,
+    peers: Vec<(&str, String)>,
+) -> SyncNode {
+    use std::time::Duration;
+
+    use asteroidb_poc::compaction::CompactionEngine;
+    use asteroidb_poc::network::sync::SyncClient;
+    use asteroidb_poc::network::{PeerConfig, PeerRegistry};
+    use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
+
+    let nid = node_id(name);
+    let namespace = Arc::new(RwLock::new(default_namespace()));
+    let eventual = Arc::new(Mutex::new(EventualApi::new(nid.clone())));
+    let certified = Arc::new(Mutex::new(CertifiedApi::new(
+        nid.clone(),
+        Arc::clone(&namespace),
+    )));
+    let detector = Arc::new(EquivocationDetector::new(None));
+    let metrics = Arc::new(RuntimeMetrics::default());
+
+    let state = Arc::new(AppState {
+        eventual: Arc::clone(&eventual),
+        certified: Arc::clone(&certified),
+        namespace,
+        metrics: Arc::clone(&metrics),
+        peers: None,
+        peer_persist_path: None,
+        namespace_persist_path: None,
+        consensus: Arc::new(Mutex::new(ControlPlaneConsensus::new(vec![]))),
+        internal_token: Some(TOKEN.to_string()),
+        self_node_id: None,
+        self_addr: None,
+        latency_model: None,
+        cluster_nodes: None,
+        slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
+        keyset_registry: Some(Arc::new(RwLock::new(registry))),
+        epoch_config: EpochConfig::default(),
+        current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        require_signed_frontiers: false,
+        equivocation: Arc::clone(&detector),
+        exclude_accused_authorities: false,
+        eventual_wal: None,
+        certified_wal: None,
+    });
+
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let http = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let peer_registry = Arc::new(Mutex::new(
+        PeerRegistry::new(
+            nid.clone(),
+            peers
+                .into_iter()
+                .map(|(id, addr)| PeerConfig {
+                    node_id: node_id(id),
+                    addr,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    ));
+    let sync_client = SyncClient::with_token(Arc::clone(&peer_registry), TOKEN.to_string());
+    let config = NodeRunnerConfig {
+        sync_interval: Some(Duration::from_millis(100)),
+        ping_interval: None,
+        internal_token: Some(TOKEN.to_string()),
+        equivocation: Some(Arc::clone(&detector)),
+        ..NodeRunnerConfig::default()
+    };
+    let mut runner = NodeRunner::with_sync(
+        nid,
+        certified,
+        CompactionEngine::with_defaults(),
+        config,
+        sync_client,
+        eventual,
+        metrics,
+    )
+    .await;
+    let shutdown = runner.shutdown_handle();
+    let runner = tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    SyncNode {
+        state,
+        addr,
+        peer_registry,
+        http,
+        shutdown,
+        runner,
+    }
+}
+
+/// T-1 (M-14 core): a split view that targets only NON-authority nodes.
+///
+/// auth-3 tells node X digest-a and node Y digest-b for the exact same
+/// frontier HLC. Neither X nor Y is an authority, so neither runs a
+/// frontier reporter — the pre-M-14 gossip lane (observed samples on
+/// authority frontier pushes) never fires, and the conflicting heads
+/// could never meet. With the sync piggyback, X's anti-entropy cycle
+/// relays its observed head to Y (and vice versa), and the receiver
+/// cross-checks and records the evidence.
+///
+/// Pre-fix this test times out (verified red before the M-14 wiring).
+#[tokio::test]
+async fn split_view_targeting_non_authorities_detected_via_sync_relay() {
+    use std::time::Duration;
+
+    let s3 = make_signer("auth-3", 111); // the equivocating authority
+    let registry = full_registry(&[&s3]);
+
+    // Y first (no peers yet), then X peering Y, then complete the mutual
+    // peering dynamically (the registry is shared with the running loop).
+    let y = spawn_sync_node("node-y", registry.clone(), vec![]).await;
+    let x = spawn_sync_node("node-x", registry, vec![("node-y", y.addr.to_string())]).await;
+    y.peer_registry
+        .lock()
+        .await
+        .add_peer(asteroidb_poc::network::PeerConfig {
+            node_id: node_id("node-x"),
+            addr: x.addr.to_string(),
+        })
+        .unwrap();
+
+    // The split view: X is told digest-a, Y digest-b, same HLC — via the
+    // ordinary frontier push receive path (as auth-3 would deliver them).
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+    let hlc = wall_ms();
+    let f_a = make_frontier("auth-3", hlc, "digest-a");
+    let f_b = make_frontier("auth-3", hlc, "digest-b");
+    client
+        .push_signed_frontiers(
+            &x.addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s3, &f_a))],
+        )
+        .await
+        .unwrap();
+    client
+        .push_signed_frontiers(
+            &y.addr.to_string(),
+            vec![f_b.clone()],
+            vec![Some(sign(&s3, &f_b))],
+        )
+        .await
+        .unwrap();
+    assert!(!x.state.equivocation.is_accused(&node_id("auth-3")));
+    assert!(!y.state.equivocation.is_accused(&node_id("auth-3")));
+
+    // The sync piggyback must make the heads meet on X or Y.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !x.state.equivocation.is_accused(&node_id("auth-3"))
+        && !y.state.equivocation.is_accused(&node_id("auth-3"))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sync-lane relay never brought the conflicting heads together"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The detecting node holds re-verifiable evidence and moved the
+    // sync-lane relay counters.
+    let detector_state = if y.state.equivocation.is_accused(&node_id("auth-3")) {
+        &y
+    } else {
+        &x
+    };
+    let report = get_json(&detector_state.addr, "/api/authority/equivocations").await;
+    assert_eq!(report["accused_authorities"], serde_json::json!(["auth-3"]));
+    let metrics = get_json(&detector_state.addr, "/api/metrics").await;
+    assert!(
+        metrics["observed_relay_sync_requests_total"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "detection must have come through the sync piggyback lane"
+    );
+
+    x.stop().await;
+    y.stop().await;
+}
+
+/// T-2: multi-hop relay across a chain of non-authority nodes.
+///
+/// X — Z — Y: X and Y are not peers. X holds digest-a, Y digest-b. X's
+/// sync cycle relays the head to Z (whose detector indexes it — F7:
+/// relayed heads re-enter the next hop's sample), and Z's own cycle
+/// relays it onward to Y, where the conflict is detected. Propagation is
+/// transitive; retention is per-hop, not end-to-end.
+#[tokio::test]
+async fn split_view_relayed_across_non_authority_chain() {
+    use std::time::Duration;
+
+    let s3 = make_signer("auth-3", 112);
+    let registry = full_registry(&[&s3]);
+
+    // Y: plain HTTP receiver (no runner) holding digest-b.
+    let (state_y, addr_y, h_y) =
+        spawn_node("node-y2", NodeOpts::with_registry(registry.clone())).await;
+    // Z: relay hop, peering Y only.
+    let z = spawn_sync_node(
+        "node-z",
+        registry.clone(),
+        vec![("node-y2", addr_y.to_string())],
+    )
+    .await;
+    // X: origin, peering Z only (X and Y never talk).
+    let x = spawn_sync_node("node-x2", registry, vec![("node-z", z.addr.to_string())]).await;
+
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+    let hlc = wall_ms();
+    let f_a = make_frontier("auth-3", hlc, "digest-a");
+    let f_b = make_frontier("auth-3", hlc, "digest-b");
+    client
+        .push_signed_frontiers(
+            &x.addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s3, &f_a))],
+        )
+        .await
+        .unwrap();
+    client
+        .push_signed_frontiers(
+            &addr_y.to_string(),
+            vec![f_b.clone()],
+            vec![Some(sign(&s3, &f_b))],
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !state_y.equivocation.is_accused(&node_id("auth-3")) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "two-hop sync relay never delivered the conflicting head to Y"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Z learned the relayed head (and indexed it) without ever having
+    // been told directly.
+    assert!(z.state.equivocation.is_known_exact(&f_a));
+
+    x.stop().await;
+    z.stop().await;
+    h_y.abort();
+}
+
+// ---------------------------------------------------------------
+// M-14: sync handler ingestion (delta / digest observed lane)
+// ---------------------------------------------------------------
+
+fn zero_hlc() -> HlcTimestamp {
+    HlcTimestamp {
+        physical: 0,
+        logical: 0,
+        node_id: String::new(),
+    }
+}
+
+fn observation(signer: &NodeSigner, f: &AckFrontier) -> ObservedAttestation {
+    ObservedAttestation {
+        signature: sign(signer, f),
+        frontier: f.clone(),
+    }
+}
+
+async fn post_delta(addr: &SocketAddr, observed: Vec<ObservedAttestation>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/api/internal/sync/delta"))
+        .bearer_auth(TOKEN)
+        .json(&DeltaSyncRequest {
+            sender: "relay-peer".into(),
+            frontier: zero_hlc(),
+            observed,
+        })
+        .send()
+        .await
+        .unwrap()
+}
+
+/// T-4: a valid observation on a delta sync request is verified, indexed
+/// and counted on the sync-lane metrics.
+#[tokio::test]
+async fn delta_sync_request_ingests_valid_observation() {
+    let s1 = make_signer("auth-1", 113);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+
+    let f = make_frontier("auth-1", wall_ms(), "sd2:delta-relay");
+    let resp = post_delta(&addr, vec![observation(&s1, &f)]).await;
+    assert!(resp.status().is_success());
+
+    assert!(
+        state.equivocation.is_known_exact(&f),
+        "head must be indexed"
+    );
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["observed_relay_sync_requests_total"], 1);
+    assert_eq!(metrics["observed_relay_sync_accepted_total"], 1);
+    assert_eq!(metrics["split_view_observations_total"], 1);
+    handle.abort();
+}
+
+/// T-5: the digest handler ingests the observed lane even when it
+/// answers `scheme_ok = false` — observation relay is orthogonal to the
+/// digest scheme version.
+#[tokio::test]
+async fn digest_sync_request_ingests_observed_even_when_scheme_rejected() {
+    let s1 = make_signer("auth-1", 114);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+
+    let f = make_frontier("auth-1", wall_ms(), "sd2:digest-relay");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/internal/sync/digest"))
+        .bearer_auth(TOKEN)
+        .json(&DigestSyncRequest {
+            sender: "relay-peer".into(),
+            scheme_version: 9_999, // unsupported on purpose
+            root: vec![],
+            buckets: vec![],
+            include_entries: false,
+            observed: vec![observation(&s1, &f)],
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["scheme_ok"], false, "scheme must still be rejected");
+
+    assert!(
+        state.equivocation.is_known_exact(&f),
+        "observed lane must be ingested even on a scheme_ok=false answer"
+    );
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["observed_relay_sync_requests_total"], 1);
+    assert_eq!(metrics["observed_relay_sync_accepted_total"], 1);
+    handle.abort();
+}
+
+/// T-6: a forged relay on the sync lane never becomes evidence and never
+/// accuses (mirror of the frontier-lane test).
+#[tokio::test]
+async fn forged_sync_lane_relay_never_becomes_evidence() {
+    let s1 = make_signer("auth-1", 115);
+    let rogue = make_signer("auth-1", 116); // unregistered key claiming auth-1
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // Seed a genuine head so a forged conflict WOULD be detectable.
+    let hlc = wall_ms();
+    let f_a = make_frontier("auth-1", hlc, "digest-a");
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s1, &f_a))],
+        )
+        .await
+        .unwrap();
+
+    let f_b = make_frontier("auth-1", hlc, "digest-b");
+    let resp = post_delta(&addr, vec![observation(&rogue, &f_b)]).await;
+    assert!(resp.status().is_success());
+
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    assert!(!state.equivocation.is_known_exact(&f_b));
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(metrics["equivocation_detected_total"], 0);
+    assert_eq!(metrics["observed_relay_sync_requests_total"], 1);
+    assert_eq!(
+        metrics["observed_relay_sync_accepted_total"], 0,
+        "a forged relay must not count as accepted"
+    );
+    handle.abort();
+}
+
+/// T-7: the per-request cap applies to the sync lane — the 65th entry is
+/// dropped (no evidence), but the same entry sent alone is detected.
+#[tokio::test]
+async fn sync_lane_observed_is_capped_per_request() {
+    let s1 = make_signer("auth-1", 117);
+    let (state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+    let base = wall_ms();
+
+    // Seed digest-a at the conflict HLC via the direct lane.
+    let f_a = make_frontier("auth-1", base, "digest-a");
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f_a.clone()],
+            vec![Some(sign(&s1, &f_a))],
+        )
+        .await
+        .unwrap();
+
+    let mut observed: Vec<ObservedAttestation> = (0..MAX_OBSERVED_PER_REQUEST as u64)
+        .map(|i| {
+            let f = make_frontier(
+                "auth-1",
+                base.saturating_sub(1_000 + i),
+                &format!("fill-{i}"),
+            );
+            observation(&s1, &f)
+        })
+        .collect();
+    let f_b = make_frontier("auth-1", base, "digest-b");
+    let conflict = observation(&s1, &f_b);
+    observed.push(conflict.clone());
+
+    let resp = post_delta(&addr, observed).await;
+    assert!(
+        resp.status().is_success(),
+        "over-cap request still succeeds"
+    );
+    assert!(
+        !state.equivocation.is_accused(&node_id("auth-1")),
+        "the entry beyond the cap must be ignored"
+    );
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(
+        metrics["observed_relay_sync_accepted_total"],
+        MAX_OBSERVED_PER_REQUEST as u64
+    );
+
+    // The dropped entry was genuinely valid: sent alone, it is detected.
+    let resp = post_delta(&addr, vec![conflict]).await;
+    assert!(resp.status().is_success());
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    handle.abort();
+}
+
+/// T-8: a node without a keyset registry drops the sync-lane observed
+/// batch entirely (unverifiable pairs must never become evidence) while
+/// the sync exchange itself stays fully functional.
+#[tokio::test]
+async fn registryless_node_drops_sync_lane_observed() {
+    let s1 = make_signer("auth-1", 118);
+    let (state, addr, handle) = spawn_node(
+        "node-nr",
+        NodeOpts {
+            registry: None,
+            exclude_accused: false,
+            persist_path: None,
+        },
+    )
+    .await;
+
+    let hlc = wall_ms();
+    for digest in ["digest-a", "digest-b"] {
+        let f = make_frontier("auth-1", hlc, digest);
+        let resp = post_delta(&addr, vec![observation(&s1, &f)]).await;
+        assert!(resp.status().is_success(), "sync must stay functional");
+    }
+
+    assert!(!state.equivocation.is_accused(&node_id("auth-1")));
+    assert!(
+        !state
+            .equivocation
+            .is_known_exact(&make_frontier("auth-1", hlc, "digest-a"))
+    );
+    let metrics = get_json(&addr, "/api/metrics").await;
+    assert_eq!(
+        metrics["observed_relay_sync_requests_total"], 0,
+        "a dropped (unverifiable) batch is not counted as processed"
+    );
+    handle.abort();
+}
+
+/// T-9: the observed lane never leaks into sync responses — delta and
+/// digest answers are byte-identical with and without an attached sample.
+#[tokio::test]
+async fn sync_responses_are_unaffected_by_observed_lane() {
+    let s1 = make_signer("auth-1", 119);
+    let (_state, addr, handle) =
+        spawn_node("node-1", NodeOpts::with_registry(full_registry(&[&s1]))).await;
+    let http = reqwest::Client::new();
+
+    let f = make_frontier("auth-1", wall_ms(), "sd2:invariance");
+    let delta_body = |observed: Vec<ObservedAttestation>| DeltaSyncRequest {
+        sender: "relay-peer".into(),
+        frontier: zero_hlc(),
+        observed,
+    };
+    let with_obs = http
+        .post(format!("http://{addr}/api/internal/sync/delta"))
+        .bearer_auth(TOKEN)
+        .json(&delta_body(vec![observation(&s1, &f)]))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let without_obs = http
+        .post(format!("http://{addr}/api/internal/sync/delta"))
+        .bearer_auth(TOKEN)
+        .json(&delta_body(vec![]))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(with_obs, without_obs, "delta response must be unaffected");
+
+    let empty_digest =
+        asteroidb_poc::store::digest::compute_store_digest(&std::collections::BTreeMap::new());
+    let digest_body = |observed: Vec<ObservedAttestation>| {
+        let mut req = DigestSyncRequest::from_digest("relay-peer", &empty_digest, true);
+        req.observed = observed;
+        req
+    };
+    let f2 = make_frontier("auth-1", wall_ms() + 1, "sd2:invariance-2");
+    let with_obs = http
+        .post(format!("http://{addr}/api/internal/sync/digest"))
+        .bearer_auth(TOKEN)
+        .json(&digest_body(vec![observation(&s1, &f2)]))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let without_obs = http
+        .post(format!("http://{addr}/api/internal/sync/digest"))
+        .bearer_auth(TOKEN)
+        .json(&digest_body(vec![]))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(with_obs, without_obs, "digest response must be unaffected");
+    handle.abort();
+}
+
+/// T-10: an equivocation detected via the sync lane purges the accused
+/// authority's pooled attestations when exclusion is enabled (same
+/// enforcement as the frontier lane).
+#[tokio::test]
+async fn sync_lane_detection_purges_pooled_attestations() {
+    let s1 = make_signer("auth-1", 120);
+    let s2 = make_signer("auth-2", 121);
+    let (state, addr, handle) = spawn_node(
+        "node-1",
+        NodeOpts {
+            registry: Some(full_registry(&[&s1, &s2])),
+            exclude_accused: true,
+            persist_path: None,
+        },
+    )
+    .await;
+    let client = FrontierSyncClient::with_token(TOKEN.to_string());
+
+    // auth-1's normal attestation is pooled first.
+    let f = make_frontier("auth-1", wall_ms(), "digest-ok");
+    client
+        .push_signed_frontiers(
+            &addr.to_string(),
+            vec![f.clone()],
+            vec![Some(sign(&s1, &f))],
+        )
+        .await
+        .unwrap();
+    {
+        let api = state.certified.lock().await;
+        assert!(api.attestation_stats().scopes >= 1, "attestation pooled");
+    }
+
+    // The conflicting pair arrives as relayed observations on a delta
+    // sync request: detection + purge must fire on the sync lane too.
+    let old_hlc = wall_ms() - 5_000;
+    let f_a = make_frontier("auth-1", old_hlc, "digest-a");
+    let f_b = make_frontier("auth-1", old_hlc, "digest-b");
+    let resp = post_delta(&addr, vec![observation(&s1, &f_a), observation(&s1, &f_b)]).await;
+    assert!(resp.status().is_success());
+
+    assert!(state.equivocation.is_accused(&node_id("auth-1")));
+    let api = state.certified.lock().await;
+    assert_eq!(
+        api.attestation_stats().scopes,
+        0,
+        "pooled attestations of the newly accused authority must be purged"
+    );
+    drop(api);
+    handle.abort();
 }

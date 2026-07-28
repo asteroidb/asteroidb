@@ -184,20 +184,76 @@ fn authority_nodes() -> Vec<NodeId> {
     }
 }
 
-/// Parse the control-plane Raft voter set from `ASTEROIDB_CONTROL_PLANE_NODES`
-/// (comma-separated node IDs, static membership). Defaults to `[self]` so a
-/// standalone node elects itself immediately and stays writable.
+/// Outcome of parsing `ASTEROIDB_CONTROL_PLANE_NODES`
+/// (see [`parse_control_plane_nodes`]).
+enum ControlPlaneNodesParse {
+    /// At least one non-empty entry.
+    Voters(std::collections::BTreeSet<NodeId>),
+    /// Unset, or set to whitespace only: standalone default (`[self]`).
+    Unset,
+    /// Set, but EVERY comma-separated entry is empty (e.g. `","`): a
+    /// definite configuration error — the caller must fail-stop rather
+    /// than silently fall back to a lone self-voter.
+    AllEntriesEmpty,
+}
+
+/// Pure parser for `ASTEROIDB_CONTROL_PLANE_NODES` (comma-separated node
+/// IDs, static membership). Empty entries (trailing comma, `a,,b`, …) are
+/// skipped with a warning instead of materializing a phantom `NodeId("")`
+/// voter — a phantom voter silently changes the majority denominator and
+/// is fed into the Raft configuration fencing as a bogus member.
+fn parse_control_plane_nodes(raw: Option<&str>) -> ControlPlaneNodesParse {
+    let Some(val) = raw else {
+        return ControlPlaneNodesParse::Unset;
+    };
+    if val.trim().is_empty() {
+        return ControlPlaneNodesParse::Unset;
+    }
+    let mut voters = std::collections::BTreeSet::new();
+    let mut skipped = 0usize;
+    for part in val.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            skipped += 1;
+        } else {
+            voters.insert(NodeId(part.to_string()));
+        }
+    }
+    if skipped > 0 {
+        eprintln!(
+            "warning: ASTEROIDB_CONTROL_PLANE_NODES contains {skipped} empty \
+             entry(ies) (stray comma?); ignoring them"
+        );
+    }
+    if voters.is_empty() {
+        ControlPlaneNodesParse::AllEntriesEmpty
+    } else {
+        ControlPlaneNodesParse::Voters(voters)
+    }
+}
+
+/// Resolve the control-plane Raft voter set from
+/// `ASTEROIDB_CONTROL_PLANE_NODES`. Defaults to `[self]` when unset so a
+/// standalone node elects itself immediately and stays writable; a set but
+/// entirely-empty value (e.g. `","`) is a fail-stop configuration error
+/// (falling back to `[self]` would silently self-elect with majority=1 and
+/// diverge from the intended cluster).
 ///
 /// NOTE: deliberately NOT derived from the gossip `PeerRegistry` — its
 /// membership shrinks on ping failures, which would silently change the
 /// majority definition and break election safety.
 fn control_plane_nodes(self_id: &NodeId) -> std::collections::BTreeSet<NodeId> {
-    match std::env::var("ASTEROIDB_CONTROL_PLANE_NODES") {
-        Ok(val) if !val.trim().is_empty() => val
-            .split(',')
-            .map(|s| NodeId(s.trim().to_string()))
-            .collect(),
-        _ => [self_id.clone()].into_iter().collect(),
+    let raw = std::env::var("ASTEROIDB_CONTROL_PLANE_NODES").ok();
+    match parse_control_plane_nodes(raw.as_deref()) {
+        ControlPlaneNodesParse::Voters(voters) => voters,
+        ControlPlaneNodesParse::Unset => [self_id.clone()].into_iter().collect(),
+        ControlPlaneNodesParse::AllEntriesEmpty => {
+            eprintln!(
+                "error: ASTEROIDB_CONTROL_PLANE_NODES is set but contains no non-empty \
+                 entries; fix the variable, or unset it for standalone mode"
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -444,6 +500,11 @@ async fn main() {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(4096),
+        // Observer namespace pull (M-17): non-voters periodically fetch the
+        // voters' committed control-plane state so their namespace — and
+        // the policy version their authority signatures carry — keeps
+        // following policy bumps. 0 disables the pull (repro/testing only).
+        observer_pull_interval: env_duration_ms("ASTEROIDB_OBSERVER_NS_PULL_MS", 5_000),
     };
     if raft_config.election_timeout_max < raft_config.election_timeout_min {
         eprintln!(
@@ -489,13 +550,39 @@ async fn main() {
         }
     };
     if !cp_voters.contains(&node_id) {
+        let pull_ms = raft_node.config().observer_pull_interval.as_millis() as u64;
         eprintln!(
             "warning: this node ({}) is NOT in ASTEROIDB_CONTROL_PLANE_NODES {:?}; \
-             it runs as an inert control-plane observer and will reject policy/authority \
-             mutations",
+             it runs as a control-plane observer: it rejects policy/authority \
+             mutations and follows the voters' committed namespace via periodic \
+             pull (ASTEROIDB_OBSERVER_NS_PULL_MS={pull_ms}, 0=disabled)",
             node_id.0,
             cp_voters.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
         );
+        // Observer-authority lifeline warning (M-17): when this non-voter
+        // is named in a local authority definition, its signatures only
+        // keep counting toward certification quorums as long as the
+        // namespace pull keeps its policy versions fresh.
+        let authority_prefixes: Vec<String> = {
+            let ns = namespace.read().unwrap_or_else(|e| e.into_inner());
+            ns.all_authority_definitions()
+                .into_iter()
+                .filter(|def| def.authority_nodes.contains(&node_id))
+                .map(|def| def.key_range.prefix.clone())
+                .collect()
+        };
+        if !authority_prefixes.is_empty() {
+            eprintln!(
+                "warning: this observer node is a certification AUTHORITY for \
+                 prefixes {authority_prefixes:?}: the namespace pull \
+                 (interval {pull_ms}ms) is the lifeline of its signature \
+                 validity — if the pull goes stale, the next policy bump \
+                 silently removes this node's contribution from the \
+                 certification quorum (watch observer_ns_last_pull_unix_ms \
+                 in GET /api/control-plane/raft/status and \
+                 attestation_stale_version_total on the voters)"
+            );
+        }
     }
     if cp_voters.len() > 1 && raft_static_peers.is_empty() {
         eprintln!(
@@ -514,7 +601,12 @@ async fn main() {
             "warning: ASTEROIDB_RAFT_PEERS is set but the control-plane voter set is \
              just this node ({}); if this is a multi-node deployment, set \
              ASTEROIDB_CONTROL_PLANE_NODES identically on EVERY node — a lone default \
-             self-elects with majority=1 and diverges from the real cluster",
+             self-elects with majority=1 and diverges from the real cluster. If this \
+             node is meant to be a non-voting OBSERVER, leaving \
+             ASTEROIDB_CONTROL_PLANE_NODES unset is also wrong: the node then \
+             considers itself a single-node voter cluster and the observer \
+             namespace pull (M-17) never starts — set the variable to the real \
+             voter set (excluding this node)",
             node_id.0,
         );
     }
@@ -768,6 +860,29 @@ async fn main() {
             .unwrap_or(300),
     );
 
+    // Stage 2 tombstone-GC hole-jump (default off, fail-closed). Enable
+    // only after a Stage 1 soak: `gc_floor_stalled_hole_dots`
+    // persisting non-zero identifies legacy holes the pre-floor sweep
+    // left behind — see docs/ops-guide.md for the procedure.
+    let gc_hole_jump_enabled = std::env::var("ASTEROIDB_GC_HOLE_JUMP")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
+    // Ops kill switch for the store-digest frontier report format (M-12):
+    // when set to 0/false, authority reports keep the legacy placeholder
+    // digest_hash. Takes effect on restart, which is safe by construction —
+    // the report clock floor guarantees the post-restart HLCs are fresh, so
+    // the two formats never meet at the same frontier HLC.
+    let frontier_store_digest = !std::env::var("ASTEROIDB_FRONTIER_STORE_DIGEST")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "0" || v == "false"
+        })
+        .unwrap_or(false);
+
     let runner_config = NodeRunnerConfig {
         bls_config,
         node_signer,
@@ -775,8 +890,18 @@ async fn main() {
         internal_token: internal_token.clone(),
         current_epoch: Some(Arc::clone(&current_epoch)),
         equivocation: Some(Arc::clone(&equivocation)),
+        // Same flag as AppState: without this, the self-report path would
+        // keep pooling this node's own attestations while the HTTP path
+        // excludes them (m-7).
+        exclude_accused_authorities,
         digest_sync_enabled,
         gc_retention,
+        gc_hole_jump_enabled,
+        frontier_store_digest,
+        // Write-ahead floor for frontier report HLCs (M-12): lives next to
+        // the other node state; without it the store-digest format never
+        // activates (fail-safe).
+        frontier_clock_floor_path: Some(data_dir.join("frontier_report_clock.json")),
         ..NodeRunnerConfig::default()
     };
 
@@ -1007,6 +1132,72 @@ mod tests {
             format!("{byte:02x}").repeat(48),
             format!("{byte:02x}").repeat(96),
         )
+    }
+
+    // ---------------------------------------------------------------
+    // parse_control_plane_nodes (m-5)
+    // ---------------------------------------------------------------
+
+    fn cp_voters_of(parse: ControlPlaneNodesParse) -> std::collections::BTreeSet<NodeId> {
+        match parse {
+            ControlPlaneNodesParse::Voters(v) => v,
+            other => panic!(
+                "expected Voters, got {}",
+                match other {
+                    ControlPlaneNodesParse::Unset => "Unset",
+                    ControlPlaneNodesParse::AllEntriesEmpty => "AllEntriesEmpty",
+                    ControlPlaneNodesParse::Voters(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn control_plane_nodes_trailing_comma_creates_no_phantom_voter() {
+        // A trailing comma must NOT materialize NodeId("") — a phantom
+        // voter changes the majority denominator (3 voters instead of 2).
+        let voters = cp_voters_of(parse_control_plane_nodes(Some("n1,n2,")));
+        assert_eq!(voters.len(), 2, "phantom empty voter must be skipped");
+        assert!(voters.contains(&NodeId("n1".into())));
+        assert!(voters.contains(&NodeId("n2".into())));
+    }
+
+    #[test]
+    fn control_plane_nodes_trims_whitespace_and_skips_empty_entries() {
+        let voters = cp_voters_of(parse_control_plane_nodes(Some("n1, n2 , ")));
+        assert_eq!(voters.len(), 2);
+        assert!(voters.contains(&NodeId("n1".into())));
+        assert!(voters.contains(&NodeId("n2".into())));
+    }
+
+    #[test]
+    fn control_plane_nodes_all_empty_entries_is_a_config_error() {
+        // Set-but-all-empty (","): definite config damage — the caller
+        // fail-stops instead of silently self-electing with majority=1.
+        for raw in [",", " , ", ",,"] {
+            assert!(
+                matches!(
+                    parse_control_plane_nodes(Some(raw)),
+                    ControlPlaneNodesParse::AllEntriesEmpty
+                ),
+                "{raw:?} must parse as AllEntriesEmpty"
+            );
+        }
+    }
+
+    #[test]
+    fn control_plane_nodes_unset_or_blank_means_standalone_default() {
+        // Existing behavior pinned: unset / empty / whitespace-only fall
+        // back to the [self] standalone default at the call site.
+        for raw in [None, Some(""), Some(" ")] {
+            assert!(
+                matches!(
+                    parse_control_plane_nodes(raw),
+                    ControlPlaneNodesParse::Unset
+                ),
+                "{raw:?} must parse as Unset"
+            );
+        }
     }
 
     #[test]

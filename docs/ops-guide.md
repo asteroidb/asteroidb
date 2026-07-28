@@ -178,8 +178,10 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と（`native-crypto` ビルドでは）BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する。`native-crypto` 無効ビルドでは Ed25519 のみで署名する |
 | `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
-| `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in |
+| `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。除外は 3 点で強制される: (1) HTTP 受信経路での検証時＋**apply 時の再チェック**（同一リクエスト内で告発が後続しても前方の attestation がすり抜けない）、(2) **告発時の attestation pool purge**（告発前にプール済みの最大 128 checkpoint 分の attestation を除去。`attestation_purged_total` で観測可能）、(3) **自己報告経路**（自ノードが告発された場合、自身の attestation も pool へ入れず、既存分を purge する）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in。**`0`（既定）では purge は発動せず、告発済み Authority の attestation は detect-only 契約どおり証明書に混入し続ける**。なお、告発**前**に組み立て済み・キャッシュ済みの証明書の遡及失効は行わない（証明書失効プロトコルは将来課題、`docs/followup-plan.md` 参照） |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
+| `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
+| `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
 
 ### Control plane Raft コンセンサス
@@ -196,6 +198,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_RAFT_HEARTBEAT_MS` | いいえ | `1000` | リーダーのハートビート（AppendEntries）周期。`heartbeat * 3 > election_timeout_min` の場合は起動時に警告が出る |
 | `ASTEROIDB_RAFT_PROPOSE_TIMEOUT_MS` | いいえ | `30000` | ポリシー変更 1 件が commit されるまでの待ち時間。超過時は HTTP 504（少数派側の分断中はこのタイムアウトで失敗する） |
 | `ASTEROIDB_RAFT_LOG_MAX` | いいえ | `4096` | ログ tail がこのエントリ数を超えると、適用済みエントリをスナップショットへ畳み込む（コンパクション）。無制限成長の防止線 |
+| `ASTEROIDB_OBSERVER_NS_PULL_MS` | いいえ | `5000` | **非 voter（observer）ノードのみ**: voter から committed 済み制御プレーン状態を pull する周期（M-17）。observer の namespace（＝その authority 署名が乗せる policy_version）はこの pull だけで policy bump に追随する。`0` で無効（テスト・再現用。無効化すると observer namespace は凍結し、observer authority は次の bump で **無音で** certification 定足数から脱落する——§14.8）。voter では無視される |
 
 **Raft 永続化は `ASTEROIDB_PERSISTENCE=off` でも常時有効**:
 `currentTerm` / `votedFor` / ログの fsync（`$ASTEROIDB_DATA_DIR/raft/` 配下）は
@@ -238,6 +241,28 @@ wal/certified/wal-<seq>.log  certified ストアの WAL セグメント
 すること。ENOSPC は自己回復しない——容量を確保して次のチェックポイント
 成功を待つ。fdatasync 自体の失敗（`always`/`interval`）は fail-stop。
 
+ローテーション途中で ENOSPC 等により作成が失敗して残る orphan セグメント
+（ヘッダ長以下の torn create）は、次のローテーションが**再起動なしで自動
+回収**する（容量回復後の append / チェックポイントはそのまま成功する）。
+例外として、rotate が `refusing to reclaim segment` を含む `InvalidData`
+で失敗し続ける場合（通常運用では発生しない不変条件違反）、当該ファイルは
+frame を含む可能性があるため自動では削除・切り詰めされない。プロセスを
+再起動した際の挙動は衝突ファイルの内容に依存する:
+
+- 内容が正規の WAL セグメントとして解釈できる場合（多重 writer が作った
+  active セグメント等）は、起動時回復が torn tail / 空セグメントとして
+  処理して復旧する。
+- 内容が WAL として解釈できない場合（ヘッダ不正や不正 frame を含む異物
+  ファイル）は、起動は `WAL ... is corrupted mid-log` で fail-stop する。
+  この場合は 13.6 症状 B の runbook に従うこと。なお当該ファイルは常に
+  最大 seq のセグメントであり ack 済みレコードを一切含まないため、この
+  ケースに**限って**は、内容を保全・確認したうえでファイルを退避（移動）
+  するか、`ASTEROIDB_WAL_RECOVER_TRUNCATE=1` で切り捨てて起動しても
+  ack 済みデータの損失はない。
+
+いずれの場合も、根本原因として同一データディレクトリに対する多重プロセス
+起動（または外部ツールによるファイル混入）を疑うこと。
+
 **注意事項**:
 
 - eventual / certified の 2 系統はそれぞれ独立にチェックポイントされる
@@ -256,23 +281,39 @@ wal/certified/wal-<seq>.log  certified ストアの WAL セグメント
   fail-stop を誘発することがある。FS 選定時に error / corruption の扱い
   分けを確認すること
 
-> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明するが、`digest_hash` の値そのものの完全性（データ内容の一致）は証明しない（digest はプレースホルダ実装）。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
+> **証明範囲の注意**: majority certificate は「過半数の Authority が当該チェックポイントまで frontier を進めたこと」を暗号学的に証明する。frontier 報告の `digest_hash` は eventual store 全体の M-7 root digest（scheme v2、`sd2:<hex64>` 形式。warm-up 未完了 tick は `sd2:cold`、eventual store 未接続は `sd2:unavailable` のセンチネル）であり、report 署名がこの内容主張を反証不能に束縛する——同一 Authority が同一 checkpoint HLC に異なるストア内容を主張すれば equivocation 証拠になる（M-12）。ただし **majority certificate 自体は digest を集約しない**。これは意図的な設計である: eventual モードでは正当な複製遅延により Authority ごとにストア内容（= digest）が異なるのが常態であり、「共通 digest 値の過半数合意」は意味論的に成立しない（延期ではなく原理的却下）。また frontier は certified レーンの主張だが digest は eventual store の内容を束縛する——検知は同一 Authority の自己主張同士の比較なので、このレーン差は健全性に影響しない。frontier 報告全体への署名により報告単位の改竄・なりすましは防止される。
+
+### Frontier 追跡と attestation pool の資源上限（M-4）
+
+frontier 追跡（`AckFrontierSet`——scope ごとに 1 エントリで固有の上限を持たず、スナップショットにも載る）と、署名検証済み attestation を保持する pool（証明書組み立ての材料置き場、非永続）は、登録済み Authority 1 台が `policy_version` / `key_range` を回転させるだけでメモリを増やせないよう、二層で防御される:
+
+- **入口検証（一次防衛）**: frontier 報告は「定義済み range と完全一致 ∧ 報告者がその range の authority set メンバー ∧ placement policy が存在 ∧ `policy_version` が現行版の `-2..=+1` ウィンドウ内」の場合のみ受理される。拒否された報告は **frontier 追跡にも attestation pool にも一切入らず**、`attestation_rejected_unknown_range_total` / `attestation_rejected_version_window_total` に計上される。拒否される scope は certification（`resolve_scope`）が要求するのと同じ「定義＋policy」条件を満たさないため、いかなる write の証明にも使われ得ない——正当損失ゼロ。ウィンドウ幅は frontier GC の保持幅（`frontier_gc_max_retained_versions` 既定 2）＋先行 1 版に一致し、ラグ中／先行中の正当な報告者を落とさない。なお placement policy を持たない range（自動シードされる catch-all `""` 定義など）は報告側（`FrontierReporter`）がそもそも報告対象にしない——受信側全ノードで admission 拒否になるだけの報告を毎 tick 生成して、警告ログと flood 信号カウンタを恒常汚染しないため。policy を後から作成すれば、次の policy 変更検知で自動的に報告対象へ昇格する。
+- **pool 内ハード上限（バックストップ）**: グローバル 1024 scope・Authority あたり 64 scope（いずれも `equivocation` 検知器の上限と同値。スケール前提を変える場合は両方を同時に引き上げる）。上限到達時は**新規 scope の作成を拒否**する（既存 scope への参加は常に受理——組み立て進行中の定足数を絶対に妨げない。resident の追い出しも行わない——過去 checkpoint の attestation は再取得不能なため）。拒否時は 1 秒間隔にスロットルされた stale scope 掃除（現行版ウィンドウ外の scope を一括除去）が走り 1 回だけ再試行する。
+- 正常運用では拒否カウンタは全てゼロが期待値。`attestation_rejected_scope_cap_total` / `attestation_rejected_authority_cap_total` の増加は「同時有効 scope 数が運用規模の想定（range 数 × 4 版）を超えた」ことを意味し、定数（`MAX_POOL_SCOPES` / `MAX_POOL_SCOPES_PER_AUTHORITY`）の引き上げ検討シグナルとなる。
 
 ### Equivocation / split-view 検知
 
 同一 Authority が矛盾する frontier 報告を（同一ピアまたは別ピアへ）署名付きで送った場合、受信ノードはこれをローカルで検知し、否認不能な証拠を保存する。
 
-- **判定条件**: 同一 `(authority_id, key_range, policy_version, frontier_hlc)` に対して `digest_hash` が異なる、**署名検証済み** attestation のペア。report 署名は frontier の全フィールド（digest 含む）を束縛するため、このペアは 2 つの相異なる署名済みメッセージそのものであり、第三者がレジストリ鍵で再検証できる **proof of misbehaviour（POM）** になる。同一チェックポイント内での frontier_hlc の前進や、鍵ローテーション中の同一 digest 再署名は定義上検知対象外（誤検知ゼロ）。無署名報告・検証に失敗した報告は証拠にならない。
-- **split-view 検知（CT-gossip Protocol 2 型）**: 各ノードは自身が観測した署名付き attestation の要約を既存の frontier push（`observed` レーン、旧ノードは無視して decode 可能）に相乗りさせて交換する。悪意 Authority がピアごとに異なる digest を報告しても、ピア間の gossip 交換後に受信側が矛盾を検知する。検知済み証拠のペアは gossip で全ピアへ能動的に伝播する。
+- **判定条件**: 同一 `(authority_id, key_range, policy_version, frontier_hlc)` に対して `digest_hash` が異なる、**署名検証済み** attestation のペア。report 署名は frontier の全フィールド（digest 含む）を束縛するため、このペアは 2 つの相異なる署名済みメッセージそのものであり、第三者がレジストリ鍵で再検証できる **proof of misbehaviour（POM）** になる。同一チェックポイント内での frontier_hlc の前進や、鍵ローテーション中の同一 digest 再署名は定義上検知対象外。無署名報告・検証に失敗した報告は証拠にならない。
+- **誤検知ゼロの根拠（M-12 以降）**: digest が実ストア内容（tick 間で正当に変化する値）になったため、誤検知ゼロは「digest が HLC の決定的関数であること」ではなく次の機構で保証される: (1) digest は **tick ごとに一度だけ**計算され、report 署名で凍結される（全 scope・全ピア・自己観測に同一バイト）。(2) report HLC はプロセス内で厳密単調。(3) 再起動を跨ぐ単調性は **ReportClockFloor**（`<data_dir>/frontier_report_clock.json`、10 秒幅リースの write-ahead fsync。fsync 失敗 tick は報告ごとスキップ = `frontier_report_skipped_floor_total`）が保証し、起動時にリース値から clock を seed する。(4) floor ファイルが無い起動（初回起動・floor 喪失）では **activation grace（180 秒 = 観測ヘッド保持 120 秒 + skew 前提 60 秒）** の間 **frontier 報告そのものを完全停止**する（形式を問わず何も署名しない）。前世代の報告形式は floor 喪失後には判別できず、プレースホルダを出すと「旧世代の `sd2:` ヘッドをピアが保持したまま、壁時計逆行（60 秒以内でも）で同一 HLC を再発行」した場合に placeholder-vs-sd2 の偽証拠が成立し得るため、無署名だけが両形式方向に安全。grace 中は floor ファイルも作成されない（grace 中にクラッシュしても次回起動は grace を最初からやり直す——floor ファイルの存在は常に「リースが全署名済み report を覆う」ことの証拠であり続ける）。grace 明けに `sd2:` 形式で報告を再開する。**grace の安全根拠（M-14 で改訂）**: 観測ヘッドは中継（frontier gossip + sync 相乗り）により hop ごとに保持期限が更新され、クラスタ全体では 120 秒を超えて生存し得るため、「grace 明けにはピア上の旧世代ヘッドが全て期限切れ」という旧論証には**依存しない**。安全性はヘッド寿命と無関係なクロック算術で成立する: ピアが索引し得る旧世代ヘッドの HLC は クラッシュ時壁時計 + 60 秒（受信側 HLC 受理境界と検知器の future-skew ガード）を超えず、壁時計逆行が skew 予算（60 秒）以内なら grace（180 秒）明けの初回報告 HLC は クラッシュ時壁時計 + 120 秒 以上——旧世代ヘッドを厳密に上回る。不変量 **grace > 2 × MAX_CLOCK_SKEW_MS（180 秒 > 120 秒、マージン 60 秒）** はテストで固定されている（`digest_activation_grace_covers_clock_swing_budget`）——**厳密不等号**であることが本質で、両側の境界は包含的（受理は「境界超え」のみ拒否）なため、等号（grace = 2 × skew）では旧世代ヘッドと同一 physical（= 同一 HLC になり得る）の報告が排除できない。retention 120 秒は grace 値の構成要素として残るが、いまや検知窓の定義であって安全性の前提ではない。コスト: floor 喪失・初回起動時のみ、当該 authority の frontier 報告が約 3 分停止する。ノード間のストア内容差（複製遅延・GC タイミング差・anti-entropy 途中）は **authority_id が異なるため構造上比較されない**——split-view 検知は「同一 Authority が同一 checkpoint に異なる内容を主張すること」の検出であり、ノード間差異の検出ではない。
+- **運用前提（M-12）**: (a) authority ノードは floor の永続化のため書き込み可能な data dir が必須（floor path 未構成なら `sd2:` 形式は決して有効化されず、プレースホルダのまま fail-safe）。(b) クロックの逆行はクラスタ前提の skew 上限 60 秒（`MAX_CLOCK_SKEW_MS`）以内であること——activation grace の幅はピア側壁時計がこの前提内であることに依存する。(c) **`frontier_report_clock.json` をバックアップから復元しないこと**。復元された floor のリースはバックアップ時点の値であり、バックアップ以降クラッシュまでに署名した report を覆わない（= 単調性証拠として偽）。しかも staleness はローカルで判別不能なため、ノードはそれを信頼して即時 `sd2:` 署名を再開してしまう。data dir をバックアップから復元する場合はこのファイルを**削除してから**起動する（削除すれば grace が適用され安全に劣化する。下の「データ復旧」表も参照）。切替・ロールバックは `ASTEROIDB_FRONTIER_STORE_DIGEST=0` + 再起動（floor により再起動後 HLC は常に新規なので、新旧形式が同一ヘッドで衝突することはない）。ローリングアップグレードに順序制約はなく（`sd2:` 文字列は旧ノードにも不透明な digest として検証・比較・中継される）、旧バイナリへのダウングレードも安全（floor ファイルは旧バイナリには読まれない無害な JSON として残るだけ）。
+- **split-view 検知（CT-gossip Protocol 2 型）**: 各ノードは自身が観測した署名付き attestation の要約を **2 本のレーン**で交換する。(1) 既存の frontier push への相乗り（`observed` レーン、authority 発。旧ノードは無視して decode 可能）。(2) **全ノード共通の anti-entropy 同期リクエスト（delta / digest）への相乗り（M-14）**——frontier push レーンだけでは、悪意 Authority が**非 authority ノードだけ**を狙って矛盾ヘッドを配ると（非 authority は frontier reporter を持たないため観測を送出せず）矛盾が出会わなかった。sync レーンは全ノードが周期実行し、中継されたヘッドは受信側の索引に入って次ホップのサンプルに再流入するため、**伝播は多段（推移的）**で分断治癒後にも再拡散する。帯域・CPU は有界: 送信は 1 サイクル・ピアごとに最大 1 リクエストへの添付（サンプル上限 64 件 ≈ 最大 ~80KB）で、**未変化サンプルは送出抑止（定常時 0 バイト）**——ただし配達済み記録は観測ヘッド保持窓（120 秒）で失効し、同一サンプルでも 1 窓に 1 回は再送される（受信側の観測索引はメモリのみで再起動・age-out で消えるため、抑止を無期限にすると中継経路が恒久的に沈黙し得る。再送は受信側で検証前に dedupe され CPU 追加コストなし）。受信は従来どおりリクエストあたり 64 件で打ち切り・既知エコーは署名検証前に dedupe。悪意 Authority がピアごとに異なる digest を報告しても、gossip 交換後に受信側が矛盾を検知する。検知済み証拠のペアは両レーンで全ピアへ能動的に伝播する。**混在期の注意（ローリングアップグレード）**: 旧ノード → 新ノード方向の delta/digest リクエストは bincode の位置依存 decode に失敗して 400 になり、送信側の既存 JSON 再送で成功する（M-8 の `compaction_floor` 追加と同一機構）。アップグレード期間中、internal sync 経路の 4xx とペイロード再送（実質倍増）は**想定内**であり、4xx ベースのアラートの誤報要因になる。新 → 旧方向は旧ノードが末尾の `observed` を無視して 200 を返す（observed が運ばれないだけで同期本体は無劣化）。旧ノードのみを経由する経路では中継が塞がるが、アップグレード完了で解消する（旧ノードは末尾バイトを黙って捨てつつ 200 を返すため送信側は「配達済み」と記録するが、その記録も 120 秒で失効するので、アップグレード後 1 窓以内に再配達される）。**ビルド構成混在（native-crypto / stub）の注意**: stub ビルドは BLS フィールドを検証せずに索引し得るため、中継サンプル生成時（`gossip_summaries`）に BLS レーンを剥離して送出する——native 受信側は BLS フィールドをデシリアライズ時に厳格検証するため、不正な BLS 文字列を 1 件でも中継すると carrier リクエスト全体がデコード不能になる。証拠の採否は全ビルドで Ed25519 レーンのみで決まるため、剥離による検知能力の低下はない（native ビルド同士は検証済み BLS レーンをそのまま中継する）。sync レーン経由の中継量は `observed_relay_sync_requests_total` / `observed_relay_sync_accepted_total` で観測できる。
 - **検知時の動作**: `EQUIVOCATION DETECTED` の警告ログ（構造化フィールド付き）、メトリクス計上（`equivocation_detected_total` ほか）、証拠のデータディレクトリへの永続化（`equivocation_evidence.json`、再起動後も保持）。**自動隔離は行わない**——Authority の排除には合意が必要であり、検知レイヤに強制を混ぜない設計（除外の opt-in は `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` を参照）。証拠は `GET /api/authority/equivocations` で取得できる。対応手順は `docs/runbook/troubleshooting.md` の「Authority Equivocation Detected」を参照。
+- **検知可能になったもの（M-12）**: 同一 Authority が同一 `(key_range, policy_version, frontier_hlc)` に**異なるストア内容**を主張する data-content split view。root digest は全キーの正準 CRDT ストリーム digest（D(k)）を集約するため、任意の 1 キーの差異が root を変える（SHA-256 衝突を除く）。比較は文字列等価なので**旧ノードの検知器も新形式の split view をそのまま検知できる**（ロールアウト即時に全観測者へ波及）。同一署名鍵を共有する重複プロセス（誤構成・鍵漏洩）も、ストア内容が分岐した時点で自己検知される。
 - **限界（重要・脅威モデル上の正直な注記）**:
   1. 検知は**事後的・確率的**であり防止ではない（reactive security）。矛盾する報告が一時的に受理・配布される時間窓を許す。
-  2. **結託した過半数**が全ノードに一貫して同じ嘘をつく非分岐型の不正は、本機構（および fork*/ハッシュチェーン系一般）では検知できない。対抗手段は Authority 群の独立配置のみ。
-  3. 悪意 Authority がピアごとに frontier_hlc を僅かにずらして報告すると、完全一致ベースの検知確率は下がる（その場合も certificate は checkpoint 単位で束縛される）。
+  2. **結託した過半数**が全ノードに一貫して同じ嘘をつく非分岐型の不正は、本機構（および fork*/ハッシュチェーン系一般）では検知できない。対抗手段は Authority 群の独立配置のみ。また digest は自己申告であり、実際にサービングしている内容との照合（PeerReview 型監査）は未実装——「全員に一貫した嘘」は digest が実体化しても不可視。さらに**内容束縛は報告側の正直な実装パスのみが強制**する: 悪意 Authority はプレースホルダ形式（HLC の決定的関数なので split の両側が常にバイト一致）や固定センチネル文字列を署名し続けることで、data-content split-view 検知から**恒久的に離脱**できる。これは検知器では不正として扱われず（digest は意図的に不透明文字列比較）、受信側メトリクス `frontier_nonbinding_digest_total` の恒常増加と `GET /api/internal/frontiers` の目視でのみ観測できる。
+  3. 悪意 Authority がピアごとに frontier_hlc を僅かにずらして報告すると、完全一致ベースの検知確率は下がる（その場合も certificate は checkpoint 単位で束縛される）。CT 型 consistency proof は将来課題。
   4. 検知遅延 ≈ frontier 報告周期 + push 伝搬遅延 + クロックスキュー。honest なピアが定期的に push し合うことが前提で、長期分断では検知が遅れる。
-  5. 観測索引は scope あたり 128 件（報告周期 1 秒でおよそ 2 分）に prune されるため、それより古い時点との矛盾はローカルでは検知できない（記録済みの証拠自体は消えない）。
+  5. 観測索引は scope あたり 128 件（報告周期 1 秒でおよそ 2 分）に prune されるため、それより古い時点との矛盾はローカルでは検知できない（記録済みの証拠自体は消えない）。保持窓は **hop ごと**（各中継先で受信時刻から再計時）であり end-to-end ではないため、M-14 の sync 相乗り中継はこの窓を跨いで多段伝播できる（`sync_interval` が保持窓 120 秒以上に設定されていると中継の実効性が失われる——起動時に WARN を出す）。
+  5b. 中継の残余盲点: 恒久分断・全経路支配（eclipse）・keyset registry を持たないノードのみの経路・混在期の旧ノードのみ経路（アップグレード完了で解消）では矛盾ヘッドが出会わない。また digest は不透明文字列比較のため、frontier HLC が完全一致しない一過性 split-view は検知対象外（項目 3 と同じ制約。CT 型 consistency proof は将来課題）。検知は本質的に確率的・遅延 SLA 型である。
   6. `observed` レーンは 1 件あたり Ed25519 検証コストがかかる（リクエストあたり 64 件で打ち切り）。内部 API には `ASTEROIDB_INTERNAL_TOKEN` の設定を推奨する。
-  7. **鍵配布そのものは検知の対象外（脅威モデル境界）**: この透明性レイヤが覆うのは frontier 報告の一致性のみであり、keyset 履歴に STR（Signed Tree Root）チェーンは無い。**鍵配布・ローテーション自体の split-view**——異なるノードに異なる `ASTEROIDB_AUTHORITY_KEYS` を配る攻撃——は検知できず、keyset の完全性は env 配布経路（構成管理・シークレット配布）の運用信頼に依存する。STR チェーンの導入は次期課題（`SECURITY.md`「既知の制限事項」および `docs/runbook/key-rotation.md` を参照）。
+  7. digest は per-key HLC・LWW タイムスタンプ等のメタデータを意図的に含まない（`src/store/digest.rs` の設計判断）ため、**メタデータのみの分岐**は不可視。
+  8. digest cache が cold の tick（`sd2:cold`、`frontier_digest_cold_total` で観測）と eventual store 未接続（`sd2:unavailable`）は内容を束縛しない。floor 無し起動の activation grace 中（最初の 180 秒）は frontier 報告そのものが停止する（内容束縛どころか報告が無い——安全性のための意図的な空白）。非束縛 tick は受信側でも `frontier_nonbinding_digest_total` で観測できる。
+  9. root digest は全ストア粒度であり、証拠は**どの key range が分岐したか**までは示さない（per-scope digest への細分化は followup M-12b）。
+  10. compaction checkpoint の digest（`src/compaction/engine.rs` 系統、FR-010）は**別系統で依然プレースホルダのまま**（未解決）。
+  11. **鍵配布そのものは検知の対象外（脅威モデル境界）**: この透明性レイヤが覆うのは frontier 報告の一致性のみであり、keyset 履歴に STR（Signed Tree Root）チェーンは無い。**鍵配布・ローテーション自体の split-view**——異なるノードに異なる `ASTEROIDB_AUTHORITY_KEYS` を配る攻撃——は検知できず、keyset の完全性は env 配布経路（構成管理・シークレット配布）の運用信頼に依存する。STR チェーンの導入は次期課題（`SECURITY.md`「既知の制限事項」および `docs/runbook/key-rotation.md` を参照）。
 
 ### BLS 鍵配布のローリングアップグレード手順（PoP 導入）
 
@@ -331,6 +372,11 @@ curl -s http://localhost:3000/api/slo | jq .
 | `digest_push_probe_total` | u64 | push 側 digest probe 試行累計 |
 | `digest_push_match_total` | u64 | probe 一致によるフル push スキップ累計 |
 | `digest_push_keys_pushed_total` | u64 | digest subset push で送ったキー数累計 |
+| `gc_floor_stalled_hole_dots` | u64 (gauge) | 直近に**実行された** GC sweep で legacy hole に停止した floor 走査数。mark のみ・ゲート不合格の tick では上書きされず、次の sweep 実行まで値を保持する。恒常的に非ゼロなら Stage 2 hole-jump の有効化を検討（3.7） |
+| `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
+| `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
+| `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
+| `sync_redundant_merge_skips_total` | u64 | RR ゲート（M-6）が抑止した冗長リモート merge 累計（no-op merge かつ delta 可視済みキー → 再スタンプ/変更ログ/WAL 書き込みをスキップ）。GC tick ごとに `EventualApi` の in-memory カウンタから反映（再起動でリセット）。アイドルクラスタで緩やかに増えるのは正常（収束済みキーのエコー吸収）。収束済みストアの双方向 sync 下で 0 に張り付く場合はピンポン回帰を疑う |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
 | `rebalance_keys_migrated` | u64 | リバランス移行キー累計 |
@@ -343,7 +389,20 @@ curl -s http://localhost:3000/api/slo | jq .
 | `equivocation_detected_total` | u64 | equivocation 証拠ペア検知累計 |
 | `equivocation_last_detected_ms` | u64 | 最終 equivocation 検知時刻 (ms、0=なし) |
 | `equivocation_accused_authorities` | u64 | 証拠が存在する Authority 数（ゲージ） |
-| `split_view_observations_total` | u64 | gossip 経由で検証・照合した観測数累計 |
+| `split_view_observations_total` | u64 | gossip 経由で検証・照合した観測数累計（frontier push・sync 相乗りの両レーン共通、M-14 以前からの連続性維持） |
+| `observed_relay_sync_requests_total` | u64 | 非空の observed レーンを載せて処理された delta/digest sync リクエスト数（M-14。registry 無しノードは全捨てのため計上しない） |
+| `observed_relay_sync_accepted_total` | u64 | sync 相乗りレーン経由で署名検証を通過し検知器へ投入された観測数（M-14。既知エコー・range 非メンバーは含まない） |
+| `attestation_pool_scopes` | u64 | attestation pool が追跡中の scope 数（ゲージ。正常時は「定義 range 数 × 高々 4 バージョン」以下） |
+| `attestation_rejected_unknown_range_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：未定義 range・authority set 非メンバー報告者・placement policy なし。**正常時ゼロ**、増加は flood または設定不整合の一次信号 |
+| `attestation_rejected_version_window_total` | u64 | 入口検証での frontier 報告拒否累計（frontier 追跡・pool の両方に不採用）：policy_version が現行版の `-2..=+1` ウィンドウ外。**正常時ゼロ** |
+| `attestation_stale_version_total` | u64 | 現行版より**古い** policy_version を報告してきた frontier の受理累計（M-17。ウィンドウ内なので受理はされるが、報告者の namespace が制御プレーンに追随できていない一次信号——凍結 observer や分断少数派 voter は **policy bump 1 回目からここに現れる**）。**正常時ゼロ**、継続増加はアラート推奨（§14.8） |
+| `attestation_rejected_fenced_total` | u64 | fence 済み `(range, version)` scope への frontier 報告の破棄累計（M-17。frontier は前進せず attestation も pool されない = 当該 authority はその scope の certification に寄与していない確証）。**正常時ゼロ**。M-17 以前この破棄は完全無音だった |
+| `attestation_rejected_scope_cap_total` | u64 | pool のグローバル scope 上限（1024）による insert 拒否累計。**正常時ゼロ** |
+| `attestation_rejected_authority_cap_total` | u64 | pool の per-authority scope 上限（64）による insert 拒否累計。**正常時ゼロ** |
+| `attestation_purged_total` | u64 | 告発された Authority の pool 済み attestation の purge 除去累計（`ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES=1` 時のみ増加し得る） |
+| `frontier_digest_cold_total` | u64 | digest cache が cold のまま `sd2:cold` センチネルで報告した frontier tick 累計。再起動・大量書き込み直後の散発は正常、恒常増加は warm-up 不収束（当該 tick は内容を束縛しない） |
+| `frontier_report_skipped_floor_total` | u64 | ReportClockFloor の fsync 失敗により**報告ごとスキップ**した frontier tick 累計。正常時ゼロ。増加は data dir 書き込み不能を意味し、この Authority は報告を停止している（certification 可用性への影響大、即調査） |
+| `frontier_nonbinding_digest_total` | u64 | 受信・受理したリモート Authority の frontier 報告のうち、`digest_hash` が内容を束縛しない形式（プレースホルダ / `sd2:cold` / `sd2:unavailable` / 不明形式）だった件数の累計。ローリングアップグレード中や cold cache 窓では一時的な増加が正常。**特定 Authority に帰属する恒常増加**（debug ログ `accepted frontier report binds no store content` で帰属確認）は、その Authority が内容束縛から離脱している唯一のシグナル（限界 2 を参照） |
 | `peer_sync` | map | ピアごとの同期統計（60 秒スライディングウィンドウ） |
 | `certification_latency_window` | object | 証明レイテンシウィンドウ統計（60 秒） |
 
@@ -504,12 +563,32 @@ digest を比較し、不一致バケットのみを転送します（設計は
   エンドポイント未実装）またはスキームバージョン不一致のノードが残存。
   ローリングアップグレードの完了を確認する。非対応ピアは 10 分 TTL で
   キャッシュされ、TTL 経過後に自動で再 probe される。
-- `digest_sync_partial_total` が恒常的に増える（root match がほぼない）のに
-  データが収束している場合、tombstone GC の非対称による偽不一致が疑わしい。
-  正しさへの影響はなく帯域のみのコスト。GC 周期（`gc_interval`）を揃えると
-  減少する。
+- `digest_sync_partial_total`: GC 直後の不一致はバケット転送が compaction
+  floor を伝播して **1 往復で自己治癒**する（scheme v2、3.7 を参照）ため、
+  一時的な増加は正常。**恒常的な増加が続く場合**は、旧ノード混在
+  （`gc_floor_rejected_dots_total` の増加を併確認）、hole 停滞
+  （`gc_floor_stalled_hole_dots`）、dead peer を疑う。
+  **歴史的注記（scheme v1 クラスタ向け）**: v1 では「GC 非対称の偽不一致は
+  帯域のみのコスト」と記載していたが、これは誤りだった。実際にはバケット
+  転送のマージが旧ピアの stale tombstone を再注入して GC を巻き戻すため、
+  持続的フォールバック下では tombstone GC がクラスタ全体で収束しない
+  ライブロックがあった（M-8）。v1 のまま運用する場合の暫定緩和は
+  `ASTEROIDB_DIGEST_SYNC_DISABLED=1`（本節冒頭のキルスイッチ）。
 - `digest_sync_failed_total` の増加はネットワーク/デコード失敗。従来フル
   シンクで救済されるため正しさは不変だが、リンク品質を確認する。
+
+**コスト特性（M-7 増分 digest キャッシュ導入後）**: digest 交換は発信側・
+応答側とも、定常状態（書き込みが少なくクラスタが収束済み）ではストアの
+クローンもキー再ハッシュも行わない（O(1)）。再起動直後の数サイクルだけは
+キャッシュが cold のため従来同様のスナップショット経路（ロック外ハッシュ）
+を通り、sync サイクル冒頭の warm-up が完了すると増分経路に移行する。
+digest 値・応答内容はどちらの経路でもビット同一なので、運用上の観測点は
+従来どおり上記メトリクスのみでよい。注意点が 1 つ: 書き込みが持続して
+いるノードでは push probe と subset push の間の並行書き込みにより
+push 証拠（`push_acked_wall_ms`、tombstone GC のピアゲート）が意図的に
+据え置かれることがある。これは安全方向（GC が待つだけ）で、書き込みが
+静まった後の root 一致 probe で自動的に前進する。tombstone GC の停滞を
+調査する際は、まず対象ピアへの書き込みレートを確認すること。
 
 **切り戻し手順**（digest 同期に起因する問題を疑う場合）:
 
@@ -522,11 +601,53 @@ digest を比較し、不一致バケットのみを転送します（設計は
 3. 問題が解消しない場合、digest 同期は原因ではない。
 
 **ローリングアップグレード時の挙動**: 旧ノードは
-`POST /api/internal/sync/digest` に 404 を返し、新ノードはそれを検知して
-従来フルシンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
+`POST /api/internal/sync/digest` に 404 を返し（またはスキームバージョン
+不一致で `scheme_ok=false` を返し）、新ノードはそれを検知して従来フル
+シンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
 混在期間中は帯域削減効果がないだけで、収束の正しさ・セッション保証は不変。
 全ノードのアップグレード完了後、10 分以内（再 probe TTL）に digest 同期が
 自動的に有効化される。
+
+scheme v2（compaction floor）への更新に固有の注意:
+
+- **GC 収束（floor 伝播）は全ノード更新後に発効する**。混在期の旧ノードは
+  floor を発行も解釈もしないため、旧ノード同士では v1 のライブロックが
+  残存する（fail-safe: tombstone が溜まる方向）。旧ノードへの remove
+  伝播は origin-retention 則により tombstone が担い続けるので、C-2 の
+  ゲート保証はそのまま旧ノードを守る。
+- **スナップショット v5 / WAL v2 は片方向アップグレード**。v5/v2 を書いた
+  ノードを旧バイナリに戻すと読めない（v3→v4 と同じ制約）。ロールバック時、
+  旧バイナリが floor を落とす方向は fail-safe（tombstone 蓄積側）。
+- 混在期の残余 corner（設計で文書化済み）: 他ノードの sweep が live として
+  跨いだ dot を並行 remove し、その tombstone がゲート通過前に floor 継承で
+  剥がれたケースでは、旧ノードへの当該 remove の伝播が full-state 経路
+  依存になる。全ノード v2 なら floor kill で完全に安全。
+
+### 3.7 tombstone GC（compaction floor）と Stage 2 hole-jump
+
+トゥームストーン GC は certified sweep（mark → retention → 二重ゲート）
+通過後、tombstone を per-(key, writer) の **compaction floor** に畳み込んで
+物理削除する。floor はマージで pointwise max 継承され（撤回不能）、stale
+tombstone / stale live dot をマージ時に棄却するため、GC はクラスタ全体で
+単調に収束する（v1 のライブロックの修正、M-8）。
+
+- 通常運用（Stage 1）で必要な操作はない。`gc_floor_stalled_uncandidated_dots`
+  は mark 後に増えた tombstone による一時停滞で、次サイクルで解消する。
+- `gc_floor_stalled_hole_dots` が **soak 後も恒常的に非ゼロ**の場合、旧方式
+  sweep が痕跡なく削除した dot（legacy hole）で floor が停止している。
+  クラスタのどこかに tombstone が残っていれば anti-entropy が hole を埋めて
+  自己治癒するため、まず数 GC サイクル分待つこと。
+- **Stage 2 有効化手順**: (1) 全ノードが v2 で soak 済みであることを確認
+  （`gc_floor_rejected_dots_total` が横ばい）。(2) `gc_floor_stalled_hole_dots`
+  が恒常非ゼロのノードに `ASTEROIDB_GC_HOLE_JUMP=1` を設定して再起動。
+  (3) hole-jump は既存の二重ゲートに加え、mark 以降に全 registry peer の
+  全量状態をエラーなしで取り込んだ **inbound ゲート**の成立時のみ発火する
+  （fail-closed）。さらに跨げるのは **mark 時点で既に hole だった dot のみ**
+  （mark が per-node カウンタをスナップショットし、それ以下の hole だけを
+  跳ぶ）。mark 後の inbound merge が新たに作った hole は対象外で次の mark を
+  待つ。ゲージが 0 に落ちたら Stage 2 は外してもよい（残すのも安全）。
+- `gc_interval` の短縮は hole 停滞・ゲート不合格には**効かない**（12.3 も
+  参照）。停滞の原因はゲート（dead peer / 分断 / hole）であり周期ではない。
 
 ---
 
@@ -817,7 +938,7 @@ Compaction が進まない場合は Authority ノードの可用性を確認し�
 | 低レイテンシ環境（同一DC内） | `sync_interval` を 1 秒に短縮 |
 | 高レイテンシ環境（WAN） | `sync_interval` を 5-10 秒に延長 |
 | 書き込み負荷が高い | `full_sync_threshold` を 0.3 に下げて早めにフルシンク |
-| メモリ使用量が多い | `gc_interval` を 30 秒に短縮 |
+| メモリ使用量が多い | `gc_interval` を 30 秒に短縮（ただしゲート不合格・hole 停滞による tombstone 蓄積には効かない — 3.7 / 12.3 を参照） |
 | フルシンク比率が高い | `sync_interval` を短縮して差分を小さく保つ |
 
 ### 7.3 バッチサイズ
@@ -1144,7 +1265,7 @@ ufw allow from 10.0.1.0/24 to any port 3000 proto tcp comment "AsteroidDB intern
 | コンポーネント | 見積もり方 |
 |--------------|-----------|
 | CRDT メタデータ | 値あたり約 100-200 バイト（HLC タイムスタンプ、ドット情報） |
-| トゥームストーン | OR-Set/OR-Map の場合、削除操作 1 件あたり約 50 バイト（GC で回収） |
+| トゥームストーン | OR-Set/OR-Map の場合、削除操作 1 件あたり約 50 バイト。certified sweep 到達後は (key, writer) ペアあたり約 50 バイト定数の compaction floor（NodeId 文字列 + カウンタ。tombstone 1 件と同程度のフットプリント）に圧縮される。優位性は 1 件あたりのサイズではなく「削除件数に比例して無制限に増える tombstone → writer 数に対して定数の floor」という件数の圧縮にある |
 | チェックポイント | キー範囲あたり最大 10 世代（アダプティブモード時） |
 | ピアレジストリ | ノード 1 台あたり約 200 バイト |
 | システム名前空間 | ポリシー数 x 約 500 バイト |
@@ -1298,7 +1419,7 @@ curl -s http://localhost:3000/api/internal/keys | jq '.entries | length'
 
 | 原因 | 対処 |
 |------|------|
-| トゥームストーン蓄積 | `gc_interval` を短縮（デフォルト 60 秒） |
+| トゥームストーン蓄積 | まず原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
 | ack-frontier エントリの蓄積 | `frontier_gc_interval` を短縮、`frontier_gc_max_retained_versions` を縮小 |
 | Compaction が進まない | Authority 可用性を確認（過半数必要） |
 | pending_count が高い | Certified Write のタイムアウト設定を見直す |
@@ -1524,6 +1645,7 @@ done
 > | `certified.snapshot.bin` + `wal/certified/` | Certified ストア | **不可**（anti-entropy 経路が無い — 破棄は恒久喪失） |
 > | `raft/`（`hard_state.json` / `log.json`） | Control-plane Raft 投票状態・ログ | **不可**（白紙化は投票済み term での二重投票を再導入し得る — §14.5 の手順以外で消さない） |
 > | `equivocation_evidence.json` | Equivocation 証拠（否認不能な POM） | **不可**（消失した証拠は戻らない） |
+> | `frontier_report_clock.json` | frontier 報告 HLC の write-ahead floor（M-12） | **喪失は安全に劣化 / 復元は禁止**。喪失しても起動は成功するが、activation grace 180 秒の間この Authority の frontier 報告が停止する（恒久喪失なし）。**バックアップからの復元は絶対にしない**——古いリースは「全署名済み report を覆う」という floor の証拠性を偽り、誤検知（正当 Authority への偽 equivocation 証拠）を招き得る。data dir を復元する場合はこのファイルを削除してから起動する |
 >
 > 退避するのは**壊れたストアのファイルのみ**。`raft/`・
 > `equivocation_evidence.json`・certified スナップショット/WAL は必ず保持する。
@@ -1604,7 +1726,11 @@ curl -s http://localhost:3000/api/control-plane/raft/status | jq .
 #   "commit_index": 12,
 #   "last_applied": 12,
 #   "last_log_index": 12,
-#   "voters": ["node-1", "node-2", "node-3"]
+#   "voters": ["node-1", "node-2", "node-3"],
+#   "observer_ns_pull_success_total": 0,   # 非 voter のみ増加（M-17、§14.8）
+#   "observer_ns_pull_failure_total": 0,
+#   "observer_ns_last_pull_unix_ms": 0,
+#   "observer_ns_version_counter": 12
 # }
 ```
 
@@ -1660,6 +1786,15 @@ joint consensus / single-server 変更は実装していない。投票者集合
 ポリシーバージョンフェンシングの単調性を担保する。非 canonical ノードに
 だけ存在した余剰ローカルポリシーは Bootstrap で置換（削除）される。
 
+**災害復旧時の observer 追随の注意（M-17）**: observer の pull 採用ガードは
+`(version_counter, last_applied_index)` の辞書式単調比較で新旧を判定する。
+Bootstrap はポリシーが 1 件以上あれば version_counter を必ず floor より増や
+すため、上記どおり「最新 namespace バージョンのノードを最初のリーダーに」
+していれば再構築後の状態は observer に自動採用される。**ポリシー 0 件で
+Bootstrap した直後**だけは counter が floor のまま進まず、既存 observer の
+採用が保留され得る（その状態には certify 対象も存在しないため実害はなく、
+最初のポリシー作成で解消する）。
+
 ### 14.3 分断時の挙動
 
 - **少数派側**（過半数と通信できない側）: ポリシーの**参照は可能**
@@ -1668,6 +1803,8 @@ joint consensus / single-server 変更は実装していない。投票者集合
 - **データプレーンの Eventual write は無影響**——可用性は CRDT 経路が担う。
 - 分断復帰後は少数派側のノードが自動的に follower へ降格し、未 commit の
   エントリは上書きされる。commit 済みエントリが失われることはない。
+- **observer（非 voter）の分断時挙動**は §14.8 を参照（署名は止めない・
+  分断中 bump の寄与消失は可視化＋自動復帰）。
 
 ### 14.4 単一ノード運用
 
@@ -1708,6 +1845,68 @@ term で二重投票し split-brain を招くため。復旧手順:
 やり取りされるため、**これらの型へのフィールド追加はワイヤ互換を壊す**。
 追加が必要な場合は新エンドポイントの追加か JSON 移行を伴うリリース手順が
 必要（`src/control_plane/raft/types.rs` の先頭コメントを参照）。
+
+### 14.8 observer（非 voter）ノードの運用と namespace pull（M-17）
+
+`ASTEROIDB_CONTROL_PLANE_NODES` に含まれないノードは **observer** として
+動作する: 選挙に参加せず、ポリシー / Authority 定義の変更を受け付けない。
+Raft は voter にしか複製しないため、observer の namespace は
+**committed 済み制御プレーン状態の定期 pull**
+（`POST /api/internal/raft/namespace`、周期 `ASTEROIDB_OBSERVER_NS_PULL_MS`、
+既定 5 秒）で voter に追随する。pull は選挙状態（term / votedFor）と定足数
+会計に一切触れず、採用は `(version_counter, last_applied_index)` の辞書式
+単調比較でガードされる（古い状態へのロールバックは構造的に不可能）。
+
+**なぜ重要か**: observer が certification authority を兼ねる場合、その署名が
+乗せる policy_version は **observer 自身の namespace** から決まる。pull が
+止まったまま policy bump が起きると、observer は旧版で署名し続け、受信側
+voter で fence され、**certification 定足数から無音で脱落する**（分母
+`total_authorities` は縮まないため、書き込みは Pending→Timeout として顕在化
+する）。M-17 以前はこの脱落を示すカウンタが存在しなかった。
+
+**監視（アラート推奨）**:
+
+- observer 側 `GET /api/control-plane/raft/status`:
+  `observer_ns_pull_success_total` / `observer_ns_pull_failure_total` /
+  `observer_ns_last_pull_unix_ms`（`now − last_pull` が **pull 間隔 × 6 超**
+  で WARN ログも出る）/ `observer_ns_version_counter`（voter の値との差が
+  namespace ラグ）。失敗カウンタは到達不能だけでなく、**応答者が voter
+  集合外だった場合（アドレス誤解決——HTTP としては毎回成功するが採用され
+  ない）と、採用時のローカル永続化失敗（ディスク満杯・read-only）も数える**。
+  これらの異常では `observer_ns_last_pull_unix_ms` は更新されないため、
+  pull-age アラートは誤設定・ローカルディスク障害でも必ず発火する（成功
+  扱いになるのは「採用した」「相手の状態が新しくなかった」健全ラウンド
+  のみ）。原因の切り分けは pull 失敗 WARN ログの error フィールドで行う。
+- voter 側 `GET /api/metrics`: `attestation_stale_version_total` の継続増加
+  （= どこかの authority——分断中の少数派 voter を含む——が旧版で報告して
+  いる。**bump 1 回目から発火する最速の信号**）、
+  `attestation_rejected_fenced_total`（fence 到達 = 寄与消失の確証）。
+
+**分断時の挙動（設計判断）**: 分断中も observer authority は**署名を止めない**。
+分断中に bump が無ければ、最後に pull 済みの版での署名は完全に有効で定足数
+に寄与し続ける（高遅延・分断環境で observer authority を置く動機そのもの）。
+分断中に bump があった場合の寄与消失は certification 意味論上どの設計でも
+不可避であり、本実装はそれを「無音の恒久欠損」から「両側で可視の一時欠損 +
+分断解消後 1 pull 間隔 + 1 tick（既定 ~6 秒）での自動復帰」に変えている。
+
+**Runbook**: observer authority の pull age が警報中（stale WARN が出ている /
+`observer_ns_last_pull_unix_ms` が古い）に policy 変更を行うと、その authority
+の寄与を分断解消まで失う。**bump 前に pull age を確認すること。**
+
+**構成の注意**:
+
+- 非 voter を authority 定義に含める `PUT /api/control-plane/authorities` は
+  拒否されず 200 で通り、レスポンスの `warnings` フィールドと WARN ログで
+  通知される（pull が生きていれば正当な構成のため）。
+- observer にするつもりのノードで `ASTEROIDB_CONTROL_PLANE_NODES` を未設定に
+  するのは誤り: そのノードは「自分だけの単一 voter クラスタ」として自己選出
+  し、**pull は起動しない**（起動時警告あり）。observer には必ず実際の voter
+  集合（自分を含まない）を設定する。
+- **デプロイ順序**: 新エンドポイントを知らない旧 voter への pull は 404 →
+  失敗カウンタ増＋バックオフとなり、従来挙動（凍結）への劣化に留まる。
+  **voter 先行 → observer 後追い**でアップグレードすること。
+- 鮮度 TTL（署名の自発停止）は実装していない。将来の opt-in ノブ候補として
+  `docs/followup-plan.md` に記録がある。
 
 ---
 

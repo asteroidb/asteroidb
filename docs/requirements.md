@@ -111,6 +111,10 @@
 - MVP の既定は「過半数 Authority 取り込み済み更新のみ圧縮可能」とすること
 - 圧縮後も `ack_frontier` を使って更新反映状況を確認できること
 - MVP の `digest_hash` 検証は key_range 単位の周期チェックポイント方式を採用すること
+  - 実装状況の系統分離（M-12 時点）: **frontier 報告の `digest_hash` は実 digest 化済み**
+    （eventual store の M-7 root digest `sd2:<hex64>` を署名付きで束縛し、split-view 検知が働く）。
+    一方 **compaction checkpoint 側の digest（`src/compaction/engine.rs`）は依然プレースホルダのまま**
+    で未解決（本 FR の「digest 不一致検出」再検証トリガはまだ実体を持たない）
 - チェックポイント作成トリガは「時間閾値または更新件数閾値」のハイブリッド方式を採用すること
 - 既定の時間閾値は `30s`、既定の更新件数閾値は `10,000 ops` とすること
 - 再検証トリガは少なくとも `digest 不一致検出` / `policy_version 変更` / `Authority 構成変更` を含むこと

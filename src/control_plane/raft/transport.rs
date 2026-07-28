@@ -16,7 +16,7 @@ use crate::types::NodeId;
 use super::node::RaftNode;
 use super::types::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    NamespaceSnapshotRequest, NamespaceSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
 };
 
 /// A peer could not be reached (or refused the request at the HTTP layer,
@@ -58,6 +58,16 @@ pub trait RaftTransport: Send + Sync {
         req: InstallSnapshotRequest,
     ) -> TransportFuture<'_, InstallSnapshotResponse>;
 
+    /// Fetch a voter's committed control-plane state (M-17 observer pull).
+    /// No default implementation on purpose: every transport must decide
+    /// how to serve this (a silent no-op would reintroduce the frozen
+    /// observer namespace this RPC exists to fix).
+    fn fetch_namespace_snapshot(
+        &self,
+        to: NodeId,
+        req: NamespaceSnapshotRequest,
+    ) -> TransportFuture<'_, NamespaceSnapshotResponse>;
+
     /// Best-effort synchronous address resolution for NotLeader hints.
     fn resolve_addr(&self, id: &NodeId) -> Option<String>;
 }
@@ -88,6 +98,14 @@ impl RaftTransport for NoopTransport {
         to: NodeId,
         _req: InstallSnapshotRequest,
     ) -> TransportFuture<'_, InstallSnapshotResponse> {
+        Box::pin(async move { Err(TransportError(format!("no transport to {}", to.0))) })
+    }
+
+    fn fetch_namespace_snapshot(
+        &self,
+        to: NodeId,
+        _req: NamespaceSnapshotRequest,
+    ) -> TransportFuture<'_, NamespaceSnapshotResponse> {
         Box::pin(async move { Err(TransportError(format!("no transport to {}", to.0))) })
     }
 
@@ -249,6 +267,17 @@ impl RaftTransport for ChannelTransport {
         Box::pin(async move {
             self.network
                 .deliver(&self.self_id, &to, |node| node.handle_install_snapshot(req))
+        })
+    }
+
+    fn fetch_namespace_snapshot(
+        &self,
+        to: NodeId,
+        _req: NamespaceSnapshotRequest,
+    ) -> TransportFuture<'_, NamespaceSnapshotResponse> {
+        Box::pin(async move {
+            self.network
+                .deliver(&self.self_id, &to, |node| Ok(node.committed_snapshot()))
         })
     }
 
