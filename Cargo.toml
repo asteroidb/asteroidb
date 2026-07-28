@@ -77,10 +77,6 @@ name = "asteroidb-cli"
 path = "src/bin/cli.rs"
 required-features = ["native-runtime"]
 
-[[test]]
-name = "http_wal_durability"
-required-features = ["native-runtime"]
-
 [[bench]]
 name = "sync_benchmark"
 harness = false

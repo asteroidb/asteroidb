@@ -32,6 +32,14 @@
 //! fsync calls in place is a code-review obligation; only OS-level fault
 //! injection (outside an in-process test's reach) could pin it.
 
+// This suite needs `native-runtime`, but the gate lives here rather than as
+// a `required-features` on a `[[test]]` manifest entry: `.dockerignore`
+// excludes `tests/`, so an explicit `[[test]]` block makes Cargo fail
+// manifest parsing ("can't find http_wal_durability test") inside the Docker
+// build context. A file-level `cfg` gates the same way and leaves the target
+// autodiscovered.
+#![cfg(feature = "native-runtime")]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

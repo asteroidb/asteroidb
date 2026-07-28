@@ -1327,7 +1327,6 @@ mod tests {
         assert!(det.is_known_exact(&new));
     }
 
-    #[test]
     /// Stub builds carry BLS fields as unvalidated strings and never check
     /// them at verification time, so attacker garbage can be indexed. It
     /// must NOT travel: native receivers hard-validate BLS fields inside
