@@ -569,6 +569,54 @@ process::abort)はバグ扱いしない。
 - **フル PreVote**(m-8 残余): 分断復帰ノードによる有界なリーダー中断(1 回の再選出)を完全に
   抑止するには PreVote RPC の追加(ワイヤ変更)が必要。将来課題。
 
+## コア十分性 思考実験(PR #340 マージ後、8 レンズ敵対的評価)
+
+総合判定: **不足**(一様ではない — Eventual レーン単体は閉じている。不足は下記 D1/D2 に集中)。
+以下は 8 シナリオ思考実験 + クロス検証で confirmed された設計不足。深刻度順。番号は着手管理用。
+
+- **D1**(fatal / 着手中)`src/runtime/node_runner.rs`(`gc_authority_gate_passed`): GC 権威ゲートが
+  全 authority 定義を AND で要求する一方、M-4 で frontier reporter は policy 無し定義を報告対象外にした。
+  既定シードの catch-all(prefix `""`、`main.rs`)に policy 未設定かつ authority 構成済みだと、来ない
+  report を待って sweep が**永久に走らない・無音**。→ GC ゲートの母集合を reporter/admission と同条件
+  (policy 無し定義を除外)に揃える + 本番同等シードでの GC 収束統合テスト。M-8 の価値を帳消しにする。
+- **D2**(fatal)`src/network/sync.rs`: anti-entropy/sync 経路に certified 参照ゼロ。証明は時計通過
+  (到達性)のみを束縛し、値はライターのローカル store+WAL にしか存在しない。ライター喪失で
+  「証明付き確定」データが消滅。→ certified store の複製経路(専用 anti-entropy か authority 値転送)を
+  設計。当面は docs の保証範囲を「到達性の証明」に訂正。D3 と同根。大型タスク。
+- **D3**(major)FR-004 の 2-step(eventual_write → status)未実装: 未知キー永遠 Pending / stale cache の
+  偽 Certified。→ eventual 書込を certified 追跡に橋渡し、または 2-step を docs から撤回し status API に
+  `NotTracked` を追加。
+- **D4**(major)C-2 GC ゲートの母集合が ~30-45 秒で evict される gossip registry 前提のため、分断中の
+  Stage 2 hole-jump が evict で live dot を破壊し得る。→ retention 超の期間ピアを保持する「GC 用 grace
+  付きピア集合」で安全論証を registry evict から切り離す。
+- **D5**(major)ドリフト >60s で acked 書込が無音消失(`hlc.rs` ClockSkew 無音破棄 + `LwwRegister::set()`
+  握り潰し)。→ set() 失敗を STALE エラーでクライアントに返す + ClockSkew 拒否カウンタ輸出。
+- **D6**(major)接触窓容量 < バックログで delta sync が同一 prefix を永遠に再送する livelock(部分失敗で
+  frontier 非前進)。→ 成功バッチ末尾までの frontier チェックポイント化(resumable sync)。
+- **D7**(major)単一 Mutex 上の per-peer O(N) 走査群が 10^6 キー帯でロック飽和。→ HLC 順変更索引 +
+  ピア並列化。着手前に実測で深刻度確定(実証不足と一体)。
+- **D8**(major)equivocation 観測索引が正当 cardinality(authority×range×版)で `MAX_TRACKED_SCOPES=1024`
+  超で LRU スラッシュ、検知能力が無メトリクスで消失。→ eviction カウンタ輸出 + 上限を設定化。
+- **D9**(major)certified × `SyncPolicy::Interval`/`Off` で ack 済み恒久喪失にガード・fence・警告が皆無
+  (eventual と非対称)。→ certified WAL に Always 強制 or 起動時拒否/WARN + ops-guide 明記。
+- **D10**(major/docs)`ops-guide` の「旧バイナリダウングレードも安全」は誤り — pre-M-12 は floor/grace を
+  持たず placeholder-vs-sd2 偽 POM が成立。→ runbook を「ダウングレードは必ず flag=0 の新バイナリ経由」に訂正。
+
+### 再考すべき受容済み限界(docs 期待値の調整)
+
+- 制御プレーン認証の fail-open 既定 + 平文 HTTP、observer pull の自己申告 node_id 採用(CFT 前提内では
+  妥当だが secure-by-default = token 未設定時に internal API 拒否/大警告 + 宛先↔node_id 束縛は数行級)。
+- `requirements.md`(split-view 検知)/ `user-guide`(「過半数が承認」)が実装(HLC 完全一致検知/到達性証明)
+  より強く読める。Byzantine スコープ外の受容自体は妥当だが文言の限定明記は必須(D2/D10 と同根)。
+- 120s 観測保持窓は週分断で split-view 検知カバレッジがゼロになる旨を Byzantine フェーズ計画に明記。
+
+### 実証不足(優先順)
+
+1. Eventual/Certified 境界のクライアント契約テスト(user-guide のコード例を実行 + ライター喪失後の
+   certified 読み)。2. 本番同等シード(catch-all 含む)での GC 収束 + evict 閾値超分断→復帰 e2e。
+3. 実電源断ハーネス(dm-flakey/LazyFS or kill -9 soak)。4. 10^6 キー×50 ピア級の bench/soak。
+5. 凍結旧形状 bincode デコードテスト。
+
 ## 参照
 
 - research の示唆: `../research/topics/*.md` 各「AsteroidDB への示唆」節、`../research/whitemap.md`
