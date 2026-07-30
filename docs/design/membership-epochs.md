@@ -1,5 +1,12 @@
 # A2: S2 メンバーシップ — grace 付き GC ピア集合(Phase 1)+ scope 付き epoch 所有層(Phase 2)(確定設計)
 
+> **SUPERSEDED(2026-07-30)**: 本設計は `core-semantics-v2.md` §5 により全面差し替え。
+> grace 窓は原則違反(応答の不在で安全集合を狭める推論の時間延長)として廃止、
+> OwnershipState(per-scope epoch / 4 状態 / vN ラッチ)は過剰設計として廃止。
+> 後継は「明示 data-node roster(追加は自動可・削除は明示のみ)」。
+> v2 へ引き継がれたのは decode_response 修正・証跡キー addr→node_id 化・
+> decommission API の 3 要素のみ。本文は経緯資料として残す。
+
 対象: R5(roadmap Phase 1b / Phase 4)。吸収する欠陥: D4(分断 30-45s で生存 peer の
 live dot を hole-jump が破壊)、decode_response の fail-open(S6 未起票)、dead-peer GC 停止の
 runbook 依存、addr キー証跡の宙吊り、cluster_nodes/registry/静的 voter の三重ソース。

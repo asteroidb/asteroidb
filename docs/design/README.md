@@ -1,5 +1,10 @@
 # コア再設計 確定設計一式(A1〜A4 + 横断統合)
 
+> **改訂(2026-07-30)**: 本 v1 設計群は `core-semantics-v2.md` により減算的に見直された。
+> 優先関係は同文書 §8 の supersession 表が定める。要点: A2 は全面 superseded(grace 窓・
+> OwnershipState 廃止 → 明示 roster)、A3 は Stage 0 のみ有効、A1/A4 は存続(A4 の
+> status 判定基準は v2 §3.6 が差し替え)、証明意味論は v2 §3(coverage 証明)が新設。
+
 作成: 2026-07-28。HEAD 4b16294(行番号アンカーは f48dc04 時点 — 実装時はシンボル名で
 再接地。Phase 0 の D6 が sync.rs / node_runner.rs の push 経路行番号を先にずらすため、
 `push_changed_keys` / `send_with_json_fallback` / `gc_gate_diagnose` 等のシンボル参照を正とする)。

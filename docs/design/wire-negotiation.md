@@ -1,5 +1,11 @@
 # A3: S5 ワイヤバージョン交渉層(確定設計)
 
+> **一部 SUPERSEDED(2026-07-30)**: `core-semantics-v2.md` §7 により Stage 1-3
+> (v= 交渉・strict decode・受動学習)はカット(将来要求先行 — A3 自身が案 B を却下した
+> 物差しが自分に当たる、という指摘の受理)。**Stage 0(fallback 3 重複製の共有モジュール
+> 統合 = 純減)のみ実施対象として有効**。再着火条件: append-only + serde(default) で
+> 表現できない新バイト形が実際に必要になった時。本文は Stage 0 の仕様と経緯資料として残す。
+
 対象: R3(roadmap Phase 2)。吸収する欠陥: fallback 3 重複製(sync.rs:707
 `send_with_json_fallback` / frontier_sync.rs:132 / raft_transport.rs `post_internal`)、
 二段デコード 2+1 箇所(sync.rs:1133-1169 pull_delta / :1210-1243 digest_sync /
