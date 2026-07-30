@@ -1,5 +1,12 @@
 # A1: S1 range_states() 導出ビュー + catch-all シード降格(確定設計)
 
+> **注記(2026-07-30)**: 本設計は `core-semantics-v2.md` §7/§8 により**存続**(文書
+> スリム化予定)。`gc_gate_diagnose` は v2 §5.1 の資源圧メトリクス・ゲート阻止診断の
+> 実装点として拡張される。GC ゲートの母集合(名簿 ∪ roster)・要求ベクトル(remover
+> 集合)・mark の時刻表現(単調時計化)は v2 §3.5 の改訂が優先し、本文 §3 のシグネチャ
+> (`mark_ms` / `peers` / `push_acked_wall_ms`)は v1 時点の形である(実装時は v2 準拠で
+> 再接地)。
+
 対象: R1 + R2(roadmap Phase 1a / Phase 2)。吸収する欠陥: D1(GC 無音永久停止)、
 check_compaction の同型無音停止(未収載潜在)、実証不足 #2 前半(本番同等シード GC 収束 e2e)。
 

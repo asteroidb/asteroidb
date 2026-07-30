@@ -4,6 +4,32 @@
 > 優先関係は同文書 §8 の supersession 表が定める。要点: A2 は全面 superseded(grace 窓・
 > OwnershipState 廃止 → 明示 roster)、A3 は Stage 0 のみ有効、A1/A4 は存続(A4 の
 > status 判定基準は v2 §3.6 が差し替え)、証明意味論は v2 §3(coverage 証明)が新設。
+>
+> **改訂 2(2026-07-30、設計検証ラウンド 1)**: v2 本文が敵対的検証の確定指摘を反映して
+> 改訂された(coverage 述語の poison/gap 但し書き復元、報告生成規律、名簿 pin、
+> claim キャリア、再開可能性、GC 全量ゲート裁定、roster 2 状態化 — 裁定記録は v2 §11)。
+> あわせて **`principles.md`(原則章程)を新設** — 全設計文書の上位規範であり、以後の
+> 改訂は同章程との整合を保つこと。A2 行の「flat roster」は v2 §5 の 2 状態
+> {active, decommissioned} に更新されている。
+>
+> **改訂 3(2026-07-30、設計検証ラウンド 2)**: v2 本文がラウンド 2 の確定指摘
+> (critical 2 / major 9 / minor 8)を反映して改訂された。主な変更: 書込時 pin の実体化
+> (ack 時 policy_version 耐久記録)、報告への scope 復元(1 報告 = 1 scope)、
+> **BLS の proof 経路からの削除(Ed25519 n 本署名に確定)**、報告配送の resumable
+> チャネル化、poison 恒久性の正直な計上、GC ゲートの remove 証拠再設計・inbound ゲート
+> 母集合の 名簿∪roster 化、混在期 GC 停止コストの計上、例外台帳への再検討条件列の追加。
+> 裁定記録は v2 §11 ラウンド 2 表。
+>
+> **改訂 4(2026-07-30、設計検証ラウンド 3)**: v2 本文がラウンド 3 の確定指摘
+> (critical 4 / major 8)と minor 8 を反映して改訂された。主な変更: **claim 粒度の
+> 再設計**(per-origin HLC 接頭辞チャンクを放棄 → 再開可能キー空間 sweep — v2 §3.8)、
+> claim 採用の送信側 qualifier 規律(v2 §3.2 規律 4)、名簿内容変更と in-flight 書込の
+> 裁定(純追加 bump の自動 forward re-pin + プール保持の pin 版対称化 — v2 §3.3)、
+> **鍵の権威レコード化**(カレンダー鍵検証の削除、keyset_version = 名簿版 — v2 §3.3/§4)、
+> GC 要求 origin 集合の remover 一本化と origin-retire 明示操作、legacy tombstone の
+> 移行裁定(v2 §3.5)、報告配送規律の両レーン一般化(v2 §3.2)。principles.md には
+> 緊張 T9/T10 が追加され、T3 が非時間トレードオフの登録簿になった(v2 §1 例外台帳は
+> 2 判定基準に純化)。裁定記録は v2 §11 ラウンド 3 表。
 
 作成: 2026-07-28。HEAD 4b16294(行番号アンカーは f48dc04 時点 — 実装時はシンボル名で
 再接地。Phase 0 の D6 が sync.rs / node_runner.rs の push 経路行番号を先にずらすため、
@@ -21,6 +47,8 @@ followup-plan.md)の更新は各フェーズの実装時に行う。今回の成
 
 | 文書 | 領域 | フェーズ |
 |---|---|---|
+| [principles.md](principles.md) | 原則章程(精神性 + P1〜P9/G1〜G4 + 緊張と裁定方針)— 全文書の上位規範 | 恒久 |
+| [core-semantics-v2.md](core-semantics-v2.md) | 設計 v2: 証明意味論の再接地(coverage 証明)・明示 roster・cut list・裁定記録 | 横断 |
 | [range-states.md](range-states.md) | A1: S1 range_states() 導出ビュー + シード降格(R1+R2、D1 吸収) | 1a / 2 |
 | [membership-epochs.md](membership-epochs.md) | A2: S2 grace 付き GC ピア集合 + scope 付き epoch 所有層(R5、D4 吸収) | 1b / 4 |
 | [wire-negotiation.md](wire-negotiation.md) | A3: S5 ワイヤバージョン交渉層(R3、実証不足 #5 内包) | 2 |

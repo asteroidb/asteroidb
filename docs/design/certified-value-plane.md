@@ -1,5 +1,13 @@
 # A4: S3 certified 値プレーン統合 Step1+2(確定設計)
 
+> **一部差し替え(2026-07-30)**: 骨子(値プレーン統合・D2/D3/D9 の解・移行手順)は
+> `core-semantics-v2.md` §8 により**存続**。ただし Step2 の status 導出基準(§4.2 行 5)は
+> 「`stored_ts <= majority_frontier`」比較から **coverage 判定(tracked (o,t) の被覆)**に
+> 差し替え(v2 §3.6 — 導出の分母は評価時の namespace でなく**書込時 pin 版の名簿**、
+> v2 §3.3)。また Timeout は保存状態から削除され(v2 §4 / §12 FR-002)、導出 status が
+> timeout を返す行は消滅する(timeout は certified_write の on_timeout=error 系応答値
+> 専用 — ラウンド 3 m5/m8)。行 1-4, 6-7 の評価順・fail-closed 規則は不変。
+
 対象: R4(roadmap Phase 3)。吸収する欠陥: D2(certified 値の非複製 — ライター喪失で
 読めない)、D3(2-step 未実装 — 未知キー永遠 Pending / eventual 上書き後の偽 Certified)、
 D9(certified × SyncPolicy::Interval/Off で ack 済み恒久喪失 — eventual 同等保護に格下げ)、

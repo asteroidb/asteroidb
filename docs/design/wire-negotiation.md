@@ -4,7 +4,10 @@
 > (v= 交渉・strict decode・受動学習)はカット(将来要求先行 — A3 自身が案 B を却下した
 > 物差しが自分に当たる、という指摘の受理)。**Stage 0(fallback 3 重複製の共有モジュール
 > 統合 = 純減)のみ実施対象として有効**。再着火条件: append-only + serde(default) で
-> 表現できない新バイト形が実際に必要になった時。本文は Stage 0 の仕様と経緯資料として残す。
+> 表現できない新バイト形が実際に必要になった時 — **試金石は v2 §3.2 の新報告形式と
+> §3.8 の DeltaSyncRequest 拡張のロールアウト**(応答エコー・ガードで運べない、または
+> 混在期の二重送信税(上り帯域 × タイムアウト相互作用)が実測で許容外なら Stage 1 を
+> 再評価 — v2 §7 の行を正とする)。本文は Stage 0 の仕様と経緯資料として残す。
 
 対象: R3(roadmap Phase 2)。吸収する欠陥: fallback 3 重複製(sync.rs:707
 `send_with_json_fallback` / frontier_sync.rs:132 / raft_transport.rs `post_internal`)、
