@@ -360,6 +360,17 @@ pub struct RuntimeMetrics {
     /// sync of a converged store indicates the ping-pong regression.
     pub sync_redundant_merge_skips_total: AtomicU64,
 
+    /// Cumulative remote-merge HLC clock updates rejected for excessive
+    /// clock skew (`HlcError::ClockSkew`) in `merge_remote_with_hlc`. The
+    /// CRDT merge itself still applies (discarding it would permanently
+    /// lose the entry), but the local clock refuses to follow the
+    /// far-future timestamp, so local typed sets on the affected keys
+    /// return `STALE_VERSION` until the wall clock catches up (D5).
+    /// Mirrored from `EventualApi::merge_clock_skew_rejects` on each GC
+    /// tick. Zero in healthy operation; sustained growth pinpoints a peer
+    /// with a broken (far-future) clock.
+    pub sync_clock_skew_rejected_total: AtomicU64,
+
     /// Cumulative number of digest push probes (before a full-state push).
     pub digest_push_probe_total: AtomicU64,
 
@@ -409,6 +420,13 @@ pub struct RuntimeMetrics {
 
     /// Gauge: number of authorities with stored equivocation evidence.
     pub equivocation_accused_authorities: AtomicU64,
+
+    /// Cumulative equivocation observation scopes evicted (LRU) under
+    /// capacity pressure — per-authority fairness or the global cap
+    /// (`ASTEROIDB_EQUIVOCATION_MAX_SCOPES`). Mirrored from the detector's
+    /// counter after each observation batch; zero while the index stays
+    /// below its bounds.
+    pub equivocation_scope_evictions_total: AtomicU64,
 
     /// Cumulative count of relayed attestations verified and cross-checked
     /// via the split-view gossip lane (both lanes: frontier push and, since
@@ -524,6 +542,7 @@ impl Default for RuntimeMetrics {
             gc_floor_rejected_dots_total: AtomicU64::default(),
             gc_floor_killed_by_floor_total: AtomicU64::default(),
             sync_redundant_merge_skips_total: AtomicU64::default(),
+            sync_clock_skew_rejected_total: AtomicU64::default(),
             digest_push_probe_total: AtomicU64::default(),
             digest_push_match_total: AtomicU64::default(),
             digest_push_keys_pushed_total: AtomicU64::default(),
@@ -539,6 +558,7 @@ impl Default for RuntimeMetrics {
             equivocation_detected_total: AtomicU64::default(),
             equivocation_last_detected_ms: AtomicU64::default(),
             equivocation_accused_authorities: AtomicU64::default(),
+            equivocation_scope_evictions_total: AtomicU64::default(),
             split_view_observations_total: AtomicU64::default(),
             observed_relay_sync_requests_total: AtomicU64::default(),
             observed_relay_sync_accepted_total: AtomicU64::default(),
@@ -734,6 +754,13 @@ impl RuntimeMetrics {
             .store(n, Ordering::Relaxed);
     }
 
+    /// Mirror the detector's cumulative scope-eviction counter
+    /// (authoritative value lives in the detector; stored, not added).
+    pub fn set_scope_evictions(&self, n: u64) {
+        self.equivocation_scope_evictions_total
+            .store(n, Ordering::Relaxed);
+    }
+
     /// Record one relayed attestation processed via the split-view gossip lane.
     pub fn record_split_view_observation(&self) {
         self.split_view_observations_total
@@ -854,6 +881,9 @@ impl RuntimeMetrics {
             equivocation_accused_authorities: self
                 .equivocation_accused_authorities
                 .load(Ordering::Relaxed),
+            equivocation_scope_evictions_total: self
+                .equivocation_scope_evictions_total
+                .load(Ordering::Relaxed),
             split_view_observations_total: self
                 .split_view_observations_total
                 .load(Ordering::Relaxed),
@@ -921,6 +951,9 @@ impl RuntimeMetrics {
                 .load(Ordering::Relaxed),
             sync_redundant_merge_skips_total: self
                 .sync_redundant_merge_skips_total
+                .load(Ordering::Relaxed),
+            sync_clock_skew_rejected_total: self
+                .sync_clock_skew_rejected_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -995,6 +1028,8 @@ pub struct MetricsSnapshot {
     pub equivocation_last_detected_ms: u64,
     /// Gauge: number of authorities with stored equivocation evidence.
     pub equivocation_accused_authorities: u64,
+    /// Cumulative equivocation observation scopes evicted (LRU) for capacity.
+    pub equivocation_scope_evictions_total: u64,
     /// Cumulative relayed attestations processed via the split-view gossip lane.
     pub split_view_observations_total: u64,
     /// Sync requests (delta/digest) whose piggybacked observation lane was
@@ -1073,6 +1108,9 @@ pub struct MetricsSnapshot {
     /// Cumulative remote merges skipped by the RR gate (no-op merge on an
     /// already delta-visible key; M-6).
     pub sync_redundant_merge_skips_total: u64,
+    /// Cumulative remote-merge HLC clock updates rejected as ClockSkew
+    /// (merge still applied; local typed sets may answer STALE_VERSION).
+    pub sync_clock_skew_rejected_total: u64,
 }
 
 #[cfg(test)]
@@ -1098,6 +1136,22 @@ mod tests {
         assert_eq!(snap.equivocation_last_detected_ms, 5_678);
         assert_eq!(snap.equivocation_accused_authorities, 2);
         assert_eq!(snap.split_view_observations_total, 1);
+    }
+
+    #[test]
+    fn scope_eviction_metric_default_zero_and_set() {
+        let metrics = RuntimeMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.equivocation_scope_evictions_total, 0);
+
+        // Mirror semantics: a later sync overwrites, never adds.
+        metrics.set_scope_evictions(3);
+        metrics.set_scope_evictions(7);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.equivocation_scope_evictions_total, 7);
+
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["equivocation_scope_evictions_total"], 7);
     }
 
     #[test]

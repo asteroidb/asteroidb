@@ -28,6 +28,7 @@ impl<T: Clone> LwwRegister<T> {
     /// Set the value if the given timestamp is strictly greater than the current one.
     ///
     /// Returns `true` if the value was updated, `false` if the timestamp was stale.
+    #[must_use = "a false result means the set was a stale no-op and must not be acked"]
     pub fn set(&mut self, value: T, timestamp: HlcTimestamp) -> bool {
         if timestamp > self.timestamp {
             self.value = Some(value);
@@ -186,7 +187,7 @@ mod tests {
     #[test]
     fn later_timestamp_wins() {
         let mut reg = LwwRegister::new();
-        reg.set(1, ts(100, 0, "node-a"));
+        let _ = reg.set(1, ts(100, 0, "node-a"));
         let updated = reg.set(2, ts(200, 0, "node-a"));
         assert!(updated);
         assert_eq!(reg.get(), Some(&2));
@@ -195,7 +196,7 @@ mod tests {
     #[test]
     fn earlier_timestamp_ignored() {
         let mut reg = LwwRegister::new();
-        reg.set(1, ts(200, 0, "node-a"));
+        let _ = reg.set(1, ts(200, 0, "node-a"));
         let updated = reg.set(2, ts(100, 0, "node-b"));
         assert!(!updated);
         assert_eq!(reg.get(), Some(&1));
@@ -204,7 +205,7 @@ mod tests {
     #[test]
     fn equal_timestamp_ignored() {
         let mut reg = LwwRegister::new();
-        reg.set(1, ts(100, 0, "node-a"));
+        let _ = reg.set(1, ts(100, 0, "node-a"));
         let updated = reg.set(2, ts(100, 0, "node-a"));
         assert!(!updated);
         assert_eq!(reg.get(), Some(&1));
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn logical_counter_breaks_tie() {
         let mut reg = LwwRegister::new();
-        reg.set("first", ts(100, 0, "node-a"));
+        let _ = reg.set("first", ts(100, 0, "node-a"));
         let updated = reg.set("second", ts(100, 1, "node-a"));
         assert!(updated);
         assert_eq!(reg.get(), Some(&"second"));
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn node_id_breaks_tie() {
         let mut reg = LwwRegister::new();
-        reg.set("alpha", ts(100, 0, "node-a"));
+        let _ = reg.set("alpha", ts(100, 0, "node-a"));
         let updated = reg.set("beta", ts(100, 0, "node-b"));
         assert!(updated);
         assert_eq!(reg.get(), Some(&"beta"));
@@ -231,10 +232,10 @@ mod tests {
     #[test]
     fn merge_higher_timestamp_wins() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(10, ts(100, 0, "node-a"));
+        let _ = reg_a.set(10, ts(100, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(20, ts(200, 0, "node-b"));
+        let _ = reg_b.set(20, ts(200, 0, "node-b"));
 
         reg_a.merge(&reg_b);
         assert_eq!(reg_a.get(), Some(&20));
@@ -243,10 +244,10 @@ mod tests {
     #[test]
     fn merge_lower_timestamp_no_change() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(10, ts(200, 0, "node-a"));
+        let _ = reg_a.set(10, ts(200, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(20, ts(100, 0, "node-b"));
+        let _ = reg_b.set(20, ts(100, 0, "node-b"));
 
         reg_a.merge(&reg_b);
         assert_eq!(reg_a.get(), Some(&10));
@@ -255,10 +256,10 @@ mod tests {
     #[test]
     fn merge_is_commutative() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(1, ts(100, 0, "node-a"));
+        let _ = reg_a.set(1, ts(100, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(2, ts(200, 0, "node-b"));
+        let _ = reg_b.set(2, ts(200, 0, "node-b"));
 
         let mut merged_ab = reg_a.clone();
         merged_ab.merge(&reg_b);
@@ -272,10 +273,10 @@ mod tests {
     #[test]
     fn merge_is_idempotent() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(42, ts(100, 0, "node-a"));
+        let _ = reg_a.set(42, ts(100, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(99, ts(200, 0, "node-b"));
+        let _ = reg_b.set(99, ts(200, 0, "node-b"));
 
         let mut merged = reg_a.clone();
         merged.merge(&reg_b);
@@ -288,7 +289,7 @@ mod tests {
     fn timestamp_accessor() {
         let mut reg = LwwRegister::new();
         let t = ts(500, 3, "node-x");
-        reg.set("val", t.clone());
+        let _ = reg.set("val", t.clone());
         assert_eq!(reg.timestamp(), &t);
     }
 
@@ -301,7 +302,7 @@ mod tests {
     #[test]
     fn serde_roundtrip() {
         let mut reg = LwwRegister::new();
-        reg.set("hello".to_string(), ts(100, 1, "node-a"));
+        let _ = reg.set("hello".to_string(), ts(100, 1, "node-a"));
 
         let json = serde_json::to_string(&reg).unwrap();
         let back: LwwRegister<String> = serde_json::from_str(&json).unwrap();
@@ -315,7 +316,7 @@ mod tests {
     #[test]
     fn delta_since_returns_some_when_newer() {
         let mut reg = LwwRegister::new();
-        reg.set("hello", ts(200, 0, "node-a"));
+        let _ = reg.set("hello", ts(200, 0, "node-a"));
 
         let delta = reg.delta_since(&ts(100, 0, ""));
         assert!(delta.is_some());
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn delta_since_returns_none_when_older() {
         let mut reg = LwwRegister::new();
-        reg.set("hello", ts(100, 0, "node-a"));
+        let _ = reg.set("hello", ts(100, 0, "node-a"));
 
         let delta = reg.delta_since(&ts(200, 0, ""));
         assert!(delta.is_none());
@@ -334,7 +335,7 @@ mod tests {
     #[test]
     fn delta_since_returns_none_when_equal() {
         let mut reg = LwwRegister::new();
-        reg.set("hello", ts(100, 0, "node-a"));
+        let _ = reg.set("hello", ts(100, 0, "node-a"));
 
         let delta = reg.delta_since(&ts(100, 0, "node-a"));
         assert!(delta.is_none());
@@ -351,10 +352,10 @@ mod tests {
     #[test]
     fn delta_round_trip_produces_same_result() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(10, ts(100, 0, "node-a"));
+        let _ = reg_a.set(10, ts(100, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(20, ts(200, 0, "node-b"));
+        let _ = reg_b.set(20, ts(200, 0, "node-b"));
 
         // Full merge path.
         let mut via_full = reg_a.clone();
@@ -371,10 +372,10 @@ mod tests {
     #[test]
     fn merge_delta_is_equivalent_to_merge() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set(1, ts(100, 0, "node-a"));
+        let _ = reg_a.set(1, ts(100, 0, "node-a"));
 
         let mut reg_b = LwwRegister::new();
-        reg_b.set(2, ts(200, 0, "node-b"));
+        let _ = reg_b.set(2, ts(200, 0, "node-b"));
 
         let mut via_merge = reg_a.clone();
         via_merge.merge(&reg_b);
@@ -407,14 +408,14 @@ mod tests {
     fn merge_changed_truth_table() {
         // Greater arm: changed.
         let mut a = LwwRegister::new();
-        a.set("old".to_string(), ts(100, 0, "node-a"));
+        let _ = a.set("old".to_string(), ts(100, 0, "node-a"));
         let mut newer = LwwRegister::new();
-        newer.set("new".to_string(), ts(200, 0, "node-b"));
+        let _ = newer.set("new".to_string(), ts(200, 0, "node-b"));
         assert!(merge_ground_truth(&mut a, &newer));
 
         // Less arm: no-op.
         let mut older = LwwRegister::new();
-        older.set("stale".to_string(), ts(50, 0, "node-c"));
+        let _ = older.set("stale".to_string(), ts(50, 0, "node-c"));
         assert!(!merge_ground_truth(&mut a, &older));
 
         // Equal timestamp, equal value (idempotent replay): no-op.
@@ -423,12 +424,12 @@ mod tests {
 
         // Equal timestamp, larger value (tiebreaker): changed.
         let mut tie = LwwRegister::new();
-        tie.set("zzz".to_string(), ts(200, 0, "node-b"));
+        let _ = tie.set("zzz".to_string(), ts(200, 0, "node-b"));
         assert!(merge_ground_truth(&mut a, &tie));
 
         // Equal timestamp, smaller value: no-op.
         let mut smaller = LwwRegister::new();
-        smaller.set("new".to_string(), ts(200, 0, "node-b"));
+        let _ = smaller.set("new".to_string(), ts(200, 0, "node-b"));
         assert!(!merge_ground_truth(&mut a, &smaller));
 
         // Empty registers (both at the zero timestamp): no-op.

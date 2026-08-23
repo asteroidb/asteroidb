@@ -111,6 +111,7 @@ where
     /// was stale compared to the current LWW-Register value. When `false`
     /// is returned, no dots are modified to prevent inconsistency between
     /// key presence and the register value.
+    #[must_use = "a false result means the set was a stale no-op and must not be acked"]
     pub fn set(&mut self, key: K, value: V, timestamp: HlcTimestamp, node_id: &NodeId) -> bool {
         // Pre-check: if the key already has a higher or equal timestamp,
         // skip the entire operation to avoid adding a dot without updating
@@ -134,9 +135,11 @@ where
             self.deferred.insert(d);
         }
 
-        // Add the new dot and update the register value.
+        // Add the new dot and update the register value. The pre-check above
+        // guarantees the timestamp dominates the entry's register, so this
+        // inner set can never be a stale no-op.
         entry.0.insert(dot);
-        entry.1.set(value, timestamp);
+        let _ = entry.1.set(value, timestamp);
         true
     }
 
@@ -691,7 +694,7 @@ mod tests {
     #[test]
     fn set_and_get() {
         let mut map = OrMap::new();
-        map.set(
+        let _ = map.set(
             "key1".to_string(),
             42,
             ts(100, 0, "node-a"),
@@ -705,8 +708,8 @@ mod tests {
     #[test]
     fn set_overwrites_value() {
         let mut map = OrMap::new();
-        map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
-        map.set("k".to_string(), 2, ts(200, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 2, ts(200, 0, "node-a"), &node("node-a"));
         assert_eq!(map.get(&"k".to_string()), Some(&2));
         assert_eq!(map.len(), 1);
     }
@@ -714,7 +717,7 @@ mod tests {
     #[test]
     fn delete_removes_key() {
         let mut map = OrMap::new();
-        map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
         assert!(map.contains_key(&"k".to_string()));
 
         map.delete(&"k".to_string());
@@ -726,20 +729,20 @@ mod tests {
     #[test]
     fn delete_and_re_add() {
         let mut map = OrMap::new();
-        map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
         map.delete(&"k".to_string());
         assert!(map.is_empty());
 
-        map.set("k".to_string(), 2, ts(200, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 2, ts(200, 0, "node-a"), &node("node-a"));
         assert_eq!(map.get(&"k".to_string()), Some(&2));
     }
 
     #[test]
     fn multiple_keys() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
-        map.set("b".to_string(), 2, ts(101, 0, "node-a"), &node("node-a"));
-        map.set("c".to_string(), 3, ts(102, 0, "node-a"), &node("node-a"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map.set("b".to_string(), 2, ts(101, 0, "node-a"), &node("node-a"));
+        let _ = map.set("c".to_string(), 3, ts(102, 0, "node-a"), &node("node-a"));
 
         assert_eq!(map.len(), 3);
         assert_eq!(map.get(&"a".to_string()), Some(&1));
@@ -761,10 +764,10 @@ mod tests {
     #[test]
     fn merge_disjoint_keys() {
         let mut map_a = OrMap::new();
-        map_a.set("x".to_string(), 10, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("x".to_string(), 10, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = OrMap::new();
-        map_b.set("y".to_string(), 20, ts(100, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("y".to_string(), 20, ts(100, 0, "node-b"), &node("node-b"));
 
         map_a.merge(&map_b);
 
@@ -776,10 +779,10 @@ mod tests {
     #[test]
     fn merge_same_key_lww() {
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = OrMap::new();
-        map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
 
         map_a.merge(&map_b);
 
@@ -791,12 +794,12 @@ mod tests {
     fn merge_convergence() {
         // Both directions of merge should produce the same result.
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
-        map_a.set("x".to_string(), 10, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("x".to_string(), 10, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = OrMap::new();
-        map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
-        map_b.set("y".to_string(), 20, ts(100, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("y".to_string(), 20, ts(100, 0, "node-b"), &node("node-b"));
 
         let mut merged_ab = map_a.clone();
         merged_ab.merge(&map_b);
@@ -830,7 +833,7 @@ mod tests {
         // After merge, key "k" should be present (add-wins).
 
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         // Clone to node B before the delete.
         let mut map_b = map_a.clone();
@@ -840,7 +843,7 @@ mod tests {
         assert!(!map_a.contains_key(&"k".to_string()));
 
         // Node B concurrently sets (new dot).
-        map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
 
         // Merge: B's new dot is not in A's deferred -> key survives.
         map_a.merge(&map_b);
@@ -852,12 +855,12 @@ mod tests {
     fn concurrent_delete_and_set_add_wins_reverse() {
         // Same as above but merge in the other direction.
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = map_a.clone();
 
         map_a.delete(&"k".to_string());
-        map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("k".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
 
         // Merge B <- A.
         map_b.merge(&map_a);
@@ -868,7 +871,7 @@ mod tests {
     #[test]
     fn both_delete_then_merge() {
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = map_a.clone();
 
@@ -886,7 +889,7 @@ mod tests {
         // B's entries but IS in B's deferred. When A merges B, A's self-only
         // entry for "k" must have its dots checked against B's deferred set.
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         // Clone to B so both replicas share the same dot for "k".
         let mut map_b = map_a.clone();
@@ -910,8 +913,8 @@ mod tests {
     fn delete_propagates_to_self_only_entry_with_other_keys_surviving() {
         // Ensure the fix only removes the correct key and not unrelated ones.
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
-        map_a.set(
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set(
             "other".to_string(),
             99,
             ts(101, 0, "node-a"),
@@ -939,10 +942,10 @@ mod tests {
     #[test]
     fn merge_is_idempotent() {
         let mut map_a = OrMap::new();
-        map_a.set("x".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("x".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = OrMap::new();
-        map_b.set("y".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("y".to_string(), 2, ts(200, 0, "node-b"), &node("node-b"));
 
         map_a.merge(&map_b);
         let len_after_first = map_a.len();
@@ -973,7 +976,7 @@ mod tests {
         // Regression test for #126: after merging a higher-timestamp value,
         // a local set with a lower timestamp should be a no-op.
         let mut map_a = OrMap::new();
-        map_a.set(
+        let _ = map_a.set(
             "k".to_string(),
             "value_a".to_string(),
             ts(100, 0, "node-a"),
@@ -981,7 +984,7 @@ mod tests {
         );
 
         let mut map_b = OrMap::new();
-        map_b.set(
+        let _ = map_b.set(
             "k".to_string(),
             "value_b".to_string(),
             ts(200, 0, "node-b"),
@@ -1014,7 +1017,7 @@ mod tests {
     #[test]
     fn set_with_equal_timestamp_is_noop() {
         let mut map = OrMap::new();
-        map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let updated = map.set("k".to_string(), 2, ts(100, 0, "node-a"), &node("node-a"));
         assert!(!updated);
@@ -1024,10 +1027,10 @@ mod tests {
     #[test]
     fn concurrent_set_different_keys() {
         let mut map_a = OrMap::new();
-        map_a.set("a".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
+        let _ = map_a.set("a".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let mut map_b = OrMap::new();
-        map_b.set("b".to_string(), 2, ts(100, 0, "node-b"), &node("node-b"));
+        let _ = map_b.set("b".to_string(), 2, ts(100, 0, "node-b"), &node("node-b"));
 
         map_a.merge(&map_b);
         assert_eq!(map_a.len(), 2);
@@ -1056,8 +1059,8 @@ mod tests {
     #[test]
     fn delta_since_returns_entries_after_frontier() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
-        map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
 
         // Frontier at 150 should only include "b".
         let delta = map.delta_since(&ts(150, 0, "")).unwrap();
@@ -1068,7 +1071,7 @@ mod tests {
     #[test]
     fn delta_since_returns_none_when_all_older() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
 
         let delta = map.delta_since(&ts(200, 0, ""));
         assert!(delta.is_none());
@@ -1077,7 +1080,7 @@ mod tests {
     #[test]
     fn delta_from_no_changes_returns_none() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
         let old = map.clone();
 
         assert!(map.delta_from(&old).is_none());
@@ -1086,10 +1089,10 @@ mod tests {
     #[test]
     fn delta_from_detects_new_entry() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
         let old = map.clone();
 
-        map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
+        let _ = map.set("b".to_string(), 2, ts(200, 0, "A"), &node("A"));
 
         let delta = map.delta_from(&old).unwrap();
         assert!(delta.contains_key(&"b".to_string()));
@@ -1099,10 +1102,10 @@ mod tests {
     #[test]
     fn delta_from_detects_updated_value() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
         let old = map.clone();
 
-        map.set("a".to_string(), 2, ts(200, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 2, ts(200, 0, "A"), &node("A"));
 
         let delta = map.delta_from(&old).unwrap();
         assert!(delta.contains_key(&"a".to_string()));
@@ -1112,7 +1115,7 @@ mod tests {
     #[test]
     fn delta_from_detects_delete() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
         let old = map.clone();
 
         map.delete(&"a".to_string());
@@ -1125,10 +1128,10 @@ mod tests {
     #[test]
     fn delta_round_trip_add_produces_same_result() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
         let old = map.clone();
 
-        map.set("b".to_string(), 2, ts(200, 0, "B"), &node("B"));
+        let _ = map.set("b".to_string(), 2, ts(200, 0, "B"), &node("B"));
 
         // Full merge path.
         let mut via_full = old.clone();
@@ -1153,8 +1156,8 @@ mod tests {
     #[test]
     fn delta_round_trip_delete_produces_same_result() {
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
-        map.set("b".to_string(), 2, ts(101, 0, "A"), &node("A"));
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let _ = map.set("b".to_string(), 2, ts(101, 0, "A"), &node("A"));
         let old = map.clone();
 
         map.delete(&"a".to_string());
@@ -1179,10 +1182,10 @@ mod tests {
     #[test]
     fn merge_delta_is_equivalent_to_merge() {
         let mut map_a = OrMap::new();
-        map_a.set("x".to_string(), 10, ts(100, 0, "A"), &node("A"));
+        let _ = map_a.set("x".to_string(), 10, ts(100, 0, "A"), &node("A"));
 
         let mut map_b = OrMap::new();
-        map_b.set("y".to_string(), 20, ts(200, 0, "B"), &node("B"));
+        let _ = map_b.set("y".to_string(), 20, ts(200, 0, "B"), &node("B"));
 
         let mut via_merge = map_a.clone();
         via_merge.merge(&map_b);
@@ -1217,7 +1220,7 @@ mod tests {
     fn swept_tombstone_is_not_reinjected_by_merge() {
         let n = node("A");
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
         map_a.delete(&"k".to_string()); // tombstone (A,1)
         let map_b = map_a.clone();
 
@@ -1242,7 +1245,7 @@ mod tests {
     fn floor_kills_stale_live_entry_on_merge() {
         let n = node("A");
         let mut map_a = OrMap::new();
-        map_a.set("k".to_string(), 1, ts(100, 0, "A"), &n);
+        let _ = map_a.set("k".to_string(), 1, ts(100, 0, "A"), &n);
         let mut map_b = map_a.clone(); // B holds (A,1) live
 
         map_a.delete(&"k".to_string());
@@ -1266,7 +1269,7 @@ mod tests {
     fn set_after_floor_survives() {
         let n = node("A");
         let mut map = OrMap::new();
-        map.set("k".to_string(), 1, ts(100, 0, "A"), &n);
+        let _ = map.set("k".to_string(), 1, ts(100, 0, "A"), &n);
         map.delete(&"k".to_string());
         map.compact_deferred_certified(&map.deferred_dots(), None);
         assert_eq!(map.compaction_floor().get(&n), Some(&1));
@@ -1287,17 +1290,17 @@ mod tests {
     fn delta_since_ships_empty_floor_and_does_not_kill_receiver_entries() {
         let n = node("A");
         let mut sender = OrMap::new();
-        sender.set("old".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
+        let _ = sender.set("old".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
         let mut receiver = sender.clone(); // receiver holds "old" live
 
         // Sender advances its floor past (A,1) — "old" stays live.
-        sender.set("gone".to_string(), 2, ts(150, 0, "A"), &n); // dot (A,2)
+        let _ = sender.set("gone".to_string(), 2, ts(150, 0, "A"), &n); // dot (A,2)
         sender.delete(&"gone".to_string());
         sender.compact_deferred_certified(&sender.deferred_dots(), None);
         assert_eq!(sender.compaction_floor().get(&n), Some(&2));
 
         // New entry only — the delta excludes "old" (ts 100 <= frontier 200).
-        sender.set("new".to_string(), 3, ts(300, 0, "A"), &n);
+        let _ = sender.set("new".to_string(), 3, ts(300, 0, "A"), &n);
         let delta = sender.delta_since(&ts(200, 0, "")).unwrap();
         assert!(!delta.contains_key(&"old".to_string()));
         assert!(
@@ -1319,12 +1322,12 @@ mod tests {
     fn delta_from_ships_empty_floor() {
         let n = node("A");
         let mut map = OrMap::new();
-        map.set("a".to_string(), 1, ts(100, 0, "A"), &n);
+        let _ = map.set("a".to_string(), 1, ts(100, 0, "A"), &n);
         map.delete(&"a".to_string());
         map.compact_deferred_certified(&map.deferred_dots(), None);
         let old = map.clone();
 
-        map.set("b".to_string(), 2, ts(200, 0, "A"), &n);
+        let _ = map.set("b".to_string(), 2, ts(200, 0, "A"), &n);
         let delta = map.delta_from(&old).unwrap();
         assert!(delta.compaction_floor.is_empty(), "INV-W");
     }
@@ -1345,10 +1348,10 @@ mod tests {
     fn certified_sweep_respects_candidates_and_unknown_nodes() {
         let n = node("A");
         let mut map = OrMap::new();
-        map.set("k1".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
+        let _ = map.set("k1".to_string(), 1, ts(100, 0, "A"), &n); // dot (A,1)
         map.delete(&"k1".to_string());
         let marked = map.deferred_dots();
-        map.set("k2".to_string(), 2, ts(200, 0, "A"), &n); // dot (A,2)
+        let _ = map.set("k2".to_string(), 2, ts(200, 0, "A"), &n); // dot (A,2)
         map.delete(&"k2".to_string()); // post-mark tombstone
 
         let outcome = map.compact_deferred_certified(&marked, None);
@@ -1382,8 +1385,8 @@ mod tests {
     fn merge_changed_identical_and_subset_are_noops() {
         let n = node("A");
         let mut a = OrMap::new();
-        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
-        a.set("gone".to_string(), "g".to_string(), ts(110, 0, "A"), &n);
+        let _ = a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = a.set("gone".to_string(), "g".to_string(), ts(110, 0, "A"), &n);
         a.delete(&"gone".to_string());
         let b = a.clone();
 
@@ -1392,7 +1395,7 @@ mod tests {
 
         // Dominated subset: b lacks a's later entry.
         let mut sup = b.clone();
-        sup.set("extra".to_string(), "e".to_string(), ts(200, 0, "A"), &n);
+        let _ = sup.set("extra".to_string(), "e".to_string(), ts(200, 0, "A"), &n);
         let mut target = sup.clone();
         let fx = merge_ground_truth(&mut target, &b);
         assert!(!fx.changed, "merging a dominated subset must be a no-op");
@@ -1402,9 +1405,9 @@ mod tests {
     fn merge_changed_register_timestamp_directions() {
         let n = node("A");
         let mut a = OrMap::new();
-        a.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
+        let _ = a.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
         let mut newer = OrMap::new();
-        newer.set(
+        let _ = newer.set(
             "k".to_string(),
             "new".to_string(),
             ts(200, 0, "B"),
@@ -1420,7 +1423,7 @@ mod tests {
         // is a distinct live dot) — but repeating the SAME merge again
         // must be a no-op.
         let mut older = OrMap::new();
-        older.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
+        let _ = older.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
         merge_ground_truth(&mut a, &older);
         let fx = merge_ground_truth(&mut a, &older);
         assert!(!fx.changed, "repeated merge of the same state is a no-op");
@@ -1430,7 +1433,7 @@ mod tests {
     fn merge_changed_tombstone_counter_floor_paths() {
         let n = node("A");
         let mut a = OrMap::new();
-        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         let mut b = a.clone();
 
         // Tombstone-only difference.
@@ -1448,7 +1451,7 @@ mod tests {
 
         // Floor advance + floor kill on a lagging replica.
         let mut swept = OrMap::new();
-        swept.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = swept.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         let mut lagging = swept.clone();
         swept.delete(&"k".to_string());
         swept.compact_deferred_certified(&swept.deferred_dots(), None);
@@ -1461,7 +1464,7 @@ mod tests {
     fn merge_changed_stale_reoffers_are_noops() {
         let n = node("A");
         let mut a = OrMap::new();
-        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         a.delete(&"k".to_string());
         let pre_sweep = a.clone(); // holds tombstone (A,1)
         a.compact_deferred_certified(&a.deferred_dots(), None);
@@ -1489,7 +1492,7 @@ mod tests {
 
         // Case 1: all dots deferred (we deleted the key).
         let mut sender = OrMap::new();
-        sender.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = sender.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         let mut a = sender.clone();
         a.delete(&"k".to_string());
         let fx = merge_ground_truth(&mut a, &sender);
@@ -1514,7 +1517,7 @@ mod tests {
     fn merge_changed_zero_counter_creates_no_ghost_entry() {
         let n = node("A");
         let mut a = OrMap::new();
-        a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
+        let _ = a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         let b: OrMap<String, String> = serde_json::from_str(
             r#"{"entries":{},"counters":{"B":0},"deferred":[],"compaction_floor":{}}"#,
         )

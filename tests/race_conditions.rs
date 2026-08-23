@@ -204,7 +204,7 @@ async fn lww_register_merge_highest_ts_wins() {
     for i in 0..NUM_PEERS {
         let mut reg = LwwRegister::new();
         // Each peer writes with a different physical timestamp.
-        reg.set(
+        let _ = reg.set(
             format!("value-{i}"),
             ts(100 + i as u64, 0, &format!("peer-{i}")),
         );
@@ -248,7 +248,7 @@ async fn or_map_merge_add_wins_correctness() {
 
     // Common base: key "k" exists.
     let mut common: OrMap<String, String> = OrMap::new();
-    common.set(
+    let _ = common.set(
         "k".to_string(),
         "original".to_string(),
         ts(100, 0, "origin"),
@@ -259,7 +259,7 @@ async fn or_map_merge_add_wins_correctness() {
     let mut setter_maps = Vec::new();
     for i in 0..NUM_SETTERS {
         let mut replica = common.clone();
-        replica.set(
+        let _ = replica.set(
             "k".to_string(),
             format!("setter-{i}"),
             ts(200 + i as u64, 0, &format!("setter-{i}")),

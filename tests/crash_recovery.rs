@@ -99,13 +99,13 @@ fn store_eventual_write_survives_crash() {
 
         // OR-Map
         let mut map = OrMap::new();
-        map.set(
+        let _ = map.set(
             "name".to_string(),
             "AsteroidDB".to_string(),
             ts(100, 0, "A"),
             &node("A"),
         );
-        map.set(
+        let _ = map.set(
             "version".to_string(),
             "0.1".to_string(),
             ts(101, 0, "A"),
@@ -115,7 +115,7 @@ fn store_eventual_write_survives_crash() {
 
         // LWW-Register
         let mut reg = LwwRegister::new();
-        reg.set("hello-world".to_string(), ts(200, 0, "A"));
+        let _ = reg.set("hello-world".to_string(), ts(200, 0, "A"));
         store.put("greeting".into(), CrdtValue::Register(reg));
 
         store.save_snapshot(&path).unwrap();
@@ -868,7 +868,7 @@ fn compaction_floor_survives_snapshot_round_trip() {
     set.compact_deferred_certified(&set.deferred_dots(), None);
 
     let mut map: OrMap<String, String> = OrMap::new();
-    map.set("k".into(), "v".into(), ts(100, 0, "A"), &n);
+    let _ = map.set("k".into(), "v".into(), ts(100, 0, "A"), &n);
     map.delete(&"k".to_string());
     map.compact_deferred_certified(&map.deferred_dots(), None);
 

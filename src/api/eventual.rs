@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::error::CrdtError;
+use crate::error::{CrdtError, HlcError};
 use crate::hlc::{Hlc, HlcTimestamp};
 use crate::session::SessionToken;
 use crate::store::kv::{CrdtValue, Store};
@@ -51,6 +51,12 @@ pub struct EventualApi {
     /// happened. In-memory observability only — never persisted, never on
     /// the wire (mirrored into `RuntimeMetrics` by the runner).
     redundant_merge_skips: u64,
+    /// Remote-merge HLC clock updates rejected as `ClockSkew` by
+    /// `merge_remote_with_hlc` (the CRDT merge itself still runs). While
+    /// the local clock refuses to follow a far-future timestamp, local
+    /// typed sets on the affected keys surface as `StaleVersion`. In-memory
+    /// observability only (mirrored into `RuntimeMetrics` by the runner).
+    merge_clock_skew_rejects: u64,
 }
 
 impl EventualApi {
@@ -68,6 +74,7 @@ impl EventualApi {
             #[cfg(not(target_arch = "wasm32"))]
             pending_poison: Vec::new(),
             redundant_merge_skips: 0,
+            merge_clock_skew_rejects: 0,
         }
     }
 
@@ -90,6 +97,7 @@ impl EventualApi {
             last_wal_pos: None,
             pending_poison: Vec::new(),
             redundant_merge_skips: 0,
+            merge_clock_skew_rejects: 0,
         }
     }
 
@@ -471,6 +479,10 @@ impl EventualApi {
     ///
     /// Creates the map if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
+    /// Returns `StaleVersion` if the fresh local HLC does not dominate the
+    /// entry's stored timestamp (possible when a remote merge carried a
+    /// far-future HLC whose clock update was rejected as ClockSkew): the
+    /// entry is left untouched and nothing is logged or acked.
     pub fn eventual_map_set(
         &mut self,
         key: &str,
@@ -491,8 +503,15 @@ impl EventualApi {
             }
         }
         let ts = self.clock.now()?;
-        if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
-            m.set(map_key, map_value, ts.clone(), &self.node_id);
+        let updated = if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
+            m.set(map_key, map_value, ts.clone(), &self.node_id)
+        } else {
+            false
+        };
+        if !updated {
+            // The set was a no-op (D5): acking it would silently drop the
+            // write, so refuse before any WAL / change-log / frontier step.
+            return Err(CrdtError::StaleVersion);
         }
         self.finish_local_write(key, &ts)?;
         Ok(ts)
@@ -531,6 +550,10 @@ impl EventualApi {
     ///
     /// Creates the register if the key does not exist.
     /// Returns `TypeMismatch` if the key exists with a different CRDT type.
+    /// Returns `StaleVersion` if the fresh local HLC does not dominate the
+    /// register's stored timestamp (possible when a remote merge carried a
+    /// far-future HLC whose clock update was rejected as ClockSkew): the
+    /// register is left untouched and nothing is logged or acked.
     pub fn eventual_register_set(
         &mut self,
         key: &str,
@@ -550,8 +573,15 @@ impl EventualApi {
             }
         }
         let ts = self.clock.now()?;
-        if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
-            r.set(value, ts.clone());
+        let updated = if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
+            r.set(value, ts.clone())
+        } else {
+            false
+        };
+        if !updated {
+            // The set was a no-op (D5): acking it would silently drop the
+            // write, so refuse before any WAL / change-log / frontier step.
+            return Err(CrdtError::StaleVersion);
         }
         self.finish_local_write(key, &ts)?;
         Ok(ts)
@@ -660,7 +690,12 @@ impl EventualApi {
         // because node_runner advances the peer frontier regardless of per-entry
         // errors, so skipped entries are never re-requested. The clock update is
         // advisory (ordering only); CRDT correctness does not depend on it.
-        let _ = self.clock.update(&hlc);
+        // ClockSkew rejections ARE counted (D5): the local clock now lags the
+        // merged timestamp, so typed sets on the affected keys will surface as
+        // StaleVersion until the wall clock catches up.
+        if let Err(HlcError::ClockSkew { .. }) = self.clock.update(&hlc) {
+            self.merge_clock_skew_rejects += 1;
+        }
         let changed = match self.store.merge_value(key.clone(), remote_value) {
             Ok(changed) => changed,
             Err(e) => {
@@ -797,6 +832,14 @@ impl EventualApi {
     /// into `RuntimeMetrics::sync_redundant_merge_skips_total`.
     pub fn redundant_merge_skips(&self) -> u64 {
         self.redundant_merge_skips
+    }
+
+    /// Cumulative count of remote-merge HLC clock updates rejected as
+    /// `ClockSkew` by `merge_remote_with_hlc` (the CRDT merge itself still
+    /// ran). In-memory observability only (resets on restart); the runner
+    /// mirrors it into `RuntimeMetrics::sync_clock_skew_rejected_total`.
+    pub fn merge_clock_skew_rejects(&self) -> u64 {
+        self.merge_clock_skew_rejects
     }
 }
 
@@ -1117,6 +1160,123 @@ mod tests {
                 expected: "Register".into(),
                 actual: "Counter".into(),
             }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D5: stale typed sets must surface as StaleVersion, and ClockSkew
+    // rejections in merge_remote_with_hlc must be counted.
+    // ---------------------------------------------------------------
+
+    /// A far-future HLC that `Hlc::update` rejects as ClockSkew but whose
+    /// entry still merges (the D5 precondition).
+    fn far_future_ts(node: &str) -> crate::hlc::HlcTimestamp {
+        hlc_ts(
+            crate::hlc::wall_clock_ms() + crate::hlc::MAX_CLOCK_SKEW_MS + 120_000,
+            0,
+            node,
+        )
+    }
+
+    #[test]
+    fn register_set_stale_returns_error_and_leaves_store_untouched() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        // Merge a register stamped far in the future: the merge applies,
+        // but the clock update is rejected as ClockSkew, so the local
+        // clock stays behind the stored LWW timestamp.
+        let far = far_future_ts("node-b");
+        let mut reg = LwwRegister::new();
+        assert!(reg.set("future".to_string(), far.clone()));
+        api.merge_remote_with_hlc("k".into(), &CrdtValue::Register(reg), far)
+            .unwrap();
+        let ts_before = api.store().timestamp_for("k").cloned();
+
+        let err = api.eventual_register_set("k", "local".into()).unwrap_err();
+        assert_eq!(err, CrdtError::StaleVersion);
+
+        // Value, change-log timestamp, and local applied frontier are all
+        // untouched (finish_local_write must not have run).
+        match api.get_eventual("k") {
+            Some(CrdtValue::Register(r)) => assert_eq!(r.get(), Some(&"future".to_string())),
+            other => panic!("expected Register, got {other:?}"),
+        }
+        assert_eq!(api.store().timestamp_for("k").cloned(), ts_before);
+        assert!(
+            api.store().applied_origin("node-a").is_none(),
+            "a refused set must not advance the local applied frontier"
+        );
+    }
+
+    #[test]
+    fn map_set_stale_returns_error_and_leaves_store_untouched() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        let far = far_future_ts("node-b");
+        let mut m: OrMap<String, String> = OrMap::new();
+        assert!(m.set("f".into(), "future".into(), far.clone(), &node("node-b")));
+        api.merge_remote_with_hlc("k".into(), &CrdtValue::Map(m), far)
+            .unwrap();
+        let ts_before = api.store().timestamp_for("k").cloned();
+
+        let err = api
+            .eventual_map_set("k", "f".into(), "local".into())
+            .unwrap_err();
+        assert_eq!(err, CrdtError::StaleVersion);
+
+        match api.get_eventual("k") {
+            Some(CrdtValue::Map(m)) => {
+                assert_eq!(m.get(&"f".to_string()), Some(&"future".to_string()))
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+        assert_eq!(api.store().timestamp_for("k").cloned(), ts_before);
+        assert!(
+            api.store().applied_origin("node-a").is_none(),
+            "a refused set must not advance the local applied frontier"
+        );
+    }
+
+    #[test]
+    fn register_set_succeeds_again_for_unrelated_keys() {
+        let mut api = EventualApi::new(node("node-a"));
+
+        // A skewed key must not affect sets on other keys.
+        let far = far_future_ts("node-b");
+        let mut reg = LwwRegister::new();
+        assert!(reg.set("future".to_string(), far.clone()));
+        api.merge_remote_with_hlc("skewed".into(), &CrdtValue::Register(reg), far)
+            .unwrap();
+
+        api.eventual_register_set("other", "v".into()).unwrap();
+        match api.get_eventual("other") {
+            Some(CrdtValue::Register(r)) => assert_eq!(r.get(), Some(&"v".to_string())),
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_clock_skew_rejects_counter_increments_only_on_skew() {
+        let mut api = EventualApi::new(node("node-a"));
+        assert_eq!(api.merge_clock_skew_rejects(), 0);
+
+        // A normal merge does not count.
+        let mut c = PnCounter::new();
+        c.increment(&node("node-b"));
+        api.merge_remote_with_hlc("a".into(), &CrdtValue::Counter(c), hlc_ts(100, 0, "node-b"))
+            .unwrap();
+        assert_eq!(api.merge_clock_skew_rejects(), 0);
+
+        // A far-future merge still applies but counts the rejection.
+        let far = far_future_ts("node-b");
+        let mut c2 = PnCounter::new();
+        c2.increment(&node("node-b"));
+        api.merge_remote_with_hlc("b".into(), &CrdtValue::Counter(c2), far)
+            .unwrap();
+        assert_eq!(api.merge_clock_skew_rejects(), 1);
+        assert!(
+            api.get_eventual("b").is_some(),
+            "the merge itself must still apply on ClockSkew"
         );
     }
 
@@ -1495,7 +1655,7 @@ mod tests {
         let mut api = EventualApi::new(node("node-b"));
 
         let mut reg = LwwRegister::new();
-        reg.set("v".to_string(), hlc_ts(100, 0, "node-c"));
+        let _ = reg.set("v".to_string(), hlc_ts(100, 0, "node-c"));
         // Merge WITHOUT origin HLC (push path) so applied_origins does not
         // cover node-a or node-c.
         api.merge_remote("reg".into(), &CrdtValue::Register(reg))
@@ -1529,7 +1689,7 @@ mod tests {
 
         // The key is a Register locally with a high LWW timestamp.
         let mut reg = LwwRegister::new();
-        reg.set("v".to_string(), hlc_ts(1_000, 0, "node-b"));
+        let _ = reg.set("v".to_string(), hlc_ts(1_000, 0, "node-b"));
         api.merge_remote("k".into(), &CrdtValue::Register(reg))
             .unwrap();
 

@@ -2158,6 +2158,11 @@ impl NodeRunner {
                     evidence_dirty = true;
                 }
             }
+            // Scope evictions happen on any observation, not only on
+            // detections, so the metric mirror is refreshed unconditionally
+            // after the batch.
+            self.metrics
+                .set_scope_evictions(detector.scope_evictions_total());
             // Persist exactly like the HTTP receive path does:
             // a self-detected equivocation signals a possible
             // key compromise, and the operator's likely response
@@ -3539,6 +3544,7 @@ impl NodeRunner {
         );
         let floor_fx = api.store_mut().take_floor_effects();
         let redundant_merge_skips = api.redundant_merge_skips();
+        let merge_clock_skew_rejects = api.merge_clock_skew_rejects();
         drop(api);
 
         // Publish floor observability: stall gauges reflect the latest
@@ -3569,6 +3575,10 @@ impl NodeRunner {
         self.metrics
             .sync_redundant_merge_skips_total
             .store(redundant_merge_skips, Ordering::Relaxed);
+        // Same cumulative semantics for the ClockSkew rejection counter (D5).
+        self.metrics
+            .sync_clock_skew_rejected_total
+            .store(merge_clock_skew_rejects, Ordering::Relaxed);
 
         if stats.collected > 0 {
             tracing::info!(

@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn map_to_json() {
         let mut m = OrMap::new();
-        m.set(
+        let _ = m.set(
             "name".to_string(),
             "AsteroidDB".to_string(),
             ts(100, 0, "a"),
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn register_to_json() {
         let mut r = LwwRegister::new();
-        r.set("hello".to_string(), ts(100, 0, "a"));
+        let _ = r.set("hello".to_string(), ts(100, 0, "a"));
 
         let json = CrdtValueJson::from_crdt_value(&CrdtValue::Register(r));
         assert_eq!(

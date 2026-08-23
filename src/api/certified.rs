@@ -741,8 +741,11 @@ impl CertifiedApi {
 
         let timestamp = self.clock.now()?;
 
-        // Write to the local store (eventual consistency path), recording
-        // the HLC so the entry is immediately visible to delta_sync.
+        // Write to the certified store, recording the HLC so the entry is
+        // visible to the store's delta scan (`entries_since`). Note that this
+        // store is a dedicated instance with no anti-entropy loop attached:
+        // no runtime delta/digest sync ever reads it, so the value written
+        // here exists only as this writer node's local store + WAL copy.
         //
         // The value is CRDT-MERGED into any existing entry, never a plain
         // replace: WAL recovery rebuilds state by merging the logged
@@ -2806,8 +2809,10 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// Verify that `certified_write` produces an entry immediately visible
-    /// to delta sync (`entries_since` / `delta_entries_since`) at the API
-    /// layer — not just at the `Store` level.
+    /// to the store's delta scan (`entries_since` / `delta_entries_since`)
+    /// at the API layer — not just at the `Store` level. This exercises the
+    /// scan mechanism only: the certified store has no runtime sync loop
+    /// attached, so nothing actually replicates these entries.
     #[test]
     fn certified_write_is_visible_to_delta_sync() {
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());
@@ -2820,7 +2825,7 @@ mod tests {
         };
 
         // Write via certified_write — this must atomically record the HLC
-        // timestamp so that the entry is immediately visible to delta sync.
+        // timestamp so that the entry is immediately visible to the scan.
         api.certified_write("key1".into(), counter_value(3), OnTimeout::Pending)
             .unwrap();
 
@@ -2839,8 +2844,8 @@ mod tests {
         assert_eq!(delta2[0].0, "key1");
     }
 
-    /// Verify that multiple `certified_write` calls each produce delta-visible
-    /// entries — all keys must appear in `entries_since`.
+    /// Verify that multiple `certified_write` calls each produce entries
+    /// visible to the delta scan — all keys must appear in `entries_since`.
     #[test]
     fn certified_write_multiple_keys_all_visible_to_delta_sync() {
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());

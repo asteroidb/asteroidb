@@ -89,7 +89,7 @@ fn apply_op(store: &mut Store, op: &StoreOp) {
             node_id,
         } => {
             let mut reg = LwwRegister::new();
-            reg.set(value.clone(), ts(*physical, *logical, node_id));
+            let _ = reg.set(value.clone(), ts(*physical, *logical, node_id));
             let _ = store.merge_value(key.clone(), &CrdtValue::Register(reg));
         }
     }

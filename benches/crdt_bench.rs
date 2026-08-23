@@ -125,7 +125,7 @@ fn bench_or_map_put_merge(c: &mut Criterion) {
 
     let mut map_a: OrMap<String, String> = OrMap::new();
     for i in 0..100 {
-        map_a.set(
+        let _ = map_a.set(
             format!("key-{i}"),
             format!("val-a-{i}"),
             ts(1000 + i, 0, "node-a"),
@@ -135,7 +135,7 @@ fn bench_or_map_put_merge(c: &mut Criterion) {
 
     let mut map_b: OrMap<String, String> = OrMap::new();
     for i in 0..100 {
-        map_b.set(
+        let _ = map_b.set(
             format!("key-{i}"),
             format!("val-b-{i}"),
             ts(2000 + i, 0, "node-b"),
@@ -158,10 +158,10 @@ fn bench_or_map_put_merge(c: &mut Criterion) {
 
 fn bench_lww_register_set_merge(c: &mut Criterion) {
     let mut reg_a = LwwRegister::new();
-    reg_a.set("value-a".to_string(), ts(100, 0, "node-a"));
+    let _ = reg_a.set("value-a".to_string(), ts(100, 0, "node-a"));
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("value-b".to_string(), ts(200, 0, "node-b"));
+    let _ = reg_b.set("value-b".to_string(), ts(200, 0, "node-b"));
 
     c.bench_function("lww_register/set_and_merge", |b| {
         b.iter(|| {
@@ -177,7 +177,7 @@ fn bench_lww_register_set(c: &mut Criterion) {
         b.iter(|| {
             let mut reg = LwwRegister::new();
             for i in 0u64..100 {
-                reg.set(format!("value-{i}"), ts(i, 0, "node-a"));
+                let _ = reg.set(format!("value-{i}"), ts(i, 0, "node-a"));
             }
             reg
         });

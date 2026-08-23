@@ -465,9 +465,9 @@ mod tests {
         let n = node("A");
 
         let mut map: OrMap<String, String> = OrMap::new();
-        map.set("k1".into(), "v1".into(), ts(100, 0, "A"), &n); // counter=1
+        let _ = map.set("k1".into(), "v1".into(), ts(100, 0, "A"), &n); // counter=1
         map.delete(&"k1".to_string()); // dot (A,1) in deferred
-        map.set("k2".into(), "v2".into(), ts(200, 0, "A"), &n); // counter=2
+        let _ = map.set("k2".into(), "v2".into(), ts(200, 0, "A"), &n); // counter=2
         assert!(map.deferred_len() > 0);
         store.put("mymap".into(), CrdtValue::Map(map));
 
@@ -495,7 +495,7 @@ mod tests {
         store.put("cnt".into(), CrdtValue::Counter(counter));
 
         let mut reg = crate::crdt::lww_register::LwwRegister::new();
-        reg.set("hello".to_string(), ts(100, 0, "A"));
+        let _ = reg.set("hello".to_string(), ts(100, 0, "A"));
         store.put("reg".into(), CrdtValue::Register(reg));
 
         assert_eq!(

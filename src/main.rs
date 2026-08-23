@@ -7,7 +7,7 @@ use asteroidb_poc::authority::bls::{BlsProofOfPossession, BlsPublicKey};
 #[cfg(not(feature = "native-crypto"))]
 use asteroidb_poc::authority::bls_stub::{BlsProofOfPossession, BlsPublicKey};
 use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
-use asteroidb_poc::authority::equivocation::EquivocationDetector;
+use asteroidb_poc::authority::equivocation::{EquivocationDetector, max_tracked_scopes_from_env};
 use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
@@ -792,9 +792,10 @@ async fn main() {
     // is what makes evidence detected via HTTP ride the outgoing gossip.
     // Evidence is persisted next to the other node state so it survives
     // restarts (the attestation pool itself is volatile).
-    let equivocation = Arc::new(EquivocationDetector::new(Some(
-        data_dir.join("equivocation_evidence.json"),
-    )));
+    let equivocation = Arc::new(EquivocationDetector::with_max_scopes(
+        Some(data_dir.join("equivocation_evidence.json")),
+        max_tracked_scopes_from_env(),
+    ));
     // Initialize the accused-authorities gauge from the restored evidence
     // store: without this, a restart resets the gauge to 0 until the next
     // *new* detection, while GET /api/authority/equivocations still reports

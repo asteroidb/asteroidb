@@ -90,11 +90,11 @@ fn type_mismatch_register_vs_map() {
     let mut store_b = Store::new();
 
     let mut reg = LwwRegister::new();
-    reg.set("val".to_string(), ts(100, 0, "A"));
+    let _ = reg.set("val".to_string(), ts(100, 0, "A"));
     store_a.put("key".into(), CrdtValue::Register(reg));
 
     let mut map = OrMap::new();
-    map.set("k".into(), "v".into(), ts(100, 0, "B"), &node("B"));
+    let _ = map.set("k".into(), "v".into(), ts(100, 0, "B"), &node("B"));
     store_b.put("key".into(), CrdtValue::Map(map));
 
     let err = store_a
@@ -247,7 +247,7 @@ fn pn_counter_merge_is_idempotent_through_store() {
 fn or_map_concurrent_set_delete_add_wins_through_store() {
     // Start with common state on both nodes.
     let mut common_map = OrMap::new();
-    common_map.set(
+    let _ = common_map.set(
         "config".to_string(),
         "initial".to_string(),
         ts(100, 0, "A"),
@@ -267,7 +267,7 @@ fn or_map_concurrent_set_delete_add_wins_through_store() {
 
     // Node B concurrently sets a new value (new dot).
     if let Some(CrdtValue::Map(m)) = store_b.get_mut("data") {
-        m.set(
+        let _ = m.set(
             "config".to_string(),
             "updated".to_string(),
             ts(200, 0, "B"),
@@ -298,7 +298,7 @@ fn or_map_multi_node_disjoint_keys_merge() {
     let mut store_b = Store::new();
 
     let mut map_a = OrMap::new();
-    map_a.set(
+    let _ = map_a.set(
         "name".to_string(),
         "Alice".to_string(),
         ts(100, 0, "A"),
@@ -307,7 +307,7 @@ fn or_map_multi_node_disjoint_keys_merge() {
     store_a.put("profile".into(), CrdtValue::Map(map_a));
 
     let mut map_b = OrMap::new();
-    map_b.set(
+    let _ = map_b.set(
         "email".to_string(),
         "bob@example.com".to_string(),
         ts(100, 0, "B"),
@@ -345,7 +345,7 @@ fn or_map_same_key_lww_through_store() {
     let mut store_b = Store::new();
 
     let mut map_a = OrMap::new();
-    map_a.set(
+    let _ = map_a.set(
         "status".to_string(),
         "online".to_string(),
         ts(100, 0, "A"),
@@ -354,7 +354,7 @@ fn or_map_same_key_lww_through_store() {
     store_a.put("user".into(), CrdtValue::Map(map_a));
 
     let mut map_b = OrMap::new();
-    map_b.set(
+    let _ = map_b.set(
         "status".to_string(),
         "offline".to_string(),
         ts(200, 0, "B"),
@@ -528,11 +528,11 @@ fn lww_register_hlc_ordering_through_store() {
     let mut store_b = Store::new();
 
     let mut reg_a = LwwRegister::new();
-    reg_a.set("old_value".to_string(), ts(100, 0, "A"));
+    let _ = reg_a.set("old_value".to_string(), ts(100, 0, "A"));
     store_a.put("config".into(), CrdtValue::Register(reg_a));
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("new_value".to_string(), ts(200, 0, "B"));
+    let _ = reg_b.set("new_value".to_string(), ts(200, 0, "B"));
     store_b.put("config".into(), CrdtValue::Register(reg_b));
 
     // Merge B into A — B has higher timestamp, so B's value wins.
@@ -552,11 +552,11 @@ fn lww_register_lower_timestamp_does_not_overwrite() {
     let mut store_b = Store::new();
 
     let mut reg_a = LwwRegister::new();
-    reg_a.set("winner".to_string(), ts(500, 0, "A"));
+    let _ = reg_a.set("winner".to_string(), ts(500, 0, "A"));
     store_a.put("r".into(), CrdtValue::Register(reg_a));
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("loser".to_string(), ts(100, 0, "B"));
+    let _ = reg_b.set("loser".to_string(), ts(100, 0, "B"));
     store_b.put("r".into(), CrdtValue::Register(reg_b));
 
     store_a
@@ -572,11 +572,11 @@ fn lww_register_logical_counter_tiebreak_through_store() {
     let mut store_b = Store::new();
 
     let mut reg_a = LwwRegister::new();
-    reg_a.set("first".to_string(), ts(100, 0, "A"));
+    let _ = reg_a.set("first".to_string(), ts(100, 0, "A"));
     store_a.put("r".into(), CrdtValue::Register(reg_a));
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("second".to_string(), ts(100, 1, "B"));
+    let _ = reg_b.set("second".to_string(), ts(100, 1, "B"));
     store_b.put("r".into(), CrdtValue::Register(reg_b));
 
     store_a
@@ -593,11 +593,11 @@ fn lww_register_node_id_tiebreak_through_store() {
     let mut store_b = Store::new();
 
     let mut reg_a = LwwRegister::new();
-    reg_a.set("alpha".to_string(), ts(100, 0, "A"));
+    let _ = reg_a.set("alpha".to_string(), ts(100, 0, "A"));
     store_a.put("r".into(), CrdtValue::Register(reg_a));
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("beta".to_string(), ts(100, 0, "B"));
+    let _ = reg_b.set("beta".to_string(), ts(100, 0, "B"));
     store_b.put("r".into(), CrdtValue::Register(reg_b));
 
     store_a
@@ -619,14 +619,14 @@ fn lww_register_with_live_hlc_clocks() {
     // Node A writes first.
     let mut reg_a = LwwRegister::new();
     let ts_a = clock_a.now().expect("HLC overflow");
-    reg_a.set("from_A".to_string(), ts_a.clone());
+    let _ = reg_a.set("from_A".to_string(), ts_a.clone());
     store_a.put("reg".into(), CrdtValue::Register(reg_a));
 
     // Node B sees A's timestamp and writes later.
     clock_b.update(&ts_a).expect("HLC overflow");
     let mut reg_b = LwwRegister::new();
     let ts_b = clock_b.now().expect("HLC overflow");
-    reg_b.set("from_B".to_string(), ts_b);
+    let _ = reg_b.set("from_B".to_string(), ts_b);
     store_b.put("reg".into(), CrdtValue::Register(reg_b));
 
     // B's timestamp is strictly after A's → B wins.
@@ -827,7 +827,7 @@ fn three_node_ring_merge_or_set_convergence() {
 #[test]
 fn three_node_ring_merge_or_map_convergence() {
     let mut ma = OrMap::new();
-    ma.set(
+    let _ = ma.set(
         "name".to_string(),
         "Alice".to_string(),
         ts(100, 0, "A"),
@@ -835,7 +835,7 @@ fn three_node_ring_merge_or_map_convergence() {
     );
 
     let mut mb = OrMap::new();
-    mb.set(
+    let _ = mb.set(
         "role".to_string(),
         "admin".to_string(),
         ts(100, 0, "B"),
@@ -843,7 +843,7 @@ fn three_node_ring_merge_or_map_convergence() {
     );
 
     let mut mc = OrMap::new();
-    mc.set(
+    let _ = mc.set(
         "team".to_string(),
         "infra".to_string(),
         ts(100, 0, "C"),
@@ -894,13 +894,13 @@ fn three_node_ring_merge_or_map_convergence() {
 #[test]
 fn three_node_ring_merge_lww_register_convergence() {
     let mut ra = LwwRegister::new();
-    ra.set("val_A".to_string(), ts(100, 0, "A"));
+    let _ = ra.set("val_A".to_string(), ts(100, 0, "A"));
 
     let mut rb = LwwRegister::new();
-    rb.set("val_B".to_string(), ts(200, 0, "B"));
+    let _ = rb.set("val_B".to_string(), ts(200, 0, "B"));
 
     let mut rc = LwwRegister::new();
-    rc.set("val_C".to_string(), ts(150, 0, "C"));
+    let _ = rc.set("val_C".to_string(), ts(150, 0, "C"));
 
     let mut store_a = Store::new();
     store_a.put("r".into(), CrdtValue::Register(ra));
@@ -968,7 +968,7 @@ fn multi_key_mixed_crdt_types_merge() {
     store_b.put("counter".into(), CrdtValue::Counter(cb));
 
     let mut rb = LwwRegister::new();
-    rb.set("hello".to_string(), ts(100, 0, "B"));
+    let _ = rb.set("hello".to_string(), ts(100, 0, "B"));
     store_b.put("register".into(), CrdtValue::Register(rb));
 
     // Merge all of B into A.
@@ -1089,7 +1089,7 @@ fn hlc_timestamps_advance_monotonically_across_stores() {
     // A writes a register.
     let ts_a1 = clock_a.now().expect("HLC overflow");
     let mut reg_a = LwwRegister::new();
-    reg_a.set("v1".to_string(), ts_a1.clone());
+    let _ = reg_a.set("v1".to_string(), ts_a1.clone());
     store_a.put("r".into(), CrdtValue::Register(reg_a));
 
     // B sees A's clock, advances, and writes.
@@ -1098,7 +1098,7 @@ fn hlc_timestamps_advance_monotonically_across_stores() {
     assert!(ts_b1 > ts_a1, "B's timestamp should be after A's");
 
     let mut reg_b = LwwRegister::new();
-    reg_b.set("v2".to_string(), ts_b1.clone());
+    let _ = reg_b.set("v2".to_string(), ts_b1.clone());
     store_b.put("r".into(), CrdtValue::Register(reg_b));
 
     // Merge: A sees B's value.
@@ -1116,7 +1116,7 @@ fn hlc_timestamps_advance_monotonically_across_stores() {
 
     // A writes again with later timestamp.
     if let Some(CrdtValue::Register(r)) = store_a.get_mut("r") {
-        r.set("v3".to_string(), ts_a2);
+        let _ = r.set("v3".to_string(), ts_a2);
     }
 
     // After merge, A's latest write wins.

@@ -1565,7 +1565,7 @@ mod tests {
     fn put_and_get_map() {
         let mut store = Store::new();
         let mut map = OrMap::new();
-        map.set(
+        let _ = map.set(
             "name".to_string(),
             "AsteroidDB".to_string(),
             ts(100, 0, "A"),
@@ -1586,7 +1586,7 @@ mod tests {
     fn put_and_get_register() {
         let mut store = Store::new();
         let mut reg = LwwRegister::new();
-        reg.set("hello".to_string(), ts(100, 0, "A"));
+        let _ = reg.set("hello".to_string(), ts(100, 0, "A"));
 
         store.put("greeting".into(), CrdtValue::Register(reg));
 
@@ -1764,7 +1764,7 @@ mod tests {
     fn merge_map_into_existing() {
         let mut store = Store::new();
         let mut m1 = OrMap::new();
-        m1.set(
+        let _ = m1.set(
             "k1".to_string(),
             "v1".to_string(),
             ts(100, 0, "A"),
@@ -1773,7 +1773,7 @@ mod tests {
         store.put("data".into(), CrdtValue::Map(m1));
 
         let mut m2 = OrMap::new();
-        m2.set(
+        let _ = m2.set(
             "k2".to_string(),
             "v2".to_string(),
             ts(200, 0, "B"),
@@ -1796,11 +1796,11 @@ mod tests {
     fn merge_register_into_existing() {
         let mut store = Store::new();
         let mut r1 = LwwRegister::new();
-        r1.set("old".to_string(), ts(100, 0, "A"));
+        let _ = r1.set("old".to_string(), ts(100, 0, "A"));
         store.put("val".into(), CrdtValue::Register(r1));
 
         let mut r2 = LwwRegister::new();
-        r2.set("new".to_string(), ts(200, 0, "B"));
+        let _ = r2.set("new".to_string(), ts(200, 0, "B"));
         store
             .merge_value("val".into(), &CrdtValue::Register(r2))
             .unwrap();
@@ -1923,7 +1923,7 @@ mod tests {
         store.put("set".into(), CrdtValue::Set(set));
 
         let mut reg = LwwRegister::new();
-        reg.set("val".to_string(), ts(100, 0, "A"));
+        let _ = reg.set("val".to_string(), ts(100, 0, "A"));
         store.put("register".into(), CrdtValue::Register(reg));
 
         assert_eq!(store.len(), 3);
@@ -1978,7 +1978,7 @@ mod tests {
 
         // Map
         let mut map = OrMap::new();
-        map.set(
+        let _ = map.set(
             "name".to_string(),
             "AsteroidDB".to_string(),
             ts(100, 0, "A"),
@@ -1988,7 +1988,7 @@ mod tests {
 
         // Register
         let mut reg = LwwRegister::new();
-        reg.set("hello".to_string(), ts(200, 0, "A"));
+        let _ = reg.set("hello".to_string(), ts(200, 0, "A"));
         store.put("greeting".into(), CrdtValue::Register(reg));
 
         // Save
@@ -2117,7 +2117,7 @@ mod tests {
         // Overwrite with different data
         let mut store2 = Store::new();
         let mut reg = LwwRegister::new();
-        reg.set("val".to_string(), ts(100, 0, "A"));
+        let _ = reg.set("val".to_string(), ts(100, 0, "A"));
         store2.put("b".into(), CrdtValue::Register(reg));
         store2.save_snapshot(&path).unwrap();
 
@@ -2803,7 +2803,7 @@ mod tests {
         store.put("set".into(), CrdtValue::Set(set));
 
         let mut reg = LwwRegister::new();
-        reg.set("hello".to_string(), ts(100, 0, "n1"));
+        let _ = reg.set("hello".to_string(), ts(100, 0, "n1"));
         store.put("reg".into(), CrdtValue::Register(reg));
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
@@ -3843,7 +3843,7 @@ mod tests {
                 }
                 6 => {
                     let mut r = LwwRegister::new();
-                    r.set(format!("v{step}"), ts(step as u64 + 1, 0, "n1"));
+                    let _ = r.set(format!("v{step}"), ts(step as u64 + 1, 0, "n1"));
                     store.put_with_timestamp(
                         key,
                         CrdtValue::Register(r),

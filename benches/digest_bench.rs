@@ -29,7 +29,7 @@ fn build_store(n: usize) -> Store {
     let mut store = Store::new();
     for i in 0..n {
         let mut reg = LwwRegister::new();
-        reg.set(format!("value-{i}"), ts(i as u64 + 1));
+        let _ = reg.set(format!("value-{i}"), ts(i as u64 + 1));
         store.put_with_timestamp(key(i), CrdtValue::Register(reg), ts(i as u64 + 1));
     }
     store
@@ -77,7 +77,8 @@ fn bench_digest(c: &mut Criterion) {
                         let mut store = warm.clone();
                         for i in 0..d.min(n) {
                             if let Some(CrdtValue::Register(reg)) = store.get_mut(&key(i)) {
-                                reg.set(format!("updated-{i}"), ts(n as u64 + i as u64 + 1));
+                                let _ =
+                                    reg.set(format!("updated-{i}"), ts(n as u64 + i as u64 + 1));
                             }
                         }
                         store

@@ -84,7 +84,7 @@ fn arb_or_map() -> impl Strategy<Value = OrMap<String, String>> {
                 let n = &nodes[node_idx as usize];
                 if is_set {
                     let timestamp = ts(ts_base + (i as u64) * 100, 0, &n.0);
-                    map.set(
+                    let _ = map.set(
                         keys[key_idx as usize].clone(),
                         values[val_idx as usize].clone(),
                         timestamp,
@@ -104,7 +104,7 @@ fn arb_lww_register() -> impl Strategy<Value = LwwRegister<String>> {
     (1..1000u64, 0..10u32, 0..3u8, "[a-z]{1,5}").prop_map(
         |(physical, logical, node_suffix, value)| {
             let mut reg = LwwRegister::new();
-            reg.set(value, ts(physical, logical, &format!("n{node_suffix}")));
+            let _ = reg.set(value, ts(physical, logical, &format!("n{node_suffix}")));
             reg
         },
     )
@@ -115,7 +115,7 @@ fn arb_lww_register_multi() -> impl Strategy<Value = LwwRegister<String>> {
     prop::collection::vec((1..1000u64, 0..10u32, 0..3u8, "[a-z]{1,5}"), 1..5).prop_map(|ops| {
         let mut reg = LwwRegister::new();
         for (physical, logical, node_suffix, value) in ops {
-            reg.set(value, ts(physical, logical, &format!("n{node_suffix}")));
+            let _ = reg.set(value, ts(physical, logical, &format!("n{node_suffix}")));
         }
         reg
     })
@@ -449,7 +449,7 @@ proptest! {
 
         // Build a common base with the key present.
         let mut common: OrMap<String, String> = OrMap::new();
-        common.set(
+        let _ = common.set(
             key.clone(),
             "original".to_string(),
             ts(ts_base, 0, "n0"),
@@ -460,7 +460,7 @@ proptest! {
         let mut replica_del = common.clone();
 
         // One replica sets the key with a new value (fresh dot).
-        replica_set.set(
+        let _ = replica_set.set(
             key.clone(),
             val.clone(),
             ts(ts_base + 100, 0, "n1"),

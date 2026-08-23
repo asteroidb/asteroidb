@@ -324,6 +324,12 @@ Eventual モードは、可用性（Availability）を優先する操作です�
 | マップ削除 | `map_delete` | `key`, `map_key` | OR-Map からキーを削除 |
 | レジスタ設定 | `register_set` | `key`, `value` | LWW-Register に値を設定 |
 
+`register_set` / `map_set` は LWW（Last-Writer-Wins）解決を使うため、保存済みの
+タイムスタンプがローカル時計より新しい場合（大幅に未来の時計を持つノードから
+同期を受けた直後など）は書き込みを適用せず `STALE_VERSION` エラー (409) を
+返す。成功応答（`ok: true`）が返った書き込みが無音で消えることはない。
+エラーを受けたらローカル時計が追いついてからリトライすること。
+
 #### 書き込み例
 
 ```bash
@@ -382,7 +388,9 @@ curl -s http://localhost:3002/api/eventual/greeting | jq .
 
 ### 3.2 Certified Read / Write
 
-Certified モードは、Authority ノード群の過半数合意を得ることで、データの確定状態を保証する操作です。金融データや重要な設定変更など、強い整合性が必要な場合に使用します。
+Certified モードは、Authority ノード群の過半数の署名付き frontier（HLC 時計の進行報告）が書き込み時刻を通過したことをもって、書き込みの確定を判定する操作です。金融データや重要な設定変更など、確定時点の証明が必要な場合に使用します。
+
+> **保証範囲の注意:** 証明が束縛するのは**到達性**——「過半数の Authority の時計（frontier）が当該書き込みの HLC タイムスタンプを通過した」こと——です。値そのものは Authority ノード群へ転送・複製されず、書き込みを受け付けたノードのローカルストアと WAL にのみ存在します（単一コピー）。したがって `certified` ステータスは「値が過半数ノードに保存された」ことを意味せず、Certified Read で値が返るのは書き込みを受け付けたノードに対してのみです。
 
 #### Certified Write
 
@@ -416,7 +424,7 @@ curl -s http://localhost:3001/api/status/account/balance | jq .
 | ステータス | 説明 |
 |-----------|------|
 | `pending` | Authority の合意待ち |
-| `certified` | 過半数の Authority が承認済み（確定） |
+| `certified` | 過半数の Authority の frontier が書き込み時刻を通過（確定） |
 | `rejected` | 合意に失敗 |
 | `timeout` | 合意がタイムアウト |
 
@@ -432,7 +440,7 @@ curl -s http://localhost:3001/api/certified/account/balance | jq .
 #    }
 ```
 
-Certified Read は値に加えて、認証ステータスと frontier（HLC タイムスタンプ）を返します。`certified` ステータスの場合、Authority の過半数がこの値を承認していることが暗号的に証明されています。
+Certified Read は値に加えて、認証ステータスと frontier（HLC タイムスタンプ）を返します。`certified` ステータスの場合、「Authority の過半数の署名付き frontier がこの書き込みの HLC タイムスタンプを通過したこと」が暗号的に証明されています。証明の対象はこの**到達性**であり、値の内容や複製を証明するものではありません——値は書き込みを受け付けたノードのローカルストア + WAL の単一コピーです（前述「保証範囲の注意」を参照）。
 
 #### 証明の検証
 
@@ -694,7 +702,7 @@ curl -s http://localhost:3001/api/eventual/article/123/tags | jq .
 
 ### 4.3 Certified Write: 金融残高の管理
 
-Certified Write を使用して、権威ある確定が必要なデータを管理するシナリオです。
+Certified Write を使用して、権威ある確定が必要なデータを管理するシナリオです。証明されるのは確定時点（過半数 frontier の通過）であり、値自体は書き込みノードのローカルストア + WAL の単一コピーである点に注意してください（§3.2「保証範囲の注意」参照）。値の耐久性が必要な場合は書き込みノードのデータディレクトリのバックアップ運用を併用してください。
 
 ```bash
 # === 口座残高を設定（Certified Write） ===

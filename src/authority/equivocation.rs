@@ -84,11 +84,19 @@ pub const OBSERVED_RETENTION_MS: u64 = 120_000;
 /// flagging either shape.
 pub const MAX_OVERFLOW_PER_SCOPE: usize = 32;
 
-/// Maximum number of distinct `(authority, key_range, policy_version)`
-/// scopes tracked in the observation index (memory DoS bound). When the
-/// index is full, the least-recently-touched scope is evicted — new scopes
-/// are always tracked, so detection is never silently disabled.
+/// Default maximum number of distinct `(authority, key_range,
+/// policy_version)` scopes tracked in the observation index (memory DoS
+/// bound). When the index is full, the least-recently-touched scope is
+/// evicted — new scopes are always tracked, so detection is never silently
+/// disabled. Overridable per deployment via [`MAX_TRACKED_SCOPES_ENV`]
+/// (the composition root passes [`max_tracked_scopes_from_env`] to
+/// [`EquivocationDetector::with_max_scopes`]).
 pub const MAX_TRACKED_SCOPES: usize = 1024;
+
+/// Environment variable overriding [`MAX_TRACKED_SCOPES`]
+/// (`ASTEROIDB_EQUIVOCATION_MAX_SCOPES`). Read once at detector
+/// construction by [`max_tracked_scopes_from_env`].
+pub const MAX_TRACKED_SCOPES_ENV: &str = "ASTEROIDB_EQUIVOCATION_MAX_SCOPES";
 
 /// Maximum scopes tracked per authority (fairness bound). Scope components
 /// are attacker-chosen (a compromised authority can sign arbitrary
@@ -122,6 +130,34 @@ pub const MAX_FRONTIERS_PER_REQUEST: usize = 256;
 
 /// Maximum observations attached to an outgoing frontier push (gossip lane).
 pub const GOSSIP_SAMPLE_MAX: usize = 64;
+
+/// Read the tracked-scope limit from [`MAX_TRACKED_SCOPES_ENV`].
+///
+/// Fail-safe: an unset variable yields [`MAX_TRACKED_SCOPES`]; an invalid
+/// value (unparsable or zero — a zero limit would evict the sole tracked
+/// scope on every observation and blind detection) logs a WARN and falls
+/// back to the default.
+pub fn max_tracked_scopes_from_env() -> usize {
+    parse_max_tracked_scopes(std::env::var(MAX_TRACKED_SCOPES_ENV).ok().as_deref())
+}
+
+fn parse_max_tracked_scopes(raw: Option<&str>) -> usize {
+    match raw {
+        None => MAX_TRACKED_SCOPES,
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(
+                    env = MAX_TRACKED_SCOPES_ENV,
+                    value = v,
+                    default = MAX_TRACKED_SCOPES,
+                    "invalid tracked-scope limit (want a positive integer); using default"
+                );
+                MAX_TRACKED_SCOPES
+            }
+        },
+    }
+}
 
 /// A signature-verified `(frontier, signature)` raw pair.
 ///
@@ -288,6 +324,16 @@ struct DetectorState {
     /// abnormal head flood (flush or blinding attempt). Never advances
     /// under honest load.
     heads_saturated_total: u64,
+    /// Scope entries evicted by [`DetectorState::make_room_for_scope`]
+    /// under capacity pressure (per-authority fairness or global cap).
+    /// Never advances while the index stays below its bounds; sustained
+    /// growth is the operator signal for a scope flood or an undersized
+    /// [`MAX_TRACKED_SCOPES_ENV`] limit.
+    scope_evictions_total: u64,
+    /// Effective global tracked-scope limit (default
+    /// [`MAX_TRACKED_SCOPES`], overridable via [`MAX_TRACKED_SCOPES_ENV`]
+    /// at construction). Always >= 1.
+    max_tracked_scopes: usize,
     /// Monotonic counter feeding `ScopeState::last_touch`.
     touch_counter: u64,
     /// Rotating start position for the evidence share of the gossip sample,
@@ -297,13 +343,18 @@ struct DetectorState {
 }
 
 impl DetectorState {
-    fn empty() -> Self {
+    fn empty(max_tracked_scopes: usize) -> Self {
         Self {
             observed: HashMap::new(),
             evidence: HashMap::new(),
             accused: HashSet::new(),
             evidence_overflow_total: 0,
             heads_saturated_total: 0,
+            scope_evictions_total: 0,
+            // A zero limit would evict the sole tracked scope on every
+            // observation; clamp so eviction-not-rejection stays meaningful
+            // even for callers that bypass the env parsing fail-safe.
+            max_tracked_scopes: max_tracked_scopes.max(1),
             touch_counter: 0,
             gossip_evidence_cursor: 0,
         }
@@ -346,7 +397,7 @@ impl DetectorState {
                 .filter(|(s, _)| s.authority_id == *authority)
                 .min_by_key(|(_, st)| st.last_touch)
                 .map(|(s, _)| s.clone())
-        } else if self.observed.len() >= MAX_TRACKED_SCOPES {
+        } else if self.observed.len() >= self.max_tracked_scopes {
             self.observed
                 .iter()
                 .min_by_key(|(_, st)| st.last_touch)
@@ -362,6 +413,7 @@ impl DetectorState {
                 "evicting least-recently-touched equivocation scope (capacity)"
             );
             self.observed.remove(&victim);
+            self.scope_evictions_total += 1;
         }
     }
 
@@ -437,7 +489,17 @@ impl EquivocationDetector {
     /// logged and ignored — detection restarts with an empty store). The
     /// observation index is intentionally volatile.
     pub fn new(persist_path: Option<PathBuf>) -> Self {
-        let mut state = DetectorState::empty();
+        Self::with_max_scopes(persist_path, MAX_TRACKED_SCOPES)
+    }
+
+    /// Create a detector with an explicit global tracked-scope limit.
+    ///
+    /// The composition root passes [`max_tracked_scopes_from_env`] here so
+    /// the [`MAX_TRACKED_SCOPES_ENV`] override reaches the observation
+    /// index; [`EquivocationDetector::new`] keeps the compiled-in default.
+    /// Zero is clamped to 1 (see `DetectorState::empty`).
+    pub fn with_max_scopes(persist_path: Option<PathBuf>, max_tracked_scopes: usize) -> Self {
+        let mut state = DetectorState::empty(max_tracked_scopes);
         if let Some(path) = &persist_path
             && path.exists()
         {
@@ -683,6 +745,23 @@ impl EquivocationDetector {
     pub fn heads_saturated_total(&self) -> u64 {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         state.heads_saturated_total
+    }
+
+    /// Number of scopes evicted from the observation index under capacity
+    /// pressure (LRU; per-authority fairness or global cap). Stays at zero
+    /// while the index is below its bounds; mirrored into the
+    /// `equivocation_scope_evictions_total` runtime metric after each
+    /// observation batch. Sustained growth indicates a scope flood or an
+    /// undersized [`MAX_TRACKED_SCOPES_ENV`] limit.
+    pub fn scope_evictions_total(&self) -> u64 {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.scope_evictions_total
+    }
+
+    /// Effective global tracked-scope limit for this detector.
+    pub fn max_tracked_scopes(&self) -> usize {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.max_tracked_scopes
     }
 
     /// Build the split-view gossip sample attached to outgoing frontier
@@ -1590,6 +1669,77 @@ mod tests {
             det.observe(&fb, &sb, NOW_MS),
             ObserveOutcome::Equivocation(_)
         ));
+    }
+
+    #[test]
+    fn per_authority_eviction_increments_counter() {
+        let signer = make_signer("auth-1", 40);
+        let det = EquivocationDetector::new(None);
+        assert_eq!(det.scope_evictions_total(), 0);
+        for i in 0..(MAX_TRACKED_SCOPES_PER_AUTHORITY + 3) {
+            let f = make_frontier("auth-1", &format!("c{i}/"), 1, 2_000, 0, "d");
+            let (f, s) = signed(&signer, &f);
+            assert!(matches!(
+                det.observe(&f, &s, NOW_MS),
+                ObserveOutcome::FirstSeen
+            ));
+        }
+        // Inserts beyond the per-authority fairness share each evict one of
+        // the authority's own least-recently-touched scopes.
+        assert_eq!(det.scope_evictions_total(), 3);
+    }
+
+    #[test]
+    fn configured_global_cap_evicts_and_counts() {
+        let signer = make_signer("any", 41);
+        let det = EquivocationDetector::with_max_scopes(None, 4);
+        assert_eq!(det.max_tracked_scopes(), 4);
+        for a in 0..6 {
+            let f = make_frontier(&format!("auth-{a}"), "p/", 1, 2_000, 0, "d");
+            let (f, s) = signed(&signer, &f);
+            assert!(matches!(
+                det.observe(&f, &s, NOW_MS),
+                ObserveOutcome::FirstSeen
+            ));
+        }
+        // Six single-scope authorities against a global cap of 4: the 5th
+        // and 6th insertions each evict the globally LRU scope.
+        assert_eq!(det.scope_evictions_total(), 2);
+        // Eviction-not-rejection: the oldest scope left, the newest is
+        // tracked.
+        assert!(!det.is_known_exact(&make_frontier("auth-0", "p/", 1, 2_000, 0, "d")));
+        assert!(det.is_known_exact(&make_frontier("auth-5", "p/", 1, 2_000, 0, "d")));
+    }
+
+    #[test]
+    fn zero_max_scopes_is_clamped_to_one() {
+        let det = EquivocationDetector::with_max_scopes(None, 0);
+        assert_eq!(det.max_tracked_scopes(), 1);
+    }
+
+    #[test]
+    fn max_scopes_parsing_falls_back_to_default_on_invalid() {
+        assert_eq!(parse_max_tracked_scopes(None), MAX_TRACKED_SCOPES);
+        assert_eq!(parse_max_tracked_scopes(Some("2048")), 2048);
+        assert_eq!(parse_max_tracked_scopes(Some(" 512 ")), 512);
+        assert_eq!(parse_max_tracked_scopes(Some("0")), MAX_TRACKED_SCOPES);
+        assert_eq!(parse_max_tracked_scopes(Some("-5")), MAX_TRACKED_SCOPES);
+        assert_eq!(parse_max_tracked_scopes(Some("1.5")), MAX_TRACKED_SCOPES);
+        assert_eq!(parse_max_tracked_scopes(Some("abc")), MAX_TRACKED_SCOPES);
+        assert_eq!(parse_max_tracked_scopes(Some("")), MAX_TRACKED_SCOPES);
+    }
+
+    #[test]
+    fn max_scopes_env_round_trip() {
+        // Only this test mutates the variable: the library reads it solely
+        // through max_tracked_scopes_from_env(), which no other test calls,
+        // so there is no parallel-test race.
+        unsafe { std::env::set_var(MAX_TRACKED_SCOPES_ENV, "777") };
+        assert_eq!(max_tracked_scopes_from_env(), 777);
+        unsafe { std::env::set_var(MAX_TRACKED_SCOPES_ENV, "not-a-number") };
+        assert_eq!(max_tracked_scopes_from_env(), MAX_TRACKED_SCOPES);
+        unsafe { std::env::remove_var(MAX_TRACKED_SCOPES_ENV) };
+        assert_eq!(max_tracked_scopes_from_env(), MAX_TRACKED_SCOPES);
     }
 
     #[test]

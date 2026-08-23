@@ -292,6 +292,11 @@ CRDT 操作をローカルの eventual ストアに適用する。
 }
 ```
 
+**注意**: 対象エントリの保存済みタイムスタンプがローカル HLC より新しい場合
+（例: 大幅に未来の時計を持つピアからの merge を受けた直後）、書き込みは
+一切適用されず `STALE_VERSION` エラー (409) を返す。無音で値が消えることは
+ない。ローカル時計が追いつけば同じ書き込みは成功する。
+
 ##### map_delete — OR-Map からのエントリ削除
 
 ```json
@@ -311,6 +316,11 @@ CRDT 操作をローカルの eventual ストアに適用する。
   "value": "hello"
 }
 ```
+
+**注意**: レジスタの保存済み LWW タイムスタンプがローカル HLC より新しい場合
+（例: 大幅に未来の時計を持つピアからの merge を受けた直後）、書き込みは
+一切適用されず `STALE_VERSION` エラー (409) を返す。無音で値が消えることは
+ない。ローカル時計が追いつけば同じ書き込みは成功する。
 
 **成功レスポンス:**
 
@@ -1873,7 +1883,7 @@ curl -X DELETE http://<leader-addr>/api/control-plane/policies/user%2F \
 | `INVALID_OP` | 400 Bad Request | 指定した CRDT 型に対して無効な操作 | 操作対象のキーの CRDT 型を確認する |
 | `TYPE_MISMATCH` | 409 Conflict | 既存キーの CRDT 型と操作の型が不一致 | キーに対して正しい型の操作を使用する（例: Counter キーには `counter_inc`/`counter_dec`） |
 | `KEY_NOT_FOUND` | 404 Not Found | 指定キーが存在しない | キー名を確認する。`set_remove`/`map_delete` は事前にキーが存在する必要がある |
-| `STALE_VERSION` | 409 Conflict | 古いバージョンでの書き込み | 最新値を再取得してリトライする |
+| `STALE_VERSION` | 409 Conflict | 古いバージョンでの書き込み。`register_set`/`map_set` では、保存済みタイムスタンプがローカル HLC より新しく LWW 上書きが no-op になる場合（時計スキューの大きいピアからの merge 直後など）に返る — 書き込みは一切適用されない | 最新値を再取得してリトライする。時計スキュー起因の場合はローカル時計が追いつけば成功する |
 | `POLICY_DENIED` | 403 Forbidden | 配置ポリシーによる拒否 | 対象キー範囲の配置ポリシーを確認する |
 | `TIMEOUT` | 504 Gateway Timeout | Authority 合意がタイムアウト | Authority ノードの稼働状況を確認する。`on_timeout=pending` で再試行可能 |
 | `SESSION_NOT_SATISFIED` | 412 Precondition Failed | セッショントークンの示す書き込みまでローカルレプリカが追いついていない | `Retry-After` に従いリトライ、`wait_ms` を増やす、または別レプリカに問い合わせる |

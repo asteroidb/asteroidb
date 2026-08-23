@@ -746,6 +746,11 @@ pub async fn post_internal_frontiers(
             "purged pooled attestations of newly accused authorities"
         );
     }
+    // Scope evictions happen on any observation, not only on detections, so
+    // the metric mirror is refreshed unconditionally after the batch.
+    state
+        .metrics
+        .set_scope_evictions(state.equivocation.scope_evictions_total());
     let stats = api.attestation_stats();
     state.metrics.set_attestation_pool_stats(
         stats.scopes,
@@ -893,6 +898,11 @@ pub(crate) fn ingest_relayed_observations(
             }
         }
     }
+    // Scope evictions happen on any observation, not only on detections, so
+    // the metric mirror is refreshed unconditionally after the batch.
+    state
+        .metrics
+        .set_scope_evictions(state.equivocation.scope_evictions_total());
     // Persist new evidence after every guard is released; the write itself
     // happens on a blocking thread and concurrent writers are serialized
     // inside `spawn_persist`.
@@ -2664,7 +2674,9 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
             let mut map = OrMap::new();
             for (k, v) in entries {
                 let ts = http_writer_now()?;
-                map.set(k.clone(), v.clone(), ts, &writer);
+                // Fresh map + strictly monotonic writer clock: the set can
+                // never be a stale no-op, so the result is safe to ignore.
+                let _ = map.set(k.clone(), v.clone(), ts, &writer);
             }
             Ok(CrdtValue::Map(map))
         }
@@ -2672,7 +2684,9 @@ fn json_to_crdt_value(json: &CrdtValueJson) -> Result<CrdtValue, CrdtError> {
             let mut reg = LwwRegister::new();
             if let Some(v) = value {
                 let ts = http_writer_now()?;
-                reg.set(v.clone(), ts);
+                // Fresh register: its zero timestamp is below any writer
+                // clock tick, so the set can never be a stale no-op.
+                let _ = reg.set(v.clone(), ts);
             }
             Ok(CrdtValue::Register(reg))
         }

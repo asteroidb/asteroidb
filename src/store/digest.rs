@@ -728,13 +728,13 @@ mod tests {
         set.remove(&"alice".to_string());
 
         let mut map = OrMap::new();
-        map.set(
+        let _ = map.set(
             "name".to_string(),
             "asteroid".to_string(),
             ts(100, 0, "node-a"),
             &node("node-a"),
         );
-        map.set(
+        let _ = map.set(
             "tier".to_string(),
             "gold".to_string(),
             ts(101, 2, "node-b"),
@@ -743,7 +743,7 @@ mod tests {
         map.delete(&"tier".to_string());
 
         let mut reg = LwwRegister::new();
-        reg.set("online".to_string(), ts(200, 1, "node-c"));
+        let _ = reg.set("online".to_string(), ts(200, 1, "node-c"));
 
         vec![
             ("counter/hits".to_string(), CrdtValue::Counter(counter)),
@@ -937,9 +937,9 @@ mod tests {
     #[test]
     fn register_writer_identity_changes_digest() {
         let mut reg_a = LwwRegister::new();
-        reg_a.set("v".to_string(), ts(100, 0, "node-a"));
+        let _ = reg_a.set("v".to_string(), ts(100, 0, "node-a"));
         let mut reg_b = LwwRegister::new();
-        reg_b.set("v".to_string(), ts(100, 0, "node-b"));
+        let _ = reg_b.set("v".to_string(), ts(100, 0, "node-b"));
 
         let a = to_btree(vec![("k".into(), CrdtValue::Register(reg_a))]);
         let b = to_btree(vec![("k".into(), CrdtValue::Register(reg_b))]);
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn empty_dot_map_entry_digests_like_absent_entry() {
         let mut map_a = OrMap::new();
-        map_a.set(
+        let _ = map_a.set(
             "doomed".to_string(),
             "v".to_string(),
             ts(100, 0, "node-a"),
@@ -1161,7 +1161,7 @@ mod tests {
 
     fn register_named(text: &str) -> CrdtValue {
         let mut register = LwwRegister::new();
-        register.set(text.into(), ts(9, 0, "node-w"));
+        let _ = register.set(text.into(), ts(9, 0, "node-w"));
         CrdtValue::Register(register)
     }
 

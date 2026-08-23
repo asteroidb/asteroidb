@@ -195,7 +195,7 @@ fn three_node_ring_mixed_keys() {
 
     // Node C: writes a register.
     let mut rc = LwwRegister::new();
-    rc.set("hello".into(), ts(100, 0, "node-c"));
+    let _ = rc.set("hello".into(), ts(100, 0, "node-c"));
     store_c.put("greeting".into(), CrdtValue::Register(rc));
 
     let mut stores = [store_a, store_b, store_c];
@@ -299,7 +299,7 @@ fn five_node_concurrent_register_write_lww_wins() {
     // Node 4 has the highest timestamp, so its value should win.
     for (i, store) in stores.iter_mut().enumerate() {
         let mut reg = LwwRegister::new();
-        reg.set(
+        let _ = reg.set(
             format!("value-{}", i),
             ts((i as u64 + 1) * 100, 0, &format!("node-{}", i)),
         );
@@ -531,7 +531,7 @@ fn mixed_crdt_types_convergence() {
     store_b.put("counter".into(), CrdtValue::Counter(cb));
 
     let mut mb = OrMap::new();
-    mb.set("k1".into(), "v1".into(), ts(100, 0, "node-b"), &nb);
+    let _ = mb.set("k1".into(), "v1".into(), ts(100, 0, "node-b"), &nb);
     store_b.put("map".into(), CrdtValue::Map(mb));
 
     // Node C: counter + register + set.
@@ -541,7 +541,7 @@ fn mixed_crdt_types_convergence() {
     store_c.put("counter".into(), CrdtValue::Counter(cc));
 
     let mut rc = LwwRegister::new();
-    rc.set("world".into(), ts(200, 0, "node-c"));
+    let _ = rc.set("world".into(), ts(200, 0, "node-c"));
     store_c.put("register".into(), CrdtValue::Register(rc));
 
     let mut sc = OrSet::new();
@@ -824,11 +824,11 @@ fn commutativity_or_map() {
     let nb = node("node-b");
 
     let mut a: OrMap<String, String> = OrMap::new();
-    a.set("k1".into(), "v1".into(), ts(100, 0, "node-a"), &na);
+    let _ = a.set("k1".into(), "v1".into(), ts(100, 0, "node-a"), &na);
 
     let mut b: OrMap<String, String> = OrMap::new();
-    b.set("k1".into(), "v2".into(), ts(200, 0, "node-b"), &nb);
-    b.set("k2".into(), "v3".into(), ts(200, 1, "node-b"), &nb);
+    let _ = b.set("k1".into(), "v2".into(), ts(200, 0, "node-b"), &nb);
+    let _ = b.set("k2".into(), "v3".into(), ts(200, 1, "node-b"), &nb);
 
     let mut ab = a.clone();
     ab.merge(&b);
@@ -857,10 +857,10 @@ fn commutativity_or_map() {
 #[test]
 fn commutativity_lww_register() {
     let mut a: LwwRegister<String> = LwwRegister::new();
-    a.set("old".into(), ts(100, 0, "node-a"));
+    let _ = a.set("old".into(), ts(100, 0, "node-a"));
 
     let mut b: LwwRegister<String> = LwwRegister::new();
-    b.set("new".into(), ts(200, 0, "node-b"));
+    let _ = b.set("new".into(), ts(200, 0, "node-b"));
 
     let mut ab = a.clone();
     ab.merge(&b);
@@ -993,14 +993,14 @@ fn associativity_or_map() {
     let nc = node("node-c");
 
     let mut a: OrMap<String, String> = OrMap::new();
-    a.set("k".into(), "va".into(), ts(100, 0, "node-a"), &na);
+    let _ = a.set("k".into(), "va".into(), ts(100, 0, "node-a"), &na);
 
     let mut b: OrMap<String, String> = OrMap::new();
-    b.set("k".into(), "vb".into(), ts(200, 0, "node-b"), &nb);
+    let _ = b.set("k".into(), "vb".into(), ts(200, 0, "node-b"), &nb);
 
     let mut c: OrMap<String, String> = OrMap::new();
-    c.set("k".into(), "vc".into(), ts(300, 0, "node-c"), &nc);
-    c.set("k2".into(), "vc2".into(), ts(300, 1, "node-c"), &nc);
+    let _ = c.set("k".into(), "vc".into(), ts(300, 0, "node-c"), &nc);
+    let _ = c.set("k2".into(), "vc2".into(), ts(300, 1, "node-c"), &nc);
 
     // (A merge B) merge C
     let mut ab_c = a.clone();
@@ -1031,13 +1031,13 @@ fn associativity_or_map() {
 #[test]
 fn associativity_lww_register() {
     let mut a: LwwRegister<String> = LwwRegister::new();
-    a.set("va".into(), ts(100, 0, "node-a"));
+    let _ = a.set("va".into(), ts(100, 0, "node-a"));
 
     let mut b: LwwRegister<String> = LwwRegister::new();
-    b.set("vb".into(), ts(200, 0, "node-b"));
+    let _ = b.set("vb".into(), ts(200, 0, "node-b"));
 
     let mut c: LwwRegister<String> = LwwRegister::new();
-    c.set("vc".into(), ts(300, 0, "node-c"));
+    let _ = c.set("vc".into(), ts(300, 0, "node-c"));
 
     let mut ab_c = a.clone();
     ab_c.merge(&b);
@@ -1148,8 +1148,8 @@ fn idempotency_or_map() {
     let na = node("node-a");
 
     let mut a: OrMap<String, String> = OrMap::new();
-    a.set("k1".into(), "v1".into(), ts(100, 0, "node-a"), &na);
-    a.set("k2".into(), "v2".into(), ts(200, 0, "node-a"), &na);
+    let _ = a.set("k1".into(), "v1".into(), ts(100, 0, "node-a"), &na);
+    let _ = a.set("k2".into(), "v2".into(), ts(200, 0, "node-a"), &na);
 
     let before_keys: Vec<String> = a.keys().into_iter().cloned().collect();
     let before_vals: Vec<Option<String>> = before_keys.iter().map(|k| a.get(k).cloned()).collect();
@@ -1174,7 +1174,7 @@ fn idempotency_or_map() {
 #[test]
 fn idempotency_lww_register() {
     let mut a: LwwRegister<String> = LwwRegister::new();
-    a.set("hello".into(), ts(100, 0, "node-a"));
+    let _ = a.set("hello".into(), ts(100, 0, "node-a"));
 
     let before = a.get().cloned();
     let snapshot = a.clone();
@@ -1304,7 +1304,7 @@ fn or_map_concurrent_set_delete_add_wins() {
 
     // Common state.
     let mut common: OrMap<String, String> = OrMap::new();
-    common.set("k".into(), "v1".into(), ts(100, 0, "node-a"), &na);
+    let _ = common.set("k".into(), "v1".into(), ts(100, 0, "node-a"), &na);
 
     let mut store_a = Store::new();
     store_a.put("data".into(), CrdtValue::Map(common.clone()));
@@ -1314,7 +1314,7 @@ fn or_map_concurrent_set_delete_add_wins() {
 
     // Node A concurrently sets a new value for "k".
     if let Some(CrdtValue::Map(m)) = store_a.get_mut("data") {
-        m.set("k".into(), "v2".into(), ts(200, 0, "node-a"), &na);
+        let _ = m.set("k".into(), "v2".into(), ts(200, 0, "node-a"), &na);
     }
 
     // Node B concurrently deletes "k".
