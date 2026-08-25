@@ -376,6 +376,11 @@ curl -s http://localhost:3000/api/slo | jq .
 | `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
 | `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
 | `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
+| `gc_last_sweep_wall_ms` | u64 (gauge) | 実際に sweep した最後の GC パスのローカル壁時計 ms。**0 = 起動以来一度も sweep していない**。tombstone GC が生きているかの最上位シグナル（3.7.1）。「進まないこと」に対してアラートする |
+| `gc_gate_blocked_authority_total` | u64 | GC 二重ゲートの authority 側で不合格になった tick 累計。lagging cluster では正常に非ゼロなので、単体ではアラートにしない（`gc_last_sweep_wall_ms` の停止原因の切り分けに使う） |
+| `gc_gate_blocked_peer_total` | u64 | 同 peer 側で不合格になった tick 累計。registry に残った dead peer が典型 |
+| `gc_gate_peer_population` | u64 (gauge) | peer ゲートが最後に評価した登録ピア数。単一ノードでは 0 が正常。**多ノード構成で 0 かつ `gc_last_sweep_wall_ms` が進んでいる場合、peer ゲートが空真のまま sweep している**（3.7.1） |
+| `compaction_unattributed_write_ops_total` | u64 | どの certifiable レンジ（authority 定義と placement policy の両方を持つ prefix）にも一致せず、compaction の ops カウンタに計上されなかった書き込み ops 累計。増え続ける場合は policy 未設定のキー空間に書き込みが集中している |
 | `sync_redundant_merge_skips_total` | u64 | RR ゲート（M-6）が抑止した冗長リモート merge 累計（no-op merge かつ delta 可視済みキー → 再スタンプ/変更ログ/WAL 書き込みをスキップ）。GC tick ごとに `EventualApi` の in-memory カウンタから反映（再起動でリセット）。アイドルクラスタで緩やかに増えるのは正常（収束済みキーのエコー吸収）。収束済みストアの双方向 sync 下で 0 に張り付く場合はピンポン回帰を疑う |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
@@ -648,6 +653,43 @@ tombstone / stale live dot をマージ時に棄却するため、GC はクラ�
   待つ。ゲージが 0 に落ちたら Stage 2 は外してもよい（残すのも安全）。
 - `gc_interval` の短縮は hole 停滞・ゲート不合格には**効かない**（12.3 も
   参照）。停滞の原因はゲート（dead peer / 分断 / hole）であり周期ではない。
+
+#### 3.7.1 「GC が一度も動いていない」の診断（D1 回帰防止）
+
+最上位の生存シグナルは **`gc_last_sweep_wall_ms`**（実際に sweep した最後の
+パスのローカル壁時計 ms、**0 = 起動以来一度も sweep していない**）。他の
+`gc_floor_*` ゲージは sweep したパスしか書かないため、これが無い状態では
+「ゲートが恒久的に閉じているノード」と「健全で回収対象が無いノード」の
+メトリクス出力が完全に同一だった。アラートはこのゲージが**進まないこと**に
+対して張り、原因の切り分けは以下の順で行う。
+
+1. `gc_last_sweep_wall_ms` が 0 のまま、または retention の数倍を超えて
+   進まない → GC は実質停止している。
+2. `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` の
+   どちらが増えているかで、閉じているゲートの半分を特定する。
+3. 該当ノードのログで `tombstone GC gate blocked` の WARN（10 分に 1 行に
+   スロットル）を見る。`reason` が原因種別、`prefix` / `peer` が対象、
+   `reported` / `required` が authority 側の充足数、`peer_lane` が
+   ピアレーンの状態を示す。
+   - `authority_under_reported`: その prefix の authority 全員分の frontier
+     報告が揃っていない（分断・停止ノード）。
+   - `frontier_behind_mark`: 報告は揃ったがデータ時刻が mark 未満。
+   - `report_not_advanced`: mark 以降にローカルで前進した報告が無い
+     （永続化から復元しただけの frontier を含む。fail-closed）。
+   - `peer_evidence_missing_or_stale`: レジストリに残った dead peer が
+     典型。9.2 のノード削除手順でレジストリから外す。
+
+**注意（無防備な sweep の検出）**: `gc_gate_peer_population` は peer ゲートが
+最後に評価したときの登録ピア数。単一ノード構成では 0 が正常だが、**多ノード
+構成でこれが 0 かつ `gc_last_sweep_wall_ms` が進んでいる場合、peer ゲートが
+空真のまま sweep している**（＝復活防止が効いていない）。sync レイヤの設定と
+ピアレジストリを確認すること。
+
+**`""`（catch-all）prefix に placement policy を作らないこと。** GC/compaction
+の母集合は「authority 定義 **と** placement policy の両方がある prefix」で、
+`""` に policy を置くとストア全体が単一レンジとして compaction 対象になり、
+`prune_timestamps_before("")` がストア全域に及ぶ。catch-all の authority 定義
+自体は（policy が無い限り）無害で、メンバーシップ判定にのみ寄与する。
 
 ---
 
@@ -1419,7 +1461,7 @@ curl -s http://localhost:3000/api/internal/keys | jq '.entries | length'
 
 | 原因 | 対処 |
 |------|------|
-| トゥームストーン蓄積 | まず原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
+| トゥームストーン蓄積 | まず `gc_last_sweep_wall_ms` を見て「一度でも sweep したか」を切り分ける（0 のまま＝GC 実質停止。3.7.1 の手順で `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` と `tombstone GC gate blocked` WARN へ）。その上で原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
 | ack-frontier エントリの蓄積 | `frontier_gc_interval` を短縮、`frontier_gc_max_retained_versions` を縮小 |
 | Compaction が進まない | Authority 可用性を確認（過半数必要） |
 | pending_count が高い | Certified Write のタイムアウト設定を見直す |

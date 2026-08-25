@@ -113,6 +113,41 @@ impl SystemNamespace {
         self.authority_definitions.values().collect()
     }
 
+    /// Ranges that can actually hold certified state: prefixes carrying BOTH
+    /// an authority definition AND a placement policy, paired with that
+    /// policy's version.
+    ///
+    /// This is the same join `CertifiedApi::resolve_scope` requires and
+    /// `FrontierReporter::discover_scopes` uses to decide what to report — a
+    /// prefix missing either half can never produce a frontier scope, so
+    /// demanding frontier evidence for it is UNSATISFIABLE, not strict. (It
+    /// is doubly unsatisfiable: the reporting side skips it, and the
+    /// receiving side rejects any report for it with
+    /// `AdmissionReject::NoPolicy`.) A definition without a policy still
+    /// contributes to MEMBERSHIP — see `FrontierReporter::is_authority` —
+    /// it simply is not a source of, or a demander of, evidence.
+    ///
+    /// Sorted by prefix: both backing maps are `HashMap`s, and callers
+    /// (`NodeRunner::check_compaction`) index into the result.
+    ///
+    /// NOTE: `NodeRunner::run_frontier_gc` and the cap-pressure sweep in
+    /// `CertifiedApi::record_attestation` compute the same join inline.
+    /// Folding them in here is a behaviour-preserving refactor; it is
+    /// deliberately NOT part of the D1 fix.
+    pub fn certifiable_ranges(&self) -> Vec<(&AuthorityDefinition, PolicyVersion)> {
+        let mut ranges: Vec<(&AuthorityDefinition, PolicyVersion)> = self
+            .authority_definitions
+            .values()
+            .filter_map(|def| {
+                self.placement_policies
+                    .get(&def.key_range.prefix)
+                    .map(|policy| (def, policy.version))
+            })
+            .collect();
+        ranges.sort_by(|a, b| a.0.key_range.prefix.cmp(&b.0.key_range.prefix));
+        ranges
+    }
+
     /// Returns the version history for observability (NFR-004).
     pub fn version_history(&self) -> &[PolicyVersion] {
         &self.version_history
@@ -526,6 +561,102 @@ mod tests {
 
         let all = ns.all_authority_definitions();
         assert_eq!(all.len(), 2);
+    }
+
+    // --- certifiable_ranges (D1) ---
+
+    /// A definition with no placement policy can never produce a frontier
+    /// scope (`FrontierReporter::discover_scopes` skips it, and
+    /// `attestation_admissible` rejects any report for it with `NoPolicy`),
+    /// so it must not appear in the population that demands frontier
+    /// evidence. This is the exact shape of the catch-all `""` seed that
+    /// `main.rs` writes on a fresh boot.
+    #[test]
+    fn certifiable_ranges_excludes_definition_without_policy() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(make_authority_def("", &["auth-1", "auth-2", "auth-3"]));
+
+        assert!(
+            ns.certifiable_ranges().is_empty(),
+            "a definition without a placement policy is not certifiable"
+        );
+    }
+
+    /// A definition PAIRED with a policy is certifiable and carries that
+    /// policy's REAL version — never the fabricated `PolicyVersion(1)` the
+    /// GC/compaction call sites used to substitute.
+    #[test]
+    fn certifiable_ranges_carries_the_real_policy_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(make_authority_def("user/", &["n1", "n2"]));
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(7),
+            key_range("user/"),
+            3,
+        ))
+        .expect("valid policy");
+
+        let ranges = ns.certifiable_ranges();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].0.key_range.prefix, "user/");
+        assert_eq!(
+            ranges[0].1,
+            PolicyVersion(7),
+            "the real policy version, not a fabricated PolicyVersion(1)"
+        );
+    }
+
+    /// A policy without a definition has no authority set to demand
+    /// evidence from: it is not a range either.
+    #[test]
+    fn certifiable_ranges_excludes_policy_without_definition() {
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("orphan/"))
+            .expect("valid policy");
+
+        assert!(ns.certifiable_ranges().is_empty());
+    }
+
+    /// The result is indexed into by `NodeRunner::check_compaction` while
+    /// both backing maps are `HashMap`s: the order must be deterministic.
+    #[test]
+    fn certifiable_ranges_is_sorted_by_prefix() {
+        let mut ns = SystemNamespace::new();
+        for prefix in ["user/", "", "a/"] {
+            ns.set_authority_definition(make_authority_def(prefix, &["n1"]));
+            ns.set_placement_policy(make_policy(prefix))
+                .expect("valid policy");
+        }
+
+        let prefixes: Vec<&str> = ns
+            .certifiable_ranges()
+            .iter()
+            .map(|(def, _)| def.key_range.prefix.as_str())
+            .collect();
+        assert_eq!(prefixes, vec!["", "a/", "user/"]);
+    }
+
+    /// Removing a policy takes its range OUT of the evidence population —
+    /// a deliberate decision, not an accident: after removal nobody can
+    /// report the scope, so demanding evidence for it would stall GC
+    /// forever (which is precisely defect D1).
+    #[test]
+    fn certifiable_ranges_policy_removal_drops_range() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(make_authority_def("user/", &["n1"]));
+        ns.set_placement_policy(make_policy("user/"))
+            .expect("valid policy");
+        assert_eq!(ns.certifiable_ranges().len(), 1);
+
+        ns.remove_placement_policy("user/");
+        assert!(
+            ns.certifiable_ranges().is_empty(),
+            "policy removal must drop the range from the evidence population"
+        );
+        assert!(
+            ns.get_authority_definition("user/").is_some(),
+            "the definition itself must survive (membership still counts)"
+        );
     }
 
     // --- get_authorities_for_key ---

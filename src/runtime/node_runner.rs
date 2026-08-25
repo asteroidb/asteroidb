@@ -393,6 +393,10 @@ pub struct NodeRunner {
     /// so it can never overstate freshness; symmetric counterpart of the
     /// OUTBOUND `push_acked_wall_ms` evidence.
     pull_reconciled_wall_ms: HashMap<String, u64>,
+    /// Wall-clock ms of the last emitted "GC gate blocked" WARN. A blocked
+    /// gate repeats on every tick, so the log line is throttled; the
+    /// counters and gauges carry the unthrottled signal.
+    gc_gate_warn_last_ms: u64,
     /// Per-peer exponential backoff state for sync retries.
     /// Tracks consecutive failures and gates retry attempts.
     peer_backoffs: HashMap<String, PeerBackoff>,
@@ -515,6 +519,39 @@ pub struct NodeRunner {
     /// format) is required.
     report_silence_until: Option<Instant>,
 }
+
+/// Why the tombstone-GC dual gate is closed on this tick.
+///
+/// Purely a LABEL for an already-taken decision: the deciders are
+/// [`NodeRunner::gc_authority_gate_passed`] and
+/// [`NodeRunner::gc_peer_gate_passed`], which
+/// [`NodeRunner::gc_gate_diagnose`] calls before classifying anything. A
+/// blocked gate repeats every tick and, before this existed, was
+/// indistinguishable in the metrics from a healthy node with nothing to
+/// collect — which is how defect D1 stayed invisible from first boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GcGateBlock {
+    /// A certifiable range has fewer reporting authorities than it has
+    /// authority nodes.
+    AuthorityUnderReported {
+        prefix: String,
+        reported: usize,
+        required: usize,
+    },
+    /// Every authority reported, but the scoped minimum frontier's DATA
+    /// time is still behind the mark.
+    FrontierBehindMark { prefix: String },
+    /// Every authority reported past the mark in data time, but at least
+    /// one report has not ADVANCED locally since the mark (receipt time —
+    /// includes every frontier merely restored from persistence).
+    ReportNotAdvanced { prefix: String },
+    /// A registered sync peer has missing or pre-mark push evidence
+    /// (commonly a dead peer left in the registry).
+    PeerEvidenceMissingOrStale { peer_addr: String },
+}
+
+/// Minimum interval between "GC gate blocked" WARN lines.
+const GC_GATE_WARN_THROTTLE_MS: u64 = 600_000;
 
 /// State for an in-progress rebalance operation.
 #[derive(Debug, Clone)]
@@ -772,6 +809,7 @@ impl NodeRunner {
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
+            gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
@@ -897,6 +935,7 @@ impl NodeRunner {
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
+            gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
@@ -3306,6 +3345,35 @@ impl NodeRunner {
         }
     }
 
+    /// The one and only definition of the range population used by the
+    /// tombstone-GC authority gate and by compaction.
+    ///
+    /// A prefix qualifies only when it carries BOTH an authority definition
+    /// and a placement policy (`SystemNamespace::certifiable_ranges`). The
+    /// previous code took every definition and fabricated `PolicyVersion(1)`
+    /// for the policy-less ones, which put scope `(prefix, 1)` into the
+    /// gate's conjunction — a scope no reporter emits (`discover_scopes`
+    /// skips policy-less definitions) and no receiver admits
+    /// (`AdmissionReject::NoPolicy`). Such a term is unsatisfiable rather
+    /// than strict, and since a policy-less range cannot hold certified
+    /// state in the first place (`resolve_scope` fails), dropping the term
+    /// removes no protection: eventual state is guarded by the peer and
+    /// inbound gates, which never consult authority definitions at all.
+    ///
+    /// Returns parallel vectors — same order, same length by construction,
+    /// built in a single pass so the two can never drift apart.
+    fn certifiable_population(
+        ns: &SystemNamespace,
+    ) -> (Vec<(KeyRange, usize)>, Vec<PolicyVersion>) {
+        let mut defs = Vec::new();
+        let mut policy_versions = Vec::new();
+        for (def, version) in ns.certifiable_ranges() {
+            defs.push((def.key_range.clone(), def.authority_nodes.len()));
+            policy_versions.push(version);
+        }
+        (defs, policy_versions)
+    }
+
     async fn check_compaction(&mut self) {
         let now = match self.clock.now() {
             Ok(ts) => ts,
@@ -3326,23 +3394,9 @@ impl NodeRunner {
             let api = self.certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
 
-            // Iterate over all authority definitions to check each key range.
-            let defs: Vec<_> = ns
-                .all_authority_definitions()
-                .into_iter()
-                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
-                .collect();
-
-            // Collect policy versions for all key ranges upfront so we don't
-            // need to re-acquire the lock later.
-            let policy_versions: Vec<_> = defs
-                .iter()
-                .map(|(key_range, _)| {
-                    ns.get_placement_policy(&key_range.prefix)
-                        .map(|p| p.version)
-                        .unwrap_or(crate::types::PolicyVersion(1))
-                })
-                .collect();
+            // Iterate over the certifiable key ranges (definition AND
+            // policy), carrying each range's real policy version.
+            let (defs, policy_versions) = Self::certifiable_population(&ns);
 
             let fs = api.frontier_set().clone();
 
@@ -3352,8 +3406,12 @@ impl NodeRunner {
 
         // Phase 2: Aggregate per-key write ops into per-range counts by
         // matching each written key against key range prefixes. Keys that
-        // don't match any range are counted under the first range as a
-        // fallback (maintains the previous behaviour of counting all ops).
+        // match no certifiable range are NOT attributed to any range —
+        // they are counted on `compaction_unattributed_write_ops_total`
+        // instead. The old fallback charged them to `defs[0]`, i.e. to a
+        // prefix picked out of `HashMap` iteration order; the catch-all
+        // `""` definition (which matches every key) was the only reason
+        // that arbitrariness never surfaced.
         if !ops_by_key.is_empty() && !defs.is_empty() {
             let mut range_ops: HashMap<&str, u64> = HashMap::new();
             for (key, count) in &ops_by_key {
@@ -3361,7 +3419,12 @@ impl NodeRunner {
                     .iter()
                     .find(|(kr, _)| key.starts_with(&kr.prefix))
                     .map(|(kr, _)| kr.prefix.as_str());
-                let prefix = matched.unwrap_or(&defs[0].0.prefix);
+                let Some(prefix) = matched else {
+                    self.metrics
+                        .compaction_unattributed_write_ops_total
+                        .fetch_add(*count, Ordering::Relaxed);
+                    continue;
+                };
                 *range_ops.entry(prefix).or_insert(0) += count;
             }
 
@@ -3374,6 +3437,12 @@ impl NodeRunner {
                     self.compaction_engine.record_op(key_range);
                 }
             }
+        } else if !ops_by_key.is_empty() {
+            // No certifiable range at all: every drained op is
+            // unattributable. Counted rather than silently discarded.
+            self.metrics
+                .compaction_unattributed_write_ops_total
+                .fetch_add(ops_by_key.values().sum::<u64>(), Ordering::Relaxed);
         }
 
         // Phase 3: Run compaction (checkpoint evaluation + pruning). Only
@@ -3508,10 +3577,16 @@ impl NodeRunner {
 
         // Evaluate the dual gate against the pending mark, if any (the
         // very first pass only marks, so the verdict is irrelevant then).
-        let gates_passed = match self.tombstone_gc.pending_mark_ms() {
-            Some(mark_ms) => self.gc_gates_passed(mark_ms).await,
-            None => false,
+        let (gates_passed, block) = match self.tombstone_gc.pending_mark_ms() {
+            Some(mark_ms) => {
+                let block = self.gc_gate_diagnosis(mark_ms).await;
+                (block.is_none(), block)
+            }
+            None => (false, None),
         };
+        if let Some(block) = &block {
+            self.record_gc_gate_block(block, now_ms);
+        }
 
         // Stage 2 hole-jump requires the ADDITIONAL inbound gate.
         let allow_hole_jump = self.config.gc_hole_jump_enabled
@@ -3550,6 +3625,14 @@ impl NodeRunner {
         // stall to 0 for most scrapes — the exact signal ops-guide 3.7
         // uses to decide on Stage 2 (and 12.3 to diagnose blocked gates).
         if stats.swept {
+            // Top-level GC liveness. Stamped ONLY by passes that actually
+            // swept, for the same reason as the stall gauges below — but
+            // unlike them a stuck value here is itself the alarm: it is
+            // the one signal that distinguishes a permanently-closed gate
+            // from a healthy node with nothing to collect.
+            self.metrics
+                .gc_last_sweep_wall_ms
+                .store(now_ms, Ordering::Relaxed);
             self.metrics
                 .gc_floor_stalled_hole_dots
                 .store(stats.stalled_holes, Ordering::Relaxed);
@@ -3582,6 +3665,84 @@ impl NodeRunner {
         }
     }
 
+    /// Count a blocked GC tick and, at most once per
+    /// [`GC_GATE_WARN_THROTTLE_MS`], say why in the log.
+    ///
+    /// A legitimately lagging cluster blocks the gate too, so these
+    /// counters are diagnostic, not alarms — alert on
+    /// `gc_last_sweep_wall_ms` failing to advance and use these to
+    /// explain it.
+    fn record_gc_gate_block(&mut self, block: &GcGateBlock, now_ms: u64) {
+        match block {
+            GcGateBlock::AuthorityUnderReported { .. }
+            | GcGateBlock::FrontierBehindMark { .. }
+            | GcGateBlock::ReportNotAdvanced { .. } => {
+                self.metrics
+                    .gc_gate_blocked_authority_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            GcGateBlock::PeerEvidenceMissingOrStale { .. } => {
+                self.metrics
+                    .gc_gate_blocked_peer_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if self.gc_gate_warn_last_ms != 0
+            && now_ms.saturating_sub(self.gc_gate_warn_last_ms) < GC_GATE_WARN_THROTTLE_MS
+        {
+            return;
+        }
+        self.gc_gate_warn_last_ms = now_ms;
+
+        // A single-node deployment (no sync layer) is expected to have no
+        // peers; a node WITH a sync layer and an empty registry is not,
+        // and sweeps there are unguarded by the peer gate.
+        let peer_population = self.metrics.gc_gate_peer_population.load(Ordering::Relaxed);
+        let peer_lane = match (&self.sync_client, peer_population) {
+            (None, _) => "none (single-node, no sync layer)",
+            (Some(_), 0) => "empty registry (peer gate vacuous)",
+            (Some(_), _) => "registered peers",
+        };
+
+        match block {
+            GcGateBlock::AuthorityUnderReported {
+                prefix,
+                reported,
+                required,
+            } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "authority_under_reported",
+                prefix = %prefix,
+                reported,
+                required,
+                peer_lane,
+                "tombstone GC gate blocked: not every authority has reported this scope"
+            ),
+            GcGateBlock::FrontierBehindMark { prefix } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "frontier_behind_mark",
+                prefix = %prefix,
+                peer_lane,
+                "tombstone GC gate blocked: scoped minimum frontier is behind the mark"
+            ),
+            GcGateBlock::ReportNotAdvanced { prefix } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "report_not_advanced",
+                prefix = %prefix,
+                peer_lane,
+                "tombstone GC gate blocked: no frontier report has advanced since the mark"
+            ),
+            GcGateBlock::PeerEvidenceMissingOrStale { peer_addr } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "peer_evidence_missing_or_stale",
+                peer = %peer_addr,
+                peer_lane,
+                "tombstone GC gate blocked: peer has no push evidence from after the mark"
+            ),
+        }
+    }
+
     /// Stage 2 INBOUND gate: every registered peer's complete state has
     /// been absorbed by a clean pull STARTED at/after the mark (see
     /// `pull_reconciled_wall_ms`). A peer without an entry fails the
@@ -3599,43 +3760,119 @@ impl NodeRunner {
     }
 
     /// Evaluate the tombstone-GC dual gate against `mark_ms` (see
-    /// [`run_gc`](Self::run_gc)).
-    async fn gc_gates_passed(&self, mark_ms: u64) -> bool {
-        // [Authority gate] — same snapshot pattern as check_compaction
-        // Phase 1: read defs + frontier set under the certified lock,
-        // evaluate off the lock.
+    /// [`run_gc`](Self::run_gc)) and, when it is closed, say WHY.
+    ///
+    /// `None` means "gate open" and is exactly `gc_authority_gate_passed &&
+    /// gc_peer_gate_passed` — the frozen predicates are the deciders; the
+    /// classification only re-walks the same population to LABEL an
+    /// already-taken decision and can never open the gate.
+    ///
+    /// INVARIANT: the authority gate protects CERTIFIED state only — its
+    /// population is the set of ranges that can hold certified state at
+    /// all (definition AND policy, see
+    /// [`certifiable_population`](Self::certifiable_population)). Eventual
+    /// state is protected by the peer gate (and, for hole-jumps, the
+    /// inbound gate), neither of which consults authority definitions.
+    async fn gc_gate_diagnosis(&self, mark_ms: u64) -> Option<GcGateBlock> {
+        // Same snapshot pattern as check_compaction Phase 1: read the
+        // population + frontier set under the certified lock, evaluate off
+        // the lock.
         let (defs, frontier_set, policy_versions) = {
             let api = self.certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
-            let defs: Vec<(KeyRange, usize)> = ns
-                .all_authority_definitions()
-                .into_iter()
-                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
-                .collect();
-            let policy_versions: Vec<PolicyVersion> = defs
-                .iter()
-                .map(|(key_range, _)| {
-                    ns.get_placement_policy(&key_range.prefix)
-                        .map(|p| p.version)
-                        .unwrap_or(crate::types::PolicyVersion(1))
-                })
-                .collect();
+            let (defs, policy_versions) = Self::certifiable_population(&ns);
             let fs = api.frontier_set().clone();
             (defs, fs, policy_versions)
         };
-        if !Self::gc_authority_gate_passed(&defs, &policy_versions, &frontier_set, mark_ms) {
-            return false;
+
+        // A node with no sync layer has no peers at all — the peer gate is
+        // then vacuous exactly as it is with an empty registry.
+        let peers = match &self.sync_client {
+            Some(sync_client) => sync_client.peer_registry().lock().await.all_peers_owned(),
+            None => Vec::new(),
+        };
+        self.metrics
+            .gc_gate_peer_population
+            .store(peers.len() as u64, Ordering::Relaxed);
+
+        Self::gc_gate_diagnose(
+            &defs,
+            &policy_versions,
+            &frontier_set,
+            &peers,
+            &self.push_acked_wall_ms,
+            mark_ms,
+        )
+    }
+
+    /// Pure classifier for the dual gate: `None` iff both frozen
+    /// predicates pass.
+    ///
+    /// The frozen predicates are called FIRST and are the only deciders.
+    /// Only when one of them says `false` is the population walked again,
+    /// purely to name the offending range or peer for logs and metrics.
+    fn gc_gate_diagnose(
+        defs: &[(KeyRange, usize)],
+        policy_versions: &[PolicyVersion],
+        frontier_set: &crate::authority::ack_frontier::AckFrontierSet,
+        peers: &[crate::network::PeerConfig],
+        push_acked_wall_ms: &HashMap<String, u64>,
+        mark_ms: u64,
+    ) -> Option<GcGateBlock> {
+        if !Self::gc_authority_gate_passed(defs, policy_versions, frontier_set, mark_ms) {
+            let named = defs.iter().enumerate().find_map(|(i, (key_range, total))| {
+                let version = &policy_versions[i];
+                let prefix = key_range.prefix.clone();
+                let scoped = frontier_set.all_for_scope(key_range, version);
+                if scoped.len() < *total {
+                    return Some(GcGateBlock::AuthorityUnderReported {
+                        prefix,
+                        reported: scoped.len(),
+                        required: *total,
+                    });
+                }
+                if !frontier_set
+                    .min_frontier_for_scope(key_range, version)
+                    .is_some_and(|min| min.physical >= mark_ms)
+                {
+                    return Some(GcGateBlock::FrontierBehindMark { prefix });
+                }
+                if !frontier_set
+                    .min_advanced_at_for_scope(key_range, version)
+                    .is_some_and(|received| received >= mark_ms)
+                {
+                    return Some(GcGateBlock::ReportNotAdvanced { prefix });
+                }
+                None
+            });
+            // The gate already said "blocked"; the walk above must have
+            // found the reason. The fallback exists only so that a future
+            // divergence between predicate and classifier degrades into an
+            // unlabelled block rather than an OPEN gate.
+            return Some(named.unwrap_or(GcGateBlock::AuthorityUnderReported {
+                prefix: String::new(),
+                reported: 0,
+                required: 0,
+            }));
         }
 
-        // [Peer gate] — every registered peer must have push evidence
-        // from after the mark.
-        if let Some(sync_client) = &self.sync_client {
-            let peers = sync_client.peer_registry().lock().await.all_peers_owned();
-            if !Self::gc_peer_gate_passed(&peers, &self.push_acked_wall_ms, mark_ms) {
-                return false;
-            }
+        if !Self::gc_peer_gate_passed(peers, push_acked_wall_ms, mark_ms) {
+            let named = peers
+                .iter()
+                .find(|peer| {
+                    !push_acked_wall_ms
+                        .get(&peer.addr)
+                        .is_some_and(|acked| *acked >= mark_ms)
+                })
+                .map(|peer| GcGateBlock::PeerEvidenceMissingOrStale {
+                    peer_addr: peer.addr.clone(),
+                });
+            return Some(named.unwrap_or(GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: String::new(),
+            }));
         }
-        true
+
+        None
     }
 
     /// Authority half of the tombstone-GC gate: every authority of every
@@ -8325,12 +8562,19 @@ mod tests {
     async fn legacy_hole_runner(
         hole_jump_enabled: bool,
     ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
+        legacy_hole_runner_with_ns(hole_jump_enabled, SystemNamespace::new()).await
+    }
+
+    /// As [`legacy_hole_runner`], but with a caller-supplied namespace so a
+    /// test can put the GC authority gate under a REAL production-shaped
+    /// namespace instead of the empty (vacuous) one.
+    async fn legacy_hole_runner_with_ns(
+        hole_jump_enabled: bool,
+        ns: SystemNamespace,
+    ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
         use crate::api::eventual::EventualApi;
 
-        let api = wrap_api(CertifiedApi::new(
-            node_id("node-1"),
-            wrap_ns(SystemNamespace::new()),
-        ));
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
         let config = NodeRunnerConfig {
             gc_interval: Duration::from_millis(1),
             gc_retention: Duration::ZERO,
@@ -8492,6 +8736,588 @@ mod tests {
             0
         );
         assert!(runner.tombstone_gc.total_collected() >= 1);
+    }
+
+    // -----------------------------------------------------------------
+    // D1: the catch-all seed must not wedge tombstone GC shut forever.
+    //
+    // `main.rs` seeds a catch-all `""` authority definition on a fresh
+    // boot and never creates a placement policy. The GC authority gate
+    // used to build its population from EVERY definition and fabricate
+    // `PolicyVersion(1)` for the policy-less ones, demanding frontier
+    // evidence for scope `("", 1)` — a scope nobody can ever report
+    // (`discover_scopes` skips policy-less definitions) and nobody can
+    // ever accept (`attestation_admissible` rejects it with `NoPolicy`).
+    // The gate was therefore permanently false from first boot, on the
+    // DEFAULT configuration, and no tombstone was ever collected.
+    // -----------------------------------------------------------------
+
+    /// The namespace `src/main.rs` produces on a fresh boot: a manual
+    /// catch-all `""` definition over the default authority set, and NO
+    /// placement policy anywhere.
+    fn production_seed_namespace() -> SystemNamespace {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+            auto_generated: false,
+        });
+        ns
+    }
+
+    /// Drive a legacy-hole runner through mark → full outbound+inbound
+    /// evidence → sweep, and report whether the sweep actually collected.
+    async fn sweeps_with_full_evidence(ns: SystemNamespace) -> (bool, u64) {
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+
+        // Saturate BOTH peer-facing gates so the authority gate is the
+        // only thing left that can hold the sweep back.
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep
+        let collected = runner.tombstone_gc.total_collected();
+        let last_sweep = runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed);
+        (collected >= 1, last_sweep)
+    }
+
+    /// D1 regression: the default fresh-boot namespace must not block the
+    /// GC authority gate. The catch-all definition has no policy, so it
+    /// cannot participate in certification at all — demanding frontier
+    /// evidence for it is unsatisfiable, not strict.
+    #[tokio::test]
+    async fn production_seed_namespace_sweeps_tombstones() {
+        let (swept, last_sweep_ms) = sweeps_with_full_evidence(production_seed_namespace()).await;
+        assert!(
+            swept,
+            "the fresh-boot catch-all seed must not wedge tombstone GC shut"
+        );
+        assert!(
+            last_sweep_ms > 0,
+            "an executed sweep must stamp gc_last_sweep_wall_ms"
+        );
+    }
+
+    /// Backward compatibility (range-states.md test plan 6): a deployment
+    /// that already persisted the seed keeps a MANUAL (`auto_generated:
+    /// false`) `""` definition forever — `recalculate_authorities` never
+    /// prunes manual definitions, and the control plane has no
+    /// `RemoveAuthority` command. GC must un-wedge on upgrade anyway.
+    ///
+    /// That this passes with `auto_generated` left at `false` is the
+    /// executable proof that demoting the seed is NOT the cure.
+    #[tokio::test]
+    async fn legacy_persisted_namespace_sweeps_tombstones() {
+        // (a) a namespace that went through the real persistence path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("system_namespace.json");
+        production_seed_namespace().save(&path).expect("save");
+        let loaded = SystemNamespace::load(&path)
+            .expect("load")
+            .expect("file exists");
+        assert!(
+            !loaded
+                .get_authority_definition("")
+                .expect("catch-all survives persistence")
+                .auto_generated,
+            "the persisted seed stays MANUAL — demoting main.rs cannot reach it"
+        );
+        let (swept, _) = sweeps_with_full_evidence(loaded).await;
+        assert!(swept, "a persisted seed namespace must not wedge GC shut");
+
+        // (b) an OLD-FORMAT file that predates the `auto_generated` field
+        //     entirely (it deserialises to `false` via `#[serde(default)]`).
+        let legacy_json = r#"{
+            "version": 2,
+            "placement_policies": {},
+            "authority_definitions": {
+                "": {
+                    "key_range": {"prefix": ""},
+                    "authority_nodes": ["auth-1", "auth-2", "auth-3"]
+                }
+            },
+            "version_history": [1, 2]
+        }"#;
+        let legacy: SystemNamespace = serde_json::from_str(legacy_json).expect("legacy namespace");
+        assert!(
+            !legacy
+                .get_authority_definition("")
+                .expect("def")
+                .auto_generated
+        );
+        let (swept, _) = sweeps_with_full_evidence(legacy).await;
+        assert!(swept, "an old-format namespace must not wedge GC shut");
+    }
+
+    /// The peer gate is what actually protects a multi-replica deployment,
+    /// and it does NOT depend on authority definitions: with the same seed
+    /// namespace but a registered peer that has never been pushed to, the
+    /// sweep must still be blocked.
+    ///
+    /// Not RED-first (it passes before the fix too, via the authority
+    /// gate); its value is proving that removing the authority-gate term
+    /// did not remove the protection. Verified by mutation — see notes.
+    #[tokio::test]
+    async fn peer_gate_alone_blocks_sweep_on_seed_namespace() {
+        let (mut runner, _eventual_api, _peer_addr) =
+            legacy_hole_runner_with_ns(true, production_seed_namespace()).await;
+
+        runner.run_gc().await; // pass 1: mark
+        runner.run_gc().await; // pass 2: no push evidence for the peer
+
+        assert_eq!(
+            runner.tombstone_gc.total_collected(),
+            0,
+            "a registered peer without push evidence must block the sweep"
+        );
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0,
+            "a blocked pass never sweeps"
+        );
+        assert!(
+            runner
+                .metrics
+                .gc_gate_blocked_peer_total
+                .load(Ordering::Relaxed)
+                > 0,
+            "the block must be attributed to the peer gate"
+        );
+    }
+
+    /// Write ops for keys covered by no certifiable range must not be
+    /// charged to an arbitrary range. The old fallback (`defs[0]`) picked
+    /// a prefix out of `HashMap` iteration order; the catch-all `""`
+    /// definition (which matches every key) was the only reason it did
+    /// not show. `node_runner_checks_compaction` cannot catch this — it
+    /// calls `engine.record_op` directly and never goes through
+    /// `drain_write_ops_by_key`.
+    #[tokio::test]
+    async fn check_compaction_drops_unattributed_ops_deterministically() {
+        for insertion_order in [["user/", "z/"], ["z/", "user/"]] {
+            let mut ns = SystemNamespace::new();
+            for prefix in insertion_order {
+                ns.set_authority_definition(AuthorityDefinition {
+                    key_range: kr(prefix),
+                    authority_nodes: vec![node_id("auth-1")],
+                    auto_generated: false,
+                });
+                ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(3), kr(prefix), 1))
+                    .expect("valid policy");
+            }
+
+            let metrics = default_metrics();
+            // A key under no certifiable range.
+            metrics.record_write_op("other/y");
+
+            let engine = CompactionEngine::new(CompactionConfig {
+                time_threshold_ms: u64::MAX,
+                ops_threshold: 1,
+            });
+            let config = NodeRunnerConfig {
+                sync_interval: None,
+                ping_interval: None,
+                ..NodeRunnerConfig::default()
+            };
+            let mut runner = NodeRunner::new(
+                node_id("node-1"),
+                wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+                engine,
+                config,
+                Arc::clone(&metrics),
+            )
+            .await;
+            runner.set_eventual_api(Arc::new(Mutex::new(
+                crate::api::eventual::EventualApi::new(node_id("node-1")),
+            )));
+
+            runner.check_compaction().await;
+
+            assert!(
+                runner.compaction_engine().get_checkpoint("user/").is_none(),
+                "an unattributable op must not be charged to user/ (order {insertion_order:?})"
+            );
+            assert!(
+                runner.compaction_engine().get_checkpoint("z/").is_none(),
+                "an unattributable op must not be charged to z/ (order {insertion_order:?})"
+            );
+            assert_eq!(
+                metrics
+                    .compaction_unattributed_write_ops_total
+                    .load(Ordering::Relaxed),
+                1,
+                "the dropped op must be counted (order {insertion_order:?})"
+            );
+        }
+    }
+
+    /// The diagnostic classifier must agree with the frozen predicates on
+    /// EVERY case the gate unit tests pin — in particular it must never
+    /// report "open" where the gate says "closed". Same fixture table as
+    /// `gc_authority_gate_requires_*` / `gc_peer_gate_*`.
+    #[test]
+    fn gc_gate_diagnose_matches_gate_decision() {
+        use crate::authority::ack_frontier::AckFrontierSet;
+
+        let peer = |name: &str, addr: &str| crate::network::PeerConfig {
+            node_id: node_id(name),
+            addr: addr.into(),
+        };
+        let mark_ms = 8_000u64;
+        let defs = vec![(kr("user/"), 2usize)];
+        let versions = vec![PolicyVersion(1)];
+        let one_def = vec![(kr("user/"), 1usize)];
+        let one_version = vec![PolicyVersion(1)];
+
+        // Authority-side fixtures.
+        let no_reports = AckFrontierSet::new();
+
+        let mut one_of_two = AckFrontierSet::new();
+        one_of_two.update(ack_frontier("auth-1", "user/", 1, 10_000));
+
+        let mut behind_mark = one_of_two.clone();
+        behind_mark.update(ack_frontier("auth-2", "user/", 1, 5_000));
+
+        let mut both_past = one_of_two.clone();
+        both_past.update(ack_frontier("auth-2", "user/", 1, 9_000));
+
+        let mut stale_receipt = AckFrontierSet::new();
+        stale_receipt.update_at(ack_frontier("auth-1", "user/", 1, 10_000), 7_000);
+
+        // Peer-side fixtures.
+        let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
+        let no_evidence: HashMap<String, u64> = HashMap::new();
+        let mut stale_evidence: HashMap<String, u64> = HashMap::new();
+        stale_evidence.insert("p1:9000".into(), 9_000);
+        stale_evidence.insert("p2:9000".into(), 7_999);
+        let mut fresh_evidence: HashMap<String, u64> = HashMap::new();
+        fresh_evidence.insert("p1:9000".into(), 9_000);
+        fresh_evidence.insert("p2:9000".into(), 8_000);
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            &[(KeyRange, usize)],
+            &[PolicyVersion],
+            &AckFrontierSet,
+            &[crate::network::PeerConfig],
+            &HashMap<String, u64>,
+        )> = vec![
+            (
+                "no reports",
+                &defs,
+                &versions,
+                &no_reports,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "1-of-2 reported",
+                &defs,
+                &versions,
+                &one_of_two,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "behind the mark",
+                &defs,
+                &versions,
+                &behind_mark,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "both past the mark",
+                &defs,
+                &versions,
+                &both_past,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "stale local receipt",
+                &one_def,
+                &one_version,
+                &stale_receipt,
+                &[],
+                &no_evidence,
+            ),
+            ("empty population", &[], &[], &no_reports, &[], &no_evidence),
+            (
+                "peer without evidence",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &no_evidence,
+            ),
+            (
+                "peer with pre-mark evidence",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &stale_evidence,
+            ),
+            (
+                "all gates satisfied",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &fresh_evidence,
+            ),
+            (
+                "pull-advanced frontier is not push evidence",
+                &[],
+                &[],
+                &no_reports,
+                &peers,
+                &no_evidence,
+            ),
+        ];
+
+        let mut seen_variants = Vec::new();
+        for (name, defs, versions, set, peers, acked) in cases {
+            let gate_open = NodeRunner::gc_authority_gate_passed(defs, versions, set, mark_ms)
+                && NodeRunner::gc_peer_gate_passed(peers, acked, mark_ms);
+            let diagnosed =
+                NodeRunner::gc_gate_diagnose(defs, versions, set, peers, acked, mark_ms);
+            assert_eq!(
+                diagnosed.is_none(),
+                gate_open,
+                "diagnose disagreed with the frozen gate on case {name:?}"
+            );
+            if let Some(block) = diagnosed {
+                seen_variants.push(std::mem::discriminant(&block));
+            }
+        }
+
+        // All four block kinds must be reachable, or the classifier is
+        // silently collapsing distinct causes.
+        let reachable = [
+            GcGateBlock::AuthorityUnderReported {
+                prefix: String::new(),
+                reported: 0,
+                required: 0,
+            },
+            GcGateBlock::FrontierBehindMark {
+                prefix: String::new(),
+            },
+            GcGateBlock::ReportNotAdvanced {
+                prefix: String::new(),
+            },
+            GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: String::new(),
+            },
+        ];
+        for variant in &reachable {
+            assert!(
+                seen_variants.contains(&std::mem::discriminant(variant)),
+                "block variant {variant:?} was never produced by the fixture table"
+            );
+        }
+
+        // Spot-check the labels carry usable detail.
+        assert_eq!(
+            NodeRunner::gc_gate_diagnose(&defs, &versions, &one_of_two, &[], &no_evidence, mark_ms),
+            Some(GcGateBlock::AuthorityUnderReported {
+                prefix: "user/".into(),
+                reported: 1,
+                required: 2,
+            })
+        );
+        assert_eq!(
+            NodeRunner::gc_gate_diagnose(
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &no_evidence,
+                mark_ms
+            ),
+            Some(GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: "p1:9000".into(),
+            })
+        );
+    }
+
+    /// A gate that is LEGITIMATELY closed (a certifiable range whose
+    /// authorities have not reported) must be counted and must leave
+    /// `gc_last_sweep_wall_ms` at zero. Independent of D1: this is the
+    /// signal that would have surfaced D1 within one scrape.
+    #[tokio::test]
+    async fn gc_gate_block_is_counted_and_surfaced() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1"), node_id("auth-2")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2))
+            .expect("valid policy");
+
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: authority gate legitimately closed
+
+        assert!(
+            runner
+                .metrics
+                .gc_gate_blocked_authority_total
+                .load(Ordering::Relaxed)
+                > 0,
+            "an unreported certifiable range must be counted as an authority-side block"
+        );
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0,
+            "no sweep executed, so the liveness gauge must stay at zero"
+        );
+        assert_eq!(
+            runner
+                .metrics
+                .gc_gate_peer_population
+                .load(Ordering::Relaxed),
+            1,
+            "the peer population gauge must reflect the registry"
+        );
+        assert_eq!(runner.tombstone_gc.total_collected(), 0);
+    }
+
+    /// The population must carry each range's REAL policy version — the
+    /// fabricated `PolicyVersion(1)` is not a conservative stand-in, it is
+    /// a second copy of D1.
+    ///
+    /// `PolicyVersion(1)` is unreachable in a real deployment: a fresh
+    /// `SystemNamespace` starts at version 1, `main.rs`'s catch-all seed
+    /// `bump_version()`s it to 2, and `PutPolicy` increments
+    /// `version_counter` BEFORE it stamps — so the first policy anyone can
+    /// ever create is version 2 or later. A gate built on version 1
+    /// therefore demands a scope that no authority reports and that
+    /// `attestation_admissible` would reject anyway, i.e. it is
+    /// permanently closed, exactly as D1 was.
+    ///
+    /// Behaviour under test: an authority reporting the scope it actually
+    /// serves opens the gate and the sweep runs.
+    #[tokio::test]
+    async fn gc_gate_opens_on_a_report_at_the_ranges_real_policy_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        // Version 7: any version a real `PutPolicy` could hand out, and
+        // deliberately not 1.
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr("user/"), 1))
+            .expect("valid policy");
+
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+
+        // The authority reports through the real admission path, for the
+        // scope it actually serves.
+        {
+            let mut api = runner.certified_api.lock().await;
+            assert!(
+                api.update_frontier(ack_frontier("auth-1", "user/", 7, u64::MAX)),
+                "a report at the range's current policy version is admissible"
+            );
+        }
+        // Saturate both peer-facing gates so the authority gate is the
+        // only thing that can still hold the sweep back.
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep
+
+        assert_eq!(
+            runner
+                .metrics
+                .gc_gate_blocked_authority_total
+                .load(Ordering::Relaxed),
+            0,
+            "a fully reported range must not block the authority gate — a gate \
+             evaluated at a fabricated PolicyVersion(1) sees no report at all"
+        );
+        assert!(
+            runner.tombstone_gc.total_collected() >= 1,
+            "the sweep must run once the range's real scope is fully reported"
+        );
+        assert!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed) > 0,
+            "an executed sweep must stamp gc_last_sweep_wall_ms"
+        );
+    }
+
+    /// Same requirement on the other consumer of the population: a
+    /// checkpoint must be stamped with the range's real policy version.
+    /// A checkpoint stamped `PolicyVersion(1)` is looked up against a
+    /// scope no authority certifies, so pruning could never proceed.
+    #[tokio::test]
+    async fn check_compaction_checkpoints_the_real_policy_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(9), kr("user/"), 1))
+            .expect("valid policy");
+
+        let metrics = default_metrics();
+        metrics.record_write_op("user/k");
+
+        let engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: u64::MAX,
+            ops_threshold: 1,
+        });
+        let config = NodeRunnerConfig {
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+            engine,
+            config,
+            Arc::clone(&metrics),
+        )
+        .await;
+        runner.set_eventual_api(Arc::new(Mutex::new(
+            crate::api::eventual::EventualApi::new(node_id("node-1")),
+        )));
+
+        runner.check_compaction().await;
+
+        let checkpoint = runner
+            .compaction_engine()
+            .get_checkpoint("user/")
+            .expect("the op threshold was reached, so a checkpoint exists");
+        assert_eq!(
+            checkpoint.policy_version,
+            PolicyVersion(9),
+            "the checkpoint must carry the range's real policy version, not a \
+             fabricated PolicyVersion(1)"
+        );
     }
 
     // -----------------------------------------------------------------

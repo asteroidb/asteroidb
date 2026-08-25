@@ -436,6 +436,13 @@ struct RunnerHarness {
 }
 
 /// Build a NodeRunner ("local") whose only peer is `peer_addr`.
+///
+/// NOTE (D1): the catch-all `""` definition below has NO placement policy,
+/// so it is not a certifiable range and the GC authority gate is vacuous
+/// here. These tests are safe only because `NodeRunnerConfig::default()`
+/// keeps `gc_interval: 60s` / `gc_retention: 300s` and they finish in
+/// seconds. Shortening either would let tombstones actually be swept, and
+/// the digest comparisons below would start to flap.
 async fn runner_against(peer_addr: &str, digest_sync_enabled: bool) -> RunnerHarness {
     let mut ns = SystemNamespace::new();
     ns.set_authority_definition(AuthorityDefinition {

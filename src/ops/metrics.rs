@@ -350,6 +350,44 @@ pub struct RuntimeMetrics {
     /// delayed pushes).
     pub gc_floor_killed_by_floor_total: AtomicU64,
 
+    /// Gauge: local wall-clock time (ms since epoch) of the last tombstone-GC
+    /// pass that actually SWEPT. `0` means "no sweep has ever executed since
+    /// this process started".
+    ///
+    /// This is the top-level liveness signal for tombstone GC and exists
+    /// because the pre-existing gc gauges are only written by passes that
+    /// swept (`stats.swept`): a permanently-blocked gate and a healthy node
+    /// with nothing to collect produced byte-identical metric output, which
+    /// is how a gate that had been closed since first boot went unnoticed.
+    /// Alert on "not advancing" — never on the block counters alone, which
+    /// are legitimately non-zero on a healthy lagging cluster.
+    pub gc_last_sweep_wall_ms: AtomicU64,
+
+    /// Cumulative GC ticks whose evaluated gate was blocked on the AUTHORITY
+    /// half (a certifiable range under-reported, behind the mark, or with no
+    /// report advanced since the mark). See the throttled `gc gate blocked`
+    /// WARN for the offending prefix.
+    pub gc_gate_blocked_authority_total: AtomicU64,
+
+    /// Cumulative GC ticks whose evaluated gate was blocked on the PEER half
+    /// (a registered peer with missing or pre-mark push evidence — commonly a
+    /// dead peer left in the registry).
+    pub gc_gate_blocked_peer_total: AtomicU64,
+
+    /// Gauge: number of registered sync peers considered by the peer half of
+    /// the GC gate at its last evaluation. `0` on a genuinely single-node
+    /// deployment — but on a MULTI-node deployment a `0` here alongside an
+    /// advancing `gc_last_sweep_wall_ms` means GC is sweeping with the peer
+    /// gate vacuous, i.e. unguarded. See docs/ops-guide.md.
+    pub gc_gate_peer_population: AtomicU64,
+
+    /// Cumulative write ops drained from the per-key counter that matched no
+    /// certifiable key range and were therefore NOT attributed to any range's
+    /// compaction ops counter. Previously such ops were charged to an
+    /// arbitrary range (`defs[0]`, a `HashMap` iteration order), which the
+    /// catch-all `""` definition merely masked.
+    pub compaction_unattributed_write_ops_total: AtomicU64,
+
     /// Cumulative remote merges skipped by the RR gate (redundant-relay
     /// suppression, M-6): the received value did not inflate local state
     /// and the key was already delta-visible, so no local re-stamp /
@@ -523,6 +561,11 @@ impl Default for RuntimeMetrics {
             gc_floor_stalled_uncandidated_dots: AtomicU64::default(),
             gc_floor_rejected_dots_total: AtomicU64::default(),
             gc_floor_killed_by_floor_total: AtomicU64::default(),
+            gc_last_sweep_wall_ms: AtomicU64::default(),
+            gc_gate_blocked_authority_total: AtomicU64::default(),
+            gc_gate_blocked_peer_total: AtomicU64::default(),
+            gc_gate_peer_population: AtomicU64::default(),
+            compaction_unattributed_write_ops_total: AtomicU64::default(),
             sync_redundant_merge_skips_total: AtomicU64::default(),
             digest_push_probe_total: AtomicU64::default(),
             digest_push_match_total: AtomicU64::default(),
@@ -919,6 +962,15 @@ impl RuntimeMetrics {
             gc_floor_killed_by_floor_total: self
                 .gc_floor_killed_by_floor_total
                 .load(Ordering::Relaxed),
+            gc_last_sweep_wall_ms: self.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            gc_gate_blocked_authority_total: self
+                .gc_gate_blocked_authority_total
+                .load(Ordering::Relaxed),
+            gc_gate_blocked_peer_total: self.gc_gate_blocked_peer_total.load(Ordering::Relaxed),
+            gc_gate_peer_population: self.gc_gate_peer_population.load(Ordering::Relaxed),
+            compaction_unattributed_write_ops_total: self
+                .compaction_unattributed_write_ops_total
+                .load(Ordering::Relaxed),
             sync_redundant_merge_skips_total: self
                 .sync_redundant_merge_skips_total
                 .load(Ordering::Relaxed),
@@ -1070,6 +1122,19 @@ pub struct MetricsSnapshot {
     pub gc_floor_rejected_dots_total: u64,
     /// Cumulative stale live dots suppressed by the compaction floor.
     pub gc_floor_killed_by_floor_total: u64,
+    /// Gauge: wall-clock ms of the last GC pass that actually swept (`0` =
+    /// never). The primary "is tombstone GC alive at all?" signal.
+    pub gc_last_sweep_wall_ms: u64,
+    /// Cumulative GC ticks blocked on the authority half of the gate.
+    pub gc_gate_blocked_authority_total: u64,
+    /// Cumulative GC ticks blocked on the peer half of the gate.
+    pub gc_gate_blocked_peer_total: u64,
+    /// Gauge: registered sync peers seen by the GC peer gate at its last
+    /// evaluation (`0` on a multi-node deployment = unguarded sweeps).
+    pub gc_gate_peer_population: u64,
+    /// Cumulative write ops that matched no certifiable key range and were
+    /// therefore not attributed to any compaction ops counter.
+    pub compaction_unattributed_write_ops_total: u64,
     /// Cumulative remote merges skipped by the RR gate (no-op merge on an
     /// already delta-visible key; M-6).
     pub sync_redundant_merge_skips_total: u64,
