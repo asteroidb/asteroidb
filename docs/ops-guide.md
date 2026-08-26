@@ -1875,6 +1875,49 @@ term で二重投票し split-brain を招くため。復旧手順:
    （commit 済みエントリの喪失リスク）。残存ノードの `raft/` を正とし、
    個別に判断する。
 
+### 14.5.1 空の authority 定義が掃き出されたときの復旧
+
+起動時に次の WARN が出た場合:
+
+```
+dropped persisted authority definitions with an empty node set
+  prefixes=["", "user/"]
+```
+
+そのノードの永続 namespace に、**authority ノードが 0 個の自動生成
+authority 定義**が残っていた。これは旧バイナリの欠陥によるもので、
+クラスタ inventory が空のまま `recalculate_authorities` が走ると、
+正規手順で設定した authority 定義が `authority_nodes: []` に置換されていた。
+authority が 0 個の scope は過半数しきい値が充足不能で何も certify できず、
+当該レンジのトゥームストーン GC も止まるため、定義を残すより削除する方が
+常に良い（定義が無ければ、正しい inventory が揃った時点で再導出される）。
+
+掃き出しは**バージョンを bump しない**（自動生成定義はノードローカルな
+導出であり複製状態には載らないため、削除は巻き戻しにならない）。
+現行バイナリでは空の自動生成定義が二度と作られないので、この WARN は
+アップグレード後の初回起動で一度だけ出る。
+
+復旧の要否判断:
+
+1. `GET /api/control-plane/authorities` を**全ノードで**実行し、WARN が
+   挙げた prefix に定義が在るか確認する。
+2. **在る場合**: 複製状態から自己修復済み。対応不要。
+3. **無い場合**: その prefix に certified な配置ポリシーが在るなら、
+   リーダーに対して定義を再投入する。
+
+```bash
+curl -X PUT http://<leader-addr>/api/control-plane/authorities \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"key_range_prefix":"user/","authority_nodes":["node-1","node-2","node-3"]}'
+```
+
+再投入するまで、当該 prefix への `POST /api/certified/{key}` は
+`403 POLICY_DENIED` を返す（authority 0 個で暗黙に Pending 滞留させるより、
+明示的に拒否する方が安全なため）。**空配列を投入して「無効化」することは
+できない**（`400 BAD_REQUEST`）。certified 運用を止めたい場合は配置ポリシー側を
+`certified: false` にするか削除すること。
+
 ### 14.6 セキュリティ
 
 `/api/internal/raft/*`（vote / append / snapshot）は他の内部エンドポイント

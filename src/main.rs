@@ -384,6 +384,27 @@ async fn main() {
             (SystemNamespace::new(), true)
         }
     };
+    // Recover from the empty-inventory bug: before `recalculate_authorities`
+    // refused to write an empty candidate set, a node with no cluster
+    // inventory rewrote every certified prefix's authority definition to
+    // `authority_nodes: [], auto_generated: true` and persisted it. Such a
+    // definition certifies nothing and blocks tombstone GC on its range, so
+    // dropping it is strictly better than keeping it: with no definition, a
+    // correct one is re-derived (or replicated in) as soon as it can be.
+    //
+    // This runs AFTER the load, never inside it: rejecting the state at load
+    // time would fall into the "starting fresh" arm above and discard every
+    // policy and authority on this node.
+    let swept = ns.sweep_empty_auto_authorities();
+    if !swept.is_empty() {
+        tracing::warn!(
+            prefixes = ?swept,
+            "dropped persisted authority definitions with an empty node set. \
+             If any of these were set manually, re-register them with \
+             PUT /api/control-plane/authorities (see ops-guide 14.4)"
+        );
+    }
+
     // Seed the catch-all authority definition only on FIRST boot. Doing it
     // unconditionally would bump the namespace version on every restart,
     // silently diverging this node's replicated control-plane state machine

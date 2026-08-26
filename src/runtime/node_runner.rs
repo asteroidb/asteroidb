@@ -5782,6 +5782,79 @@ mod tests {
         assert_eq!(def.unwrap().authority_nodes.len(), 3);
     }
 
+    /// Reproduces the shipped binary's actual state: `main.rs` creates
+    /// `cluster_nodes` empty and never writes to it, so the very first
+    /// certification tick recalculates authorities against an empty
+    /// inventory. Before the empty-candidate guard, that tick replaced the
+    /// operator's authority definition with `authority_nodes: []` -- on every
+    /// node, without going through Raft, one second after startup.
+    #[tokio::test]
+    async fn empty_cluster_inventory_does_not_erase_a_manual_authority_definition() {
+        use crate::placement::PlacementPolicy;
+
+        let mut ns = SystemNamespace::new();
+        // No required tags: an empty inventory, not a tag mismatch, is what
+        // empties the candidate set.
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3).with_certified(true),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2"), node_id("n3")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+        runner.run().await;
+
+        let api_lock = api.lock().await;
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let def = ns
+            .get_authority_definition("user/")
+            .expect("the definition must survive an empty inventory");
+        assert_eq!(
+            def.authority_nodes.len(),
+            3,
+            "an empty cluster inventory must not empty the authority set"
+        );
+        assert!(
+            !def.auto_generated,
+            "a manual definition must not be flipped to auto-generated"
+        );
+    }
+
     #[tokio::test]
     async fn cluster_nodes_accessor_returns_shared_ref() {
         let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![make_node(
@@ -7771,7 +7844,17 @@ mod tests {
 
         // Demote/re-promote: the floor survives and the grace is not
         // re-armed (no second initialization).
-        cluster_nodes.write().unwrap().clear();
+        //
+        // Demote by replacing n1 in the inventory, not by emptying it:
+        // `recalculate_authorities` treats an empty candidate set as "no
+        // inventory available" and leaves existing definitions alone, so
+        // clearing the list demotes nobody. Replacement is also the shape a
+        // real demotion takes (a node leaves while others remain).
+        {
+            let mut nodes = cluster_nodes.write().unwrap();
+            nodes.clear();
+            nodes.push(crate::node::Node::new(node_id("n2"), NodeMode::Store));
+        }
         runner.detect_membership_changes().await;
         assert!(runner.frontier_reporter.is_none(), "demoted");
         assert!(

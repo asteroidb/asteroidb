@@ -113,6 +113,46 @@ impl SystemNamespace {
         self.authority_definitions.values().collect()
     }
 
+    /// One-shot local repair: drop auto-generated authority definitions that
+    /// carry no authority nodes. Returns the removed prefixes, ascending.
+    ///
+    /// Before the empty-candidate guard in `recalculate_authorities`, a node
+    /// with an empty cluster inventory rewrote every certified prefix's
+    /// definition to `authority_nodes: [], auto_generated: true` and persisted
+    /// it. Such a definition certifies nothing (`majority_threshold(0)` is
+    /// unsatisfiable) and blocks tombstone GC on its range, so it is strictly
+    /// worse than no definition at all: with no definition, a correct one is
+    /// re-derived as soon as a real inventory arrives.
+    ///
+    /// Deliberately does NOT bump the namespace version. Auto-generated
+    /// definitions are node-local derivations that never enter the replicated
+    /// state -- `build_bootstrap_command` filters on `!auto_generated` -- so
+    /// removing one rolls nothing back. Bumping would make `RaftNode::new`'s
+    /// `marker_matches_ns` check fail, which on a node holding a snapshot
+    /// discards the persisted namespace in favour of the snapshot.
+    ///
+    /// Only empty definitions are touched. A populated `auto_generated: true`
+    /// definition may be a legitimate FR-003 derivation or a manual definition
+    /// that the old bug flipped, and nothing distinguishes the two; those are
+    /// left for `replace_control_plane_core` or re-derivation to correct.
+    /// Manual definitions are never removed, empty or not: an empty one holds
+    /// information this function cannot reconstruct.
+    ///
+    /// Idempotent, and a no-op once the guard is in place.
+    pub fn sweep_empty_auto_authorities(&mut self) -> Vec<String> {
+        let mut removed: Vec<String> = self
+            .authority_definitions
+            .iter()
+            .filter(|(_, def)| def.auto_generated && def.authority_nodes.is_empty())
+            .map(|(prefix, _)| prefix.clone())
+            .collect();
+        removed.sort();
+        for prefix in &removed {
+            self.authority_definitions.remove(prefix);
+        }
+        removed
+    }
+
     /// Ranges that can actually hold certified state: prefixes carrying BOTH
     /// an authority definition AND a placement policy, paired with that
     /// policy's version.
@@ -209,6 +249,10 @@ impl SystemNamespace {
     /// Only bumps the namespace version if at least one authority definition
     /// was actually created or modified.
     ///
+    /// **Never produces an empty `authority_nodes` set.** An empty candidate
+    /// list means the caller has no cluster inventory, not that the range has
+    /// no authorities; existing definitions are left alone in that case.
+    ///
     /// Returns the number of authority definitions that changed.
     pub fn recalculate_authorities(&mut self, nodes: &[Node]) -> usize {
         let policies: Vec<PlacementPolicy> = self.placement_policies.values().cloned().collect();
@@ -252,6 +296,29 @@ impl SystemNamespace {
             let prefix = &policy.key_range.prefix;
 
             let needs_update = match self.authority_definitions.get(prefix) {
+                // Never replace an existing definition with an empty set.
+                // Symmetric with the `None` arm below, and together they make
+                // "recalculate_authorities never produces an empty
+                // authority_nodes" an invariant of this function.
+                //
+                // This is what production actually hits: nothing writes to
+                // `cluster_nodes` in the shipped binary, so `select_nodes`
+                // receives `&[]` and returns `[]` on every tick.
+                //
+                // DO NOT turn this into an `auto_generated` guard ("never
+                // overwrite a manual definition"). The doc comment above
+                // promises that, but three tests depend on exactly the
+                // opposite -- they set a manual definition and require
+                // recalculation to replace it from a NON-EMPTY candidate set:
+                //   tests/authority_auto_reconfig.rs:428
+                //     authority_demotion_stops_frontier_reporting
+                //   tests/compound_e2e.rs:226
+                //     authority_reconfig_with_key_rotation_and_delta_sync
+                //   tests/compound_e2e.rs:865
+                //     node_runner_reconfig_and_version_fencing_with_rotation
+                // Demotion by tag change is a real feature; an empty candidate
+                // set is not a demotion, it is an absent inventory.
+                Some(_) if candidates.is_empty() => false,
                 Some(existing) => {
                     let mut existing_sorted = existing.authority_nodes.clone();
                     existing_sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1297,5 +1364,156 @@ mod tests {
             !def.auto_generated,
             "definitions set via set_authority_definition should default to manual"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Empty-candidate guard and recovery sweep (P0-2)
+    // ---------------------------------------------------------------
+
+    /// The shipped binary never writes to `cluster_nodes`, so
+    /// `select_nodes(&[])` returns `[]` on every tick. Without this guard the
+    /// first certification tick after startup replaced every authority
+    /// definition on a certified prefix with `authority_nodes: []`.
+    #[test]
+    fn recalculate_does_not_replace_an_existing_definition_with_an_empty_set() {
+        let mut ns = SystemNamespace::new();
+        // Untagged certified policy: every node matches, so an empty
+        // inventory -- not a tag mismatch -- is what empties the candidates.
+        ns.set_placement_policy(make_certified_policy("", &[]))
+            .unwrap();
+        ns.set_authority_definition(make_authority_def("", &["n1", "n2"]));
+        let version_before = *ns.version();
+
+        let changed = ns.recalculate_authorities(&[]);
+
+        assert_eq!(changed, 0, "an empty inventory must change nothing");
+        let def = ns.get_authority_definition("").expect("still defined");
+        assert_eq!(
+            def.authority_nodes,
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+        assert!(
+            !def.auto_generated,
+            "a manual definition must not be flipped to auto-generated; \
+             build_bootstrap_command filters on !auto_generated, so the flip \
+             is what permanently drops it from the replicated state"
+        );
+        assert_eq!(*ns.version(), version_before, "no change, no version bump");
+    }
+
+    /// The same guard has to hold for an auto-generated definition: shrinking
+    /// a working set to empty is never an improvement.
+    #[test]
+    fn recalculate_does_not_empty_an_auto_generated_definition() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("", &[]))
+            .unwrap();
+        assert_eq!(
+            ns.recalculate_authorities(&[make_node("n1", NodeMode::Store, &[])]),
+            1
+        );
+
+        assert_eq!(ns.recalculate_authorities(&[]), 0);
+        assert_eq!(
+            ns.get_authority_definition("")
+                .expect("still defined")
+                .authority_nodes,
+            vec![NodeId("n1".into())]
+        );
+    }
+
+    #[test]
+    fn sweep_removes_empty_auto_generated_definitions() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range("broken/"),
+            authority_nodes: vec![],
+            auto_generated: true,
+        });
+
+        assert_eq!(
+            ns.sweep_empty_auto_authorities(),
+            vec!["broken/".to_string()]
+        );
+        assert!(ns.get_authority_definition("broken/").is_none());
+        // Idempotent.
+        assert!(ns.sweep_empty_auto_authorities().is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_manual_and_non_empty_definitions() {
+        let mut ns = SystemNamespace::new();
+        // Manual and empty: information we cannot reconstruct, so it stays.
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range("manual/"),
+            authority_nodes: vec![],
+            auto_generated: false,
+        });
+        // Auto but populated: a legitimate FR-003 derivation.
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range("auto/"),
+            authority_nodes: vec![NodeId("n1".into())],
+            auto_generated: true,
+        });
+
+        assert!(ns.sweep_empty_auto_authorities().is_empty());
+        assert!(ns.get_authority_definition("manual/").is_some());
+        assert!(ns.get_authority_definition("auto/").is_some());
+    }
+
+    /// The sweep must not bump the namespace version: `RaftNode::new` compares
+    /// the apply marker's `ns_version` against the in-memory one, and a
+    /// mismatch makes a node with a snapshot discard its persisted namespace.
+    #[test]
+    fn sweep_does_not_bump_the_namespace_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range("broken/"),
+            authority_nodes: vec![],
+            auto_generated: true,
+        });
+        let version_before = *ns.version();
+
+        assert_eq!(ns.sweep_empty_auto_authorities().len(), 1);
+        assert_eq!(*ns.version(), version_before);
+    }
+
+    /// Contract test, and it is meant to stay green forever: a persisted
+    /// namespace carrying an empty authority definition must still load.
+    /// Validating it in `load` would fail into `main.rs`'s "starting fresh"
+    /// fallback and discard every policy and authority on the node.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn persisted_namespace_with_an_empty_authority_definition_still_loads() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range("broken/"),
+            authority_nodes: vec![],
+            auto_generated: true,
+        });
+        ns.set_authority_definition(make_authority_def("good/", &["n1"]));
+
+        let dir = std::env::temp_dir().join(format!(
+            "asteroidb-ns-empty-auth-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("system_namespace.json");
+        ns.save(&path).unwrap();
+
+        let loaded = SystemNamespace::load(&path)
+            .expect("an empty authority definition must not fail the load")
+            .expect("file exists");
+        assert!(
+            loaded
+                .get_authority_definition("broken/")
+                .is_some_and(|d| d.authority_nodes.is_empty())
+        );
+        assert!(loaded.get_authority_definition("good/").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
