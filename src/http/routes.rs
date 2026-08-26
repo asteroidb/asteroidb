@@ -2221,6 +2221,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// An authority set with no nodes certifies nothing, and the proof it
+    /// would issue (`total_authorities: 0`) is rejected by the verifier. It is
+    /// a 400, rejected before it can reach the Raft log -- mirroring the
+    /// `replica_count < 1` guard on `PUT /api/control-plane/policies`.
+    #[tokio::test]
+    async fn cp_put_authorities_rejects_an_empty_node_set() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(Arc::clone(&state));
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/control-plane/authorities")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-secret")
+            .body(Body::from(
+                r#"{"key_range_prefix":"x/","authority_nodes":[],"approvals":[]}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .namespace
+                .read()
+                .unwrap()
+                .get_authority_definition("x/")
+                .is_none(),
+            "the rejected definition must not reach the namespace"
+        );
+    }
+
     #[tokio::test]
     async fn cp_put_policies_rejects_missing_token() {
         let state = test_state_with_token(Some("test-secret".into()));

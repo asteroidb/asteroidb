@@ -1710,8 +1710,17 @@ Authority 定義を設定する。
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `key_range_prefix` | string | 対象キー範囲プレフィックス |
-| `authority_nodes` | string[] | Authority ノード ID のリスト |
+| `authority_nodes` | string[] | Authority ノード ID のリスト。**空配列は `400 BAD_REQUEST`**（下記参照） |
 | `approvals` | string[] | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
+
+**空の `authority_nodes` は受理されない（400）。** Authority が 0 個の scope は
+過半数しきい値が充足不能で何も certify できず、仮に証明を発行しても
+`total_authorities: 0` は検証側で必ず invalid になる（required = 1 / contributing = 0）。
+プレフィックスの certified 運用を止めたい場合は、配置ポリシーを削除するか
+`certified: false` に変更すること。この検査は propose の前段で行われるため、
+拒否されたリクエストは Raft ログに一切残らない。
+なお、当該 scope の authority 定義が（何らかの理由で）空のまま残っている間、
+`POST /api/certified/{key}` は `403 POLICY_DENIED` を返す。
 
 **レスポンスボディ:**
 

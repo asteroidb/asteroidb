@@ -1032,6 +1032,20 @@ pub async fn set_authority_definition(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetAuthorityDefinitionRequest>,
 ) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
+    // An empty authority set certifies nothing: `majority_threshold(0)` is
+    // unsatisfiable, so every certified write under the prefix would wedge,
+    // and any proof issued for it (`total_authorities: 0`) is rejected by the
+    // verifier. Reject before proposing, so nothing reaches the Raft log --
+    // mirroring the `replica_count < 1` guard in `set_placement_policy`.
+    if req.authority_nodes.is_empty() {
+        return Err(ApiError(CrdtError::InvalidArgument(
+            "authority_nodes must contain at least one node; to stop \
+             certifying a prefix, remove its placement policy or set \
+             certified=false instead"
+                .to_string(),
+        )));
+    }
+
     // `approvals` from old clients is accepted but ignored (deprecated).
     let spec = AuthoritySpec {
         prefix: req.key_range_prefix.clone(),

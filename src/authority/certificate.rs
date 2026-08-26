@@ -1186,8 +1186,26 @@ impl DualModeCertificate {
 
 /// Compute the majority threshold for a given number of authorities.
 ///
-/// `threshold = total / 2 + 1`
+/// `threshold = total / 2 + 1`, except that **zero authorities are
+/// unsatisfiable**: the threshold is `usize::MAX`, so no signer count can ever
+/// meet it.
+///
+/// The plain formula yields `1` for `total == 0`, which would let a single
+/// signature stand in for a majority of an empty authority set. Returning `0`
+/// instead would be worse still -- `has_majority` is `count >= threshold`, so
+/// a threshold of 0 makes a certificate with *no* signatures claim a majority.
+/// "Unsatisfiable" is the only answer that is safe in both directions.
+///
+/// Note that `src/authority/verifier.rs` and `src/http/handlers.rs` compute
+/// `total / 2 + 1` independently; they are left alone deliberately. They are
+/// the *verifying* side, where `total == 0` already yields `required = 1 >
+/// contributing = 0` and so rejects. Routing them through this function would
+/// not change any outcome, and consolidating the five copies of the formula
+/// is a behaviour-preserving refactor that belongs in its own commit.
 fn majority_threshold(total: usize) -> usize {
+    if total == 0 {
+        return usize::MAX;
+    }
     total / 2 + 1
 }
 
@@ -1572,6 +1590,14 @@ mod tests {
 
     #[test]
     fn majority_threshold_values() {
+        // 0 nodes: unsatisfiable. `total / 2 + 1` yields 1 here, which would
+        // let a single signature (or a single residual ack frontier) stand in
+        // for a majority of an empty authority set. Returning 0 instead would
+        // be worse still: `has_majority` would then be `count >= 0`, i.e.
+        // always true, so a certificate with no signatures at all would claim
+        // a majority. The only safe answer is "no signer count can satisfy
+        // this".
+        assert_eq!(majority_threshold(0), usize::MAX);
         // 1 node: need 1
         assert_eq!(majority_threshold(1), 1);
         // 3 nodes: need 2
@@ -1580,6 +1606,31 @@ mod tests {
         assert_eq!(majority_threshold(5), 3);
         // 7 nodes: need 4
         assert_eq!(majority_threshold(7), 4);
+    }
+
+    /// A certificate can never hold a majority of an empty authority set,
+    /// however many signatures it carries.
+    #[test]
+    fn no_certificate_has_a_majority_of_zero_authorities() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+        assert!(!cert.has_majority(0), "0 signatures, 0 authorities");
+
+        for i in 0..3 {
+            let (sk, vk) = make_key_pair();
+            let sig = sign_message(&sk, &message);
+            cert.add_signature(make_auth_sig(NodeId(format!("auth-{i}")), vk, sig));
+            assert!(
+                !cert.has_majority(0),
+                "{} signatures must not carry a majority of an empty \
+                 authority set",
+                i + 1
+            );
+        }
     }
 
     #[test]
