@@ -182,7 +182,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
 | `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
-| `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
+| `RUST_LOG` | いいえ | `info` | ログレベル（tracing-subscriber 形式）。**未設定・空文字列の場合は `info` 相当**（6.1 を参照）。値を明示した場合はその指定がそのまま尊重される（`RUST_LOG=error` で ERROR のみに絞ることもできる） |
 
 ### Control plane Raft コンセンサス
 
@@ -852,6 +852,13 @@ asteroidb-cli --host localhost:3000 slo
 
 AsteroidDB は `tracing` + `tracing-subscriber` を使用した構造化ログを出力します。
 ログレベルは `RUST_LOG` 環境変数で制御します。
+
+**`RUST_LOG` を設定しない場合の既定は `info`** です。`Dockerfile` にも
+`docker-compose.yml` / `docker-compose.scale.yml` にも `RUST_LOG` は書かれていないため、
+出荷構成ではこのコード側の既定がそのまま効きます（既定が ERROR だと full sync の 413、
+署名不正、checkpoint 失敗、GC ゲート阻止、ping 失敗といった WARN が 1 行も出ず、
+他の障害が観測できなくなるため）。`RUST_LOG` を明示した場合は既定は注入されず、
+指定した内容だけが有効になります。
 
 ### 6.2 ログレベル設定例
 

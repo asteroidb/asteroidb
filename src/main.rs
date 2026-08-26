@@ -297,12 +297,33 @@ async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Build the `tracing` filter from an explicit `RUST_LOG` value.
+///
+/// Defaults to INFO when `RUST_LOG` is absent, empty, or made entirely of
+/// unparseable directives. `EnvFilter::from_default_env()` defaults to
+/// ERROR-only instead, and neither the `Dockerfile` nor either compose file
+/// sets `RUST_LOG` — so the shipped stacks emitted no WARN and no INFO at
+/// all, hiding every operational warning the runtime raises.
+///
+/// An explicit `RUST_LOG` still wins: `parse_lossy` injects the default
+/// directive only when the parsed directive set comes out empty, so
+/// `RUST_LOG=error` (and every other value) behaves exactly as before.
+///
+/// Taking the value as a parameter (rather than reading the environment
+/// inside) keeps this deterministically testable.
+fn log_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize structured logging. Users control verbosity via RUST_LOG env var
-    // (e.g. RUST_LOG=info or RUST_LOG=asteroidb_poc=debug).
+    // Initialize structured logging. Verbosity is INFO by default and is
+    // controlled by the RUST_LOG env var when set (e.g. RUST_LOG=warn or
+    // RUST_LOG=asteroidb_poc=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_env_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     // Load configuration: either from a config file or from individual env vars.
@@ -1091,6 +1112,60 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // Log filter defaults (P2-1)
+    // ---------------------------------------------------------------
+
+    /// Without `RUST_LOG`, the shipped Docker images must still emit INFO and
+    /// WARN. `EnvFilter::from_default_env()` defaults to ERROR-only, which
+    /// silences every operational warning (full-sync 413, bad signature,
+    /// checkpoint failure, GC gate block, ping failure) in the shipped
+    /// compose stacks, where no `RUST_LOG` is set.
+    #[test]
+    fn log_filter_defaults_to_info_when_rust_log_is_unset() {
+        use tracing_subscriber::layer::Filter;
+        assert_eq!(
+            Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(None)),
+            Some(tracing::level_filters::LevelFilter::INFO),
+            "RUST_LOG unset must default to INFO, not ERROR"
+        );
+    }
+
+    /// An empty `RUST_LOG` (`RUST_LOG=` in a compose file) is equivalent to
+    /// unset and must not silence the process either.
+    #[test]
+    fn log_filter_defaults_to_info_when_rust_log_is_empty() {
+        use tracing_subscriber::layer::Filter;
+        assert_eq!(
+            Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(Some(""))),
+            Some(tracing::level_filters::LevelFilter::INFO),
+        );
+    }
+
+    /// An explicit `RUST_LOG` still wins in both directions: the default is
+    /// only a fallback, never an override.
+    #[test]
+    fn log_filter_honours_an_explicit_rust_log() {
+        use tracing_subscriber::layer::Filter;
+        for (directive, expected) in [
+            ("error", tracing::level_filters::LevelFilter::ERROR),
+            ("warn", tracing::level_filters::LevelFilter::WARN),
+            (
+                "asteroidb_poc=debug",
+                tracing::level_filters::LevelFilter::DEBUG,
+            ),
+            ("trace", tracing::level_filters::LevelFilter::TRACE),
+        ] {
+            assert_eq!(
+                Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(Some(
+                    directive
+                ))),
+                Some(expected),
+                "RUST_LOG={directive} must be honoured verbatim"
+            );
+        }
+    }
 
     /// Deterministic Ed25519 verifying key and its hex encoding.
     fn ed_key_hex(byte: u8) -> (ed25519_dalek::VerifyingKey, String) {
