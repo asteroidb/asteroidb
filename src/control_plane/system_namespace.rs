@@ -249,9 +249,26 @@ impl SystemNamespace {
     /// Only bumps the namespace version if at least one authority definition
     /// was actually created or modified.
     ///
-    /// **Never produces an empty `authority_nodes` set.** An empty candidate
-    /// list means the caller has no cluster inventory, not that the range has
-    /// no authorities; existing definitions are left alone in that case.
+    /// **Never produces an empty `authority_nodes` set.** An existing
+    /// definition is kept whenever the candidate list comes out empty.
+    ///
+    /// A candidate list can be empty for two different reasons, and this
+    /// function deliberately treats them the same:
+    ///
+    /// * `nodes` is empty — the caller has no cluster inventory. This is what
+    ///   the shipped binary hits, and emptying the definition here is simply
+    ///   wrong.
+    /// * `nodes` is non-empty but no node satisfies the policy's
+    ///   `required_tags` / `forbidden_tags`. Emptying the definition would be
+    ///   defensible as "nobody is eligible any more", but the result is a
+    ///   prefix whose certified writes are refused outright
+    ///   (`resolve_scope` rejects `total == 0`) with no way back except a
+    ///   manual `PUT`. Keeping the previous authorities degrades instead:
+    ///   they are stale, not absent. This case is logged at WARN; the
+    ///   inventory-absent case is not, because it fires on every tick.
+    ///
+    /// The consequence worth knowing is that tag-driven *demotion to nobody*
+    /// does not happen. Demotion to a smaller non-empty set does.
     ///
     /// Returns the number of authority definitions that changed.
     pub fn recalculate_authorities(&mut self, nodes: &[Node]) -> usize {
@@ -317,8 +334,22 @@ impl SystemNamespace {
                 //   tests/compound_e2e.rs:865
                 //     node_runner_reconfig_and_version_fencing_with_rotation
                 // Demotion by tag change is a real feature; an empty candidate
-                // set is not a demotion, it is an absent inventory.
-                Some(_) if candidates.is_empty() => false,
+                // set is not a demotion, it is an absent inventory -- or, when
+                // `nodes` is non-empty, a policy no node satisfies. See the
+                // function doc for why both are handled the same way.
+                Some(_) if candidates.is_empty() => {
+                    if !nodes.is_empty() {
+                        tracing::warn!(
+                            key_range = %prefix,
+                            cluster_nodes = nodes.len(),
+                            "no node satisfies this certified policy's tag \
+                             constraints; keeping the existing authority set \
+                             (stale authorities degrade; an empty set would \
+                             refuse every certified write on the range)"
+                        );
+                    }
+                    false
+                }
                 Some(existing) => {
                     let mut existing_sorted = existing.authority_nodes.clone();
                     existing_sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1421,6 +1452,62 @@ mod tests {
                 .expect("still defined")
                 .authority_nodes,
             vec![NodeId("n1".into())]
+        );
+    }
+
+    /// The guard keys on the *candidate* list, not the node list, so it also
+    /// covers the case the doc calls out separately: a full inventory in which
+    /// no node satisfies the policy's tag constraints. The definition is kept
+    /// (stale authorities beat a range that refuses every certified write),
+    /// and unlike the absent-inventory case this one is worth a WARN.
+    #[test]
+    fn recalculate_keeps_the_definition_when_no_node_matches_the_tags() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("data/", &["region:eu"]))
+            .unwrap();
+        ns.set_authority_definition(make_authority_def("data/", &["n1", "n2"]));
+        let version_before = *ns.version();
+
+        // A real inventory -- but everyone is in the wrong region.
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["region:us"]),
+            make_node("n2", NodeMode::Store, &["region:us"]),
+        ];
+        let changed = ns.recalculate_authorities(&nodes);
+
+        assert_eq!(changed, 0, "no eligible node is not a demotion to nobody");
+        let def = ns.get_authority_definition("data/").expect("still defined");
+        assert_eq!(
+            def.authority_nodes,
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+        assert!(!def.auto_generated);
+        assert_eq!(*ns.version(), version_before);
+    }
+
+    /// Demotion to a smaller *non-empty* set still works -- the guard must not
+    /// be read as "tag changes can never shrink an authority set".
+    #[test]
+    fn recalculate_still_demotes_to_a_smaller_non_empty_set() {
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_certified_policy("data/", &["region:eu"]))
+            .unwrap();
+        ns.set_authority_definition(make_authority_def("data/", &["n1", "n2"]));
+
+        let nodes = vec![
+            make_node("n1", NodeMode::Store, &["region:us"]),
+            make_node("n2", NodeMode::Store, &["region:eu"]),
+        ];
+        assert_eq!(ns.recalculate_authorities(&nodes), 1);
+        assert_eq!(
+            ns.get_authority_definition("data/")
+                .unwrap()
+                .authority_nodes,
+            vec![NodeId("n2".into())]
         );
     }
 

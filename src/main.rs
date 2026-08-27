@@ -170,18 +170,55 @@ fn parse_bls_with_pop(
 
 /// Parse authority node IDs from `ASTEROIDB_AUTHORITY_NODES` env var (comma-separated),
 /// falling back to the default `["auth-1", "auth-2", "auth-3"]`.
-fn authority_nodes() -> Vec<NodeId> {
-    match std::env::var("ASTEROIDB_AUTHORITY_NODES") {
-        Ok(val) if !val.trim().is_empty() => val
-            .split(',')
-            .map(|s| NodeId(s.trim().to_string()))
-            .collect(),
-        _ => vec![
+///
+/// Empty entries (`a,,b`, a trailing comma, `","`) and repeats are dropped
+/// with a warning, mirroring `parse_control_plane_nodes`. Both would wedge the
+/// seeded catch-all range rather than merely look untidy: the majority
+/// denominator is the length of this list, while ack frontiers are keyed by
+/// `(key_range, policy_version, authority_id)`, so a repeated ID inflates the
+/// denominator without being able to supply a second frontier, and a blank ID
+/// names a node that can never report at all.
+fn parse_authority_nodes(raw: Option<&str>) -> Vec<NodeId> {
+    let default = || {
+        vec![
             NodeId("auth-1".into()),
             NodeId("auth-2".into()),
             NodeId("auth-3".into()),
-        ],
+        ]
+    };
+    let Some(val) = raw.filter(|v| !v.trim().is_empty()) else {
+        return default();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    let mut skipped = 0usize;
+    for part in val.split(',') {
+        let part = part.trim();
+        if part.is_empty() || !seen.insert(part.to_string()) {
+            skipped += 1;
+            continue;
+        }
+        nodes.push(NodeId(part.to_string()));
     }
+    if skipped > 0 {
+        eprintln!(
+            "warning: ASTEROIDB_AUTHORITY_NODES contains {skipped} empty or \
+             duplicate entry(ies); ignoring them"
+        );
+    }
+    if nodes.is_empty() {
+        eprintln!(
+            "warning: ASTEROIDB_AUTHORITY_NODES has no usable entries; \
+             falling back to the default authority set"
+        );
+        return default();
+    }
+    nodes
+}
+
+fn authority_nodes() -> Vec<NodeId> {
+    parse_authority_nodes(std::env::var("ASTEROIDB_AUTHORITY_NODES").ok().as_deref())
 }
 
 /// Outcome of parsing `ASTEROIDB_CONTROL_PLANE_NODES`
@@ -411,7 +448,7 @@ async fn main() {
             prefixes = ?swept,
             "dropped persisted authority definitions with an empty node set. \
              If any of these were set manually, re-register them with \
-             PUT /api/control-plane/authorities (see ops-guide 14.4)"
+             PUT /api/control-plane/authorities (see ops-guide 14.5.1)"
         );
     }
 
@@ -1310,6 +1347,73 @@ mod tests {
                     ControlPlaneNodesParse::Unset
                 ),
                 "{raw:?} must parse as Unset"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // parse_authority_nodes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn authority_nodes_defaults_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_authority_nodes(raw),
+                vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ],
+                "{raw:?} must fall back to the default authority set"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_nodes_trims_and_preserves_order() {
+        assert_eq!(
+            parse_authority_nodes(Some(" n1 , n2 ,n3")),
+            vec![
+                NodeId("n1".into()),
+                NodeId("n2".into()),
+                NodeId("n3".into())
+            ]
+        );
+    }
+
+    /// A phantom `NodeId("")` inflates the majority denominator with a node
+    /// that can never report a frontier, wedging every certified write on the
+    /// seeded catch-all range.
+    #[test]
+    fn authority_nodes_skips_empty_entries() {
+        assert_eq!(
+            parse_authority_nodes(Some("n1,,n2,")),
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+    }
+
+    /// Same wedge, different cause: ack frontiers are keyed by authority ID,
+    /// so `["n1","n1"]` needs 2 frontiers from a set that can supply 1.
+    #[test]
+    fn authority_nodes_drops_duplicates() {
+        assert_eq!(
+            parse_authority_nodes(Some("n1,n2,n1")),
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+    }
+
+    #[test]
+    fn authority_nodes_all_empty_entries_fall_back_to_the_default() {
+        for raw in [",", " , ", ",,"] {
+            assert_eq!(
+                parse_authority_nodes(Some(raw)),
+                vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ],
+                "{raw:?} must not produce phantom NodeId(\"\") authorities"
             );
         }
     }

@@ -1912,11 +1912,34 @@ curl -X PUT http://<leader-addr>/api/control-plane/authorities \
   -d '{"key_range_prefix":"user/","authority_nodes":["node-1","node-2","node-3"]}'
 ```
 
-再投入するまで、当該 prefix への `POST /api/certified/{key}` は
+再投入するまで、当該 prefix への `POST /api/certified/write` は
 `403 POLICY_DENIED` を返す（authority 0 個で暗黙に Pending 滞留させるより、
-明示的に拒否する方が安全なため）。**空配列を投入して「無効化」することは
-できない**（`400 BAD_REQUEST`）。certified 運用を止めたい場合は配置ポリシー側を
-`certified: false` にするか削除すること。
+明示的に拒否する方が安全なため）。`GET /api/certified/{key}` は 200 のまま
+`status: "Pending"` を返す。
+
+**空配列・重複 ID・空文字列 ID の投入で「無効化」することはできない**
+（いずれも `400 BAD_REQUEST`）。certified 運用を止めたい場合は
+`DELETE /api/control-plane/policies/{prefix}` で配置ポリシーを削除すること。
+**`certified: false` への変更では止まらない** — certified 経路のどこも
+このフラグを読んでいないため、この API で作った手動定義はそのまま
+certify し続ける（詳細は api-reference の該当節）。
+
+#### 手動で作られた空の authority 定義について
+
+掃き出しが落とすのは `auto_generated` な空定義だけで、**手動の空定義
+（`auto_generated: false`）は意図的に残る** — 空であっても、そこには
+この関数が再構成できない運用者の意図が入っている可能性があるため。
+ただし旧バイナリはこの API で空配列を受理していたので、そうした定義が
+残っているノードが**まだ Bootstrap していない制御プレーンの最初のリーダー**
+になると、`Bootstrap` エントリに載って全ノードへ複製される
+（`Bootstrap` / `InstallSnapshot` の apply 側には空 spec のスキップが無い）。
+新規クラスタ、または pre-Raft からの移行中にのみ起こりうる。
+
+**移行前チェック**: pre-Raft からの移行、または既存 namespace を持つノードで
+新しく Raft をブートストラップする前に、全ノードで
+`GET /api/control-plane/authorities` を実行し、`authority_nodes` が空の
+エントリが無いことを確認する。在る場合は先に非空の値を PUT しておくこと
+（当該プレフィックスは P0-3 の修正により恒久的に `403` になる）。
 
 ### 14.6 セキュリティ
 
@@ -1937,6 +1960,30 @@ curl -X PUT http://<leader-addr>/api/control-plane/authorities \
 やり取りされるため、**これらの型へのフィールド追加はワイヤ互換を壊す**。
 追加が必要な場合は新エンドポイントの追加か JSON 移行を伴うリリース手順が
 必要（`src/control_plane/raft/types.rs` の先頭コメントを参照）。
+
+#### 空 `PutAuthority` エントリと混在バージョン
+
+現行バイナリは空 `authority_nodes` の `PutAuthority` を**決定的 no-op**
+として apply する（旧バイナリは定義をそのまま書き込んでいた）。同じ
+committed エントリの適用結果がバイナリ世代で変わるため、混在期間中は
+状態機械が分岐しうる。到達経路は 2 つ:
+
+1. **アップグレード中の新規 PUT**: 旧バイナリのリーダーだけが空配列を
+   受理する（新バイナリは propose 前に 400）。→ **全ノードの更新が
+   完了するまで空の `authority_nodes` を PUT しないこと。**
+2. **アップグレード前に commit 済みのエントリの再適用**: そのエントリが
+   まだログ末尾に残っているノードは新バイナリで no-op になり、先に
+   スナップショットへ畳み込んでいたノードは定義を保持したまま起動する。
+   スナップショット境界はノードごとに異なる（`InstallSnapshot` で復旧した
+   ノード、後から join したノード）ため、**完全に更新済みのクラスタでも
+   分岐が残りうる**。
+
+いずれの分岐も「certify する / しない」ではなく「certify を拒否する形が
+2 通りある」だけなので安全側だが、収束させるには当該プレフィックスへ
+非空の `PUT /api/control-plane/authorities` を 1 回行えばよい
+（全ノードが同じ定義に上書きされる）。
+アップグレード後に `GET /api/control-plane/authorities` を全ノードで
+突き合わせ、差異があればこの手順で揃えること。
 
 ### 14.8 observer（非 voter）ノードの運用と namespace pull（M-17）
 

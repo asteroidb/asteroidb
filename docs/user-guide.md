@@ -260,8 +260,13 @@ cargo run --release
 > マルチリージョン構成でも下記のタグ設定は有効で、配置ポリシーの
 > `required_tags` / `forbidden_tags` もそのまま登録できるが、
 > **authority 定義は `PUT /api/control-plane/authorities` で明示的に
-> 設定すること**。`GET /api/topology` とレイテンシ計測はこの制限の影響を
-> 受けない。解消は follow-up（`docs/followup-plan.md`）。
+> 設定すること**。
+>
+> `GET /api/topology` はノード数とノード ID を正しく返すが、**リージョン
+> 分類は自ノードにしか効かない** — タグが伝播しないため、各ノードは自分を
+> 実リージョンに、他の全ノードを `unknown` リージョンに置いた結果を返す
+> （ノードごとに異なる応答になる）。レイテンシ計測自体は影響を受けない。
+> 解消は follow-up（`docs/followup-plan.md`）。
 
 **東京リージョンのノード設定例:**
 

@@ -447,6 +447,18 @@ pub struct NodeRunner {
     /// Computed from sorted node IDs so that same-size replacements
     /// (e.g. 1 leave + 1 join) are detected correctly.
     tracked_cluster_generation: u64,
+    /// Fingerprint of everything [`FrontierReporter::discover_scopes`] reads,
+    /// used to reconcile [`Self::frontier_reporter`] against the namespace on
+    /// each certification tick.
+    ///
+    /// Authority definitions change for reasons that have nothing to do with
+    /// cluster membership -- `PUT /api/control-plane/authorities`, a Raft
+    /// `PutAuthority` apply, the startup sweep -- and
+    /// `detect_membership_changes` is not reached at all while placement is
+    /// frozen. Without this the reporter could only ever be promoted by a
+    /// membership change, so a node re-registered as an authority at runtime
+    /// would never start reporting frontiers.
+    tracked_reporter_fingerprint: u64,
     /// Optional membership client for periodic peer list exchange (ping).
     membership_client: Option<MembershipClient>,
     /// Optional SLO tracker for recording operational observations.
@@ -759,13 +771,20 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
+        let (reporter, tracked_versions, tracked_policies, reporter_fingerprint, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies, api.store().max_known_hlc())
+            let fingerprint = Self::reporter_fingerprint(&ns, &node_id);
+            (
+                reporter,
+                versions,
+                policies,
+                fingerprint,
+                api.store().max_known_hlc(),
+            )
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -829,6 +848,7 @@ impl NodeRunner {
             inventory_source: None,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
+            tracked_reporter_fingerprint: reporter_fingerprint,
             membership_client: None,
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
@@ -884,13 +904,20 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
+        let (reporter, tracked_versions, tracked_policies, reporter_fingerprint, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies, api.store().max_known_hlc())
+            let fingerprint = Self::reporter_fingerprint(&ns, &node_id);
+            (
+                reporter,
+                versions,
+                policies,
+                fingerprint,
+                api.store().max_known_hlc(),
+            )
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -958,6 +985,7 @@ impl NodeRunner {
             // Use sentinel value to force initial recalculation on first tick,
             // consistent with `with_cluster_nodes()`.
             tracked_cluster_generation: u64::MAX,
+            tracked_reporter_fingerprint: reporter_fingerprint,
             membership_client: None,
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
@@ -1431,6 +1459,11 @@ impl NodeRunner {
         // Check for cluster membership changes first.
         self.detect_membership_changes().await;
 
+        // Then reconcile the reporter against the namespace itself, which
+        // changes for reasons membership never sees (an operator PUT, a Raft
+        // `PutAuthority` apply, the startup sweep).
+        self.reconcile_frontier_reporter().await;
+
         // Snapshot current versions while briefly holding the locks.
         let current_versions: HashMap<String, PolicyVersion> = {
             let api = self.certified_api.lock().await;
@@ -1803,6 +1836,109 @@ impl NodeRunner {
         hasher.finish()
     }
 
+    /// Fingerprint the namespace state that decides what this node reports.
+    ///
+    /// `FrontierReporter::discover_scopes` reads exactly three things per
+    /// authority definition: the prefix, whether this node is a member, and
+    /// the placement policy version for that prefix (a definition without a
+    /// policy is membership-relevant but never reported, which is why the
+    /// missing case gets its own sentinel rather than being skipped).
+    fn reporter_fingerprint(ns: &SystemNamespace, node_id: &NodeId) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut entries: Vec<(&str, bool, Option<u64>)> = ns
+            .all_authority_definitions()
+            .into_iter()
+            .map(|def| {
+                (
+                    def.key_range.prefix.as_str(),
+                    def.authority_nodes.contains(node_id),
+                    ns.get_placement_policy(&def.key_range.prefix)
+                        .map(|p| p.version.0),
+                )
+            })
+            .collect();
+        entries.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        entries.len().hash(&mut hasher);
+        for entry in entries {
+            entry.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Install a freshly discovered reporter, promoting or demoting this node.
+    fn adopt_reporter(&mut self, reporter: FrontierReporter) {
+        if reporter.is_authority() {
+            self.frontier_reporter = Some(reporter);
+            // Runtime promotion (M-12): a node promoted here was NOT an
+            // authority at construction time, so init_report_floor never
+            // ran and the store-digest machinery (floor, activation
+            // instant, floorless-boot silence) would silently stay off —
+            // the node would report the legacy placeholder for its whole
+            // process lifetime with no WARN and no restart-monotonicity
+            // coverage. Run the exact constructor initialization now.
+            // Guarded on report_floor so a demote/re-promote cycle keeps
+            // the already-initialized floor and does not re-arm the
+            // grace (the floor stays valid across demotion: it is only
+            // ever advanced, never regressed).
+            if self.report_floor.is_none() && self.store_digest_active_at.is_none() {
+                let (floor, active_at, silence_until) =
+                    Self::init_report_floor(&self.config, &self.node_id, &mut self.clock, true);
+                self.report_floor = floor;
+                self.store_digest_active_at = active_at;
+                self.report_silence_until = silence_until;
+            }
+        } else {
+            // Demotion: keep report_floor / store_digest_active_at so a
+            // later re-promotion resumes with full restart-monotonicity
+            // evidence instead of re-running the activation grace.
+            self.frontier_reporter = None;
+        }
+    }
+
+    /// Reconcile the frontier reporter against the current namespace.
+    ///
+    /// Runs on every certification tick, independent of both the membership
+    /// fingerprint and the placement freeze. `detect_membership_changes` also
+    /// adopts a reporter, but only along a path that a peer-derived inventory
+    /// closes entirely — and only for changes that a *cluster* change caused.
+    /// An operator repopulating a swept definition with
+    /// `PUT /api/control-plane/authorities` (ops-guide 14.5.1) changes neither,
+    /// so without this the node would accept the definition and still never
+    /// report a frontier for it, leaving the range uncertifiable until restart.
+    async fn reconcile_frontier_reporter(&mut self) {
+        let outcome = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
+            let fingerprint = Self::reporter_fingerprint(&ns, &self.node_id);
+            if fingerprint == self.tracked_reporter_fingerprint {
+                None
+            } else {
+                Some((
+                    fingerprint,
+                    FrontierReporter::new(self.node_id.clone(), &ns),
+                ))
+            }
+        };
+        let Some((fingerprint, reporter)) = outcome else {
+            return;
+        };
+        self.tracked_reporter_fingerprint = fingerprint;
+        let was_authority = self.frontier_reporter.is_some();
+        self.adopt_reporter(reporter);
+        match (was_authority, self.frontier_reporter.is_some()) {
+            (false, true) => tracing::info!(
+                node_id = %self.node_id.0,
+                "promoted to frontier authority by an authority-definition change"
+            ),
+            (true, false) => tracing::info!(
+                node_id = %self.node_id.0,
+                "demoted from frontier authority by an authority-definition change"
+            ),
+            _ => {}
+        }
+    }
+
     async fn detect_membership_changes(&mut self) {
         let current_generation = {
             let nodes = self.cluster_nodes.read().unwrap_or_else(|e| e.into_inner());
@@ -1836,36 +1972,21 @@ impl NodeRunner {
             ns.recalculate_authorities(&nodes)
         };
 
-        if changed > 0 {
-            // Refresh the frontier reporter to pick up new authority scopes.
+        // Refresh the frontier reporter to pick up new authority scopes.
+        let promoted = if changed > 0 {
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
-            let reporter = FrontierReporter::new(self.node_id.clone(), &ns);
-            if reporter.is_authority() {
-                self.frontier_reporter = Some(reporter);
-                // Runtime promotion (M-12): a node promoted here was NOT an
-                // authority at construction time, so init_report_floor never
-                // ran and the store-digest machinery (floor, activation
-                // instant, floorless-boot silence) would silently stay off —
-                // the node would report the legacy placeholder for its whole
-                // process lifetime with no WARN and no restart-monotonicity
-                // coverage. Run the exact constructor initialization now.
-                // Guarded on report_floor so a demote/re-promote cycle keeps
-                // the already-initialized floor and does not re-arm the
-                // grace (the floor stays valid across demotion: it is only
-                // ever advanced, never regressed).
-                if self.report_floor.is_none() && self.store_digest_active_at.is_none() {
-                    let (floor, active_at, silence_until) =
-                        Self::init_report_floor(&self.config, &self.node_id, &mut self.clock, true);
-                    self.report_floor = floor;
-                    self.store_digest_active_at = active_at;
-                    self.report_silence_until = silence_until;
-                }
-            } else {
-                // Demotion: keep report_floor / store_digest_active_at so a
-                // later re-promotion resumes with full restart-monotonicity
-                // evidence instead of re-running the activation grace.
-                self.frontier_reporter = None;
-            }
+            Some((
+                Self::reporter_fingerprint(&ns, &self.node_id),
+                FrontierReporter::new(self.node_id.clone(), &ns),
+            ))
+        } else {
+            None
+        };
+        drop(api);
+
+        if let Some((fingerprint, reporter)) = promoted {
+            self.tracked_reporter_fingerprint = fingerprint;
+            self.adopt_reporter(reporter);
         }
 
         // Rebuild topology view to reflect the new membership.
@@ -5977,7 +6098,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
             let _ = handle.send(true);
         });
-        runner.run().await;
+        let stats = runner.run().await;
+        assert!(
+            stats.certification_ticks > 0,
+            "the run loop must actually have ticked, otherwise the definition \
+             surviving proves nothing about the guard"
+        );
 
         let api_lock = api.lock().await;
         let ns = api_lock
@@ -6037,6 +6163,15 @@ mod tests {
         )
         .await;
 
+        // The same two `Arc`s `main.rs` hands to `AppState`, which is what
+        // `GET /api/topology` reads.
+        let topology_view = Arc::new(std::sync::RwLock::new(TopologyView::build(
+            &[],
+            &LatencyModel::new(),
+        )));
+        runner.set_latency_model(Arc::new(std::sync::RwLock::new(LatencyModel::new())));
+        runner.set_topology_view(topology_view.clone());
+
         runner.set_cluster_inventory_source(
             crate::node::Node::new(node_id("n1"), NodeMode::Both),
             peer_registry_with("n1", &[("n2", "127.0.0.1:3002"), ("n3", "127.0.0.1:3003")]),
@@ -6047,8 +6182,20 @@ mod tests {
         let ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
         assert_eq!(ids, vec!["n1", "n2", "n3"], "self plus every peer, sorted");
 
-        let view = TopologyView::build(&nodes, &LatencyModel::new());
+        // The shared view is what the endpoint serves, and it is refreshed on
+        // the membership path -- which stays reachable while placement is
+        // frozen precisely so topology keeps following the cluster.
+        runner.detect_membership_changes().await;
+        let view = topology_view.read().unwrap();
         assert_eq!(view.total_nodes, 3);
+        assert_eq!(
+            view.regions
+                .iter()
+                .find(|r| r.name == "unknown")
+                .map(|r| r.node_count),
+            Some(3),
+            "peers carry no region tag, and neither does this untagged self node"
+        );
     }
 
     /// The self node contributes its real mode and tags, which is the whole
@@ -6140,6 +6287,232 @@ mod tests {
             "a peer-derived inventory must not narrow the authority set to [self]"
         );
         assert!(!def.auto_generated);
+    }
+
+    /// `detect_membership_changes` is not the only way into
+    /// `recalculate_authorities`: a placement *policy* change reaches it too,
+    /// on a path membership never touches. That gate needs its own coverage --
+    /// opening it lets a tag-constrained policy narrow the set to `[self]`,
+    /// which is the `total == 1` single-signer hazard.
+    #[tokio::test]
+    async fn policy_change_does_not_recalculate_authorities_while_placement_is_frozen() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // Only this node can carry the required tag; the peer arrives without
+        // one, so `select_nodes` would return exactly `[n1]`.
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Both);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        // Baseline tick, then a policy version bump -- the membership
+        // fingerprint is unchanged from here on, so only the policy path runs.
+        runner.detect_version_changes().await;
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(
+                PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
+                    .with_certified(true)
+                    .with_required_tags([Tag("dc:tokyo".into())].into()),
+            )
+            .unwrap();
+        }
+        runner.detect_version_changes().await;
+
+        let ns = shared_ns.read().unwrap_or_else(|e| e.into_inner());
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(
+            def.authority_nodes,
+            vec![node_id("n1"), node_id("n2")],
+            "a policy change must not narrow the authority set to [self] \
+             while the inventory is peer-derived"
+        );
+        assert!(!def.auto_generated);
+    }
+
+    /// The third frozen path: a rebalance plan built from placeholder tags
+    /// would move real keys onto nodes that were never shown to match.
+    #[tokio::test]
+    async fn rebalance_plans_are_not_computed_while_placement_is_frozen() {
+        use crate::api::eventual::EventualApi;
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("n1"))));
+        {
+            let mut ea = eventual_api.lock().await;
+            let mut counter = crate::crdt::pn_counter::PnCounter::new();
+            counter.increment(&node_id("n1"));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
+        }
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_api.clone());
+
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Store);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.detect_version_changes().await;
+        assert!(runner.active_rebalance_plans.is_empty());
+
+        // Drop the tag requirement: the placeholder peer would now "match",
+        // which is exactly the fabricated-attribute move the gate prevents.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3))
+                .unwrap();
+        }
+        runner.detect_version_changes().await;
+
+        assert!(
+            runner.active_rebalance_plans.is_empty(),
+            "no rebalance may be planned from an inventory with placeholder tags"
+        );
+        assert_eq!(
+            runner
+                .metrics()
+                .rebalance_start_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// The recovery runbook (ops-guide 14.5.1) tells the operator to
+    /// re-register a swept authority definition with `PUT
+    /// /api/control-plane/authorities`. That changes neither the cluster
+    /// fingerprint nor any policy version, and in a shipped binary
+    /// `detect_membership_changes` returns early anyway -- so the reporter has
+    /// to be reconciled against the namespace directly, or the range stays
+    /// uncertifiable until the process restarts.
+    #[tokio::test]
+    async fn a_new_authority_definition_promotes_the_reporter_while_frozen() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3).with_certified(true),
+        )
+        .unwrap();
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(dir.path().join("frontier_report_clock.json")),
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+        assert!(
+            runner.frontier_reporter.is_none(),
+            "no definition yet, so not an authority"
+        );
+        assert!(runner.report_floor.is_none(), "non-authority: no floor");
+
+        runner.detect_version_changes().await;
+        assert!(runner.frontier_reporter.is_none(), "still no definition");
+
+        // What `PUT /api/control-plane/authorities` ends up doing.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr("user/"),
+                authority_nodes: vec![node_id("n1"), node_id("n2")],
+                auto_generated: false,
+            });
+        }
+        runner.detect_version_changes().await;
+
+        let reporter = runner
+            .frontier_reporter
+            .as_ref()
+            .expect("re-registering the definition must promote this node");
+        assert_eq!(reporter.authority_scopes().len(), 1);
+        assert!(
+            runner.report_floor.is_some(),
+            "runtime promotion must initialise the report clock floor"
+        );
+
+        // ... and removing it again demotes.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr("user/"),
+                authority_nodes: vec![node_id("n2")],
+                auto_generated: false,
+            });
+        }
+        runner.detect_version_changes().await;
+        assert!(runner.frontier_reporter.is_none(), "demoted");
+        assert!(
+            runner.report_floor.is_some(),
+            "the floor survives demotion so a re-promotion does not re-arm the grace"
+        );
     }
 
     /// The gate must not consume the membership change: leaving the

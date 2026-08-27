@@ -1717,17 +1717,37 @@ Authority 定義を設定する。
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `key_range_prefix` | string | 対象キー範囲プレフィックス |
-| `authority_nodes` | string[] | Authority ノード ID のリスト。**空配列は `400 BAD_REQUEST`**（下記参照） |
+| `authority_nodes` | string[] | Authority ノード ID のリスト。**空配列・重複・空文字列は `400 BAD_REQUEST`**（下記参照） |
 | `approvals` | string[] | **Deprecated**。受理されるが無視される（合意は Raft が担う） |
 
 **空の `authority_nodes` は受理されない（400）。** Authority が 0 個の scope は
 過半数しきい値が充足不能で何も certify できず、仮に証明を発行しても
-`total_authorities: 0` は検証側で必ず invalid になる（required = 1 / contributing = 0）。
-プレフィックスの certified 運用を止めたい場合は、配置ポリシーを削除するか
-`certified: false` に変更すること。この検査は propose の前段で行われるため、
-拒否されたリクエストは Raft ログに一切残らない。
-なお、当該 scope の authority 定義が（何らかの理由で）空のまま残っている間、
-`POST /api/certified/{key}` は `403 POLICY_DENIED` を返す。
+`total_authorities: 0` は検証側でも必ず invalid になる。
+
+**重複・空文字列の node ID も受理されない（400）。** 過半数の分母は
+`authority_nodes.len()` だが、ack frontier は `(key_range, policy_version,
+authority_id)` でキーされるため、同じ ID を N 個並べても frontier は 1 本しか
+供給できない（`["n1","n1"]` は 1 本しか出せない集合に 2 本を要求する）。
+空文字列 ID はどのノードも指さないので永久に報告されない。どちらも当該
+プレフィックスの certified write を恒久的に Pending にする。
+
+この検査は propose の前段で行われるため、拒否されたリクエストは Raft ログに
+一切残らない。
+
+**プレフィックスの certified 運用を止める方法は、配置ポリシーの削除
+（`DELETE /api/control-plane/policies/{prefix}`）だけ。**
+`certified: false` への変更では止まらない: certified 経路のどこも
+このフラグを読んでいない（`resolve_scope` は authority 定義と配置ポリシーの
+両方が在ることだけを要求する）。また authority 定義を削除する API は存在せず、
+`recalculate_authorities` が自動削除するのは `auto_generated` な定義だけなので、
+この API で作った手動定義は decertify しても残り、certify し続ける。
+なおポリシーを削除すると当該プレフィックスの certified write は
+`400 INVALID_ARGUMENT`（ポリシー無し）になる。
+
+当該 scope の authority 定義が（何らかの理由で）空のまま残っている間、
+`POST /api/certified/write` は `403 POLICY_DENIED` を返す。
+`GET /api/certified/{key}` は 200 のまま `status: "Pending"` /
+`frontier: null` を返す（読み取りは scope 解決の失敗を握り潰す）。
 
 **レスポンスボディ:**
 

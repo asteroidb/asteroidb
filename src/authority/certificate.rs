@@ -1196,13 +1196,20 @@ impl DualModeCertificate {
 /// a threshold of 0 makes a certificate with *no* signatures claim a majority.
 /// "Unsatisfiable" is the only answer that is safe in both directions.
 ///
-/// Note that `src/authority/verifier.rs` and `src/http/handlers.rs` compute
-/// `total / 2 + 1` independently; they are left alone deliberately. They are
-/// the *verifying* side, where `total == 0` already yields `required = 1 >
-/// contributing = 0` and so rejects. Routing them through this function would
-/// not change any outcome, and consolidating the five copies of the formula
-/// is a behaviour-preserving refactor that belongs in its own commit.
-fn majority_threshold(total: usize) -> usize {
+/// This is the single definition of the threshold. Every issuing site
+/// (`MajorityCertificate::has_majority`, `DualModeCertificate::has_majority`,
+/// `AttestationPool::build_certificates`) and every verifying site
+/// (`authority::verifier`, the BLS-aggregate short-circuit in
+/// `http::handlers::verify_proof`) routes through it, so "zero authorities are
+/// unsatisfiable" holds on both sides of the protocol.
+///
+/// Verification is NOT self-securing here: `verify_proof` takes the
+/// denominator from the bundle, and `contributing_count` is the length of the
+/// verified-signer list with no membership check against the authority set. A
+/// bundle carrying `total_authorities: 0` plus one valid signature therefore
+/// used to verify as a majority of nobody. Routing the verifier through this
+/// function is what closes that asymmetry.
+pub(crate) fn majority_threshold(total: usize) -> usize {
     if total == 0 {
         return usize::MAX;
     }

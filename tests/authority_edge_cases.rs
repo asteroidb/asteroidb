@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
-use asteroidb_poc::authority::ack_frontier::AckFrontier;
+use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
 use asteroidb_poc::authority::certificate::{
     AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
     sign_message,
@@ -592,26 +592,56 @@ fn empty_authority_set_rejects_new_certified_writes() {
     );
 }
 
+/// Compaction is the consumer the `AckFrontierSet` guard exists for.
+///
+/// `CompactionEngine::is_compactable` resolves the authority count itself and
+/// never goes through `CertifiedApi::resolve_scope`, so the `total == 0`
+/// refusal on the write path does not cover it. A residual frontier -- one
+/// admitted while the set was still populated, and still in scope because
+/// emptying a definition does not bump the placement policy version -- would
+/// otherwise count as a majority of nobody and authorise reclaiming
+/// tombstones past the checkpoint.
 #[test]
-fn residual_frontier_does_not_certify_an_emptied_authority_set() {
+fn residual_frontier_does_not_unblock_compaction_for_an_emptied_authority_set() {
     let mut ns = SystemNamespace::new();
     ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(""), 1).with_certified(true))
         .unwrap();
     ns.set_authority_definition(make_authority_def("", &["auth-1"]));
 
     let shared_ns = wrap_ns(ns);
-    let mut api = CertifiedApi::new(node_id("auth-1"), shared_ns.clone());
 
-    // A frontier admitted while the authority set was still populated. It
-    // survives the set being emptied: `set_authority_definition` does not bump
-    // the placement policy version, so the frontier stays in scope.
-    api.update_frontier(AckFrontier {
+    let mut engine = CompactionEngine::with_defaults();
+    engine.create_checkpoint(
+        kr(""),
+        ts(1_700_000_000_000, 0, "node-1"),
+        "digest".into(),
+        PolicyVersion(1),
+    );
+
+    // A frontier admitted while the authority set was still populated, far
+    // past the checkpoint.
+    let mut frontiers = AckFrontierSet::new();
+    frontiers.update(AckFrontier {
         authority_id: node_id("auth-1"),
         frontier_hlc: ts(u64::MAX - 1, u32::MAX, "zzz"),
         key_range: kr(""),
         policy_version: PolicyVersion(1),
         digest_hash: String::new(),
     });
+
+    // The count `NodeRunner::check_compaction` would pass, read from the
+    // namespace, before and after the set is emptied.
+    let total_before = shared_ns
+        .read()
+        .unwrap()
+        .get_authority_definition("")
+        .unwrap()
+        .authority_nodes
+        .len();
+    assert!(
+        engine.is_compactable("", &frontiers, total_before),
+        "baseline: the frontier does authorise compaction for a real set of 1"
+    );
 
     {
         let mut ns = shared_ns.write().unwrap();
@@ -622,15 +652,17 @@ fn residual_frontier_does_not_certify_an_emptied_authority_set() {
         });
     }
 
-    // Whether or not the write is admitted, nothing may reach Certified.
-    let _ = api.certified_write("key-a".into(), counter_value(1), OnTimeout::Pending);
-    api.process_certifications();
-
+    let total_after = shared_ns
+        .read()
+        .unwrap()
+        .get_authority_definition("")
+        .unwrap()
+        .authority_nodes
+        .len();
+    assert_eq!(total_after, 0);
     assert!(
-        api.pending_writes()
-            .iter()
-            .all(|pw| pw.status != CertificationStatus::Certified),
-        "a single residual frontier must not certify a write against an \
+        !engine.is_compactable("", &frontiers, total_after),
+        "a single residual frontier must not authorise compaction against an \
          empty authority set"
     );
 }

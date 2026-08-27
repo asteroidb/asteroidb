@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::authority::certificate::{
-    AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate,
+    AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate, majority_threshold,
 };
 use crate::authority::frontier_sig::VerifiedAttestation;
 use crate::hlc::HlcTimestamp;
@@ -285,8 +285,8 @@ impl AttestationPool {
     }
 
     /// Assemble certificates for the newest checkpoint `C` satisfying
-    /// `min_ts <= C` with at least `total_authorities / 2 + 1` distinct
-    /// Ed25519 signers.
+    /// `min_ts <= C` with at least `majority_threshold(total_authorities)`
+    /// distinct Ed25519 signers. Zero authorities never qualify.
     ///
     /// Returns `(C, ed25519_certificate, optional_bls_certificate)`.
     /// The BLS certificate is attached when, at the same checkpoint, a
@@ -309,7 +309,11 @@ impl AttestationPool {
             policy_version,
         };
         let checkpoints = self.entries.get(&scope)?;
-        let threshold = total_authorities / 2 + 1;
+        // `majority_threshold`, not the inline formula: this is an *issuing*
+        // site. `0 / 2 + 1 == 1` would mint a signed 1-of-0 certificate for an
+        // emptied authority set, which is exactly what the rest of this series
+        // set out to make impossible.
+        let threshold = majority_threshold(total_authorities);
 
         for (physical, atts) in checkpoints.iter().rev() {
             let checkpoint = HlcTimestamp {
@@ -528,6 +532,27 @@ mod tests {
             logical: 0,
             node_id: "writer".into(),
         }
+    }
+
+    /// `build_certificates` is an issuing site, not a verifying one: with the
+    /// plain `total / 2 + 1` it minted a signed 1-of-0 certificate for an
+    /// emptied authority set.
+    #[test]
+    fn zero_authorities_never_build_a_certificate() {
+        let s1 = make_signer("auth-1", 1, false);
+        let mut pool = AttestationPool::new();
+        pool.insert(
+            &kr("user/"),
+            PolicyVersion(1),
+            attest(&s1, 10_500),
+            TEST_NOW,
+        );
+
+        assert!(
+            pool.build_certificates(&kr("user/"), PolicyVersion(1), 0, &write_ts(9_000))
+                .is_none(),
+            "an empty authority set must not be able to mint a certificate"
+        );
     }
 
     #[test]

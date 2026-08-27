@@ -619,14 +619,18 @@ inventory を placement 経路(`recalculate_authorities` 2 箇所と
   `authority_nodes` を持つ `AuthoritySpec` を素通しする(`PutAuthority` 側は
   決定的 no-op で塞いだ)。`install` が走るか否かはノードごとの apply marker
   次第なので、install 側で落とすと namespace 射影がノード間で分岐する。
-- `authority/verifier.rs` の 4 箇所と `http/handlers.rs` の 1 箇所が
-  `total / 2 + 1` を `majority_threshold` を使わず再実装している。共通ヘルパへの
-  集約は妥当だが、振る舞い保存のリファクタとして独立コミットにすべき。
-- `main.rs` の `authority_nodes()` に空エントリのフィルタが無く、
-  `ASTEROIDB_AUTHORITY_NODES=","` が `NodeId("")` × 2 の幽霊 authority を
-  初回起動シードに焼き込む。`parse_control_plane_nodes` は同じ問題に
-  fail-stop で対処しており非対称。直すなら fail-stop 一択
-  (素朴に非空フィルタを足すと空 Vec になり別の問題を作る)。
+  **`sweep_empty_auto_authorities` が手動の空定義を意図的に残す設計との合成に
+  注意**: 旧バイナリが受理した手動の空定義を持つノードが、まだ Bootstrap して
+  いない制御プレーンの最初のリーダーになると、`build_bootstrap_command` が
+  `!auto_generated` の定義を全て載せるため、その空定義がクラスタ全体へ複製
+  される。移行前チェックを ops-guide 14.5.1 に記載済み。
+- `certified_cache` は空定義化の**前**に certify されたキーについて、
+  以後も `total_authorities: 0` の proof を返し続ける(`resolve_scope` の拒否は
+  キャッシュヒットには効かない)。キャッシュは意図的に揮発なので再起動で消える。
+- `main.rs` の `authority_nodes()` は空エントリと重複を warning 付きで捨て、
+  使える値が 1 つも無ければ既定値に落ちる(`parse_control_plane_nodes` の
+  fail-stop とは非対称だが、こちらは Raft の過半数定義ではなく初回起動の
+  シードなので、fail-stop より既定へのフォールバックを選んだ)。
 
 ## 参照
 

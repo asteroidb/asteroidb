@@ -2253,6 +2253,55 @@ mod tests {
         );
     }
 
+    /// Duplicate and blank node IDs produce the same unsatisfiable wedge as
+    /// an empty array, one step further in: the denominator is
+    /// `authority_nodes.len()`, but ack frontiers are keyed by authority ID,
+    /// so N copies of one ID can only ever supply one frontier.
+    #[tokio::test]
+    async fn cp_put_authorities_rejects_duplicate_and_blank_node_ids() {
+        for (label, body) in [
+            (
+                "duplicate",
+                r#"{"key_range_prefix":"x/","authority_nodes":["n1","n1"],"approvals":[]}"#,
+            ),
+            (
+                "blank",
+                r#"{"key_range_prefix":"x/","authority_nodes":["n1",""],"approvals":[]}"#,
+            ),
+            (
+                "whitespace",
+                r#"{"key_range_prefix":"x/","authority_nodes":["n1","  "],"approvals":[]}"#,
+            ),
+        ] {
+            let state = test_state_with_token(Some("test-secret".into()));
+            let app = router(Arc::clone(&state));
+
+            let req = Request::builder()
+                .method("PUT")
+                .uri("/api/control-plane/authorities")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-secret")
+                .body(Body::from(body))
+                .unwrap();
+
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{label} node IDs must be rejected"
+            );
+            assert!(
+                state
+                    .namespace
+                    .read()
+                    .unwrap()
+                    .get_authority_definition("x/")
+                    .is_none(),
+                "the rejected {label} definition must not reach the namespace"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn cp_put_policies_rejects_missing_token() {
         let state = test_state_with_token(Some("test-secret".into()));
