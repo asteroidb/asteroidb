@@ -1089,6 +1089,13 @@ curl http://localhost:3000/api/slo
 }
 ```
 
+**リージョン名の由来と `unknown`:** リージョン名はノードの `region:` タグから
+導出される。ノードのタグはノード間で伝播されない（`PeerInfo` / `AnnounceRequest`
+にタグのフィールドが無い）ため、**自ノード以外は常に `unknown` リージョンに
+分類される**。`total_nodes` と各ノード ID は正しく、リージョン分類だけが
+自ノード分に限られる。タグをワイヤに載せる作業は follow-up
+（`docs/followup-plan.md`）。
+
 **curl 例:**
 
 ```bash

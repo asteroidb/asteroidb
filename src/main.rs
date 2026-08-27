@@ -327,11 +327,13 @@ async fn main() {
         .init();
 
     // Load configuration: either from a config file or from individual env vars.
-    let (node_id, bind_addr, advertise_addr, config_peer_registry) =
+    // `self_node` carries this node's real mode and tags; it used to be
+    // discarded here, which left nothing in the process that knew them.
+    let (self_node, bind_addr, advertise_addr, config_peer_registry) =
         match std::env::var("ASTEROIDB_CONFIG") {
             Ok(config_path) => match NodeConfig::load(&config_path) {
                 Ok(config) => {
-                    let node_id = config.node.id;
+                    let self_node = config.node;
                     let bind_addr = config.bind_addr.to_string();
                     // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then config field, then bind_addr.
                     let advertise_addr = std::env::var("ASTEROIDB_ADVERTISE_ADDR")
@@ -339,7 +341,7 @@ async fn main() {
                         .or(config.advertise_addr)
                         .unwrap_or_else(|| bind_addr.clone());
                     let peer_registry = config.peers;
-                    (node_id, bind_addr, advertise_addr, Some(peer_registry))
+                    (self_node, bind_addr, advertise_addr, Some(peer_registry))
                 }
                 Err(e) => {
                     eprintln!("error: failed to load config file '{config_path}': {e}");
@@ -351,13 +353,21 @@ async fn main() {
                     .unwrap_or_else(|_| "127.0.0.1:3000".into());
                 let node_id_str =
                     std::env::var("ASTEROIDB_NODE_ID").unwrap_or_else(|_| "node-1".into());
-                let node_id = NodeId(node_id_str);
+                // Without a config file there is no source for mode or tags,
+                // and no env var supplies them. `Both` with no tags is what
+                // `generate_cluster_configs` and every shipped config use.
+                let self_node = asteroidb_poc::node::Node::new(
+                    NodeId(node_id_str),
+                    asteroidb_poc::types::NodeMode::Both,
+                );
                 // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then fall back to bind_addr.
                 let advertise_addr =
                     std::env::var("ASTEROIDB_ADVERTISE_ADDR").unwrap_or_else(|_| bind_addr.clone());
-                (node_id, bind_addr, advertise_addr, None)
+                (self_node, bind_addr, advertise_addr, None)
             }
         };
+
+    let node_id = self_node.id.clone();
 
     println!("AsteroidDB starting... (node_id={})", node_id.0);
 
@@ -665,8 +675,11 @@ async fn main() {
     let shared_latency_model = Arc::new(std::sync::RwLock::new(
         asteroidb_poc::placement::latency::LatencyModel::new(),
     ));
+    // Seeded with this node so that `GET /api/topology` is correct even
+    // before the first inventory refresh; the runner keeps it in step with
+    // the peer registry from there.
     let shared_cluster_nodes: Arc<std::sync::RwLock<Vec<asteroidb_poc::node::Node>>> =
-        Arc::new(std::sync::RwLock::new(Vec::new()));
+        Arc::new(std::sync::RwLock::new(vec![self_node.clone()]));
     let shared_topology_view = Arc::new(std::sync::RwLock::new(
         asteroidb_poc::placement::topology::TopologyView::build(
             &[],
@@ -985,6 +998,11 @@ async fn main() {
         Arc::clone(&shared_cluster_nodes),
     )
     .await;
+    // Give the runner a real cluster inventory. Nothing populated
+    // `cluster_nodes` before this, so `GET /api/topology` always reported an
+    // empty cluster. This also freezes FR-003 / FR-007 until peer identity is
+    // propagated on the wire — see `placement_inventory_usable`.
+    runner.set_cluster_inventory_source(self_node.clone(), Arc::clone(&shared_peers));
 
     // Build a second membership client for the runner's periodic ping loop.
     let runner_membership_client = if let Some(ref token) = internal_token {

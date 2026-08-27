@@ -23,6 +23,7 @@ use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp, MAX_CLOCK_SKEW_MS};
+use crate::network::PeerRegistry;
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
@@ -432,6 +433,16 @@ pub struct NodeRunner {
     /// `recalculate_authorities()` on the system namespace, updating
     /// authority definitions based on placement policy tag criteria.
     cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
+    /// This node's own `Node` record (id, mode, tags) from its config file.
+    ///
+    /// Set together with [`Self::inventory_source`]; see
+    /// [`Self::set_cluster_inventory_source`].
+    self_node: Option<Node>,
+    /// Peer registry to derive [`Self::cluster_nodes`] from.
+    ///
+    /// `None` (the default, and what every in-process test uses) means the
+    /// caller owns `cluster_nodes` and the runner only reads it.
+    inventory_source: Option<Arc<Mutex<PeerRegistry>>>,
     /// Hash-based fingerprint for detecting cluster membership changes.
     /// Computed from sorted node IDs so that same-size replacements
     /// (e.g. 1 leave + 1 join) are detected correctly.
@@ -814,6 +825,8 @@ impl NodeRunner {
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
+            self_node: None,
+            inventory_source: None,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
             membership_client: None,
@@ -940,6 +953,8 @@ impl NodeRunner {
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
+            self_node: None,
+            inventory_source: None,
             // Use sentinel value to force initial recalculation on first tick,
             // consistent with `with_cluster_nodes()`.
             tracked_cluster_generation: u64::MAX,
@@ -1054,6 +1069,108 @@ impl NodeRunner {
     /// Set the membership client for periodic peer list exchange (ping).
     pub fn set_membership_client(&mut self, client: MembershipClient) {
         self.membership_client = Some(client);
+    }
+
+    /// Derive `cluster_nodes` from the peer registry instead of expecting the
+    /// caller to maintain it.
+    ///
+    /// Only `main.rs` calls this. Tests that hand `with_cluster_nodes` an
+    /// explicit inventory leave it unset and keep full control of the list.
+    ///
+    /// Declaring an inventory source also **freezes placement** — see
+    /// [`placement_inventory_usable`](Self::placement_inventory_usable). The
+    /// two are deliberately the same switch: a peer-registry inventory is the
+    /// only kind that is missing peer identity, and it must never reach
+    /// `select_nodes`.
+    pub fn set_cluster_inventory_source(
+        &mut self,
+        self_node: Node,
+        peers: Arc<Mutex<PeerRegistry>>,
+    ) {
+        self.self_node = Some(self_node);
+        self.inventory_source = Some(peers);
+        tracing::warn!(
+            node = %self.node_id.0,
+            "peer identity (mode/tags) is not propagated on the wire, so the \
+             cluster inventory derived from the peer registry is incomplete. \
+             Automatic authority derivation (FR-003) and rebalance planning \
+             (FR-007) are frozen; set authority definitions explicitly with \
+             PUT /api/control-plane/authorities. GET /api/topology and \
+             latency-aware routing are unaffected."
+        );
+    }
+
+    /// Whether the current cluster inventory may be fed to placement
+    /// (`recalculate_authorities`, `compute_rebalance_plans`).
+    ///
+    /// False exactly when the inventory is derived from the peer registry.
+    /// `PeerConfig` carries only `node_id` and `addr`: neither `mode` nor
+    /// `tags` is on the wire, so peers can only be materialised with
+    /// placeholder attributes.
+    ///
+    /// Feeding that to `PlacementPolicy::select_nodes` would be worse than
+    /// feeding it nothing. Under a policy with `required_tags`, only this node
+    /// carries real tags, so `matches_node` reduces the candidate set to
+    /// `[self]` — on every node, each naming itself, none of it via Raft. That
+    /// scope then has `total == 1` and `majority_threshold(1) == 1`, so a
+    /// single node certifies writes with its own signature alone **and the
+    /// resulting proof verifies**. The `total == 0` bug this series also fixes
+    /// at least announced itself at verification time; `total == 1` does not.
+    ///
+    /// Substituting defaults does not help either: assuming `Both` makes
+    /// subscribe-only peers eligible as store authorities, assuming
+    /// `Subscribe` silently shrinks the set, and an empty tag set trivially
+    /// satisfies `forbidden_tags`.
+    ///
+    /// Nothing is lost by freezing: with no writer at all, `select_nodes(&[])`
+    /// already returned `[]` on every tick, so FR-003 and FR-007 have never
+    /// run in a shipped binary. Unfreezing is the completion condition for
+    /// propagating peer identity on the wire (follow-up).
+    fn placement_inventory_usable(&self) -> bool {
+        self.inventory_source.is_none()
+    }
+
+    /// Rebuild `cluster_nodes` from the peer registry.
+    ///
+    /// No-op unless [`set_cluster_inventory_source`](Self::set_cluster_inventory_source)
+    /// was called. Peers are materialised as `NodeMode::Both` with no tags —
+    /// placeholders that `placement_inventory_usable` keeps away from
+    /// placement. They are safe for `TopologyView`, which publishes only
+    /// region names, node counts and node IDs, and buckets an untagged node
+    /// under `"unknown"` — an honest "region not known".
+    async fn refresh_cluster_inventory(&mut self) {
+        let Some(peers) = &self.inventory_source else {
+            return;
+        };
+        let peer_configs = {
+            // Drop the tokio guard before taking the std RwLock below: a std
+            // lock must never be held across an await, and this keeps the two
+            // locks from ever overlapping.
+            let registry = peers.lock().await;
+            registry.all_peers_owned()
+        };
+
+        let mut nodes: Vec<Node> = peer_configs
+            .into_iter()
+            .map(|p| Node::new(p.node_id, crate::types::NodeMode::Both))
+            .collect();
+        if let Some(self_node) = &self.self_node {
+            nodes.retain(|n| n.id != self_node.id);
+            nodes.push(self_node.clone());
+        }
+        nodes.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        // Write only when the membership actually changed, so an unchanged
+        // registry does not churn the cluster fingerprint every tick.
+        let mut current = self
+            .cluster_nodes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let unchanged = current.len() == nodes.len()
+            && current.iter().zip(nodes.iter()).all(|(a, b)| a.id == b.id);
+        if !unchanged {
+            *current = nodes;
+        }
     }
 
     /// Set the SLO tracker for recording operational observations.
@@ -1307,6 +1424,10 @@ impl NodeRunner {
     /// Also detects cluster membership changes (node join/leave) and triggers
     /// authority recalculation when the node list changes.
     async fn detect_version_changes(&mut self) {
+        // Refresh the inventory before reading it (no-op unless a peer
+        // registry was declared as the source).
+        self.refresh_cluster_inventory().await;
+
         // Check for cluster membership changes first.
         self.detect_membership_changes().await;
 
@@ -1380,12 +1501,14 @@ impl NodeRunner {
             }
 
             // Recalculate authorities when any policy change is detected.
-            let nodes: Vec<Node> = self
-                .cluster_nodes
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            {
+            // Skipped while the inventory is peer-derived; see
+            // `placement_inventory_usable`.
+            if self.placement_inventory_usable() {
+                let nodes: Vec<Node> = self
+                    .cluster_nodes
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let mut ns = api.namespace().write().unwrap_or_else(|e| e.into_inner());
                 ns.recalculate_authorities(&nodes);
             }
@@ -1397,9 +1520,13 @@ impl NodeRunner {
             }
         }
 
-        // Compute rebalance plans for changed policies.
-        self.compute_rebalance_plans(&changes, &deleted_prefixes)
-            .await;
+        // Compute rebalance plans for changed policies. Also gated: a plan
+        // built from placeholder tags would move real data to the wrong
+        // nodes, which is worse than not rebalancing at all.
+        if self.placement_inventory_usable() {
+            self.compute_rebalance_plans(&changes, &deleted_prefixes)
+                .await;
+        }
 
         // Update tracked versions and policies.
         self.tracked_policy_versions = current_versions;
@@ -1684,6 +1811,17 @@ impl NodeRunner {
         if current_generation == self.tracked_cluster_generation {
             return;
         }
+
+        // While placement is frozen the membership change is still real —
+        // topology must follow it — but it must not reach `select_nodes`.
+        // Deliberately leave `tracked_cluster_generation` alone so that the
+        // recalculation fires as soon as the gate ever opens, instead of the
+        // change being silently consumed here.
+        if !self.placement_inventory_usable() {
+            self.rebuild_topology();
+            return;
+        }
+
         self.tracked_cluster_generation = current_generation;
 
         let nodes: Vec<Node> = self
@@ -3342,6 +3480,11 @@ impl NodeRunner {
                     "peer list exchange completed, no new peers"
                 );
             }
+
+            // Ping is what discovers and evicts peers, so pick the result up
+            // immediately rather than waiting for the next certification tick.
+            self.refresh_cluster_inventory().await;
+            self.rebuild_topology();
         }
     }
 
@@ -5853,6 +5996,239 @@ mod tests {
             !def.auto_generated,
             "a manual definition must not be flipped to auto-generated"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Peer-registry-derived cluster inventory (P0-2)
+    // ---------------------------------------------------------------
+
+    fn peer_registry_with(
+        self_id: &str,
+        entries: &[(&str, &str)],
+    ) -> Arc<Mutex<crate::network::PeerRegistry>> {
+        let peers = entries
+            .iter()
+            .map(|(id, addr)| crate::network::PeerConfig {
+                node_id: node_id(id),
+                addr: (*addr).to_string(),
+            })
+            .collect();
+        Arc::new(Mutex::new(
+            crate::network::PeerRegistry::new(node_id(self_id), peers).unwrap(),
+        ))
+    }
+
+    /// The shipped binary never wrote to `cluster_nodes`, so `GET
+    /// /api/topology` reported an empty cluster forever and the documented
+    /// response example was unreachable.
+    #[tokio::test]
+    async fn peer_registry_populates_cluster_nodes_and_topology() {
+        use crate::placement::latency::LatencyModel;
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002"), ("n3", "127.0.0.1:3003")]),
+        );
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap().clone();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "n2", "n3"], "self plus every peer, sorted");
+
+        let view = TopologyView::build(&nodes, &LatencyModel::new());
+        assert_eq!(view.total_nodes, 3);
+    }
+
+    /// The self node contributes its real mode and tags, which is the whole
+    /// reason `main.rs` now keeps `config.node` instead of just its id.
+    /// (`PeerRegistry` rejects self in the peer list, so the de-duplication in
+    /// `refresh_cluster_inventory` is defensive only and cannot be provoked
+    /// through the registry API.)
+    #[tokio::test]
+    async fn self_node_contributes_its_real_mode_and_tags() {
+        use crate::types::{NodeMode, Tag};
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Store);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap().clone();
+        assert_eq!(nodes.len(), 2, "self plus the one peer");
+        let me = nodes.iter().find(|n| n.id == node_id("n1")).unwrap();
+        assert_eq!(me.mode, NodeMode::Store, "config mode, not the placeholder");
+        assert!(me.tags.contains(&Tag("dc:tokyo".into())));
+    }
+
+    /// A peer-derived inventory carries no peer tags, so it must never reach
+    /// `select_nodes`. Without the freeze a tag-constrained policy would
+    /// shrink the candidate set to `[self]`, giving `total == 1` and letting
+    /// one node certify writes with its own signature alone.
+    #[tokio::test]
+    async fn placement_is_frozen_while_the_inventory_is_peer_derived() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // Only this node carries the required tag; the peer cannot.
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Both);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        runner.detect_membership_changes().await;
+
+        let ns = shared_ns.read().unwrap();
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(
+            def.authority_nodes,
+            vec![node_id("n1"), node_id("n2")],
+            "a peer-derived inventory must not narrow the authority set to [self]"
+        );
+        assert!(!def.auto_generated);
+    }
+
+    /// The gate must not consume the membership change: leaving the
+    /// fingerprint untracked is what makes recalculation fire the moment the
+    /// gate ever opens.
+    #[tokio::test]
+    async fn membership_fingerprint_is_not_consumed_while_placement_is_frozen() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        runner.detect_membership_changes().await;
+
+        assert_eq!(
+            runner.tracked_cluster_generation,
+            u64::MAX,
+            "the sentinel must survive so the first unfrozen tick recalculates"
+        );
+    }
+
+    /// Repeated refreshes over an unchanged registry must not churn the
+    /// fingerprint (which would re-trigger recalculation every tick).
+    #[tokio::test]
+    async fn refresh_is_stable_when_the_registry_does_not_change() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        let first = NodeRunner::cluster_fingerprint(&cluster_nodes.read().unwrap());
+        runner.refresh_cluster_inventory().await;
+        let second = NodeRunner::cluster_fingerprint(&cluster_nodes.read().unwrap());
+        assert_eq!(first, second);
+    }
+
+    /// Without a declared source the runner must not touch `cluster_nodes` at
+    /// all: every in-process test supplies its own inventory.
+    #[tokio::test]
+    async fn refresh_is_a_noop_without_a_declared_inventory_source() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![make_node(
+            "explicit",
+            NodeMode::Store,
+            &["dc:tokyo"],
+        )]));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        assert!(runner.placement_inventory_usable());
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, node_id("explicit"));
     }
 
     #[tokio::test]

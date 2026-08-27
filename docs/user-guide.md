@@ -250,6 +250,19 @@ cargo run --release
 
 異なるリージョンにノードを配置する場合、タグを使用してリージョン情報を設定します。
 
+> **注意（現行バージョンの制限）:** ノードのタグと `mode` は**ノード間で伝播されない**
+> （join / ping / announce のいずれのワイヤ型にもフィールドが無い）。そのため、
+> 各ノードは自分のタグしか知らない。この状態でタグ条件付きポリシーから
+> authority を自動導出すると、各ノードが「自分だけ」を authority とみなして
+> Raft を経ずに分岐するため、**タグベースの authority 自動導出（FR-003）と
+> リバランス計画（FR-007）は無効化されている**。
+>
+> マルチリージョン構成でも下記のタグ設定は有効で、配置ポリシーの
+> `required_tags` / `forbidden_tags` もそのまま登録できるが、
+> **authority 定義は `PUT /api/control-plane/authorities` で明示的に
+> 設定すること**。`GET /api/topology` とレイテンシ計測はこの制限の影響を
+> 受けない。解消は follow-up（`docs/followup-plan.md`）。
+
 **東京リージョンのノード設定例:**
 
 ```json
