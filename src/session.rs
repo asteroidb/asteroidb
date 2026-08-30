@@ -471,18 +471,18 @@ mod tests {
     #[test]
     fn parse_rejects_invalid_inputs() {
         let cases: Vec<String> = vec![
-            "".into(),                              // empty
-            "v2:1.0.61".into(),                     // unknown version
-            "v1:xyz.0.61".into(),                   // non-hex physical
-            "v1:1.zz.61".into(),                    // non-hex logical
-            "v1:1.0.6g".into(),                     // non-hex node id
-            "v1:1.0".into(),                        // missing field
-            "v1:1.0.61.99".into(),                  // extra field
-            "v1:1.0.".into(),                       // empty node id
-            format!("v1:1ffffffffffffffff.0.61"),   // u64 overflow (17 hex digits)
-            format!("v1:1.1ffffffff.61"),           // u32 overflow
-            format!("v1:1.0.{}", "61".repeat(129)), // node id 129 bytes
-            format!("v1:1.0.ff"),                   // node id not UTF-8
+            "".into(),                               // empty
+            "v2:1.0.61".into(),                      // unknown version
+            "v1:xyz.0.61".into(),                    // non-hex physical
+            "v1:1.zz.61".into(),                     // non-hex logical
+            "v1:1.0.6g".into(),                      // non-hex node id
+            "v1:1.0".into(),                         // missing field
+            "v1:1.0.61.99".into(),                   // extra field
+            "v1:1.0.".into(),                        // empty node id
+            "v1:1ffffffffffffffff.0.61".to_string(), // u64 overflow (17 hex digits)
+            "v1:1.1ffffffff.61".to_string(),         // u32 overflow
+            format!("v1:1.0.{}", "61".repeat(129)),  // node id 129 bytes
+            "v1:1.0.ff".to_string(),                 // node id not UTF-8
         ];
         for case in cases {
             assert!(
