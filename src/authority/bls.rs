@@ -216,7 +216,9 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
         }
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
         .collect()
 }

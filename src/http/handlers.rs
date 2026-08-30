@@ -1032,6 +1032,48 @@ pub async fn set_authority_definition(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetAuthorityDefinitionRequest>,
 ) -> Result<Json<AuthorityDefinitionResponse>, ApiError> {
+    // An empty authority set certifies nothing: `majority_threshold(0)` is
+    // unsatisfiable, so every certified write under the prefix would wedge,
+    // and any proof issued for it (`total_authorities: 0`) is rejected by the
+    // verifier. Reject before proposing, so nothing reaches the Raft log --
+    // mirroring the `replica_count < 1` guard in `set_placement_policy`.
+    //
+    // The remedy named here is deliberately NOT `certified: false`. Nothing on
+    // the certified path reads that flag: `CertifiedApi::resolve_scope` needs
+    // only a definition plus a policy, and `recalculate_authorities` deletes a
+    // decertified prefix's definition only when it is `auto_generated`. A
+    // manual definition, which is what this endpoint creates, survives
+    // decertification and keeps certifying. Removing the policy is what
+    // actually stops it.
+    if req.authority_nodes.is_empty() {
+        return Err(ApiError(CrdtError::InvalidArgument(
+            "authority_nodes must contain at least one node; to stop \
+             certifying a prefix, remove its placement policy with \
+             DELETE /api/control-plane/policies/{prefix}"
+                .to_string(),
+        )));
+    }
+
+    // Duplicate and blank node IDs produce the same unsatisfiable wedge the
+    // guard above prevents, one step further in. The majority denominator is
+    // `authority_nodes.len()`, but ack frontiers are keyed by
+    // `(key_range, policy_version, authority_id)`, so N copies of one ID can
+    // only ever contribute one frontier: `["n1","n1"]` needs 2 of a set that
+    // can supply 1. A blank ID names no node at all and can never report.
+    let mut seen = std::collections::HashSet::new();
+    for node in &req.authority_nodes {
+        if node.trim().is_empty() {
+            return Err(ApiError(CrdtError::InvalidArgument(
+                "authority_nodes must not contain empty node IDs".to_string(),
+            )));
+        }
+        if !seen.insert(node.as_str()) {
+            return Err(ApiError(CrdtError::InvalidArgument(format!(
+                "authority_nodes must not contain duplicates: '{node}' appears more than once"
+            ))));
+        }
+    }
+
     // `approvals` from old clients is accepted but ignored (deprecated).
     let spec = AuthoritySpec {
         prefix: req.key_range_prefix.clone(),
@@ -1391,7 +1433,9 @@ pub async fn verify_proof(
     Json(req): Json<VerifyProofRequest>,
 ) -> Result<Json<VerifyProofResponse>, ApiError> {
     use crate::api::certified::ProofBundle;
-    use crate::authority::certificate::{AuthoritySignature, KeysetVersion, MajorityCertificate};
+    use crate::authority::certificate::{
+        AuthoritySignature, KeysetVersion, MajorityCertificate, majority_threshold,
+    };
     use crate::authority::verifier;
     use crate::hlc::HlcTimestamp;
     use crate::types::{KeyRange, NodeId, PolicyVersion};
@@ -1504,7 +1548,7 @@ pub async fn verify_proof(
                     .iter()
                     .filter(|(id, _)| authority_members.contains(id))
                     .count(),
-                required_count: total_authorities / 2 + 1,
+                required_count: majority_threshold(total_authorities),
             }));
         }
         cert.set_bls_aggregate(signers, aggregated);

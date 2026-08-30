@@ -182,7 +182,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
 | `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
-| `RUST_LOG` | いいえ | なし | ログレベル（tracing-subscriber 形式） |
+| `RUST_LOG` | いいえ | `info` | ログレベル（tracing-subscriber 形式）。**未設定・空文字列の場合は `info` 相当**（6.1 を参照）。値を明示した場合はその指定がそのまま尊重される（`RUST_LOG=error` で ERROR のみに絞ることもできる） |
 
 ### Control plane Raft コンセンサス
 
@@ -376,6 +376,11 @@ curl -s http://localhost:3000/api/slo | jq .
 | `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
 | `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
 | `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
+| `gc_last_sweep_wall_ms` | u64 (gauge) | 実際に sweep した最後の GC パスのローカル壁時計 ms。**0 = 起動以来一度も sweep していない**。tombstone GC が生きているかの最上位シグナル（3.7.1）。「進まないこと」に対してアラートする |
+| `gc_gate_blocked_authority_total` | u64 | GC 二重ゲートの authority 側で不合格になった tick 累計。lagging cluster では正常に非ゼロなので、単体ではアラートにしない（`gc_last_sweep_wall_ms` の停止原因の切り分けに使う） |
+| `gc_gate_blocked_peer_total` | u64 | 同 peer 側で不合格になった tick 累計。registry に残った dead peer が典型 |
+| `gc_gate_peer_population` | u64 (gauge) | peer ゲートが最後に評価した登録ピア数。単一ノードでは 0 が正常。**多ノード構成で 0 かつ `gc_last_sweep_wall_ms` が進んでいる場合、peer ゲートが空真のまま sweep している**（3.7.1） |
+| `compaction_unattributed_write_ops_total` | u64 | どの certifiable レンジ（authority 定義と placement policy の両方を持つ prefix）にも一致せず、compaction の ops カウンタに計上されなかった書き込み ops 累計。増え続ける場合は policy 未設定のキー空間に書き込みが集中している |
 | `sync_redundant_merge_skips_total` | u64 | RR ゲート（M-6）が抑止した冗長リモート merge 累計（no-op merge かつ delta 可視済みキー → 再スタンプ/変更ログ/WAL 書き込みをスキップ）。GC tick ごとに `EventualApi` の in-memory カウンタから反映（再起動でリセット）。アイドルクラスタで緩やかに増えるのは正常（収束済みキーのエコー吸収）。収束済みストアの双方向 sync 下で 0 に張り付く場合はピンポン回帰を疑う |
 | `write_ops_total` | u64 | 書き込み操作累計 |
 | `rebalance_start_total` | u64 | リバランス開始累計 |
@@ -649,6 +654,43 @@ tombstone / stale live dot をマージ時に棄却するため、GC はクラ�
 - `gc_interval` の短縮は hole 停滞・ゲート不合格には**効かない**（12.3 も
   参照）。停滞の原因はゲート（dead peer / 分断 / hole）であり周期ではない。
 
+#### 3.7.1 「GC が一度も動いていない」の診断（D1 回帰防止）
+
+最上位の生存シグナルは **`gc_last_sweep_wall_ms`**（実際に sweep した最後の
+パスのローカル壁時計 ms、**0 = 起動以来一度も sweep していない**）。他の
+`gc_floor_*` ゲージは sweep したパスしか書かないため、これが無い状態では
+「ゲートが恒久的に閉じているノード」と「健全で回収対象が無いノード」の
+メトリクス出力が完全に同一だった。アラートはこのゲージが**進まないこと**に
+対して張り、原因の切り分けは以下の順で行う。
+
+1. `gc_last_sweep_wall_ms` が 0 のまま、または retention の数倍を超えて
+   進まない → GC は実質停止している。
+2. `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` の
+   どちらが増えているかで、閉じているゲートの半分を特定する。
+3. 該当ノードのログで `tombstone GC gate blocked` の WARN（10 分に 1 行に
+   スロットル）を見る。`reason` が原因種別、`prefix` / `peer` が対象、
+   `reported` / `required` が authority 側の充足数、`peer_lane` が
+   ピアレーンの状態を示す。
+   - `authority_under_reported`: その prefix の authority 全員分の frontier
+     報告が揃っていない（分断・停止ノード）。
+   - `frontier_behind_mark`: 報告は揃ったがデータ時刻が mark 未満。
+   - `report_not_advanced`: mark 以降にローカルで前進した報告が無い
+     （永続化から復元しただけの frontier を含む。fail-closed）。
+   - `peer_evidence_missing_or_stale`: レジストリに残った dead peer が
+     典型。9.2 のノード削除手順でレジストリから外す。
+
+**注意（無防備な sweep の検出）**: `gc_gate_peer_population` は peer ゲートが
+最後に評価したときの登録ピア数。単一ノード構成では 0 が正常だが、**多ノード
+構成でこれが 0 かつ `gc_last_sweep_wall_ms` が進んでいる場合、peer ゲートが
+空真のまま sweep している**（＝復活防止が効いていない）。sync レイヤの設定と
+ピアレジストリを確認すること。
+
+**`""`（catch-all）prefix に placement policy を作らないこと。** GC/compaction
+の母集合は「authority 定義 **と** placement policy の両方がある prefix」で、
+`""` に policy を置くとストア全体が単一レンジとして compaction 対象になり、
+`prune_timestamps_before("")` がストア全域に及ぶ。catch-all の authority 定義
+自体は（policy が無い限り）無害で、メンバーシップ判定にのみ寄与する。
+
 ---
 
 ## 4. SLO メトリクスの解釈とアラート基準
@@ -810,6 +852,13 @@ asteroidb-cli --host localhost:3000 slo
 
 AsteroidDB は `tracing` + `tracing-subscriber` を使用した構造化ログを出力します。
 ログレベルは `RUST_LOG` 環境変数で制御します。
+
+**`RUST_LOG` を設定しない場合の既定は `info`** です。`Dockerfile` にも
+`docker-compose.yml` / `docker-compose.scale.yml` にも `RUST_LOG` は書かれていないため、
+出荷構成ではこのコード側の既定がそのまま効きます（既定が ERROR だと full sync の 413、
+署名不正、checkpoint 失敗、GC ゲート阻止、ping 失敗といった WARN が 1 行も出ず、
+他の障害が観測できなくなるため）。`RUST_LOG` を明示した場合は既定は注入されず、
+指定した内容だけが有効になります。
 
 ### 6.2 ログレベル設定例
 
@@ -1419,7 +1468,7 @@ curl -s http://localhost:3000/api/internal/keys | jq '.entries | length'
 
 | 原因 | 対処 |
 |------|------|
-| トゥームストーン蓄積 | まず原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
+| トゥームストーン蓄積 | まず `gc_last_sweep_wall_ms` を見て「一度でも sweep したか」を切り分ける（0 のまま＝GC 実質停止。3.7.1 の手順で `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` と `tombstone GC gate blocked` WARN へ）。その上で原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
 | ack-frontier エントリの蓄積 | `frontier_gc_interval` を短縮、`frontier_gc_max_retained_versions` を縮小 |
 | Compaction が進まない | Authority 可用性を確認（過半数必要） |
 | pending_count が高い | Certified Write のタイムアウト設定を見直す |
@@ -1826,6 +1875,72 @@ term で二重投票し split-brain を招くため。復旧手順:
    （commit 済みエントリの喪失リスク）。残存ノードの `raft/` を正とし、
    個別に判断する。
 
+### 14.5.1 空の authority 定義が掃き出されたときの復旧
+
+起動時に次の WARN が出た場合:
+
+```
+dropped persisted authority definitions with an empty node set
+  prefixes=["", "user/"]
+```
+
+そのノードの永続 namespace に、**authority ノードが 0 個の自動生成
+authority 定義**が残っていた。これは旧バイナリの欠陥によるもので、
+クラスタ inventory が空のまま `recalculate_authorities` が走ると、
+正規手順で設定した authority 定義が `authority_nodes: []` に置換されていた。
+authority が 0 個の scope は過半数しきい値が充足不能で何も certify できず、
+当該レンジのトゥームストーン GC も止まるため、定義を残すより削除する方が
+常に良い（定義が無ければ、正しい inventory が揃った時点で再導出される）。
+
+掃き出しは**バージョンを bump しない**（自動生成定義はノードローカルな
+導出であり複製状態には載らないため、削除は巻き戻しにならない）。
+現行バイナリでは空の自動生成定義が二度と作られないので、この WARN は
+アップグレード後の初回起動で一度だけ出る。
+
+復旧の要否判断:
+
+1. `GET /api/control-plane/authorities` を**全ノードで**実行し、WARN が
+   挙げた prefix に定義が在るか確認する。
+2. **在る場合**: 複製状態から自己修復済み。対応不要。
+3. **無い場合**: その prefix に certified な配置ポリシーが在るなら、
+   リーダーに対して定義を再投入する。
+
+```bash
+curl -X PUT http://<leader-addr>/api/control-plane/authorities \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"key_range_prefix":"user/","authority_nodes":["node-1","node-2","node-3"]}'
+```
+
+再投入するまで、当該 prefix への `POST /api/certified/write` は
+`403 POLICY_DENIED` を返す（authority 0 個で暗黙に Pending 滞留させるより、
+明示的に拒否する方が安全なため）。`GET /api/certified/{key}` は 200 のまま
+`status: "Pending"` を返す。
+
+**空配列・重複 ID・空文字列 ID の投入で「無効化」することはできない**
+（いずれも `400 BAD_REQUEST`）。certified 運用を止めたい場合は
+`DELETE /api/control-plane/policies/{prefix}` で配置ポリシーを削除すること。
+**`certified: false` への変更では止まらない** — certified 経路のどこも
+このフラグを読んでいないため、この API で作った手動定義はそのまま
+certify し続ける（詳細は api-reference の該当節）。
+
+#### 手動で作られた空の authority 定義について
+
+掃き出しが落とすのは `auto_generated` な空定義だけで、**手動の空定義
+（`auto_generated: false`）は意図的に残る** — 空であっても、そこには
+この関数が再構成できない運用者の意図が入っている可能性があるため。
+ただし旧バイナリはこの API で空配列を受理していたので、そうした定義が
+残っているノードが**まだ Bootstrap していない制御プレーンの最初のリーダー**
+になると、`Bootstrap` エントリに載って全ノードへ複製される
+（`Bootstrap` / `InstallSnapshot` の apply 側には空 spec のスキップが無い）。
+新規クラスタ、または pre-Raft からの移行中にのみ起こりうる。
+
+**移行前チェック**: pre-Raft からの移行、または既存 namespace を持つノードで
+新しく Raft をブートストラップする前に、全ノードで
+`GET /api/control-plane/authorities` を実行し、`authority_nodes` が空の
+エントリが無いことを確認する。在る場合は先に非空の値を PUT しておくこと
+（当該プレフィックスは P0-3 の修正により恒久的に `403` になる）。
+
 ### 14.6 セキュリティ
 
 `/api/internal/raft/*`（vote / append / snapshot）は他の内部エンドポイント
@@ -1845,6 +1960,30 @@ term で二重投票し split-brain を招くため。復旧手順:
 やり取りされるため、**これらの型へのフィールド追加はワイヤ互換を壊す**。
 追加が必要な場合は新エンドポイントの追加か JSON 移行を伴うリリース手順が
 必要（`src/control_plane/raft/types.rs` の先頭コメントを参照）。
+
+#### 空 `PutAuthority` エントリと混在バージョン
+
+現行バイナリは空 `authority_nodes` の `PutAuthority` を**決定的 no-op**
+として apply する（旧バイナリは定義をそのまま書き込んでいた）。同じ
+committed エントリの適用結果がバイナリ世代で変わるため、混在期間中は
+状態機械が分岐しうる。到達経路は 2 つ:
+
+1. **アップグレード中の新規 PUT**: 旧バイナリのリーダーだけが空配列を
+   受理する（新バイナリは propose 前に 400）。→ **全ノードの更新が
+   完了するまで空の `authority_nodes` を PUT しないこと。**
+2. **アップグレード前に commit 済みのエントリの再適用**: そのエントリが
+   まだログ末尾に残っているノードは新バイナリで no-op になり、先に
+   スナップショットへ畳み込んでいたノードは定義を保持したまま起動する。
+   スナップショット境界はノードごとに異なる（`InstallSnapshot` で復旧した
+   ノード、後から join したノード）ため、**完全に更新済みのクラスタでも
+   分岐が残りうる**。
+
+いずれの分岐も「certify する / しない」ではなく「certify を拒否する形が
+2 通りある」だけなので安全側だが、収束させるには当該プレフィックスへ
+非空の `PUT /api/control-plane/authorities` を 1 回行えばよい
+（全ノードが同じ定義に上書きされる）。
+アップグレード後に `GET /api/control-plane/authorities` を全ノードで
+突き合わせ、差異があればこの手順で揃えること。
 
 ### 14.8 observer（非 voter）ノードの運用と namespace pull（M-17）
 

@@ -569,6 +569,69 @@ process::abort)はバグ扱いしない。
 - **フル PreVote**(m-8 残余): 分断復帰ノードによる有界なリーダー中断(1 回の再選出)を完全に
   抑止するには PreVote RPC の追加(ワイヤ変更)が必要。将来課題。
 
+## P0-2c: ピア identity(mode / tags)のワイヤ伝搬
+
+**状態: 未着手。これが入るまで FR-003(authority 自動導出)と FR-007(リバランス計画)は
+production で凍結されている。**
+
+背景: `PeerConfig` は `node_id` と `addr` しか持たず、`PeerInfo`(JoinResponse /
+PingRequest / PingResponse の 3 経路)にも `AnnounceRequest` にもタグ・mode の
+フィールドが無い。`JoinRequest.tags` だけはワイヤに存在するが、
+`handlers::internal_join` が `PeerConfig` を組む際に捨てている。
+
+そのため peer registry から組んだクラスタ inventory はピアの mode / tags を欠く。
+これを `PlacementPolicy::select_nodes` に通すと、`required_tags` 付きポリシーでは
+自ノードだけがタグを持つため candidates が `[self]` に縮み、各ノードが Raft を
+経ずに互いに異なる authority 定義を持つ。`majority_threshold(1) == 1` なので
+**単独ノードが自分の署名だけで Certified 証明を発行し、その証明は検証も通る**。
+`total == 0` は検証時に露見するが `total == 1` は静かに通るため、これはより悪い。
+未知の mode / tags を既定値で埋める回避策も同じ穴を開ける(`Both` と仮定すれば
+Subscribe 専用ノードが store authority になり、空タグは `forbidden_tags` を
+自明に満たす)。
+
+そのため `NodeRunner::placement_inventory_usable()` が、peer registry 由来の
+inventory を placement 経路(`recalculate_authorities` 2 箇所と
+`compute_rebalance_plans`)から遮断している。`GET /api/topology` と
+レイテンシ計測は inventory をそのまま使う(`TopologyView` は region 名 /
+ノード数 / ノード ID しか公開せず、タグ不明のノードは `"unknown"` リージョンに
+落ちる = 正直な表現)。
+
+作業内容:
+
+1. `NodeIdentity { mode, tags }` を `PeerInfo` と `AnnounceRequest` に載せる
+   (`#[serde(default)]` 必須 — 旧ノードとの混在で壊さないため)。
+2. `handlers::internal_join` が `JoinRequest.tags` を捨てるのをやめる。
+3. `PeerConfig` に `Option<NodeMode>` / `Option<Vec<Tag>>` を
+   `#[serde(default, skip_serializing_if = ...)]` で追加。`configs/*.json` と
+   永続 `peer_registry.json` の**両方**に serialize されるため default 必須。
+4. `PeerRegistry` に identity を更新する upsert 経路を足す(現状 `update_address` のみ)。
+   `generation` を bump するかは fingerprint 更新頻度との兼ね合いで要判断。
+5. 「タグ無し」と「タグ未知」を型で区別する。ローリング更新中は必ず
+   identity 未知のピアが発生するため、`Node.tags: HashSet<Tag>` には未知状態を
+   表現できない。
+6. **完了条件: `placement_inventory_usable()` を「identity 未解決のピアが 0 件なら
+   true」に変更し、凍結を解除する。** それまでは凍結を回避する env ノブを
+   用意しないこと(分岐を招く抜け穴になる)。
+
+関連する既知の残穴(同時に検討する価値がある):
+
+- `state_machine::apply` の `Bootstrap` 分岐と `install` は、空の
+  `authority_nodes` を持つ `AuthoritySpec` を素通しする(`PutAuthority` 側は
+  決定的 no-op で塞いだ)。`install` が走るか否かはノードごとの apply marker
+  次第なので、install 側で落とすと namespace 射影がノード間で分岐する。
+  **`sweep_empty_auto_authorities` が手動の空定義を意図的に残す設計との合成に
+  注意**: 旧バイナリが受理した手動の空定義を持つノードが、まだ Bootstrap して
+  いない制御プレーンの最初のリーダーになると、`build_bootstrap_command` が
+  `!auto_generated` の定義を全て載せるため、その空定義がクラスタ全体へ複製
+  される。移行前チェックを ops-guide 14.5.1 に記載済み。
+- `certified_cache` は空定義化の**前**に certify されたキーについて、
+  以後も `total_authorities: 0` の proof を返し続ける(`resolve_scope` の拒否は
+  キャッシュヒットには効かない)。キャッシュは意図的に揮発なので再起動で消える。
+- `main.rs` の `authority_nodes()` は空エントリと重複を warning 付きで捨て、
+  使える値が 1 つも無ければ既定値に落ちる(`parse_control_plane_nodes` の
+  fail-stop とは非対称だが、こちらは Raft の過半数定義ではなく初回起動の
+  シードなので、fail-stop より既定へのフォールバックを選んだ)。
+
 ## 参照
 
 - research の示唆: `../research/topics/*.md` 各「AsteroidDB への示唆」節、`../research/whitemap.md`

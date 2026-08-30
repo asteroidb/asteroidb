@@ -434,6 +434,15 @@ impl AckFrontierSet {
             distinct_scopes.len(),
         );
 
+        // Zero authorities certify nothing. `total / 2 + 1` yields 1 here, so
+        // without this guard a single residual frontier -- admitted before the
+        // authority definition was emptied, and still in scope because
+        // emptying the definition does not bump the placement policy version
+        // -- would be treated as a majority of nobody.
+        if total_authorities == 0 {
+            return None;
+        }
+
         let majority = total_authorities / 2 + 1;
         if self.frontiers.len() < majority {
             return None;
@@ -484,6 +493,16 @@ impl AckFrontierSet {
         policy_version: &PolicyVersion,
         total_authorities: usize,
     ) -> Option<HlcTimestamp> {
+        // See `majority_frontier`: zero authorities certify nothing. This is
+        // the single choke point that covers all three consumers of the
+        // threshold -- certified writes (`CertifiedApi::process_certifications`),
+        // certified reads (`CertifiedApi::get_certified`) and compaction
+        // (`CompactionEngine::is_compactable`, which resolves the authority
+        // count itself and so never passes through `resolve_scope`).
+        if total_authorities == 0 {
+            return None;
+        }
+
         let majority = total_authorities / 2 + 1;
         let scoped: Vec<&AckFrontier> = self.all_for_scope(key_range, policy_version);
         if scoped.len() < majority {
@@ -964,6 +983,59 @@ mod tests {
 
         let mf = set.majority_frontier(1).unwrap();
         assert_eq!(mf.physical, 100);
+    }
+
+    // ---------------------------------------------------------------
+    // Zero authorities: nothing is ever certified (P0-3)
+    // ---------------------------------------------------------------
+
+    /// With an empty authority set, `total / 2 + 1` evaluates to 1, so a
+    /// single residual frontier -- one that was admitted before the authority
+    /// definition was emptied -- would satisfy the "majority". Zero
+    /// authorities must certify nothing at all.
+    #[test]
+    fn zero_authorities_never_reach_a_majority_frontier() {
+        let mut set = AckFrontierSet::new();
+        assert!(set.majority_frontier(0).is_none(), "no frontiers at all");
+
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+        assert!(
+            set.majority_frontier(0).is_none(),
+            "a residual frontier must not stand in for a majority of an \
+             empty authority set"
+        );
+
+        set.update(make_frontier("auth-2", 200, 0, "user/"));
+        assert!(set.majority_frontier(0).is_none(), "two frontiers");
+    }
+
+    #[test]
+    fn zero_authorities_never_reach_a_scoped_majority_frontier() {
+        let mut set = AckFrontierSet::new();
+        assert!(
+            set.majority_frontier_for_scope(&kr("user/"), &pv(1), 0)
+                .is_none()
+        );
+
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+        assert!(
+            set.majority_frontier_for_scope(&kr("user/"), &pv(1), 0)
+                .is_none(),
+            "a residual scoped frontier must not stand in for a majority of \
+             an empty authority set"
+        );
+    }
+
+    /// The guard has to hold at the `is_certified_at*` level too: that is what
+    /// the certification worker and the compaction engine actually call.
+    #[test]
+    fn zero_authorities_certify_nothing() {
+        let mut set = AckFrontierSet::new();
+        set.update(make_frontier("auth-1", 100, 0, "user/"));
+
+        let long_past = make_ts(1, 0, "w");
+        assert!(!set.is_certified_at(&long_past, 0));
+        assert!(!set.is_certified_at_for_scope(&long_past, &kr("user/"), &pv(1), 0));
     }
 
     // ---------------------------------------------------------------

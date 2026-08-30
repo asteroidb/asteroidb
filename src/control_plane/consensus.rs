@@ -179,6 +179,12 @@ impl ControlPlaneConsensus {
                     .await?
                 {
                     ApplyOutcome::AuthorityApplied(def) => Ok(def),
+                    // The apply side skips an empty authority set as a
+                    // deterministic no-op. Surface it as a 400-class error
+                    // rather than letting it fall through to `Internal`.
+                    ApplyOutcome::Noop => Err(CrdtError::InvalidArgument(
+                        "authority_nodes must contain at least one node".into(),
+                    )),
                     other => Err(CrdtError::Internal(format!(
                         "unexpected apply outcome for authority update: {other:?}"
                     ))),
@@ -270,6 +276,36 @@ mod tests {
     }
 
     // --- Single-node mode ---
+
+    /// The apply-side no-op for an empty authority spec has to surface as a
+    /// 400-class error, not as `Internal` via the catch-all arm. Mirrors the
+    /// `replica_count == 0` handling in `propose_policy_update`.
+    #[tokio::test]
+    async fn empty_authority_spec_is_rejected_as_invalid_argument() {
+        let namespace = fresh_namespace();
+        let consensus =
+            ControlPlaneConsensus::single_node_for_test(node_id("solo"), Arc::clone(&namespace));
+
+        let err = consensus
+            .propose_authority_update(AuthoritySpec {
+                prefix: "user/".into(),
+                authority_nodes: vec![],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, CrdtError::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert!(
+            namespace
+                .read()
+                .unwrap()
+                .get_authority_definition("user/")
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn single_node_commits_immediately_and_updates_namespace() {

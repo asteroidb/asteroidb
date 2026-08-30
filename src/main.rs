@@ -170,18 +170,55 @@ fn parse_bls_with_pop(
 
 /// Parse authority node IDs from `ASTEROIDB_AUTHORITY_NODES` env var (comma-separated),
 /// falling back to the default `["auth-1", "auth-2", "auth-3"]`.
-fn authority_nodes() -> Vec<NodeId> {
-    match std::env::var("ASTEROIDB_AUTHORITY_NODES") {
-        Ok(val) if !val.trim().is_empty() => val
-            .split(',')
-            .map(|s| NodeId(s.trim().to_string()))
-            .collect(),
-        _ => vec![
+///
+/// Empty entries (`a,,b`, a trailing comma, `","`) and repeats are dropped
+/// with a warning, mirroring `parse_control_plane_nodes`. Both would wedge the
+/// seeded catch-all range rather than merely look untidy: the majority
+/// denominator is the length of this list, while ack frontiers are keyed by
+/// `(key_range, policy_version, authority_id)`, so a repeated ID inflates the
+/// denominator without being able to supply a second frontier, and a blank ID
+/// names a node that can never report at all.
+fn parse_authority_nodes(raw: Option<&str>) -> Vec<NodeId> {
+    let default = || {
+        vec![
             NodeId("auth-1".into()),
             NodeId("auth-2".into()),
             NodeId("auth-3".into()),
-        ],
+        ]
+    };
+    let Some(val) = raw.filter(|v| !v.trim().is_empty()) else {
+        return default();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut nodes = Vec::new();
+    let mut skipped = 0usize;
+    for part in val.split(',') {
+        let part = part.trim();
+        if part.is_empty() || !seen.insert(part.to_string()) {
+            skipped += 1;
+            continue;
+        }
+        nodes.push(NodeId(part.to_string()));
     }
+    if skipped > 0 {
+        eprintln!(
+            "warning: ASTEROIDB_AUTHORITY_NODES contains {skipped} empty or \
+             duplicate entry(ies); ignoring them"
+        );
+    }
+    if nodes.is_empty() {
+        eprintln!(
+            "warning: ASTEROIDB_AUTHORITY_NODES has no usable entries; \
+             falling back to the default authority set"
+        );
+        return default();
+    }
+    nodes
+}
+
+fn authority_nodes() -> Vec<NodeId> {
+    parse_authority_nodes(std::env::var("ASTEROIDB_AUTHORITY_NODES").ok().as_deref())
 }
 
 /// Outcome of parsing `ASTEROIDB_CONTROL_PLANE_NODES`
@@ -297,20 +334,43 @@ async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Build the `tracing` filter from an explicit `RUST_LOG` value.
+///
+/// Defaults to INFO when `RUST_LOG` is absent, empty, or made entirely of
+/// unparseable directives. `EnvFilter::from_default_env()` defaults to
+/// ERROR-only instead, and neither the `Dockerfile` nor either compose file
+/// sets `RUST_LOG` — so the shipped stacks emitted no WARN and no INFO at
+/// all, hiding every operational warning the runtime raises.
+///
+/// An explicit `RUST_LOG` still wins: `parse_lossy` injects the default
+/// directive only when the parsed directive set comes out empty, so
+/// `RUST_LOG=error` (and every other value) behaves exactly as before.
+///
+/// Taking the value as a parameter (rather than reading the environment
+/// inside) keeps this deterministically testable.
+fn log_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialize structured logging. Users control verbosity via RUST_LOG env var
-    // (e.g. RUST_LOG=info or RUST_LOG=asteroidb_poc=debug).
+    // Initialize structured logging. Verbosity is INFO by default and is
+    // controlled by the RUST_LOG env var when set (e.g. RUST_LOG=warn or
+    // RUST_LOG=asteroidb_poc=debug).
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_env_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     // Load configuration: either from a config file or from individual env vars.
-    let (node_id, bind_addr, advertise_addr, config_peer_registry) =
+    // `self_node` carries this node's real mode and tags; it used to be
+    // discarded here, which left nothing in the process that knew them.
+    let (self_node, bind_addr, advertise_addr, config_peer_registry) =
         match std::env::var("ASTEROIDB_CONFIG") {
             Ok(config_path) => match NodeConfig::load(&config_path) {
                 Ok(config) => {
-                    let node_id = config.node.id;
+                    let self_node = config.node;
                     let bind_addr = config.bind_addr.to_string();
                     // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then config field, then bind_addr.
                     let advertise_addr = std::env::var("ASTEROIDB_ADVERTISE_ADDR")
@@ -318,7 +378,7 @@ async fn main() {
                         .or(config.advertise_addr)
                         .unwrap_or_else(|| bind_addr.clone());
                     let peer_registry = config.peers;
-                    (node_id, bind_addr, advertise_addr, Some(peer_registry))
+                    (self_node, bind_addr, advertise_addr, Some(peer_registry))
                 }
                 Err(e) => {
                     eprintln!("error: failed to load config file '{config_path}': {e}");
@@ -330,13 +390,21 @@ async fn main() {
                     .unwrap_or_else(|_| "127.0.0.1:3000".into());
                 let node_id_str =
                     std::env::var("ASTEROIDB_NODE_ID").unwrap_or_else(|_| "node-1".into());
-                let node_id = NodeId(node_id_str);
+                // Without a config file there is no source for mode or tags,
+                // and no env var supplies them. `Both` with no tags is what
+                // `generate_cluster_configs` and every shipped config use.
+                let self_node = asteroidb_poc::node::Node::new(
+                    NodeId(node_id_str),
+                    asteroidb_poc::types::NodeMode::Both,
+                );
                 // Prefer ASTEROIDB_ADVERTISE_ADDR env var, then fall back to bind_addr.
                 let advertise_addr =
                     std::env::var("ASTEROIDB_ADVERTISE_ADDR").unwrap_or_else(|_| bind_addr.clone());
-                (node_id, bind_addr, advertise_addr, None)
+                (self_node, bind_addr, advertise_addr, None)
             }
         };
+
+    let node_id = self_node.id.clone();
 
     println!("AsteroidDB starting... (node_id={})", node_id.0);
 
@@ -363,6 +431,27 @@ async fn main() {
             (SystemNamespace::new(), true)
         }
     };
+    // Recover from the empty-inventory bug: before `recalculate_authorities`
+    // refused to write an empty candidate set, a node with no cluster
+    // inventory rewrote every certified prefix's authority definition to
+    // `authority_nodes: [], auto_generated: true` and persisted it. Such a
+    // definition certifies nothing and blocks tombstone GC on its range, so
+    // dropping it is strictly better than keeping it: with no definition, a
+    // correct one is re-derived (or replicated in) as soon as it can be.
+    //
+    // This runs AFTER the load, never inside it: rejecting the state at load
+    // time would fall into the "starting fresh" arm above and discard every
+    // policy and authority on this node.
+    let swept = ns.sweep_empty_auto_authorities();
+    if !swept.is_empty() {
+        tracing::warn!(
+            prefixes = ?swept,
+            "dropped persisted authority definitions with an empty node set. \
+             If any of these were set manually, re-register them with \
+             PUT /api/control-plane/authorities (see ops-guide 14.5.1)"
+        );
+    }
+
     // Seed the catch-all authority definition only on FIRST boot. Doing it
     // unconditionally would bump the namespace version on every restart,
     // silently diverging this node's replicated control-plane state machine
@@ -623,8 +712,11 @@ async fn main() {
     let shared_latency_model = Arc::new(std::sync::RwLock::new(
         asteroidb_poc::placement::latency::LatencyModel::new(),
     ));
+    // Seeded with this node so that `GET /api/topology` is correct even
+    // before the first inventory refresh; the runner keeps it in step with
+    // the peer registry from there.
     let shared_cluster_nodes: Arc<std::sync::RwLock<Vec<asteroidb_poc::node::Node>>> =
-        Arc::new(std::sync::RwLock::new(Vec::new()));
+        Arc::new(std::sync::RwLock::new(vec![self_node.clone()]));
     let shared_topology_view = Arc::new(std::sync::RwLock::new(
         asteroidb_poc::placement::topology::TopologyView::build(
             &[],
@@ -943,6 +1035,11 @@ async fn main() {
         Arc::clone(&shared_cluster_nodes),
     )
     .await;
+    // Give the runner a real cluster inventory. Nothing populated
+    // `cluster_nodes` before this, so `GET /api/topology` always reported an
+    // empty cluster. This also freezes FR-003 / FR-007 until peer identity is
+    // propagated on the wire — see `placement_inventory_usable`.
+    runner.set_cluster_inventory_source(self_node.clone(), Arc::clone(&shared_peers));
 
     // Build a second membership client for the runner's periodic ping loop.
     let runner_membership_client = if let Some(ref token) = internal_token {
@@ -1092,6 +1189,60 @@ async fn main() {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // Log filter defaults (P2-1)
+    // ---------------------------------------------------------------
+
+    /// Without `RUST_LOG`, the shipped Docker images must still emit INFO and
+    /// WARN. `EnvFilter::from_default_env()` defaults to ERROR-only, which
+    /// silences every operational warning (full-sync 413, bad signature,
+    /// checkpoint failure, GC gate block, ping failure) in the shipped
+    /// compose stacks, where no `RUST_LOG` is set.
+    #[test]
+    fn log_filter_defaults_to_info_when_rust_log_is_unset() {
+        use tracing_subscriber::layer::Filter;
+        assert_eq!(
+            Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(None)),
+            Some(tracing::level_filters::LevelFilter::INFO),
+            "RUST_LOG unset must default to INFO, not ERROR"
+        );
+    }
+
+    /// An empty `RUST_LOG` (`RUST_LOG=` in a compose file) is equivalent to
+    /// unset and must not silence the process either.
+    #[test]
+    fn log_filter_defaults_to_info_when_rust_log_is_empty() {
+        use tracing_subscriber::layer::Filter;
+        assert_eq!(
+            Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(Some(""))),
+            Some(tracing::level_filters::LevelFilter::INFO),
+        );
+    }
+
+    /// An explicit `RUST_LOG` still wins in both directions: the default is
+    /// only a fallback, never an override.
+    #[test]
+    fn log_filter_honours_an_explicit_rust_log() {
+        use tracing_subscriber::layer::Filter;
+        for (directive, expected) in [
+            ("error", tracing::level_filters::LevelFilter::ERROR),
+            ("warn", tracing::level_filters::LevelFilter::WARN),
+            (
+                "asteroidb_poc=debug",
+                tracing::level_filters::LevelFilter::DEBUG,
+            ),
+            ("trace", tracing::level_filters::LevelFilter::TRACE),
+        ] {
+            assert_eq!(
+                Filter::<tracing_subscriber::Registry>::max_level_hint(&log_env_filter(Some(
+                    directive
+                ))),
+                Some(expected),
+                "RUST_LOG={directive} must be honoured verbatim"
+            );
+        }
+    }
+
     /// Deterministic Ed25519 verifying key and its hex encoding.
     fn ed_key_hex(byte: u8) -> (ed25519_dalek::VerifyingKey, String) {
         let mut seed = [0u8; 32];
@@ -1196,6 +1347,73 @@ mod tests {
                     ControlPlaneNodesParse::Unset
                 ),
                 "{raw:?} must parse as Unset"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // parse_authority_nodes
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn authority_nodes_defaults_when_unset_or_blank() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_authority_nodes(raw),
+                vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ],
+                "{raw:?} must fall back to the default authority set"
+            );
+        }
+    }
+
+    #[test]
+    fn authority_nodes_trims_and_preserves_order() {
+        assert_eq!(
+            parse_authority_nodes(Some(" n1 , n2 ,n3")),
+            vec![
+                NodeId("n1".into()),
+                NodeId("n2".into()),
+                NodeId("n3".into())
+            ]
+        );
+    }
+
+    /// A phantom `NodeId("")` inflates the majority denominator with a node
+    /// that can never report a frontier, wedging every certified write on the
+    /// seeded catch-all range.
+    #[test]
+    fn authority_nodes_skips_empty_entries() {
+        assert_eq!(
+            parse_authority_nodes(Some("n1,,n2,")),
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+    }
+
+    /// Same wedge, different cause: ack frontiers are keyed by authority ID,
+    /// so `["n1","n1"]` needs 2 frontiers from a set that can supply 1.
+    #[test]
+    fn authority_nodes_drops_duplicates() {
+        assert_eq!(
+            parse_authority_nodes(Some("n1,n2,n1")),
+            vec![NodeId("n1".into()), NodeId("n2".into())]
+        );
+    }
+
+    #[test]
+    fn authority_nodes_all_empty_entries_fall_back_to_the_default() {
+        for raw in [",", " , ", ",,"] {
+            assert_eq!(
+                parse_authority_nodes(Some(raw)),
+                vec![
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ],
+                "{raw:?} must not produce phantom NodeId(\"\") authorities"
             );
         }
     }

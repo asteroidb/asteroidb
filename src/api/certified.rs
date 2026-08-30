@@ -497,6 +497,24 @@ impl CertifiedApi {
         let key_range = auth_def.key_range.clone();
         let total = auth_def.authority_nodes.len();
 
+        // A scope with zero authorities cannot certify anything: the proof it
+        // would issue carries `total_authorities: 0`, and
+        // `majority_threshold(0)` is unsatisfiable on both sides -- the
+        // issuing side here and `authority::verifier`, which routes through
+        // the same function. Refuse the scope outright rather than record a
+        // write that can only ever be self-contradictory.
+        // `PolicyDenied` matches the "no authority definition" case just
+        // above; `InvalidArgument` is already taken by the missing-policy case
+        // below and describes a malformed request, not a denied one.
+        if total == 0 {
+            return Err(CrdtError::PolicyDenied(format!(
+                "authority definition for prefix '{}' has no authority nodes; \
+                 certification is impossible until it is repopulated via \
+                 PUT /api/control-plane/authorities",
+                key_range.prefix
+            )));
+        }
+
         let policy_version = ns
             .get_placement_policy(&key_range.prefix)
             .map(|p| p.version)

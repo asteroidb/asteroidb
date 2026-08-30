@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::api::certified::ProofBundle;
 use crate::authority::certificate::{
     CertError, DualModeCertificate, EpochConfig, FormatVersionConfig, KeysetRegistry,
-    create_certificate_message,
+    create_certificate_message, majority_threshold,
 };
 
 /// Result of verifying a proof bundle.
@@ -20,6 +20,10 @@ pub struct VerificationResult {
     /// Number of authorities that contributed to this proof.
     pub contributing_count: usize,
     /// Number of authorities required for majority.
+    ///
+    /// `usize::MAX` when the proof claims zero total authorities: no signer
+    /// count can meet it, so `has_majority` is always false. See
+    /// [`majority_threshold`].
     pub required_count: usize,
     /// Result of signature verification if a certificate is present.
     /// `None` if no certificate was included.
@@ -38,12 +42,23 @@ pub struct VerificationResult {
 ///
 /// External clients can use this to verify certification without trusting
 /// the node that returned the proof.
+///
+/// The denominator comes from the bundle and `contributing_count` is the
+/// number of signatures that verified — there is no membership check against
+/// an authority set, because an independent verifier has none. That makes the
+/// `total_authorities == 0` case load-bearing here rather than merely
+/// theoretical: `total / 2 + 1` yields 1, so a bundle claiming zero
+/// authorities and carrying one valid signature would verify as a majority of
+/// nobody. [`majority_threshold`] makes zero unsatisfiable instead.
+/// (A bundle that claims `total_authorities: 1` still verifies, of course; a
+/// caller that knows the real authority set must compare the denominator
+/// against it, as `http::handlers::verify_proof` does.)
 pub fn verify_proof(
     bundle: &ProofBundle,
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = bundle.total_authorities / 2 + 1;
+    let required = majority_threshold(bundle.total_authorities);
 
     // A proof without a certificate is always invalid — a caller could
     // fabricate a "valid" proof by simply listing enough authority IDs.
@@ -109,7 +124,7 @@ pub fn verify_proof_with_registry(
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = bundle.total_authorities / 2 + 1;
+    let required = majority_threshold(bundle.total_authorities);
 
     // A proof without a certificate is always invalid.
     let (contributing_count, signatures_valid) = match bundle.certificate.as_ref() {
@@ -185,7 +200,7 @@ pub fn verify_dual_proof_with_registry(
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = total_authorities / 2 + 1;
+    let required = majority_threshold(total_authorities);
 
     let format_ok = format_config
         .map(|fc| fc.is_version_acceptable(cert.format_version, elapsed_since_upgrade_secs))
@@ -228,7 +243,7 @@ pub fn verify_proof_with_registry_detailed(
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> Result<VerificationResult, CertError> {
-    let required = bundle.total_authorities / 2 + 1;
+    let required = majority_threshold(bundle.total_authorities);
 
     let (contributing_count, signatures_valid) = if let Some(cert) = &bundle.certificate {
         let message = create_certificate_message(
@@ -406,6 +421,37 @@ mod tests {
         assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(false));
+    }
+
+    /// A bundle claiming zero total authorities plus one valid signature used
+    /// to verify: `0 / 2 + 1 == 1`, and nothing checks the signer against an
+    /// authority set. That made the verifier disagree with the issuing side,
+    /// which refuses such a scope outright.
+    #[test]
+    fn zero_total_authorities_never_verifies() {
+        let proof = make_proof(1, 0, true);
+        let result = verify_proof(&proof, None, 0);
+
+        assert!(!result.valid, "a majority of nobody is not a majority");
+        assert!(!result.has_majority);
+        assert_eq!(result.contributing_count, 1);
+        assert_eq!(
+            result.required_count,
+            usize::MAX,
+            "zero authorities must be reported as unsatisfiable, not as 1"
+        );
+        // The signature itself is genuine; only the denominator is not.
+        assert_eq!(result.signatures_valid, Some(true));
+    }
+
+    #[test]
+    fn zero_total_authorities_never_verifies_with_registry() {
+        let (proof, registry) = make_proof_with_registry(1, 0, 1);
+        let result =
+            verify_proof_with_registry(&proof, &registry, 0, &EpochConfig::default(), None, 0);
+        assert!(!result.valid);
+        assert!(!result.has_majority);
+        assert_eq!(result.required_count, usize::MAX);
     }
 
     #[test]

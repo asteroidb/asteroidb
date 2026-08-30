@@ -23,6 +23,7 @@ use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
 use crate::hlc::{Hlc, HlcTimestamp, MAX_CLOCK_SKEW_MS};
+use crate::network::PeerRegistry;
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
@@ -393,6 +394,10 @@ pub struct NodeRunner {
     /// so it can never overstate freshness; symmetric counterpart of the
     /// OUTBOUND `push_acked_wall_ms` evidence.
     pull_reconciled_wall_ms: HashMap<String, u64>,
+    /// Wall-clock ms of the last emitted "GC gate blocked" WARN. A blocked
+    /// gate repeats on every tick, so the log line is throttled; the
+    /// counters and gauges carry the unthrottled signal.
+    gc_gate_warn_last_ms: u64,
     /// Per-peer exponential backoff state for sync retries.
     /// Tracks consecutive failures and gates retry attempts.
     peer_backoffs: HashMap<String, PeerBackoff>,
@@ -428,10 +433,32 @@ pub struct NodeRunner {
     /// `recalculate_authorities()` on the system namespace, updating
     /// authority definitions based on placement policy tag criteria.
     cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
+    /// This node's own `Node` record (id, mode, tags) from its config file.
+    ///
+    /// Set together with [`Self::inventory_source`]; see
+    /// [`Self::set_cluster_inventory_source`].
+    self_node: Option<Node>,
+    /// Peer registry to derive [`Self::cluster_nodes`] from.
+    ///
+    /// `None` (the default, and what every in-process test uses) means the
+    /// caller owns `cluster_nodes` and the runner only reads it.
+    inventory_source: Option<Arc<Mutex<PeerRegistry>>>,
     /// Hash-based fingerprint for detecting cluster membership changes.
     /// Computed from sorted node IDs so that same-size replacements
     /// (e.g. 1 leave + 1 join) are detected correctly.
     tracked_cluster_generation: u64,
+    /// Fingerprint of everything [`FrontierReporter::discover_scopes`] reads,
+    /// used to reconcile [`Self::frontier_reporter`] against the namespace on
+    /// each certification tick.
+    ///
+    /// Authority definitions change for reasons that have nothing to do with
+    /// cluster membership -- `PUT /api/control-plane/authorities`, a Raft
+    /// `PutAuthority` apply, the startup sweep -- and
+    /// `detect_membership_changes` is not reached at all while placement is
+    /// frozen. Without this the reporter could only ever be promoted by a
+    /// membership change, so a node re-registered as an authority at runtime
+    /// would never start reporting frontiers.
+    tracked_reporter_fingerprint: u64,
     /// Optional membership client for periodic peer list exchange (ping).
     membership_client: Option<MembershipClient>,
     /// Optional SLO tracker for recording operational observations.
@@ -515,6 +542,39 @@ pub struct NodeRunner {
     /// format) is required.
     report_silence_until: Option<Instant>,
 }
+
+/// Why the tombstone-GC dual gate is closed on this tick.
+///
+/// Purely a LABEL for an already-taken decision: the deciders are
+/// [`NodeRunner::gc_authority_gate_passed`] and
+/// [`NodeRunner::gc_peer_gate_passed`], which
+/// [`NodeRunner::gc_gate_diagnose`] calls before classifying anything. A
+/// blocked gate repeats every tick and, before this existed, was
+/// indistinguishable in the metrics from a healthy node with nothing to
+/// collect — which is how defect D1 stayed invisible from first boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GcGateBlock {
+    /// A certifiable range has fewer reporting authorities than it has
+    /// authority nodes.
+    AuthorityUnderReported {
+        prefix: String,
+        reported: usize,
+        required: usize,
+    },
+    /// Every authority reported, but the scoped minimum frontier's DATA
+    /// time is still behind the mark.
+    FrontierBehindMark { prefix: String },
+    /// Every authority reported past the mark in data time, but at least
+    /// one report has not ADVANCED locally since the mark (receipt time —
+    /// includes every frontier merely restored from persistence).
+    ReportNotAdvanced { prefix: String },
+    /// A registered sync peer has missing or pre-mark push evidence
+    /// (commonly a dead peer left in the registry).
+    PeerEvidenceMissingOrStale { peer_addr: String },
+}
+
+/// Minimum interval between "GC gate blocked" WARN lines.
+const GC_GATE_WARN_THROTTLE_MS: u64 = 600_000;
 
 /// State for an in-progress rebalance operation.
 #[derive(Debug, Clone)]
@@ -711,13 +771,20 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
+        let (reporter, tracked_versions, tracked_policies, reporter_fingerprint, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies, api.store().max_known_hlc())
+            let fingerprint = Self::reporter_fingerprint(&ns, &node_id);
+            (
+                reporter,
+                versions,
+                policies,
+                fingerprint,
+                api.store().max_known_hlc(),
+            )
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -772,12 +839,16 @@ impl NodeRunner {
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
+            gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
+            self_node: None,
+            inventory_source: None,
             // Use sentinel value to force initial recalculation on first tick.
             tracked_cluster_generation: u64::MAX,
+            tracked_reporter_fingerprint: reporter_fingerprint,
             membership_client: None,
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
@@ -833,13 +904,20 @@ impl NodeRunner {
         metrics: Arc<RuntimeMetrics>,
         cluster_nodes: Arc<std::sync::RwLock<Vec<Node>>>,
     ) -> Self {
-        let (reporter, tracked_versions, tracked_policies, recovered_max_hlc) = {
+        let (reporter, tracked_versions, tracked_policies, reporter_fingerprint, recovered_max_hlc) = {
             let api = certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
             let reporter = FrontierReporter::new(node_id.clone(), &ns);
             let versions = Self::snapshot_policy_versions(&ns);
             let policies = Self::snapshot_policies(&ns);
-            (reporter, versions, policies, api.store().max_known_hlc())
+            let fingerprint = Self::reporter_fingerprint(&ns, &node_id);
+            (
+                reporter,
+                versions,
+                policies,
+                fingerprint,
+                api.store().max_known_hlc(),
+            )
         };
         let frontier_reporter = if reporter.is_authority() {
             Some(reporter)
@@ -897,13 +975,17 @@ impl NodeRunner {
             push_acked_wall_ms: HashMap::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
+            gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
+            self_node: None,
+            inventory_source: None,
             // Use sentinel value to force initial recalculation on first tick,
             // consistent with `with_cluster_nodes()`.
             tracked_cluster_generation: u64::MAX,
+            tracked_reporter_fingerprint: reporter_fingerprint,
             membership_client: None,
             slo_tracker: None,
             active_rebalance_plans: HashMap::new(),
@@ -1015,6 +1097,108 @@ impl NodeRunner {
     /// Set the membership client for periodic peer list exchange (ping).
     pub fn set_membership_client(&mut self, client: MembershipClient) {
         self.membership_client = Some(client);
+    }
+
+    /// Derive `cluster_nodes` from the peer registry instead of expecting the
+    /// caller to maintain it.
+    ///
+    /// Only `main.rs` calls this. Tests that hand `with_cluster_nodes` an
+    /// explicit inventory leave it unset and keep full control of the list.
+    ///
+    /// Declaring an inventory source also **freezes placement** — see
+    /// [`placement_inventory_usable`](Self::placement_inventory_usable). The
+    /// two are deliberately the same switch: a peer-registry inventory is the
+    /// only kind that is missing peer identity, and it must never reach
+    /// `select_nodes`.
+    pub fn set_cluster_inventory_source(
+        &mut self,
+        self_node: Node,
+        peers: Arc<Mutex<PeerRegistry>>,
+    ) {
+        self.self_node = Some(self_node);
+        self.inventory_source = Some(peers);
+        tracing::warn!(
+            node = %self.node_id.0,
+            "peer identity (mode/tags) is not propagated on the wire, so the \
+             cluster inventory derived from the peer registry is incomplete. \
+             Automatic authority derivation (FR-003) and rebalance planning \
+             (FR-007) are frozen; set authority definitions explicitly with \
+             PUT /api/control-plane/authorities. GET /api/topology and \
+             latency-aware routing are unaffected."
+        );
+    }
+
+    /// Whether the current cluster inventory may be fed to placement
+    /// (`recalculate_authorities`, `compute_rebalance_plans`).
+    ///
+    /// False exactly when the inventory is derived from the peer registry.
+    /// `PeerConfig` carries only `node_id` and `addr`: neither `mode` nor
+    /// `tags` is on the wire, so peers can only be materialised with
+    /// placeholder attributes.
+    ///
+    /// Feeding that to `PlacementPolicy::select_nodes` would be worse than
+    /// feeding it nothing. Under a policy with `required_tags`, only this node
+    /// carries real tags, so `matches_node` reduces the candidate set to
+    /// `[self]` — on every node, each naming itself, none of it via Raft. That
+    /// scope then has `total == 1` and `majority_threshold(1) == 1`, so a
+    /// single node certifies writes with its own signature alone **and the
+    /// resulting proof verifies**. The `total == 0` bug this series also fixes
+    /// at least announced itself at verification time; `total == 1` does not.
+    ///
+    /// Substituting defaults does not help either: assuming `Both` makes
+    /// subscribe-only peers eligible as store authorities, assuming
+    /// `Subscribe` silently shrinks the set, and an empty tag set trivially
+    /// satisfies `forbidden_tags`.
+    ///
+    /// Nothing is lost by freezing: with no writer at all, `select_nodes(&[])`
+    /// already returned `[]` on every tick, so FR-003 and FR-007 have never
+    /// run in a shipped binary. Unfreezing is the completion condition for
+    /// propagating peer identity on the wire (follow-up).
+    fn placement_inventory_usable(&self) -> bool {
+        self.inventory_source.is_none()
+    }
+
+    /// Rebuild `cluster_nodes` from the peer registry.
+    ///
+    /// No-op unless [`set_cluster_inventory_source`](Self::set_cluster_inventory_source)
+    /// was called. Peers are materialised as `NodeMode::Both` with no tags —
+    /// placeholders that `placement_inventory_usable` keeps away from
+    /// placement. They are safe for `TopologyView`, which publishes only
+    /// region names, node counts and node IDs, and buckets an untagged node
+    /// under `"unknown"` — an honest "region not known".
+    async fn refresh_cluster_inventory(&mut self) {
+        let Some(peers) = &self.inventory_source else {
+            return;
+        };
+        let peer_configs = {
+            // Drop the tokio guard before taking the std RwLock below: a std
+            // lock must never be held across an await, and this keeps the two
+            // locks from ever overlapping.
+            let registry = peers.lock().await;
+            registry.all_peers_owned()
+        };
+
+        let mut nodes: Vec<Node> = peer_configs
+            .into_iter()
+            .map(|p| Node::new(p.node_id, crate::types::NodeMode::Both))
+            .collect();
+        if let Some(self_node) = &self.self_node {
+            nodes.retain(|n| n.id != self_node.id);
+            nodes.push(self_node.clone());
+        }
+        nodes.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        // Write only when the membership actually changed, so an unchanged
+        // registry does not churn the cluster fingerprint every tick.
+        let mut current = self
+            .cluster_nodes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let unchanged = current.len() == nodes.len()
+            && current.iter().zip(nodes.iter()).all(|(a, b)| a.id == b.id);
+        if !unchanged {
+            *current = nodes;
+        }
     }
 
     /// Set the SLO tracker for recording operational observations.
@@ -1268,8 +1452,17 @@ impl NodeRunner {
     /// Also detects cluster membership changes (node join/leave) and triggers
     /// authority recalculation when the node list changes.
     async fn detect_version_changes(&mut self) {
+        // Refresh the inventory before reading it (no-op unless a peer
+        // registry was declared as the source).
+        self.refresh_cluster_inventory().await;
+
         // Check for cluster membership changes first.
         self.detect_membership_changes().await;
+
+        // Then reconcile the reporter against the namespace itself, which
+        // changes for reasons membership never sees (an operator PUT, a Raft
+        // `PutAuthority` apply, the startup sweep).
+        self.reconcile_frontier_reporter().await;
 
         // Snapshot current versions while briefly holding the locks.
         let current_versions: HashMap<String, PolicyVersion> = {
@@ -1341,12 +1534,14 @@ impl NodeRunner {
             }
 
             // Recalculate authorities when any policy change is detected.
-            let nodes: Vec<Node> = self
-                .cluster_nodes
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            {
+            // Skipped while the inventory is peer-derived; see
+            // `placement_inventory_usable`.
+            if self.placement_inventory_usable() {
+                let nodes: Vec<Node> = self
+                    .cluster_nodes
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let mut ns = api.namespace().write().unwrap_or_else(|e| e.into_inner());
                 ns.recalculate_authorities(&nodes);
             }
@@ -1358,9 +1553,13 @@ impl NodeRunner {
             }
         }
 
-        // Compute rebalance plans for changed policies.
-        self.compute_rebalance_plans(&changes, &deleted_prefixes)
-            .await;
+        // Compute rebalance plans for changed policies. Also gated: a plan
+        // built from placeholder tags would move real data to the wrong
+        // nodes, which is worse than not rebalancing at all.
+        if self.placement_inventory_usable() {
+            self.compute_rebalance_plans(&changes, &deleted_prefixes)
+                .await;
+        }
 
         // Update tracked versions and policies.
         self.tracked_policy_versions = current_versions;
@@ -1637,6 +1836,109 @@ impl NodeRunner {
         hasher.finish()
     }
 
+    /// Fingerprint the namespace state that decides what this node reports.
+    ///
+    /// `FrontierReporter::discover_scopes` reads exactly three things per
+    /// authority definition: the prefix, whether this node is a member, and
+    /// the placement policy version for that prefix (a definition without a
+    /// policy is membership-relevant but never reported, which is why the
+    /// missing case gets its own sentinel rather than being skipped).
+    fn reporter_fingerprint(ns: &SystemNamespace, node_id: &NodeId) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut entries: Vec<(&str, bool, Option<u64>)> = ns
+            .all_authority_definitions()
+            .into_iter()
+            .map(|def| {
+                (
+                    def.key_range.prefix.as_str(),
+                    def.authority_nodes.contains(node_id),
+                    ns.get_placement_policy(&def.key_range.prefix)
+                        .map(|p| p.version.0),
+                )
+            })
+            .collect();
+        entries.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        entries.len().hash(&mut hasher);
+        for entry in entries {
+            entry.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Install a freshly discovered reporter, promoting or demoting this node.
+    fn adopt_reporter(&mut self, reporter: FrontierReporter) {
+        if reporter.is_authority() {
+            self.frontier_reporter = Some(reporter);
+            // Runtime promotion (M-12): a node promoted here was NOT an
+            // authority at construction time, so init_report_floor never
+            // ran and the store-digest machinery (floor, activation
+            // instant, floorless-boot silence) would silently stay off —
+            // the node would report the legacy placeholder for its whole
+            // process lifetime with no WARN and no restart-monotonicity
+            // coverage. Run the exact constructor initialization now.
+            // Guarded on report_floor so a demote/re-promote cycle keeps
+            // the already-initialized floor and does not re-arm the
+            // grace (the floor stays valid across demotion: it is only
+            // ever advanced, never regressed).
+            if self.report_floor.is_none() && self.store_digest_active_at.is_none() {
+                let (floor, active_at, silence_until) =
+                    Self::init_report_floor(&self.config, &self.node_id, &mut self.clock, true);
+                self.report_floor = floor;
+                self.store_digest_active_at = active_at;
+                self.report_silence_until = silence_until;
+            }
+        } else {
+            // Demotion: keep report_floor / store_digest_active_at so a
+            // later re-promotion resumes with full restart-monotonicity
+            // evidence instead of re-running the activation grace.
+            self.frontier_reporter = None;
+        }
+    }
+
+    /// Reconcile the frontier reporter against the current namespace.
+    ///
+    /// Runs on every certification tick, independent of both the membership
+    /// fingerprint and the placement freeze. `detect_membership_changes` also
+    /// adopts a reporter, but only along a path that a peer-derived inventory
+    /// closes entirely — and only for changes that a *cluster* change caused.
+    /// An operator repopulating a swept definition with
+    /// `PUT /api/control-plane/authorities` (ops-guide 14.5.1) changes neither,
+    /// so without this the node would accept the definition and still never
+    /// report a frontier for it, leaving the range uncertifiable until restart.
+    async fn reconcile_frontier_reporter(&mut self) {
+        let outcome = {
+            let api = self.certified_api.lock().await;
+            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
+            let fingerprint = Self::reporter_fingerprint(&ns, &self.node_id);
+            if fingerprint == self.tracked_reporter_fingerprint {
+                None
+            } else {
+                Some((
+                    fingerprint,
+                    FrontierReporter::new(self.node_id.clone(), &ns),
+                ))
+            }
+        };
+        let Some((fingerprint, reporter)) = outcome else {
+            return;
+        };
+        self.tracked_reporter_fingerprint = fingerprint;
+        let was_authority = self.frontier_reporter.is_some();
+        self.adopt_reporter(reporter);
+        match (was_authority, self.frontier_reporter.is_some()) {
+            (false, true) => tracing::info!(
+                node_id = %self.node_id.0,
+                "promoted to frontier authority by an authority-definition change"
+            ),
+            (true, false) => tracing::info!(
+                node_id = %self.node_id.0,
+                "demoted from frontier authority by an authority-definition change"
+            ),
+            _ => {}
+        }
+    }
+
     async fn detect_membership_changes(&mut self) {
         let current_generation = {
             let nodes = self.cluster_nodes.read().unwrap_or_else(|e| e.into_inner());
@@ -1645,6 +1947,17 @@ impl NodeRunner {
         if current_generation == self.tracked_cluster_generation {
             return;
         }
+
+        // While placement is frozen the membership change is still real —
+        // topology must follow it — but it must not reach `select_nodes`.
+        // Deliberately leave `tracked_cluster_generation` alone so that the
+        // recalculation fires as soon as the gate ever opens, instead of the
+        // change being silently consumed here.
+        if !self.placement_inventory_usable() {
+            self.rebuild_topology();
+            return;
+        }
+
         self.tracked_cluster_generation = current_generation;
 
         let nodes: Vec<Node> = self
@@ -1659,36 +1972,21 @@ impl NodeRunner {
             ns.recalculate_authorities(&nodes)
         };
 
-        if changed > 0 {
-            // Refresh the frontier reporter to pick up new authority scopes.
+        // Refresh the frontier reporter to pick up new authority scopes.
+        let promoted = if changed > 0 {
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
-            let reporter = FrontierReporter::new(self.node_id.clone(), &ns);
-            if reporter.is_authority() {
-                self.frontier_reporter = Some(reporter);
-                // Runtime promotion (M-12): a node promoted here was NOT an
-                // authority at construction time, so init_report_floor never
-                // ran and the store-digest machinery (floor, activation
-                // instant, floorless-boot silence) would silently stay off —
-                // the node would report the legacy placeholder for its whole
-                // process lifetime with no WARN and no restart-monotonicity
-                // coverage. Run the exact constructor initialization now.
-                // Guarded on report_floor so a demote/re-promote cycle keeps
-                // the already-initialized floor and does not re-arm the
-                // grace (the floor stays valid across demotion: it is only
-                // ever advanced, never regressed).
-                if self.report_floor.is_none() && self.store_digest_active_at.is_none() {
-                    let (floor, active_at, silence_until) =
-                        Self::init_report_floor(&self.config, &self.node_id, &mut self.clock, true);
-                    self.report_floor = floor;
-                    self.store_digest_active_at = active_at;
-                    self.report_silence_until = silence_until;
-                }
-            } else {
-                // Demotion: keep report_floor / store_digest_active_at so a
-                // later re-promotion resumes with full restart-monotonicity
-                // evidence instead of re-running the activation grace.
-                self.frontier_reporter = None;
-            }
+            Some((
+                Self::reporter_fingerprint(&ns, &self.node_id),
+                FrontierReporter::new(self.node_id.clone(), &ns),
+            ))
+        } else {
+            None
+        };
+        drop(api);
+
+        if let Some((fingerprint, reporter)) = promoted {
+            self.tracked_reporter_fingerprint = fingerprint;
+            self.adopt_reporter(reporter);
         }
 
         // Rebuild topology view to reflect the new membership.
@@ -3303,7 +3601,41 @@ impl NodeRunner {
                     "peer list exchange completed, no new peers"
                 );
             }
+
+            // Ping is what discovers and evicts peers, so pick the result up
+            // immediately rather than waiting for the next certification tick.
+            self.refresh_cluster_inventory().await;
+            self.rebuild_topology();
         }
+    }
+
+    /// The one and only definition of the range population used by the
+    /// tombstone-GC authority gate and by compaction.
+    ///
+    /// A prefix qualifies only when it carries BOTH an authority definition
+    /// and a placement policy (`SystemNamespace::certifiable_ranges`). The
+    /// previous code took every definition and fabricated `PolicyVersion(1)`
+    /// for the policy-less ones, which put scope `(prefix, 1)` into the
+    /// gate's conjunction — a scope no reporter emits (`discover_scopes`
+    /// skips policy-less definitions) and no receiver admits
+    /// (`AdmissionReject::NoPolicy`). Such a term is unsatisfiable rather
+    /// than strict, and since a policy-less range cannot hold certified
+    /// state in the first place (`resolve_scope` fails), dropping the term
+    /// removes no protection: eventual state is guarded by the peer and
+    /// inbound gates, which never consult authority definitions at all.
+    ///
+    /// Returns parallel vectors — same order, same length by construction,
+    /// built in a single pass so the two can never drift apart.
+    fn certifiable_population(
+        ns: &SystemNamespace,
+    ) -> (Vec<(KeyRange, usize)>, Vec<PolicyVersion>) {
+        let mut defs = Vec::new();
+        let mut policy_versions = Vec::new();
+        for (def, version) in ns.certifiable_ranges() {
+            defs.push((def.key_range.clone(), def.authority_nodes.len()));
+            policy_versions.push(version);
+        }
+        (defs, policy_versions)
     }
 
     async fn check_compaction(&mut self) {
@@ -3326,23 +3658,9 @@ impl NodeRunner {
             let api = self.certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
 
-            // Iterate over all authority definitions to check each key range.
-            let defs: Vec<_> = ns
-                .all_authority_definitions()
-                .into_iter()
-                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
-                .collect();
-
-            // Collect policy versions for all key ranges upfront so we don't
-            // need to re-acquire the lock later.
-            let policy_versions: Vec<_> = defs
-                .iter()
-                .map(|(key_range, _)| {
-                    ns.get_placement_policy(&key_range.prefix)
-                        .map(|p| p.version)
-                        .unwrap_or(crate::types::PolicyVersion(1))
-                })
-                .collect();
+            // Iterate over the certifiable key ranges (definition AND
+            // policy), carrying each range's real policy version.
+            let (defs, policy_versions) = Self::certifiable_population(&ns);
 
             let fs = api.frontier_set().clone();
 
@@ -3352,8 +3670,12 @@ impl NodeRunner {
 
         // Phase 2: Aggregate per-key write ops into per-range counts by
         // matching each written key against key range prefixes. Keys that
-        // don't match any range are counted under the first range as a
-        // fallback (maintains the previous behaviour of counting all ops).
+        // match no certifiable range are NOT attributed to any range —
+        // they are counted on `compaction_unattributed_write_ops_total`
+        // instead. The old fallback charged them to `defs[0]`, i.e. to a
+        // prefix picked out of `HashMap` iteration order; the catch-all
+        // `""` definition (which matches every key) was the only reason
+        // that arbitrariness never surfaced.
         if !ops_by_key.is_empty() && !defs.is_empty() {
             let mut range_ops: HashMap<&str, u64> = HashMap::new();
             for (key, count) in &ops_by_key {
@@ -3361,7 +3683,12 @@ impl NodeRunner {
                     .iter()
                     .find(|(kr, _)| key.starts_with(&kr.prefix))
                     .map(|(kr, _)| kr.prefix.as_str());
-                let prefix = matched.unwrap_or(&defs[0].0.prefix);
+                let Some(prefix) = matched else {
+                    self.metrics
+                        .compaction_unattributed_write_ops_total
+                        .fetch_add(*count, Ordering::Relaxed);
+                    continue;
+                };
                 *range_ops.entry(prefix).or_insert(0) += count;
             }
 
@@ -3374,6 +3701,12 @@ impl NodeRunner {
                     self.compaction_engine.record_op(key_range);
                 }
             }
+        } else if !ops_by_key.is_empty() {
+            // No certifiable range at all: every drained op is
+            // unattributable. Counted rather than silently discarded.
+            self.metrics
+                .compaction_unattributed_write_ops_total
+                .fetch_add(ops_by_key.values().sum::<u64>(), Ordering::Relaxed);
         }
 
         // Phase 3: Run compaction (checkpoint evaluation + pruning). Only
@@ -3508,10 +3841,16 @@ impl NodeRunner {
 
         // Evaluate the dual gate against the pending mark, if any (the
         // very first pass only marks, so the verdict is irrelevant then).
-        let gates_passed = match self.tombstone_gc.pending_mark_ms() {
-            Some(mark_ms) => self.gc_gates_passed(mark_ms).await,
-            None => false,
+        let (gates_passed, block) = match self.tombstone_gc.pending_mark_ms() {
+            Some(mark_ms) => {
+                let block = self.gc_gate_diagnosis(mark_ms).await;
+                (block.is_none(), block)
+            }
+            None => (false, None),
         };
+        if let Some(block) = &block {
+            self.record_gc_gate_block(block, now_ms);
+        }
 
         // Stage 2 hole-jump requires the ADDITIONAL inbound gate.
         let allow_hole_jump = self.config.gc_hole_jump_enabled
@@ -3550,6 +3889,14 @@ impl NodeRunner {
         // stall to 0 for most scrapes — the exact signal ops-guide 3.7
         // uses to decide on Stage 2 (and 12.3 to diagnose blocked gates).
         if stats.swept {
+            // Top-level GC liveness. Stamped ONLY by passes that actually
+            // swept, for the same reason as the stall gauges below — but
+            // unlike them a stuck value here is itself the alarm: it is
+            // the one signal that distinguishes a permanently-closed gate
+            // from a healthy node with nothing to collect.
+            self.metrics
+                .gc_last_sweep_wall_ms
+                .store(now_ms, Ordering::Relaxed);
             self.metrics
                 .gc_floor_stalled_hole_dots
                 .store(stats.stalled_holes, Ordering::Relaxed);
@@ -3582,6 +3929,84 @@ impl NodeRunner {
         }
     }
 
+    /// Count a blocked GC tick and, at most once per
+    /// [`GC_GATE_WARN_THROTTLE_MS`], say why in the log.
+    ///
+    /// A legitimately lagging cluster blocks the gate too, so these
+    /// counters are diagnostic, not alarms — alert on
+    /// `gc_last_sweep_wall_ms` failing to advance and use these to
+    /// explain it.
+    fn record_gc_gate_block(&mut self, block: &GcGateBlock, now_ms: u64) {
+        match block {
+            GcGateBlock::AuthorityUnderReported { .. }
+            | GcGateBlock::FrontierBehindMark { .. }
+            | GcGateBlock::ReportNotAdvanced { .. } => {
+                self.metrics
+                    .gc_gate_blocked_authority_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            GcGateBlock::PeerEvidenceMissingOrStale { .. } => {
+                self.metrics
+                    .gc_gate_blocked_peer_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if self.gc_gate_warn_last_ms != 0
+            && now_ms.saturating_sub(self.gc_gate_warn_last_ms) < GC_GATE_WARN_THROTTLE_MS
+        {
+            return;
+        }
+        self.gc_gate_warn_last_ms = now_ms;
+
+        // A single-node deployment (no sync layer) is expected to have no
+        // peers; a node WITH a sync layer and an empty registry is not,
+        // and sweeps there are unguarded by the peer gate.
+        let peer_population = self.metrics.gc_gate_peer_population.load(Ordering::Relaxed);
+        let peer_lane = match (&self.sync_client, peer_population) {
+            (None, _) => "none (single-node, no sync layer)",
+            (Some(_), 0) => "empty registry (peer gate vacuous)",
+            (Some(_), _) => "registered peers",
+        };
+
+        match block {
+            GcGateBlock::AuthorityUnderReported {
+                prefix,
+                reported,
+                required,
+            } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "authority_under_reported",
+                prefix = %prefix,
+                reported,
+                required,
+                peer_lane,
+                "tombstone GC gate blocked: not every authority has reported this scope"
+            ),
+            GcGateBlock::FrontierBehindMark { prefix } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "frontier_behind_mark",
+                prefix = %prefix,
+                peer_lane,
+                "tombstone GC gate blocked: scoped minimum frontier is behind the mark"
+            ),
+            GcGateBlock::ReportNotAdvanced { prefix } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "report_not_advanced",
+                prefix = %prefix,
+                peer_lane,
+                "tombstone GC gate blocked: no frontier report has advanced since the mark"
+            ),
+            GcGateBlock::PeerEvidenceMissingOrStale { peer_addr } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "peer_evidence_missing_or_stale",
+                peer = %peer_addr,
+                peer_lane,
+                "tombstone GC gate blocked: peer has no push evidence from after the mark"
+            ),
+        }
+    }
+
     /// Stage 2 INBOUND gate: every registered peer's complete state has
     /// been absorbed by a clean pull STARTED at/after the mark (see
     /// `pull_reconciled_wall_ms`). A peer without an entry fails the
@@ -3599,43 +4024,119 @@ impl NodeRunner {
     }
 
     /// Evaluate the tombstone-GC dual gate against `mark_ms` (see
-    /// [`run_gc`](Self::run_gc)).
-    async fn gc_gates_passed(&self, mark_ms: u64) -> bool {
-        // [Authority gate] — same snapshot pattern as check_compaction
-        // Phase 1: read defs + frontier set under the certified lock,
-        // evaluate off the lock.
+    /// [`run_gc`](Self::run_gc)) and, when it is closed, say WHY.
+    ///
+    /// `None` means "gate open" and is exactly `gc_authority_gate_passed &&
+    /// gc_peer_gate_passed` — the frozen predicates are the deciders; the
+    /// classification only re-walks the same population to LABEL an
+    /// already-taken decision and can never open the gate.
+    ///
+    /// INVARIANT: the authority gate protects CERTIFIED state only — its
+    /// population is the set of ranges that can hold certified state at
+    /// all (definition AND policy, see
+    /// [`certifiable_population`](Self::certifiable_population)). Eventual
+    /// state is protected by the peer gate (and, for hole-jumps, the
+    /// inbound gate), neither of which consults authority definitions.
+    async fn gc_gate_diagnosis(&self, mark_ms: u64) -> Option<GcGateBlock> {
+        // Same snapshot pattern as check_compaction Phase 1: read the
+        // population + frontier set under the certified lock, evaluate off
+        // the lock.
         let (defs, frontier_set, policy_versions) = {
             let api = self.certified_api.lock().await;
             let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
-            let defs: Vec<(KeyRange, usize)> = ns
-                .all_authority_definitions()
-                .into_iter()
-                .map(|def| (def.key_range.clone(), def.authority_nodes.len()))
-                .collect();
-            let policy_versions: Vec<PolicyVersion> = defs
-                .iter()
-                .map(|(key_range, _)| {
-                    ns.get_placement_policy(&key_range.prefix)
-                        .map(|p| p.version)
-                        .unwrap_or(crate::types::PolicyVersion(1))
-                })
-                .collect();
+            let (defs, policy_versions) = Self::certifiable_population(&ns);
             let fs = api.frontier_set().clone();
             (defs, fs, policy_versions)
         };
-        if !Self::gc_authority_gate_passed(&defs, &policy_versions, &frontier_set, mark_ms) {
-            return false;
+
+        // A node with no sync layer has no peers at all — the peer gate is
+        // then vacuous exactly as it is with an empty registry.
+        let peers = match &self.sync_client {
+            Some(sync_client) => sync_client.peer_registry().lock().await.all_peers_owned(),
+            None => Vec::new(),
+        };
+        self.metrics
+            .gc_gate_peer_population
+            .store(peers.len() as u64, Ordering::Relaxed);
+
+        Self::gc_gate_diagnose(
+            &defs,
+            &policy_versions,
+            &frontier_set,
+            &peers,
+            &self.push_acked_wall_ms,
+            mark_ms,
+        )
+    }
+
+    /// Pure classifier for the dual gate: `None` iff both frozen
+    /// predicates pass.
+    ///
+    /// The frozen predicates are called FIRST and are the only deciders.
+    /// Only when one of them says `false` is the population walked again,
+    /// purely to name the offending range or peer for logs and metrics.
+    fn gc_gate_diagnose(
+        defs: &[(KeyRange, usize)],
+        policy_versions: &[PolicyVersion],
+        frontier_set: &crate::authority::ack_frontier::AckFrontierSet,
+        peers: &[crate::network::PeerConfig],
+        push_acked_wall_ms: &HashMap<String, u64>,
+        mark_ms: u64,
+    ) -> Option<GcGateBlock> {
+        if !Self::gc_authority_gate_passed(defs, policy_versions, frontier_set, mark_ms) {
+            let named = defs.iter().enumerate().find_map(|(i, (key_range, total))| {
+                let version = &policy_versions[i];
+                let prefix = key_range.prefix.clone();
+                let scoped = frontier_set.all_for_scope(key_range, version);
+                if scoped.len() < *total {
+                    return Some(GcGateBlock::AuthorityUnderReported {
+                        prefix,
+                        reported: scoped.len(),
+                        required: *total,
+                    });
+                }
+                if !frontier_set
+                    .min_frontier_for_scope(key_range, version)
+                    .is_some_and(|min| min.physical >= mark_ms)
+                {
+                    return Some(GcGateBlock::FrontierBehindMark { prefix });
+                }
+                if !frontier_set
+                    .min_advanced_at_for_scope(key_range, version)
+                    .is_some_and(|received| received >= mark_ms)
+                {
+                    return Some(GcGateBlock::ReportNotAdvanced { prefix });
+                }
+                None
+            });
+            // The gate already said "blocked"; the walk above must have
+            // found the reason. The fallback exists only so that a future
+            // divergence between predicate and classifier degrades into an
+            // unlabelled block rather than an OPEN gate.
+            return Some(named.unwrap_or(GcGateBlock::AuthorityUnderReported {
+                prefix: String::new(),
+                reported: 0,
+                required: 0,
+            }));
         }
 
-        // [Peer gate] — every registered peer must have push evidence
-        // from after the mark.
-        if let Some(sync_client) = &self.sync_client {
-            let peers = sync_client.peer_registry().lock().await.all_peers_owned();
-            if !Self::gc_peer_gate_passed(&peers, &self.push_acked_wall_ms, mark_ms) {
-                return false;
-            }
+        if !Self::gc_peer_gate_passed(peers, push_acked_wall_ms, mark_ms) {
+            let named = peers
+                .iter()
+                .find(|peer| {
+                    !push_acked_wall_ms
+                        .get(&peer.addr)
+                        .is_some_and(|acked| *acked >= mark_ms)
+                })
+                .map(|peer| GcGateBlock::PeerEvidenceMissingOrStale {
+                    peer_addr: peer.addr.clone(),
+                });
+            return Some(named.unwrap_or(GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: String::new(),
+            }));
         }
-        true
+
+        None
     }
 
     /// Authority half of the tombstone-GC gate: every authority of every
@@ -5543,6 +6044,564 @@ mod tests {
             "authority definition should be auto-created from certified policy"
         );
         assert_eq!(def.unwrap().authority_nodes.len(), 3);
+    }
+
+    /// Reproduces the shipped binary's actual state: `main.rs` creates
+    /// `cluster_nodes` empty and never writes to it, so the very first
+    /// certification tick recalculates authorities against an empty
+    /// inventory. Before the empty-candidate guard, that tick replaced the
+    /// operator's authority definition with `authority_nodes: []` -- on every
+    /// node, without going through Raft, one second after startup.
+    #[tokio::test]
+    async fn empty_cluster_inventory_does_not_erase_a_manual_authority_definition() {
+        use crate::placement::PlacementPolicy;
+
+        let mut ns = SystemNamespace::new();
+        // No required tags: an empty inventory, not a tag mismatch, is what
+        // empties the candidate set.
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3).with_certified(true),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2"), node_id("n3")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), shared_ns.clone()));
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+
+        let config = NodeRunnerConfig {
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_secs(60),
+            compaction_check_interval: Duration::from_secs(60),
+            frontier_report_interval: Duration::from_secs(60),
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("node-1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            config,
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = handle.send(true);
+        });
+        let stats = runner.run().await;
+        assert!(
+            stats.certification_ticks > 0,
+            "the run loop must actually have ticked, otherwise the definition \
+             surviving proves nothing about the guard"
+        );
+
+        let api_lock = api.lock().await;
+        let ns = api_lock
+            .namespace()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let def = ns
+            .get_authority_definition("user/")
+            .expect("the definition must survive an empty inventory");
+        assert_eq!(
+            def.authority_nodes.len(),
+            3,
+            "an empty cluster inventory must not empty the authority set"
+        );
+        assert!(
+            !def.auto_generated,
+            "a manual definition must not be flipped to auto-generated"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Peer-registry-derived cluster inventory (P0-2)
+    // ---------------------------------------------------------------
+
+    fn peer_registry_with(
+        self_id: &str,
+        entries: &[(&str, &str)],
+    ) -> Arc<Mutex<crate::network::PeerRegistry>> {
+        let peers = entries
+            .iter()
+            .map(|(id, addr)| crate::network::PeerConfig {
+                node_id: node_id(id),
+                addr: (*addr).to_string(),
+            })
+            .collect();
+        Arc::new(Mutex::new(
+            crate::network::PeerRegistry::new(node_id(self_id), peers).unwrap(),
+        ))
+    }
+
+    /// The shipped binary never wrote to `cluster_nodes`, so `GET
+    /// /api/topology` reported an empty cluster forever and the documented
+    /// response example was unreachable.
+    #[tokio::test]
+    async fn peer_registry_populates_cluster_nodes_and_topology() {
+        use crate::placement::latency::LatencyModel;
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // The same two `Arc`s `main.rs` hands to `AppState`, which is what
+        // `GET /api/topology` reads.
+        let topology_view = Arc::new(std::sync::RwLock::new(TopologyView::build(
+            &[],
+            &LatencyModel::new(),
+        )));
+        runner.set_latency_model(Arc::new(std::sync::RwLock::new(LatencyModel::new())));
+        runner.set_topology_view(topology_view.clone());
+
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002"), ("n3", "127.0.0.1:3003")]),
+        );
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap().clone();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["n1", "n2", "n3"], "self plus every peer, sorted");
+
+        // The shared view is what the endpoint serves, and it is refreshed on
+        // the membership path -- which stays reachable while placement is
+        // frozen precisely so topology keeps following the cluster.
+        runner.detect_membership_changes().await;
+        let view = topology_view.read().unwrap();
+        assert_eq!(view.total_nodes, 3);
+        assert_eq!(
+            view.regions
+                .iter()
+                .find(|r| r.name == "unknown")
+                .map(|r| r.node_count),
+            Some(3),
+            "peers carry no region tag, and neither does this untagged self node"
+        );
+    }
+
+    /// The self node contributes its real mode and tags, which is the whole
+    /// reason `main.rs` now keeps `config.node` instead of just its id.
+    /// (`PeerRegistry` rejects self in the peer list, so the de-duplication in
+    /// `refresh_cluster_inventory` is defensive only and cannot be provoked
+    /// through the registry API.)
+    #[tokio::test]
+    async fn self_node_contributes_its_real_mode_and_tags() {
+        use crate::types::{NodeMode, Tag};
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Store);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap().clone();
+        assert_eq!(nodes.len(), 2, "self plus the one peer");
+        let me = nodes.iter().find(|n| n.id == node_id("n1")).unwrap();
+        assert_eq!(me.mode, NodeMode::Store, "config mode, not the placeholder");
+        assert!(me.tags.contains(&Tag("dc:tokyo".into())));
+    }
+
+    /// A peer-derived inventory carries no peer tags, so it must never reach
+    /// `select_nodes`. Without the freeze a tag-constrained policy would
+    /// shrink the candidate set to `[self]`, giving `total == 1` and letting
+    /// one node certify writes with its own signature alone.
+    #[tokio::test]
+    async fn placement_is_frozen_while_the_inventory_is_peer_derived() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // Only this node carries the required tag; the peer cannot.
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Both);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        runner.detect_membership_changes().await;
+
+        let ns = shared_ns.read().unwrap();
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(
+            def.authority_nodes,
+            vec![node_id("n1"), node_id("n2")],
+            "a peer-derived inventory must not narrow the authority set to [self]"
+        );
+        assert!(!def.auto_generated);
+    }
+
+    /// `detect_membership_changes` is not the only way into
+    /// `recalculate_authorities`: a placement *policy* change reaches it too,
+    /// on a path membership never touches. That gate needs its own coverage --
+    /// opening it lets a tag-constrained policy narrow the set to `[self]`,
+    /// which is the `total == 1` single-signer hazard.
+    #[tokio::test]
+    async fn policy_change_does_not_recalculate_authorities_while_placement_is_frozen() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3)
+                .with_certified(true)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("n1"), node_id("n2")],
+            auto_generated: false,
+        });
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        // Only this node can carry the required tag; the peer arrives without
+        // one, so `select_nodes` would return exactly `[n1]`.
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Both);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        // Baseline tick, then a policy version bump -- the membership
+        // fingerprint is unchanged from here on, so only the policy path runs.
+        runner.detect_version_changes().await;
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(
+                PlacementPolicy::new(PolicyVersion(2), kr("user/"), 3)
+                    .with_certified(true)
+                    .with_required_tags([Tag("dc:tokyo".into())].into()),
+            )
+            .unwrap();
+        }
+        runner.detect_version_changes().await;
+
+        let ns = shared_ns.read().unwrap_or_else(|e| e.into_inner());
+        let def = ns.get_authority_definition("user/").unwrap();
+        assert_eq!(
+            def.authority_nodes,
+            vec![node_id("n1"), node_id("n2")],
+            "a policy change must not narrow the authority set to [self] \
+             while the inventory is peer-derived"
+        );
+        assert!(!def.auto_generated);
+    }
+
+    /// The third frozen path: a rebalance plan built from placeholder tags
+    /// would move real keys onto nodes that were never shown to match.
+    #[tokio::test]
+    async fn rebalance_plans_are_not_computed_while_placement_is_frozen() {
+        use crate::api::eventual::EventualApi;
+        use crate::placement::PlacementPolicy;
+        use crate::types::{NodeMode, Tag};
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("data/"), 3)
+                .with_required_tags([Tag("dc:tokyo".into())].into()),
+        )
+        .unwrap();
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("n1"))));
+        {
+            let mut ea = eventual_api.lock().await;
+            let mut counter = crate::crdt::pn_counter::PnCounter::new();
+            counter.increment(&node_id("n1"));
+            ea.eventual_write("data/k1".to_string(), CrdtValue::Counter(counter))
+                .unwrap();
+        }
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_api.clone());
+
+        let mut self_node = crate::node::Node::new(node_id("n1"), NodeMode::Store);
+        self_node.add_tag(Tag("dc:tokyo".into()));
+        runner.set_cluster_inventory_source(
+            self_node,
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.detect_version_changes().await;
+        assert!(runner.active_rebalance_plans.is_empty());
+
+        // Drop the tag requirement: the placeholder peer would now "match",
+        // which is exactly the fabricated-attribute move the gate prevents.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(2), kr("data/"), 3))
+                .unwrap();
+        }
+        runner.detect_version_changes().await;
+
+        assert!(
+            runner.active_rebalance_plans.is_empty(),
+            "no rebalance may be planned from an inventory with placeholder tags"
+        );
+        assert_eq!(
+            runner
+                .metrics()
+                .rebalance_start_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// The recovery runbook (ops-guide 14.5.1) tells the operator to
+    /// re-register a swept authority definition with `PUT
+    /// /api/control-plane/authorities`. That changes neither the cluster
+    /// fingerprint nor any policy version, and in a shipped binary
+    /// `detect_membership_changes` returns early anyway -- so the reporter has
+    /// to be reconciled against the namespace directly, or the range stays
+    /// uncertifiable until the process restarts.
+    #[tokio::test]
+    async fn a_new_authority_definition_promotes_the_reporter_while_frozen() {
+        use crate::placement::PlacementPolicy;
+        use crate::types::NodeMode;
+
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(
+            PlacementPolicy::new(PolicyVersion(1), kr("user/"), 3).with_certified(true),
+        )
+        .unwrap();
+        let shared_ns = wrap_ns(ns);
+        let api = wrap_api(CertifiedApi::new(node_id("n1"), shared_ns.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(dir.path().join("frontier_report_clock.json")),
+                frontier_digest_activation_grace: Some(Duration::ZERO),
+                ..NodeRunnerConfig::default()
+            },
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+        assert!(
+            runner.frontier_reporter.is_none(),
+            "no definition yet, so not an authority"
+        );
+        assert!(runner.report_floor.is_none(), "non-authority: no floor");
+
+        runner.detect_version_changes().await;
+        assert!(runner.frontier_reporter.is_none(), "still no definition");
+
+        // What `PUT /api/control-plane/authorities` ends up doing.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr("user/"),
+                authority_nodes: vec![node_id("n1"), node_id("n2")],
+                auto_generated: false,
+            });
+        }
+        runner.detect_version_changes().await;
+
+        let reporter = runner
+            .frontier_reporter
+            .as_ref()
+            .expect("re-registering the definition must promote this node");
+        assert_eq!(reporter.authority_scopes().len(), 1);
+        assert!(
+            runner.report_floor.is_some(),
+            "runtime promotion must initialise the report clock floor"
+        );
+
+        // ... and removing it again demotes.
+        {
+            let mut ns = shared_ns.write().unwrap_or_else(|e| e.into_inner());
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr("user/"),
+                authority_nodes: vec![node_id("n2")],
+                auto_generated: false,
+            });
+        }
+        runner.detect_version_changes().await;
+        assert!(runner.frontier_reporter.is_none(), "demoted");
+        assert!(
+            runner.report_floor.is_some(),
+            "the floor survives demotion so a re-promotion does not re-arm the grace"
+        );
+    }
+
+    /// The gate must not consume the membership change: leaving the
+    /// fingerprint untracked is what makes recalculation fire the moment the
+    /// gate ever opens.
+    #[tokio::test]
+    async fn membership_fingerprint_is_not_consumed_while_placement_is_frozen() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        runner.detect_membership_changes().await;
+
+        assert_eq!(
+            runner.tracked_cluster_generation,
+            u64::MAX,
+            "the sentinel must survive so the first unfrozen tick recalculates"
+        );
+    }
+
+    /// Repeated refreshes over an unchanged registry must not churn the
+    /// fingerprint (which would re-trigger recalculation every tick).
+    #[tokio::test]
+    async fn refresh_is_stable_when_the_registry_does_not_change() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(Vec::<crate::node::Node>::new()));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+        runner.set_cluster_inventory_source(
+            crate::node::Node::new(node_id("n1"), NodeMode::Both),
+            peer_registry_with("n1", &[("n2", "127.0.0.1:3002")]),
+        );
+
+        runner.refresh_cluster_inventory().await;
+        let first = NodeRunner::cluster_fingerprint(&cluster_nodes.read().unwrap());
+        runner.refresh_cluster_inventory().await;
+        let second = NodeRunner::cluster_fingerprint(&cluster_nodes.read().unwrap());
+        assert_eq!(first, second);
+    }
+
+    /// Without a declared source the runner must not touch `cluster_nodes` at
+    /// all: every in-process test supplies its own inventory.
+    #[tokio::test]
+    async fn refresh_is_a_noop_without_a_declared_inventory_source() {
+        use crate::types::NodeMode;
+
+        let cluster_nodes = Arc::new(std::sync::RwLock::new(vec![make_node(
+            "explicit",
+            NodeMode::Store,
+            &["dc:tokyo"],
+        )]));
+        let mut runner = NodeRunner::with_cluster_nodes(
+            node_id("n1"),
+            wrap_api(CertifiedApi::new(node_id("n1"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig::default(),
+            default_metrics(),
+            cluster_nodes.clone(),
+        )
+        .await;
+
+        assert!(runner.placement_inventory_usable());
+        runner.refresh_cluster_inventory().await;
+
+        let nodes = cluster_nodes.read().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, node_id("explicit"));
     }
 
     #[tokio::test]
@@ -7534,7 +8593,17 @@ mod tests {
 
         // Demote/re-promote: the floor survives and the grace is not
         // re-armed (no second initialization).
-        cluster_nodes.write().unwrap().clear();
+        //
+        // Demote by replacing n1 in the inventory, not by emptying it:
+        // `recalculate_authorities` treats an empty candidate set as "no
+        // inventory available" and leaves existing definitions alone, so
+        // clearing the list demotes nobody. Replacement is also the shape a
+        // real demotion takes (a node leaves while others remain).
+        {
+            let mut nodes = cluster_nodes.write().unwrap();
+            nodes.clear();
+            nodes.push(crate::node::Node::new(node_id("n2"), NodeMode::Store));
+        }
         runner.detect_membership_changes().await;
         assert!(runner.frontier_reporter.is_none(), "demoted");
         assert!(
@@ -8325,12 +9394,19 @@ mod tests {
     async fn legacy_hole_runner(
         hole_jump_enabled: bool,
     ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
+        legacy_hole_runner_with_ns(hole_jump_enabled, SystemNamespace::new()).await
+    }
+
+    /// As [`legacy_hole_runner`], but with a caller-supplied namespace so a
+    /// test can put the GC authority gate under a REAL production-shaped
+    /// namespace instead of the empty (vacuous) one.
+    async fn legacy_hole_runner_with_ns(
+        hole_jump_enabled: bool,
+        ns: SystemNamespace,
+    ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
         use crate::api::eventual::EventualApi;
 
-        let api = wrap_api(CertifiedApi::new(
-            node_id("node-1"),
-            wrap_ns(SystemNamespace::new()),
-        ));
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns)));
         let config = NodeRunnerConfig {
             gc_interval: Duration::from_millis(1),
             gc_retention: Duration::ZERO,
@@ -8492,6 +9568,588 @@ mod tests {
             0
         );
         assert!(runner.tombstone_gc.total_collected() >= 1);
+    }
+
+    // -----------------------------------------------------------------
+    // D1: the catch-all seed must not wedge tombstone GC shut forever.
+    //
+    // `main.rs` seeds a catch-all `""` authority definition on a fresh
+    // boot and never creates a placement policy. The GC authority gate
+    // used to build its population from EVERY definition and fabricate
+    // `PolicyVersion(1)` for the policy-less ones, demanding frontier
+    // evidence for scope `("", 1)` — a scope nobody can ever report
+    // (`discover_scopes` skips policy-less definitions) and nobody can
+    // ever accept (`attestation_admissible` rejects it with `NoPolicy`).
+    // The gate was therefore permanently false from first boot, on the
+    // DEFAULT configuration, and no tombstone was ever collected.
+    // -----------------------------------------------------------------
+
+    /// The namespace `src/main.rs` produces on a fresh boot: a manual
+    /// catch-all `""` definition over the default authority set, and NO
+    /// placement policy anywhere.
+    fn production_seed_namespace() -> SystemNamespace {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node_id("auth-1"), node_id("auth-2"), node_id("auth-3")],
+            auto_generated: false,
+        });
+        ns
+    }
+
+    /// Drive a legacy-hole runner through mark → full outbound+inbound
+    /// evidence → sweep, and report whether the sweep actually collected.
+    async fn sweeps_with_full_evidence(ns: SystemNamespace) -> (bool, u64) {
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+
+        // Saturate BOTH peer-facing gates so the authority gate is the
+        // only thing left that can hold the sweep back.
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep
+        let collected = runner.tombstone_gc.total_collected();
+        let last_sweep = runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed);
+        (collected >= 1, last_sweep)
+    }
+
+    /// D1 regression: the default fresh-boot namespace must not block the
+    /// GC authority gate. The catch-all definition has no policy, so it
+    /// cannot participate in certification at all — demanding frontier
+    /// evidence for it is unsatisfiable, not strict.
+    #[tokio::test]
+    async fn production_seed_namespace_sweeps_tombstones() {
+        let (swept, last_sweep_ms) = sweeps_with_full_evidence(production_seed_namespace()).await;
+        assert!(
+            swept,
+            "the fresh-boot catch-all seed must not wedge tombstone GC shut"
+        );
+        assert!(
+            last_sweep_ms > 0,
+            "an executed sweep must stamp gc_last_sweep_wall_ms"
+        );
+    }
+
+    /// Backward compatibility (range-states.md test plan 6): a deployment
+    /// that already persisted the seed keeps a MANUAL (`auto_generated:
+    /// false`) `""` definition forever — `recalculate_authorities` never
+    /// prunes manual definitions, and the control plane has no
+    /// `RemoveAuthority` command. GC must un-wedge on upgrade anyway.
+    ///
+    /// That this passes with `auto_generated` left at `false` is the
+    /// executable proof that demoting the seed is NOT the cure.
+    #[tokio::test]
+    async fn legacy_persisted_namespace_sweeps_tombstones() {
+        // (a) a namespace that went through the real persistence path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("system_namespace.json");
+        production_seed_namespace().save(&path).expect("save");
+        let loaded = SystemNamespace::load(&path)
+            .expect("load")
+            .expect("file exists");
+        assert!(
+            !loaded
+                .get_authority_definition("")
+                .expect("catch-all survives persistence")
+                .auto_generated,
+            "the persisted seed stays MANUAL — demoting main.rs cannot reach it"
+        );
+        let (swept, _) = sweeps_with_full_evidence(loaded).await;
+        assert!(swept, "a persisted seed namespace must not wedge GC shut");
+
+        // (b) an OLD-FORMAT file that predates the `auto_generated` field
+        //     entirely (it deserialises to `false` via `#[serde(default)]`).
+        let legacy_json = r#"{
+            "version": 2,
+            "placement_policies": {},
+            "authority_definitions": {
+                "": {
+                    "key_range": {"prefix": ""},
+                    "authority_nodes": ["auth-1", "auth-2", "auth-3"]
+                }
+            },
+            "version_history": [1, 2]
+        }"#;
+        let legacy: SystemNamespace = serde_json::from_str(legacy_json).expect("legacy namespace");
+        assert!(
+            !legacy
+                .get_authority_definition("")
+                .expect("def")
+                .auto_generated
+        );
+        let (swept, _) = sweeps_with_full_evidence(legacy).await;
+        assert!(swept, "an old-format namespace must not wedge GC shut");
+    }
+
+    /// The peer gate is what actually protects a multi-replica deployment,
+    /// and it does NOT depend on authority definitions: with the same seed
+    /// namespace but a registered peer that has never been pushed to, the
+    /// sweep must still be blocked.
+    ///
+    /// Not RED-first (it passes before the fix too, via the authority
+    /// gate); its value is proving that removing the authority-gate term
+    /// did not remove the protection. Verified by mutation — see notes.
+    #[tokio::test]
+    async fn peer_gate_alone_blocks_sweep_on_seed_namespace() {
+        let (mut runner, _eventual_api, _peer_addr) =
+            legacy_hole_runner_with_ns(true, production_seed_namespace()).await;
+
+        runner.run_gc().await; // pass 1: mark
+        runner.run_gc().await; // pass 2: no push evidence for the peer
+
+        assert_eq!(
+            runner.tombstone_gc.total_collected(),
+            0,
+            "a registered peer without push evidence must block the sweep"
+        );
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0,
+            "a blocked pass never sweeps"
+        );
+        assert!(
+            runner
+                .metrics
+                .gc_gate_blocked_peer_total
+                .load(Ordering::Relaxed)
+                > 0,
+            "the block must be attributed to the peer gate"
+        );
+    }
+
+    /// Write ops for keys covered by no certifiable range must not be
+    /// charged to an arbitrary range. The old fallback (`defs[0]`) picked
+    /// a prefix out of `HashMap` iteration order; the catch-all `""`
+    /// definition (which matches every key) was the only reason it did
+    /// not show. `node_runner_checks_compaction` cannot catch this — it
+    /// calls `engine.record_op` directly and never goes through
+    /// `drain_write_ops_by_key`.
+    #[tokio::test]
+    async fn check_compaction_drops_unattributed_ops_deterministically() {
+        for insertion_order in [["user/", "z/"], ["z/", "user/"]] {
+            let mut ns = SystemNamespace::new();
+            for prefix in insertion_order {
+                ns.set_authority_definition(AuthorityDefinition {
+                    key_range: kr(prefix),
+                    authority_nodes: vec![node_id("auth-1")],
+                    auto_generated: false,
+                });
+                ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(3), kr(prefix), 1))
+                    .expect("valid policy");
+            }
+
+            let metrics = default_metrics();
+            // A key under no certifiable range.
+            metrics.record_write_op("other/y");
+
+            let engine = CompactionEngine::new(CompactionConfig {
+                time_threshold_ms: u64::MAX,
+                ops_threshold: 1,
+            });
+            let config = NodeRunnerConfig {
+                sync_interval: None,
+                ping_interval: None,
+                ..NodeRunnerConfig::default()
+            };
+            let mut runner = NodeRunner::new(
+                node_id("node-1"),
+                wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+                engine,
+                config,
+                Arc::clone(&metrics),
+            )
+            .await;
+            runner.set_eventual_api(Arc::new(Mutex::new(
+                crate::api::eventual::EventualApi::new(node_id("node-1")),
+            )));
+
+            runner.check_compaction().await;
+
+            assert!(
+                runner.compaction_engine().get_checkpoint("user/").is_none(),
+                "an unattributable op must not be charged to user/ (order {insertion_order:?})"
+            );
+            assert!(
+                runner.compaction_engine().get_checkpoint("z/").is_none(),
+                "an unattributable op must not be charged to z/ (order {insertion_order:?})"
+            );
+            assert_eq!(
+                metrics
+                    .compaction_unattributed_write_ops_total
+                    .load(Ordering::Relaxed),
+                1,
+                "the dropped op must be counted (order {insertion_order:?})"
+            );
+        }
+    }
+
+    /// The diagnostic classifier must agree with the frozen predicates on
+    /// EVERY case the gate unit tests pin — in particular it must never
+    /// report "open" where the gate says "closed". Same fixture table as
+    /// `gc_authority_gate_requires_*` / `gc_peer_gate_*`.
+    #[test]
+    fn gc_gate_diagnose_matches_gate_decision() {
+        use crate::authority::ack_frontier::AckFrontierSet;
+
+        let peer = |name: &str, addr: &str| crate::network::PeerConfig {
+            node_id: node_id(name),
+            addr: addr.into(),
+        };
+        let mark_ms = 8_000u64;
+        let defs = vec![(kr("user/"), 2usize)];
+        let versions = vec![PolicyVersion(1)];
+        let one_def = vec![(kr("user/"), 1usize)];
+        let one_version = vec![PolicyVersion(1)];
+
+        // Authority-side fixtures.
+        let no_reports = AckFrontierSet::new();
+
+        let mut one_of_two = AckFrontierSet::new();
+        one_of_two.update(ack_frontier("auth-1", "user/", 1, 10_000));
+
+        let mut behind_mark = one_of_two.clone();
+        behind_mark.update(ack_frontier("auth-2", "user/", 1, 5_000));
+
+        let mut both_past = one_of_two.clone();
+        both_past.update(ack_frontier("auth-2", "user/", 1, 9_000));
+
+        let mut stale_receipt = AckFrontierSet::new();
+        stale_receipt.update_at(ack_frontier("auth-1", "user/", 1, 10_000), 7_000);
+
+        // Peer-side fixtures.
+        let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
+        let no_evidence: HashMap<String, u64> = HashMap::new();
+        let mut stale_evidence: HashMap<String, u64> = HashMap::new();
+        stale_evidence.insert("p1:9000".into(), 9_000);
+        stale_evidence.insert("p2:9000".into(), 7_999);
+        let mut fresh_evidence: HashMap<String, u64> = HashMap::new();
+        fresh_evidence.insert("p1:9000".into(), 9_000);
+        fresh_evidence.insert("p2:9000".into(), 8_000);
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            &[(KeyRange, usize)],
+            &[PolicyVersion],
+            &AckFrontierSet,
+            &[crate::network::PeerConfig],
+            &HashMap<String, u64>,
+        )> = vec![
+            (
+                "no reports",
+                &defs,
+                &versions,
+                &no_reports,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "1-of-2 reported",
+                &defs,
+                &versions,
+                &one_of_two,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "behind the mark",
+                &defs,
+                &versions,
+                &behind_mark,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "both past the mark",
+                &defs,
+                &versions,
+                &both_past,
+                &[],
+                &no_evidence,
+            ),
+            (
+                "stale local receipt",
+                &one_def,
+                &one_version,
+                &stale_receipt,
+                &[],
+                &no_evidence,
+            ),
+            ("empty population", &[], &[], &no_reports, &[], &no_evidence),
+            (
+                "peer without evidence",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &no_evidence,
+            ),
+            (
+                "peer with pre-mark evidence",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &stale_evidence,
+            ),
+            (
+                "all gates satisfied",
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &fresh_evidence,
+            ),
+            (
+                "pull-advanced frontier is not push evidence",
+                &[],
+                &[],
+                &no_reports,
+                &peers,
+                &no_evidence,
+            ),
+        ];
+
+        let mut seen_variants = Vec::new();
+        for (name, defs, versions, set, peers, acked) in cases {
+            let gate_open = NodeRunner::gc_authority_gate_passed(defs, versions, set, mark_ms)
+                && NodeRunner::gc_peer_gate_passed(peers, acked, mark_ms);
+            let diagnosed =
+                NodeRunner::gc_gate_diagnose(defs, versions, set, peers, acked, mark_ms);
+            assert_eq!(
+                diagnosed.is_none(),
+                gate_open,
+                "diagnose disagreed with the frozen gate on case {name:?}"
+            );
+            if let Some(block) = diagnosed {
+                seen_variants.push(std::mem::discriminant(&block));
+            }
+        }
+
+        // All four block kinds must be reachable, or the classifier is
+        // silently collapsing distinct causes.
+        let reachable = [
+            GcGateBlock::AuthorityUnderReported {
+                prefix: String::new(),
+                reported: 0,
+                required: 0,
+            },
+            GcGateBlock::FrontierBehindMark {
+                prefix: String::new(),
+            },
+            GcGateBlock::ReportNotAdvanced {
+                prefix: String::new(),
+            },
+            GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: String::new(),
+            },
+        ];
+        for variant in &reachable {
+            assert!(
+                seen_variants.contains(&std::mem::discriminant(variant)),
+                "block variant {variant:?} was never produced by the fixture table"
+            );
+        }
+
+        // Spot-check the labels carry usable detail.
+        assert_eq!(
+            NodeRunner::gc_gate_diagnose(&defs, &versions, &one_of_two, &[], &no_evidence, mark_ms),
+            Some(GcGateBlock::AuthorityUnderReported {
+                prefix: "user/".into(),
+                reported: 1,
+                required: 2,
+            })
+        );
+        assert_eq!(
+            NodeRunner::gc_gate_diagnose(
+                &defs,
+                &versions,
+                &both_past,
+                &peers,
+                &no_evidence,
+                mark_ms
+            ),
+            Some(GcGateBlock::PeerEvidenceMissingOrStale {
+                peer_addr: "p1:9000".into(),
+            })
+        );
+    }
+
+    /// A gate that is LEGITIMATELY closed (a certifiable range whose
+    /// authorities have not reported) must be counted and must leave
+    /// `gc_last_sweep_wall_ms` at zero. Independent of D1: this is the
+    /// signal that would have surfaced D1 within one scrape.
+    #[tokio::test]
+    async fn gc_gate_block_is_counted_and_surfaced() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1"), node_id("auth-2")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2))
+            .expect("valid policy");
+
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: authority gate legitimately closed
+
+        assert!(
+            runner
+                .metrics
+                .gc_gate_blocked_authority_total
+                .load(Ordering::Relaxed)
+                > 0,
+            "an unreported certifiable range must be counted as an authority-side block"
+        );
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0,
+            "no sweep executed, so the liveness gauge must stay at zero"
+        );
+        assert_eq!(
+            runner
+                .metrics
+                .gc_gate_peer_population
+                .load(Ordering::Relaxed),
+            1,
+            "the peer population gauge must reflect the registry"
+        );
+        assert_eq!(runner.tombstone_gc.total_collected(), 0);
+    }
+
+    /// The population must carry each range's REAL policy version — the
+    /// fabricated `PolicyVersion(1)` is not a conservative stand-in, it is
+    /// a second copy of D1.
+    ///
+    /// `PolicyVersion(1)` is unreachable in a real deployment: a fresh
+    /// `SystemNamespace` starts at version 1, `main.rs`'s catch-all seed
+    /// `bump_version()`s it to 2, and `PutPolicy` increments
+    /// `version_counter` BEFORE it stamps — so the first policy anyone can
+    /// ever create is version 2 or later. A gate built on version 1
+    /// therefore demands a scope that no authority reports and that
+    /// `attestation_admissible` would reject anyway, i.e. it is
+    /// permanently closed, exactly as D1 was.
+    ///
+    /// Behaviour under test: an authority reporting the scope it actually
+    /// serves opens the gate and the sweep runs.
+    #[tokio::test]
+    async fn gc_gate_opens_on_a_report_at_the_ranges_real_policy_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        // Version 7: any version a real `PutPolicy` could hand out, and
+        // deliberately not 1.
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr("user/"), 1))
+            .expect("valid policy");
+
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+
+        runner.run_gc().await; // pass 1: mark
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+
+        // The authority reports through the real admission path, for the
+        // scope it actually serves.
+        {
+            let mut api = runner.certified_api.lock().await;
+            assert!(
+                api.update_frontier(ack_frontier("auth-1", "user/", 7, u64::MAX)),
+                "a report at the range's current policy version is admissible"
+            );
+        }
+        // Saturate both peer-facing gates so the authority gate is the
+        // only thing that can still hold the sweep back.
+        runner
+            .push_acked_wall_ms
+            .insert(peer_addr.clone(), u64::MAX);
+        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+
+        runner.run_gc().await; // pass 2: sweep
+
+        assert_eq!(
+            runner
+                .metrics
+                .gc_gate_blocked_authority_total
+                .load(Ordering::Relaxed),
+            0,
+            "a fully reported range must not block the authority gate — a gate \
+             evaluated at a fabricated PolicyVersion(1) sees no report at all"
+        );
+        assert!(
+            runner.tombstone_gc.total_collected() >= 1,
+            "the sweep must run once the range's real scope is fully reported"
+        );
+        assert!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed) > 0,
+            "an executed sweep must stamp gc_last_sweep_wall_ms"
+        );
+    }
+
+    /// Same requirement on the other consumer of the population: a
+    /// checkpoint must be stamped with the range's real policy version.
+    /// A checkpoint stamped `PolicyVersion(1)` is looked up against a
+    /// scope no authority certifies, so pruning could never proceed.
+    #[tokio::test]
+    async fn check_compaction_checkpoints_the_real_policy_version() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(9), kr("user/"), 1))
+            .expect("valid policy");
+
+        let metrics = default_metrics();
+        metrics.record_write_op("user/k");
+
+        let engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: u64::MAX,
+            ops_threshold: 1,
+        });
+        let config = NodeRunnerConfig {
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+            engine,
+            config,
+            Arc::clone(&metrics),
+        )
+        .await;
+        runner.set_eventual_api(Arc::new(Mutex::new(
+            crate::api::eventual::EventualApi::new(node_id("node-1")),
+        )));
+
+        runner.check_compaction().await;
+
+        let checkpoint = runner
+            .compaction_engine()
+            .get_checkpoint("user/")
+            .expect("the op threshold was reached, so a checkpoint exists");
+        assert_eq!(
+            checkpoint.policy_version,
+            PolicyVersion(9),
+            "the checkpoint must carry the range's real policy version, not a \
+             fabricated PolicyVersion(1)"
+        );
     }
 
     // -----------------------------------------------------------------

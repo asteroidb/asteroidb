@@ -68,6 +68,13 @@ pub fn apply(
             }
         }
         ControlPlaneCommand::PutAuthority(spec) => {
+            if spec.authority_nodes.is_empty() {
+                // Deterministic defensive no-op; propose-side validation
+                // rejects this before it can reach the log. A scope with zero
+                // authorities certifies nothing, so applying it could only
+                // wedge the prefix (and erase a working definition).
+                return ApplyOutcome::Noop;
+            }
             let def = spec.to_definition();
             ns.set_authority_definition(def.clone());
             state.authorities.insert(spec.prefix.clone(), spec.clone());
@@ -338,6 +345,57 @@ mod tests {
         assert!(matches!(outcome, ApplyOutcome::Noop));
         assert_eq!(state.version_counter, 0);
         assert!(ns.get_placement_policy("bad/").is_none());
+    }
+
+    /// Mirrors `zero_replica_policy_is_deterministic_noop`: an authority spec
+    /// with no nodes is defensively skipped at apply time. A scope with zero
+    /// authorities certifies nothing (`majority_threshold(0)` is
+    /// unsatisfiable), so committing one would only wedge the prefix.
+    #[test]
+    fn empty_authority_spec_is_deterministic_noop() {
+        let mut state = ControlPlaneState::default();
+        let mut ns = SystemNamespace::new();
+        let version_before = ns.version().0;
+
+        let outcome = apply(
+            &entry(1, ControlPlaneCommand::PutAuthority(auth_spec("bad/", &[]))),
+            &mut state,
+            &mut ns,
+        );
+
+        assert!(matches!(outcome, ApplyOutcome::Noop), "{outcome:?}");
+        assert!(ns.get_authority_definition("bad/").is_none());
+        assert!(!state.authorities.contains_key("bad/"));
+        assert_eq!(ns.version().0, version_before, "namespace untouched");
+    }
+
+    /// An empty spec must not erase an authority definition that is already
+    /// in place either.
+    #[test]
+    fn empty_authority_spec_does_not_clobber_an_existing_definition() {
+        let mut state = ControlPlaneState::default();
+        let mut ns = SystemNamespace::new();
+        apply(
+            &entry(
+                1,
+                ControlPlaneCommand::PutAuthority(auth_spec("user/", &["n1", "n2"])),
+            ),
+            &mut state,
+            &mut ns,
+        );
+
+        apply(
+            &entry(
+                2,
+                ControlPlaneCommand::PutAuthority(auth_spec("user/", &[])),
+            ),
+            &mut state,
+            &mut ns,
+        );
+
+        let def = ns.get_authority_definition("user/").expect("still defined");
+        assert_eq!(def.authority_nodes.len(), 2);
+        assert_eq!(state.authorities["user/"].authority_nodes.len(), 2);
     }
 
     #[test]

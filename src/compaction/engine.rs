@@ -544,6 +544,36 @@ mod tests {
         assert!(engine.is_compactable("user/", &frontiers, 3));
     }
 
+    /// Compaction resolves the authority count itself and never passes
+    /// through `CertifiedApi::resolve_scope`, so the `total == 0` refusal in
+    /// the API layer does not cover it. It is the most dangerous consumer of
+    /// the `AckFrontierSet` guard: without it a single residual frontier --
+    /// admitted before the authority set was emptied -- would count as a
+    /// majority of nobody and let tombstones past the checkpoint be reclaimed.
+    #[test]
+    fn is_compactable_with_zero_authorities() {
+        let mut engine = CompactionEngine::with_defaults();
+        let kr = make_key_range("user/");
+
+        engine.create_checkpoint(
+            kr.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+
+        // One residual frontier, far past the checkpoint.
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 10_000, "user/"));
+
+        assert!(
+            !engine.is_compactable("user/", &frontiers, 0),
+            "an emptied authority set must never authorise compaction"
+        );
+        // Sanity: the same frontier does authorise it for a real set of 1.
+        assert!(engine.is_compactable("user/", &frontiers, 1));
+    }
+
     #[test]
     fn is_compactable_with_frontiers_behind() {
         let mut engine = CompactionEngine::with_defaults();
