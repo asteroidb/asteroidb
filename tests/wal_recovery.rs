@@ -467,11 +467,26 @@ fn open_certified(dir: &Path, node_id: &str) -> CertifiedApi {
     let mut store = Store::load_snapshot_bincode_or_default(&snapshot).unwrap();
     let read = wal::read_all_segments(&dir.join("wal-certified")).unwrap();
     assert_ne!(read.outcome, WalReadOutcome::Corruption);
+    let mut origins = HashMap::new();
     for record in read.records {
+        if let wal::WalRecord::CertifiedUpsert {
+            key,
+            policy_version,
+            ..
+        } = &record
+        {
+            origins.insert(key.clone(), *policy_version);
+        }
         wal::replay_record(&mut store, record);
     }
     let writer = WalWriter::open(wal_cfg(&dir.join("wal-certified"))).unwrap();
-    CertifiedApi::recovered(node(node_id), test_namespace(), store, Some(writer))
+    CertifiedApi::recovered(
+        node(node_id),
+        test_namespace(),
+        store,
+        Some(writer),
+        origins,
+    )
 }
 
 /// Certified values recover; certification status regresses to Pending
@@ -1093,4 +1108,351 @@ async fn checkpoint_recovers_after_rotate_failure() {
             "checkpointed write {key} must recover"
         );
     }
+}
+
+// ---------------------------------------------------------------
+// (g) fence persistence across restart (fix/fence-persistence-across-restart)
+//
+// A certified write issued under policy v_old, then fenced when the
+// operator bumps v_old -> v_new, must NOT re-certify under a v_new
+// frontier after a restart that lands inside the max_age_ms window. The
+// live path keeps such a write Pending (heading to Timeout) because it
+// stays in the fenced v_old scope; recovery must reproduce that, not
+// silently re-tag it v_new and certify it off a v_new authority frontier.
+// ---------------------------------------------------------------
+
+fn user_namespace(version: u64) -> Arc<std::sync::RwLock<SystemNamespace>> {
+    let mut ns = SystemNamespace::new();
+    ns.set_authority_definition(AuthorityDefinition {
+        key_range: KeyRange {
+            prefix: "user/".into(),
+        },
+        authority_nodes: vec![node("auth-1")], // majority = 1
+        auto_generated: false,
+    });
+    ns.set_placement_policy(asteroidb_poc::placement::PlacementPolicy::new(
+        asteroidb_poc::types::PolicyVersion(version),
+        KeyRange {
+            prefix: "user/".into(),
+        },
+        1,
+    ))
+    .unwrap();
+    Arc::new(std::sync::RwLock::new(ns))
+}
+
+fn user_frontier(
+    version: u64,
+    cover_physical: u64,
+) -> asteroidb_poc::authority::ack_frontier::AckFrontier {
+    asteroidb_poc::authority::ack_frontier::AckFrontier {
+        authority_id: node("auth-1"),
+        frontier_hlc: hlc(cover_physical, 0, "auth-1"),
+        key_range: KeyRange {
+            prefix: "user/".into(),
+        },
+        policy_version: asteroidb_poc::types::PolicyVersion(version),
+        digest_hash: "auth-1-cover".into(),
+    }
+}
+
+fn user_v2_frontier(cover_physical: u64) -> asteroidb_poc::authority::ack_frontier::AckFrontier {
+    user_frontier(2, cover_physical)
+}
+
+/// WAL-only (un-checkpointed) write: the record itself must carry the
+/// origin policy version so recovery re-tracks it under v1 and re-fences.
+#[test]
+fn fenced_wal_only_write_stays_uncertified_across_restart() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Always,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    // Incarnation 1: write user/x under policy v1; operator then bumps to
+    // v2 and the running node fences v1 (in-memory, lost on crash). No
+    // checkpoint: the write lives WAL-only, inside the max_age_ms window.
+    let write_ts = {
+        let (mut api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        let status = api
+            .certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
+            .unwrap();
+        assert_eq!(status, CertificationStatus::Pending);
+        let ts = api.pending_writes()[0].timestamp.clone();
+        api.fence_version(
+            &KeyRange {
+                prefix: "user/".into(),
+            },
+            PolicyVersion(1),
+        );
+        ts
+    };
+
+    // Incarnation 2: restart already under policy v2.
+    let (mut api, _s) = recover_certified(node("node-a"), user_namespace(2), &cfg).unwrap();
+
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("recovered write must be tracked");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "recovered write must keep its ORIGIN policy version v1, not be re-tagged v2"
+    );
+
+    assert!(
+        api.update_frontier(user_v2_frontier(write_ts.physical + 10_000)),
+        "v2 frontier report should be admitted"
+    );
+    // Inside the max_age_ms window: live path would still be Pending.
+    api.process_certifications_with_timeout(write_ts.physical + 30_000);
+
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a v1 write fenced before a crash must NOT certify under a v2 frontier after restart"
+    );
+    assert!(
+        api.is_version_fenced(
+            &KeyRange {
+                prefix: "user/".into()
+            },
+            &PolicyVersion(1)
+        ),
+        "the old policy version must be re-derived as fenced after recovery"
+    );
+}
+
+/// Checkpointed (snapshot, WAL pruned) write: the origin survives only via
+/// the certified origins sidecar written at checkpoint time.
+#[tokio::test]
+async fn fenced_checkpointed_write_stays_uncertified_across_restart() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, checkpoint_certified, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Off,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    let write_ts;
+    {
+        let (mut api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        api.certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
+            .unwrap();
+        write_ts = api.pending_writes()[0].timestamp.clone();
+        api.fence_version(
+            &KeyRange {
+                prefix: "user/".into(),
+            },
+            PolicyVersion(1),
+        );
+        // Checkpoint: snapshot the store and prune the WAL segment holding
+        // the write's origin record.
+        let api_arc = Arc::new(tokio::sync::Mutex::new(api));
+        checkpoint_certified(&api_arc, &cfg).await.unwrap();
+    }
+
+    let (mut api, _s) = recover_certified(node("node-a"), user_namespace(2), &cfg).unwrap();
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("checkpointed write must recover");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "checkpointed write must keep its ORIGIN policy version v1 via the sidecar"
+    );
+    assert!(api.update_frontier(user_v2_frontier(write_ts.physical + 10_000)));
+    api.process_certifications_with_timeout(write_ts.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a checkpointed v1 write must NOT certify under a v2 frontier after restart"
+    );
+}
+
+/// A write that was ALREADY `Certified` under v1 before the bump+fence must
+/// behave identically to the still-`Pending` case across a restart, on BOTH
+/// recovery paths. The certification state is volatile (it regresses to
+/// `Pending`), so the origin must be pinned to v1 and the fence re-derived
+/// regardless of the pre-crash status — otherwise the checkpointed path
+/// (which prunes the origin-carrying WAL record) would drop the certified
+/// write's origin, re-tag it v2, and re-certify it off a v2 frontier while the
+/// WAL-only path (which harvests every record's origin) keeps it uncertified:
+/// a restart-dependent certification result. Both paths must agree.
+///
+/// WAL-only variant: the origin rides the retained `CertifiedUpsert` record.
+#[test]
+fn fenced_certified_wal_only_write_regresses_uncertified_across_restart() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Always,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    let write_ts = {
+        let (mut api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        api.certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
+            .unwrap();
+        let ts = api.pending_writes()[0].timestamp.clone();
+        // Actually certify it under v1 (single authority, majority 1).
+        assert!(api.update_frontier(user_frontier(1, ts.physical + 10_000)));
+        api.process_certifications();
+        assert_eq!(
+            api.get_certification_status("user/x"),
+            CertificationStatus::Certified,
+            "precondition: the write is Certified under v1 before the bump"
+        );
+        // Operator bumps v1 -> v2; the running node fences v1 (in-memory).
+        api.fence_version(
+            &KeyRange {
+                prefix: "user/".into(),
+            },
+            PolicyVersion(1),
+        );
+        ts
+        // No checkpoint: the write's origin survives via the WAL record.
+    };
+
+    let (mut api, _s) = recover_certified(node("node-a"), user_namespace(2), &cfg).unwrap();
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("recovered write must be tracked");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "a previously-Certified write must still recover under its ORIGIN v1"
+    );
+    assert!(api.update_frontier(user_v2_frontier(write_ts.physical + 10_000)));
+    api.process_certifications_with_timeout(write_ts.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a v1 write certified-then-fenced before a crash must NOT re-certify under v2"
+    );
+    assert!(api.is_version_fenced(
+        &KeyRange {
+            prefix: "user/".into()
+        },
+        &PolicyVersion(1)
+    ));
+}
+
+/// Checkpointed variant of the previously-`Certified` case: the origin
+/// survives ONLY through the certified origins sidecar. Before this fix the
+/// sidecar excluded `Certified` writes, so this recovered as v2 and
+/// re-certified — diverging from the WAL-only path above.
+#[tokio::test]
+async fn fenced_certified_checkpointed_write_regresses_uncertified_across_restart() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, checkpoint_certified, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Off,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    let write_ts;
+    {
+        let (mut api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
+        let mut c = PnCounter::new();
+        c.increment(&node("node-a"));
+        api.certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
+            .unwrap();
+        write_ts = api.pending_writes()[0].timestamp.clone();
+        // Drive the write to Certified under v1 BEFORE the bump.
+        assert!(api.update_frontier(user_frontier(1, write_ts.physical + 10_000)));
+        api.process_certifications();
+        assert_eq!(
+            api.get_certification_status("user/x"),
+            CertificationStatus::Certified,
+            "precondition: the write is Certified under v1 before the bump"
+        );
+        api.fence_version(
+            &KeyRange {
+                prefix: "user/".into(),
+            },
+            PolicyVersion(1),
+        );
+        // Checkpoint: snapshot + prune the WAL. The origin of this
+        // now-Certified write must still be captured in the sidecar.
+        let api_arc = Arc::new(tokio::sync::Mutex::new(api));
+        checkpoint_certified(&api_arc, &cfg).await.unwrap();
+    }
+
+    let (mut api, _s) = recover_certified(node("node-a"), user_namespace(2), &cfg).unwrap();
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("checkpointed write must recover");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "a checkpointed previously-Certified write must recover under its ORIGIN v1 \
+         (the sidecar must capture Certified writes too, matching the WAL path)"
+    );
+    assert!(api.update_frontier(user_v2_frontier(write_ts.physical + 10_000)));
+    api.process_certifications_with_timeout(write_ts.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a checkpointed v1 write certified-then-fenced before a crash must NOT re-certify \
+         under v2 — the checkpointed and WAL-only paths must agree"
+    );
+    assert!(api.is_version_fenced(
+        &KeyRange {
+            prefix: "user/".into()
+        },
+        &PolicyVersion(1)
+    ));
 }

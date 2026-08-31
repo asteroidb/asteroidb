@@ -364,12 +364,27 @@ impl CertifiedApi {
     /// issued after the restart are strictly greater than anything already
     /// persisted. The certification state starts empty: recovered values
     /// read as `Pending` until re-certified (fail-closed).
+    ///
+    /// `origins` maps each recovered key to the policy version its write was
+    /// issued under (harvested from `WalRecord::CertifiedUpsert` records and
+    /// the certified origins sidecar). Recovered writes are re-tracked under
+    /// their origin version rather than the current one, and any origin that
+    /// trails the current policy version has its `(range, origin)` scope
+    /// re-fenced — reconstructing the FR-009 fence that a version bump
+    /// installed in memory but that no snapshot/WAL persisted. Without this,
+    /// a write fenced just before a crash would be re-tagged with the current
+    /// version and certified off a newer authority frontier after the restart
+    /// (fix/fence-persistence-across-restart). The advancing frontier
+    /// watermarks, attestations and certified cache stay deliberately
+    /// volatile: this only ADDS fences to an empty `AckFrontierSet`, never
+    /// restores advancing state, so the "regress to Pending" contract holds.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn recovered(
         node_id: NodeId,
         namespace: Arc<RwLock<SystemNamespace>>,
         store: Store,
         wal: Option<WalWriter>,
+        origins: HashMap<String, PolicyVersion>,
     ) -> Self {
         let mut clock = Hlc::new(node_id.0);
         if let Some(max) = store.max_known_hlc() {
@@ -395,7 +410,7 @@ impl CertifiedApi {
             wal,
             last_wal_pos: None,
         };
-        api.rebuild_pending_from_store();
+        api.rebuild_pending_from_store(&origins);
         api
     }
 
@@ -409,9 +424,22 @@ impl CertifiedApi {
     /// recovery, so every entry is re-tracked as `Pending` and promoted as
     /// attestations are re-collected. Keys without an authority definition
     /// cannot certify and are skipped.
+    ///
+    /// `origins` carries each key's WRITE-TIME policy version (from the WAL /
+    /// sidecar). A recovered write is re-tracked under its origin version,
+    /// not the current one: `resolve_scope` reports the current version, but
+    /// certifying an old write at the new version would ignore the fence the
+    /// version bump installed. When the origin trails the current version the
+    /// `(range, origin)` scope is re-fenced here, so late old-version
+    /// attestations are rejected and the write cannot be certified off the
+    /// current version's frontier after a restart (FR-009,
+    /// fix/fence-persistence-across-restart). Keys absent from `origins`
+    /// (pre-upgrade data, or non-certified keys) fall back to the current
+    /// version — today's behaviour.
     #[cfg(not(target_arch = "wasm32"))]
-    fn rebuild_pending_from_store(&mut self) {
+    fn rebuild_pending_from_store(&mut self, origins: &HashMap<String, PolicyVersion>) {
         let keys: Vec<String> = self.store.keys().into_iter().cloned().collect();
+        let mut fences: Vec<(KeyRange, PolicyVersion)> = Vec::new();
         for key in keys {
             let (Some(value), Some(timestamp)) = (
                 self.store.get(&key).cloned(),
@@ -419,10 +447,20 @@ impl CertifiedApi {
             ) else {
                 continue;
             };
-            let Ok((key_range, policy_version, total_authorities)) = self.resolve_scope(&key)
+            let Ok((key_range, current_version, total_authorities)) = self.resolve_scope(&key)
             else {
                 continue;
             };
+            // Prefer the persisted origin version; fall back to the current
+            // one when it is unknown (pre-upgrade snapshot/WAL data).
+            let policy_version = origins.get(&key).copied().unwrap_or(current_version);
+            // A write issued under an older-than-current version was fenced at
+            // the version bump on the live node; that fence was in-memory
+            // only. Re-derive it so the recovered write stays isolated in its
+            // old scope (no re-certification off the current frontier).
+            if policy_version < current_version {
+                fences.push((key_range.clone(), policy_version));
+            }
             self.pending_writes.push(PendingWrite {
                 key,
                 value,
@@ -432,6 +470,9 @@ impl CertifiedApi {
                 policy_version,
                 total_authorities,
             });
+        }
+        for (range, version) in fences {
+            self.fence_version(&range, version);
         }
     }
 
@@ -808,10 +849,17 @@ impl CertifiedApi {
                 self.store.get(&key).cloned().ok_or_else(|| {
                     CrdtError::Internal(format!("no post-state for WAL key {key}"))
                 })?;
-            let record = WalRecord::UpsertApplied {
+            // Log the origin policy version alongside the post-state so a
+            // restart can re-track this write under the version it was
+            // written with (and re-derive its FR-009 fence), instead of
+            // silently re-tagging it with the current post-bump version and
+            // certifying it off a newer authority frontier
+            // (fix/fence-persistence-across-restart).
+            let record = WalRecord::CertifiedUpsert {
                 key: key.clone(),
                 value: post_state,
                 hlc: timestamp.clone(),
+                policy_version,
             };
             match wal.append(&record) {
                 Ok(pos) => self.last_wal_pos = Some(pos),

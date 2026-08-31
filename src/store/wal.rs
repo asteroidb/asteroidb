@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use crate::hlc::HlcTimestamp;
 use crate::store::backend::{create_dir_all_durable, fsync_dir};
 use crate::store::kv::{CrdtValue, Store};
+use crate::types::PolicyVersion;
 
 /// Segment file magic (8 bytes).
 pub const WAL_MAGIC: [u8; 8] = *b"ADBWAL\x00\x01";
@@ -76,12 +77,22 @@ pub const WAL_MAGIC: [u8; 8] = *b"ADBWAL\x00\x01";
 /// v2: `CrdtValue` payloads gained the `compaction_floor` field inside
 /// `OrSet`/`OrMap` (M-8). v1 segments decode via [`WalRecordV1`].
 ///
+/// v3: added the tail variant [`WalRecord::CertifiedUpsert`], which carries
+/// the write's origin `policy_version` so recovery can re-track a certified
+/// write under the policy version it was WRITTEN with (not the current one)
+/// and re-derive its FR-009 fence across a restart. Because the new variant
+/// is appended at the END of the enum, the bincode variant indices of the
+/// existing variants are unchanged: a v2 segment (which never holds a
+/// `CertifiedUpsert`) decodes byte-for-byte identically through the current
+/// [`WalRecord`] shape, so v2 and v3 share the `_` decode arm in
+/// [`parse_segment`] and no frozen `WalRecordV2` shape is needed.
+///
 /// MAINTAINER WARNING: the record payload is bincode — positional and
-/// non-self-describing. Any change to [`WalRecord`] variants or fields
-/// requires bumping this version and adding a versioned decode arm in
-/// [`parse_segment`] (as [`WalRecordV1`] does for v1, sharing the frozen
-/// v4 CRDT shapes with the snapshot path).
-pub const WAL_FORMAT_VERSION: u32 = 2;
+/// non-self-describing. A change to an EXISTING [`WalRecord`] variant's
+/// fields (not a tail-appended new variant) requires bumping this version
+/// and adding a versioned decode arm in [`parse_segment`] (as [`WalRecordV1`]
+/// does for v1, sharing the frozen v4 CRDT shapes with the snapshot path).
+pub const WAL_FORMAT_VERSION: u32 = 3;
 
 /// Size of the segment header in bytes.
 const SEGMENT_HEADER_LEN: usize = 16;
@@ -131,6 +142,21 @@ pub enum WalRecord {
         applied: HashMap<String, HlcTimestamp>,
         visible: HashMap<String, HlcTimestamp>,
         failed: Vec<String>,
+    },
+    /// A certified-store mutation, carrying the write's ORIGIN policy
+    /// version alongside the post-state. Replays exactly like
+    /// [`UpsertApplied`](WalRecord::UpsertApplied) into the store, but the
+    /// recovery path (`recover_store`) also harvests `key -> policy_version`
+    /// so [`CertifiedApi::recovered`](crate::api::certified::CertifiedApi)
+    /// can re-track the write under the version it was written with and
+    /// re-derive its FR-009 fence — instead of silently re-tagging it with
+    /// the current (post-bump) version. Tail variant: see the v3 note on
+    /// [`WAL_FORMAT_VERSION`].
+    CertifiedUpsert {
+        key: String,
+        value: CrdtValue,
+        hlc: HlcTimestamp,
+        policy_version: PolicyVersion,
     },
 }
 
@@ -1071,6 +1097,20 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
 pub fn replay_record(store: &mut Store, record: WalRecord) {
     match record {
         WalRecord::UpsertApplied { key, value, hlc } => {
+            if let Err(e) = store.merge_value(key.clone(), &value) {
+                tracing::warn!(key = %key, error = %e, "WAL replay merge failed; poisoning key");
+                store.note_merge_failed(&key);
+            }
+            store.record_change_max(&key, hlc.clone());
+            store.note_applied(&hlc);
+        }
+        // A certified write replays into the store exactly like
+        // `UpsertApplied` (same merge + max-monotone metadata); the origin
+        // `policy_version` it also carries is harvested separately by
+        // `recover_store`, not here (this arm only touches the store).
+        WalRecord::CertifiedUpsert {
+            key, value, hlc, ..
+        } => {
             if let Err(e) = store.merge_value(key.clone(), &value) {
                 tracing::warn!(key = %key, error = %e, "WAL replay merge failed; poisoning key");
                 store.note_merge_failed(&key);
@@ -2144,12 +2184,13 @@ mod tests {
         .unwrap();
         drop(wal);
 
-        // Header carries version 2.
+        // Header carries the current writer version (v3 since the tail
+        // `CertifiedUpsert` variant was added; v2 and v3 share a decode arm).
         let (_, path) = list_segments(dir.path()).unwrap().pop().unwrap();
         let data = fs::read(&path).unwrap();
         let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         assert_eq!(version, WAL_FORMAT_VERSION);
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let read = read_all_segments(dir.path()).unwrap();
         assert_eq!(read.outcome, WalReadOutcome::Clean);
@@ -2163,6 +2204,93 @@ mod tests {
                 assert_eq!(s.deferred_len(), 0);
             }
             other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    /// Write a raw segment with an explicit header version and current-shape
+    /// framed records (used to forge an "old writer" v2 segment).
+    fn write_segment_versioned(dir: &Path, header_version: u32, records: &[WalRecord]) {
+        let mut data = Vec::new();
+        let mut header = [0u8; SEGMENT_HEADER_LEN];
+        header[..8].copy_from_slice(&WAL_MAGIC);
+        header[8..12].copy_from_slice(&header_version.to_le_bytes());
+        data.extend_from_slice(&header);
+        for record in records {
+            let payload = encode(record);
+            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            data.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            data.extend_from_slice(&payload);
+        }
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(segment_file_name(1)), data).unwrap();
+    }
+
+    /// A v2 segment written before the v3 tail variant existed must still
+    /// decode after the bump: the existing variants keep their bincode
+    /// indices, so v2 and v3 share the current [`WalRecord`] decode arm.
+    #[test]
+    fn v2_segment_still_decodes_after_v3_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment_versioned(
+            dir.path(),
+            2,
+            &[
+                upsert("k0", 3, 100),
+                WalRecord::MergeFailed {
+                    keys: vec!["bad".into()],
+                },
+            ],
+        );
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        assert_eq!(read.records.len(), 2);
+        let mut store = Store::new();
+        for record in read.records {
+            replay_record(&mut store, record);
+        }
+        match store.get("k0") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 3),
+            other => panic!("expected Counter, got {other:?}"),
+        }
+        assert!(store.merge_failed_contains("bad"));
+    }
+
+    /// A `CertifiedUpsert` round-trips through a v3 segment, carrying the
+    /// origin policy version, and replays into the store like `UpsertApplied`.
+    #[test]
+    fn certified_upsert_round_trips_with_policy_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        wal.append(&WalRecord::CertifiedUpsert {
+            key: "user/x".into(),
+            value: counter(2, "A"),
+            hlc: ts(100, 0, "A"),
+            policy_version: PolicyVersion(7),
+        })
+        .unwrap();
+        drop(wal);
+
+        let read = read_all_segments(dir.path()).unwrap();
+        assert_eq!(read.outcome, WalReadOutcome::Clean);
+        assert_eq!(read.records.len(), 1);
+        match &read.records[0] {
+            WalRecord::CertifiedUpsert {
+                key,
+                policy_version,
+                ..
+            } => {
+                assert_eq!(key, "user/x");
+                assert_eq!(*policy_version, PolicyVersion(7));
+            }
+            other => panic!("expected CertifiedUpsert, got {other:?}"),
+        }
+        let mut store = Store::new();
+        for record in read.records {
+            replay_record(&mut store, record);
+        }
+        match store.get("user/x") {
+            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
+            other => panic!("expected Counter, got {other:?}"),
         }
     }
 }
