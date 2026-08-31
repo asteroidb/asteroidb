@@ -2522,6 +2522,7 @@ impl NodeRunner {
                 stats.rejected_scope_cap_total,
                 stats.rejected_authority_cap_total,
                 stats.purged_total,
+                stats.frontier_skew_rejected_total,
             );
         }
 
@@ -5900,11 +5901,15 @@ mod tests {
 
         let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
 
-        // Set a very high initial frontier manually.
+        // Set a very high (but within clock-skew) initial frontier manually.
+        // The P0-6 guard rejects reports beyond `now + MAX_CLOCK_SKEW_MS`, so
+        // a real-but-high value exercises the "does not regress" intent
+        // without tripping it.
+        let high_physical = crate::hlc::wall_clock_ms() + 30_000;
         api.update_frontier(AckFrontier {
             authority_id: node_id("auth-1"),
             frontier_hlc: HlcTimestamp {
-                physical: u64::MAX - 1000,
+                physical: high_physical,
                 logical: 0,
                 node_id: "auth-1".into(),
             },
@@ -5947,7 +5952,7 @@ mod tests {
         let frontiers = api.all_frontiers();
         assert!(!frontiers.is_empty());
         assert!(
-            frontiers[0].frontier_hlc.physical >= u64::MAX - 1000,
+            frontiers[0].frontier_hlc.physical >= high_physical,
             "frontier must not regress below the manually-set high value"
         );
     }
@@ -10066,8 +10071,12 @@ mod tests {
         // scope it actually serves.
         {
             let mut api = runner.certified_api.lock().await;
+            // A very high (but within clock-skew) frontier: high enough to
+            // consume all state as of the mark, without tripping the P0-6
+            // future-skew guard in `AckFrontierSet::update_at`.
+            let high = crate::hlc::wall_clock_ms() + 30_000;
             assert!(
-                api.update_frontier(ack_frontier("auth-1", "user/", 7, u64::MAX)),
+                api.update_frontier(ack_frontier("auth-1", "user/", 7, high)),
                 "a report at the range's current policy version is admissible"
             );
         }

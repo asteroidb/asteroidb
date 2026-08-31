@@ -66,14 +66,17 @@ fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> 
     }
 }
 
-/// Return a physical timestamp far in the future (current time + 10 minutes).
-/// This ensures that any write's HLC timestamp will be below the frontier.
+/// Return a physical timestamp ahead of the wall clock but WITHIN
+/// `MAX_CLOCK_SKEW_MS` (60s), so it sits above any write's HLC yet is admitted
+/// as a peer report by the P0-6 future-skew guard (`AckFrontierSet::update_at`).
+/// A larger offset (e.g. +10 minutes) would now be rejected as an implausible
+/// far-future report.
 fn future_physical() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-        + 600_000 // +10 minutes
+        + 30_000 // +30 seconds (< MAX_CLOCK_SKEW_MS)
 }
 
 fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {

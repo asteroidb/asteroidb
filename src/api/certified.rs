@@ -260,6 +260,11 @@ pub struct AttestationPoolStats {
     pub rejected_authority_cap_total: u64,
     /// Attestations removed by accused-authority purges (m-7).
     pub purged_total: u64,
+    /// Frontier reports dropped because their `frontier_hlc.physical` was
+    /// more than `MAX_CLOCK_SKEW_MS` ahead of this node's local wall clock
+    /// (P0-6). Sustained growth means a peer's clock is badly skewed or an
+    /// authority is reporting far-future frontiers. Zero in steady state.
+    pub frontier_skew_rejected_total: u64,
 }
 
 /// Certified consistency API (FR-002, FR-004).
@@ -333,10 +338,12 @@ impl CertifiedApi {
     /// The `namespace` provides authority definitions for key-range-scoped
     /// certification decisions via longest-prefix match.
     pub fn new(node_id: NodeId, namespace: Arc<RwLock<SystemNamespace>>) -> Self {
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.set_local_authority(node_id.clone());
         Self {
             store: Store::new(),
             clock: Hlc::new(node_id.0),
-            frontiers: AckFrontierSet::new(),
+            frontiers,
             namespace,
             pending_writes: Vec::new(),
             retention: RetentionPolicy::default(),
@@ -386,6 +393,8 @@ impl CertifiedApi {
         wal: Option<WalWriter>,
         origins: HashMap<String, PolicyVersion>,
     ) -> Self {
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.set_local_authority(node_id.clone());
         let mut clock = Hlc::new(node_id.0);
         if let Some(max) = store.max_known_hlc() {
             clock.seed_recovered(&max);
@@ -393,7 +402,7 @@ impl CertifiedApi {
         let mut api = Self {
             store,
             clock,
-            frontiers: AckFrontierSet::new(),
+            frontiers,
             namespace,
             pending_writes: Vec::new(),
             retention: RetentionPolicy::default(),
@@ -500,10 +509,12 @@ impl CertifiedApi {
         namespace: Arc<RwLock<SystemNamespace>>,
         retention: RetentionPolicy,
     ) -> Self {
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.set_local_authority(node_id.clone());
         Self {
             store: Store::new(),
             clock: Hlc::new(node_id.0),
-            frontiers: AckFrontierSet::new(),
+            frontiers,
             namespace,
             pending_writes: Vec::new(),
             retention,
@@ -1223,6 +1234,7 @@ impl CertifiedApi {
             rejected_scope_cap_total: self.attestations.rejected_scope_cap_total(),
             rejected_authority_cap_total: self.attestations.rejected_authority_cap_total(),
             purged_total: self.attestations.purged_attestations_total(),
+            frontier_skew_rejected_total: self.frontiers.skew_rejected_total(),
         }
     }
 

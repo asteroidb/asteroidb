@@ -495,6 +495,12 @@ pub struct RuntimeMetrics {
     /// Cumulative attestations removed by accused-authority purges (m-7).
     pub attestation_purged_total: AtomicU64,
 
+    /// Frontier reports dropped because their `frontier_hlc.physical` was
+    /// more than `MAX_CLOCK_SKEW_MS` ahead of this node's wall clock (P0-6).
+    /// Zero in steady state; growth signals a badly skewed peer clock or an
+    /// authority reporting far-future frontiers.
+    pub frontier_skew_rejected_total: AtomicU64,
+
     /// Frontier report ticks whose `digest_hash` fell back to the cold
     /// sentinel because the store digest cache was not warm (M-12).
     /// Occasional after restarts/bursts; sustained growth means warm-up
@@ -593,6 +599,7 @@ impl Default for RuntimeMetrics {
             attestation_rejected_authority_cap_total: AtomicU64::default(),
             attestation_pool_scopes: AtomicU64::default(),
             attestation_purged_total: AtomicU64::default(),
+            frontier_skew_rejected_total: AtomicU64::default(),
             frontier_digest_cold_total: AtomicU64::default(),
             frontier_report_skipped_floor_total: AtomicU64::default(),
             frontier_nonbinding_digest_total: AtomicU64::default(),
@@ -813,6 +820,7 @@ impl RuntimeMetrics {
         rejected_scope_cap: u64,
         rejected_authority_cap: u64,
         purged: u64,
+        frontier_skew_rejected: u64,
     ) {
         self.attestation_pool_scopes
             .store(scopes, Ordering::Relaxed);
@@ -830,6 +838,8 @@ impl RuntimeMetrics {
             .store(rejected_authority_cap, Ordering::Relaxed);
         self.attestation_purged_total
             .store(purged, Ordering::Relaxed);
+        self.frontier_skew_rejected_total
+            .store(frontier_skew_rejected, Ordering::Relaxed);
     }
 
     /// Record the completion of a rebalance operation.
@@ -926,6 +936,7 @@ impl RuntimeMetrics {
                 .load(Ordering::Relaxed),
             attestation_pool_scopes: self.attestation_pool_scopes.load(Ordering::Relaxed),
             attestation_purged_total: self.attestation_purged_total.load(Ordering::Relaxed),
+            frontier_skew_rejected_total: self.frontier_skew_rejected_total.load(Ordering::Relaxed),
             frontier_digest_cold_total: self.frontier_digest_cold_total.load(Ordering::Relaxed),
             frontier_report_skipped_floor_total: self
                 .frontier_report_skipped_floor_total
@@ -1077,6 +1088,9 @@ pub struct MetricsSnapshot {
     pub attestation_pool_scopes: u64,
     /// Cumulative attestations removed by accused-authority purges.
     pub attestation_purged_total: u64,
+    /// Frontier reports dropped for exceeding the future clock-skew bound
+    /// (P0-6). Zero in steady state.
+    pub frontier_skew_rejected_total: u64,
     /// Frontier report ticks that fell back to the cold digest sentinel.
     pub frontier_digest_cold_total: u64,
     /// Frontier report ticks skipped because the clock floor fsync failed.
@@ -1178,7 +1192,7 @@ mod tests {
         assert_eq!(snap.attestation_pool_scopes, 0);
         assert_eq!(snap.attestation_purged_total, 0);
 
-        metrics.set_attestation_pool_stats(4, 1, 2, 7, 8, 3, 5, 6);
+        metrics.set_attestation_pool_stats(4, 1, 2, 7, 8, 3, 5, 6, 9);
         let snap = metrics.snapshot();
         assert_eq!(snap.attestation_pool_scopes, 4);
         assert_eq!(snap.attestation_rejected_unknown_range_total, 1);
@@ -1188,9 +1202,10 @@ mod tests {
         assert_eq!(snap.attestation_rejected_scope_cap_total, 3);
         assert_eq!(snap.attestation_rejected_authority_cap_total, 5);
         assert_eq!(snap.attestation_purged_total, 6);
+        assert_eq!(snap.frontier_skew_rejected_total, 9);
 
         // Absolute-value semantics: a later sync overwrites, never adds.
-        metrics.set_attestation_pool_stats(1, 1, 2, 7, 8, 3, 5, 6);
+        metrics.set_attestation_pool_stats(1, 1, 2, 7, 8, 3, 5, 6, 9);
         let snap = metrics.snapshot();
         assert_eq!(snap.attestation_pool_scopes, 1);
 

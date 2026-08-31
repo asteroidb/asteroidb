@@ -756,6 +756,7 @@ pub async fn post_internal_frontiers(
         stats.rejected_scope_cap_total,
         stats.rejected_authority_cap_total,
         stats.purged_total,
+        stats.frontier_skew_rejected_total,
     );
     let resp = crate::network::frontier_sync::FrontierPushResponse { accepted };
     internal_response(&resp, accept)
