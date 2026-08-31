@@ -695,6 +695,33 @@ pub async fn post_internal_frontiers(
     let mut api = state.certified.lock().await;
     let mut accepted = 0;
     for (frontier, attestation) in to_apply {
+        // `AckFrontierSet::update_at` EXEMPTS a report whose authority id is
+        // this node's own from the future clock-skew guard: the node's
+        // in-process self-report (see `report_frontiers` /
+        // `sign_apply_and_push_frontiers`) carries its monotonic HLC, which
+        // after a clock-floor recovery may legitimately exceed
+        // `wall + MAX_CLOCK_SKEW_MS`. That trust is only valid in-process —
+        // self-frontiers are never legitimately ingested over the network.
+        // A peer could otherwise POST an unsigned report carrying the local
+        // id and a far-future physical time and ride the exemption to pin the
+        // local slot far-future under the monotone rule, re-opening the
+        // 1-of-N certified-read forgery the guard closes for peers (P0-6).
+        // Re-impose the SAME bound update_at applies to peers here, at the
+        // untrusted boundary, before the exemption is reached (strict `>`,
+        // `saturating_add`, physical only — a verbatim mirror). A within-skew
+        // self-id network report is no more powerful than a within-skew peer
+        // report and is left alone; only the far-future pin is dropped.
+        if state.self_node_id.as_ref() == Some(&frontier.authority_id)
+            && frontier.frontier_hlc.physical
+                > now_ms.saturating_add(crate::hlc::MAX_CLOCK_SKEW_MS)
+        {
+            tracing::warn!(
+                authority = %frontier.authority_id.0,
+                key_range = %frontier.key_range.prefix,
+                "dropping far-future network frontier report claiming this node's own authority id"
+            );
+            continue;
+        }
         // Receive-side observability (M-12): content binding is enforced
         // only by the reporter's own honest code path — a compromised
         // authority can permanently opt out by signing placeholder- or

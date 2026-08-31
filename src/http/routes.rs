@@ -283,6 +283,77 @@ mod tests {
         })
     }
 
+    /// Like `test_state_signing`, but the local node IS a member of the
+    /// catch-all range's authority set and `self_node_id` is populated — the
+    /// setup needed to exercise the self-report clock-skew exemption (P0-6).
+    /// `self_id` is used as BOTH the CertifiedApi node id (so its
+    /// `AckFrontierSet`'s `local_authority` matches) and `self_node_id`.
+    fn test_state_self_authority(
+        self_id: &str,
+        registry: Option<crate::authority::certificate::KeysetRegistry>,
+    ) -> Arc<AppState> {
+        let node_id = NodeId(self_id.into());
+
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            authority_nodes: vec![
+                NodeId(self_id.into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            KeyRange {
+                prefix: String::new(),
+            },
+            3,
+        ))
+        .unwrap();
+
+        let namespace = Arc::new(RwLock::new(ns));
+
+        let consensus =
+            crate::control_plane::consensus::ControlPlaneConsensus::single_node_for_test(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            );
+
+        Arc::new(AppState {
+            eventual: Arc::new(Mutex::new(EventualApi::new(node_id.clone()))),
+            certified: Arc::new(Mutex::new(CertifiedApi::new(
+                node_id.clone(),
+                Arc::clone(&namespace),
+            ))),
+            namespace,
+            metrics: Arc::new(RuntimeMetrics::default()),
+            peers: None,
+            peer_persist_path: None,
+            namespace_persist_path: None,
+            consensus: Arc::new(Mutex::new(consensus)),
+            internal_token: None,
+            self_node_id: Some(node_id),
+            self_addr: None,
+            latency_model: None,
+            cluster_nodes: None,
+            slo_tracker: Arc::new(crate::ops::slo::SloTracker::new()),
+            keyset_registry: registry.map(|r| Arc::new(RwLock::new(r))),
+            epoch_config: crate::authority::certificate::EpochConfig::default(),
+            current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            require_signed_frontiers: false,
+            equivocation: Arc::new(crate::authority::equivocation::EquivocationDetector::new(
+                None,
+            )),
+            exclude_accused_authorities: false,
+            eventual_wal: None,
+            certified_wal: None,
+        })
+    }
+
     // ---------------------------------------------------------------
     // Eventual write + read round-trip
     // ---------------------------------------------------------------
@@ -2915,6 +2986,75 @@ mod tests {
         // Frontier for the catch-all range (auth-1 IS a member): accepted.
         let result = push_frontiers(&app, &make_body("", current_pv(&state))).await;
         assert_eq!(result.accepted, 1);
+    }
+
+    /// P0-6 follow-up: a network frontier report CLAIMING this node's own
+    /// authority id must be dropped at ingestion. Otherwise a peer could ride
+    /// the in-process self-report clock-skew exemption in
+    /// `AckFrontierSet::update_at` to pin the local slot far-future and
+    /// re-open the 1-of-N certified-read forgery. Lenient (no-registry) mode,
+    /// where unsigned reports are otherwise accepted, is the exposed config.
+    #[tokio::test]
+    async fn network_frontier_claiming_local_authority_id_dropped() {
+        let state = test_state_self_authority("auth-1", None);
+        let pv = current_pv(&state);
+        let app = router(Arc::clone(&state));
+
+        // A report claiming the local node's own id (auth-1) with a far-future
+        // physical time. Without the drop it would sail past the self-report
+        // skew exemption and pin the local slot.
+        let far_future = crate::hlc::wall_clock_ms()
+            .saturating_add(crate::hlc::MAX_CLOCK_SKEW_MS)
+            .saturating_add(366 * 24 * 60 * 60 * 1000);
+        let spoof = crate::authority::ack_frontier::AckFrontier {
+            authority_id: NodeId("auth-1".into()),
+            frontier_hlc: HlcTimestamp {
+                physical: far_future,
+                logical: 0,
+                node_id: "auth-1".into(),
+            },
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            policy_version: pv,
+            digest_hash: "spoof".into(),
+        };
+        let body = FrontierPushRequest {
+            frontiers: vec![spoof],
+            signatures: vec![None],
+            observed: vec![],
+        };
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 0,
+            "a network report claiming the local node's own authority id must be dropped"
+        );
+
+        // A legitimate PEER report (auth-2) within skew is still accepted —
+        // proving the drop is specific to the self id, not a blanket failure.
+        let peer = crate::authority::ack_frontier::AckFrontier {
+            authority_id: NodeId("auth-2".into()),
+            frontier_hlc: HlcTimestamp {
+                physical: crate::hlc::wall_clock_ms(),
+                logical: 0,
+                node_id: "auth-2".into(),
+            },
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            policy_version: pv,
+            digest_hash: "peer".into(),
+        };
+        let body = FrontierPushRequest {
+            frontiers: vec![peer],
+            signatures: vec![None],
+            observed: vec![],
+        };
+        let result = push_frontiers(&app, &body).await;
+        assert_eq!(
+            result.accepted, 1,
+            "a within-skew report from a distinct peer authority must still be accepted"
+        );
     }
 
     /// Full HTTP round-trip: certified write → signed frontier pushes →
