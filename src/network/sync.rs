@@ -926,12 +926,38 @@ impl SyncClient {
                     if resp.status().is_success() {
                         // Parse the response body to check for per-key merge
                         // errors. Only count entries that were actually merged.
-                        let sync_resp: Option<SyncResponse> =
-                            Self::decode_response(resp).await.ok();
-                        let error_keys: Vec<String> = sync_resp
-                            .as_ref()
-                            .map(|r| r.errors.iter().map(|e| e.key.clone()).collect())
-                            .unwrap_or_default();
+                        //
+                        // A 2xx with an UNDECODABLE body (truncation, a
+                        // reverse-proxy text/html 200, a representation
+                        // mismatch) is NOT evidence the batch merged: treating
+                        // it as full success would advance the caller's GC
+                        // evidence (push_frontiers / push_acked_wall_ms) on a
+                        // fabricated ack, letting tombstone GC physically
+                        // delete values a peer still holds live (they then
+                        // resurrect on pull and never re-enter a delta). Fail
+                        // this batch and every un-attempted later batch, exactly
+                        // as the non-success-status path does.
+                        let sync_resp: SyncResponse = match Self::decode_response(resp).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer_addr = %peer_addr,
+                                    error = %e,
+                                    "delta push batch returned 2xx but an undecodable body; \
+                                     treating the batch as unconfirmed"
+                                );
+                                for rem in &chunks[ci..] {
+                                    failed_keys.extend(rem.iter().map(|(k, _)| k.clone()));
+                                }
+                                return Err(SyncPushError {
+                                    pushed: total_pushed,
+                                    failed_keys,
+                                    reason: format!("undecodable 2xx response: {e}"),
+                                });
+                            }
+                        };
+                        let error_keys: Vec<String> =
+                            sync_resp.errors.iter().map(|e| e.key.clone()).collect();
                         let error_count = error_keys.len();
                         let actually_pushed = chunk.len().saturating_sub(error_count);
                         if error_count > 0 {
@@ -1639,6 +1665,53 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.pushed, 0);
+    }
+
+    /// P0-4: a peer that answers 2xx with a body that cannot be decoded as a
+    /// `SyncResponse` (truncation, a reverse-proxy text/html 200, a
+    /// representation mismatch) must NOT be reported as a successful push.
+    /// Otherwise the caller advances its GC evidence on a fabricated ack.
+    #[tokio::test]
+    async fn push_changed_keys_undecodable_2xx_is_not_success() {
+        use axum::response::IntoResponse;
+
+        let app = axum::Router::new().route(
+            "/api/internal/sync",
+            axum::routing::post(|| async {
+                // 2xx, but the body is not a decodable SyncResponse.
+                (
+                    [(axum::http::header::CONTENT_TYPE, CONTENT_TYPE_BINCODE)],
+                    vec![0xFFu8; 8],
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = SyncClient::new(shared_registry(vec![]));
+        let mut counter = PnCounter::new();
+        counter.increment(&nid("node-1"));
+        let entries = vec![("key1".to_string(), CrdtValue::Counter(counter))];
+
+        let result = client
+            .push_changed_keys(&addr.to_string(), entries, "node-1", DEFAULT_BATCH_SIZE)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 2xx with an undecodable body must not be reported as a successful push"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.failed_keys.contains(&"key1".to_string()),
+            "the unconfirmed key must be reported as failed, got {:?}",
+            err.failed_keys
+        );
+        server.abort();
     }
 
     // ---------------------------------------------------------------
