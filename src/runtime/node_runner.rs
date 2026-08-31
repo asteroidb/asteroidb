@@ -2814,6 +2814,21 @@ impl NodeRunner {
                 // when `frontier >= pruned_floor`; otherwise compaction may be
                 // hiding un-pushed keys in `(frontier, pruned_floor]`.
                 let pruned_floor = api.store().pruned_floor().cloned();
+                // Whether the delta baseline sits at/above the pruned floor.
+                // When it does NOT, compaction may have dropped the timestamps
+                // of keys in `(frontier, pruned_floor]` that were never pushed
+                // to this peer — hiding them from the scan (which only sees
+                // surviving `ts > frontier` entries). That is true for BOTH an
+                // empty scan AND a non-empty one: a non-empty delta conveys the
+                // surviving keys but still omits the pruned ones, so recording
+                // push evidence in that case would open the tombstone-GC peer
+                // gate without those keys ever reaching the peer, breaking the
+                // dead-peer fail-closed promise. Gate `push_acked_wall_ms` in
+                // every push arm below on this.
+                let floor_covered = match &pruned_floor {
+                    None => true,
+                    Some(floor) => frontier >= *floor,
+                };
 
                 // Compute change rate and decide whether to use delta or full sync.
                 let change_rate = if total_keys > 0 {
@@ -3118,8 +3133,26 @@ impl NodeRunner {
                                     // gate: the scan (taken at scan_wall_ms)
                                     // was fully conveyed with zero per-key
                                     // errors (`Ok` implies no failed keys).
-                                    self.push_acked_wall_ms
-                                        .insert(peer_key.clone(), scan_wall_ms);
+                                    // Honest ONLY when the baseline covers the
+                                    // pruned floor — otherwise compaction hid
+                                    // pruned keys in `(frontier, pruned_floor]`
+                                    // from the scan, so they were never pushed
+                                    // even though this (non-empty) push
+                                    // succeeded. Fail-closed: withhold evidence
+                                    // until a later cycle whose baseline has
+                                    // caught up to the floor supplies it.
+                                    if floor_covered {
+                                        self.push_acked_wall_ms
+                                            .insert(peer_key.clone(), scan_wall_ms);
+                                    } else {
+                                        tracing::debug!(
+                                            peer = %peer.node_id.0,
+                                            "delta push baseline sits below the \
+                                             pruned floor; withholding push \
+                                             evidence (compaction may hide \
+                                             un-pushed keys from this peer)"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -3149,7 +3182,8 @@ impl NodeRunner {
                     } else {
                         // Empty scan: nothing above the push-only baseline.
                         // This is only honest push evidence when compaction
-                        // has NOT pruned timestamps above the baseline. If
+                        // has NOT pruned timestamps above the baseline (the
+                        // `floor_covered` gate computed with the scan). If
                         // `frontier < pruned_floor`, keys in
                         // `(frontier, pruned_floor]` that were never pushed to
                         // this peer are hidden from the scan, so recording the
@@ -3159,10 +3193,6 @@ impl NodeRunner {
                         // Fail-closed: withhold evidence in that case; a later
                         // cycle whose baseline has caught up to the floor, or a
                         // real non-empty push, supplies honest evidence.
-                        let floor_covered = match &pruned_floor {
-                            None => true,
-                            Some(floor) => frontier >= *floor,
-                        };
                         if floor_covered {
                             self.push_acked_wall_ms
                                 .insert(peer_key.clone(), scan_wall_ms);
@@ -10478,6 +10508,144 @@ mod tests {
             !runner.push_acked_wall_ms.contains_key(&peer_key),
             "an empty scan below the pruned floor must not record push evidence"
         );
+    }
+
+    /// P0-5 (symmetric case): a NON-EMPTY delta push whose baseline sits
+    /// BELOW the store's pruned floor must ALSO withhold push evidence. The
+    /// push succeeds and conveys the surviving keys, but compaction has
+    /// already dropped the timestamps of keys in `(baseline, pruned_floor]` —
+    /// keys that may never have been pushed to this peer — so even a
+    /// successful non-empty push does not prove the peer holds them.
+    /// Recording it as evidence would open the tombstone-GC peer gate for a
+    /// lagging peer (fail-open), the same resurrection class as the
+    /// empty-scan hole.
+    #[tokio::test]
+    async fn nonempty_push_below_pruned_floor_withholds_push_evidence() {
+        use crate::network::{PeerConfig, PeerRegistry};
+        use axum::response::IntoResponse;
+
+        let eventual = Arc::new(Mutex::new(EventualApi::new(node_id("node-x"))));
+        {
+            let mut api = eventual.lock().await;
+            // Filler keys BELOW the floor keep the change rate in delta
+            // territory: a single changed key over a 1-key store would trip
+            // the full-sync fallback and skip the delta-push arm entirely.
+            for i in 0..20 {
+                let mut c = PnCounter::new();
+                c.increment(&node_id("node-x"));
+                api.store_mut().put_with_timestamp(
+                    format!("old-{i}"),
+                    CrdtValue::Counter(c),
+                    hlc_ts(100, 0, "node-x"),
+                );
+            }
+            // One key ABOVE the floor: it survives pruning, so the scan since
+            // the baseline is NON-EMPTY.
+            let mut c = PnCounter::new();
+            c.increment(&node_id("node-x"));
+            api.store_mut().put_with_timestamp(
+                "keep".into(),
+                CrdtValue::Counter(c),
+                hlc_ts(3000, 0, "node-x"),
+            );
+            api.store_mut()
+                .prune_timestamps_before("", &hlc_ts(2000, 0, "node-x"));
+            assert!(api.store().pruned_floor().is_some());
+            assert!(
+                !api.store()
+                    .delta_entries_since(&hlc_ts(500, 0, "node-x"))
+                    .is_empty(),
+                "the scan above the baseline must be non-empty (keep survives pruning)"
+            );
+        }
+
+        // Mock peer that ACCEPTS the push (200 + empty per-key errors) and
+        // returns an empty delta pull.
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/sync",
+                axum::routing::post(|| async {
+                    axum::Json(crate::network::sync::SyncResponse {
+                        merged: 1,
+                        errors: vec![],
+                    })
+                    .into_response()
+                }),
+            )
+            .route(
+                "/api/internal/sync/delta",
+                axum::routing::post(|| async {
+                    axum::Json(DeltaSyncResponse {
+                        entries: vec![],
+                        sender_frontier: None,
+                        applied_origins: HashMap::new(),
+                        merge_failed_keys: vec![],
+                        pruned_floor: None,
+                        visible_origins: HashMap::new(),
+                        untracked_entries: HashMap::new(),
+                    })
+                    .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let registry = PeerRegistry::new(
+            node_id("node-x"),
+            vec![PeerConfig {
+                node_id: node_id("peer-1"),
+                addr: addr.to_string(),
+            }],
+        )
+        .unwrap();
+        let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+        let config = NodeRunnerConfig {
+            sync_interval: Some(Duration::from_millis(50)),
+            ping_interval: None,
+            digest_sync_enabled: false,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::with_sync(
+            node_id("node-x"),
+            wrap_api(CertifiedApi::new(node_id("node-x"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            sync_client,
+            Arc::clone(&eventual),
+            default_metrics(),
+        )
+        .await;
+
+        let peer_key = addr.to_string();
+        // Delta path with a push baseline BELOW the pruned floor (a lagging
+        // peer that never received the pruned keys).
+        runner
+            .peer_frontiers
+            .insert(peer_key.clone(), hlc_ts(500, 0, "node-x"));
+        runner
+            .push_frontiers
+            .insert(peer_key.clone(), hlc_ts(500, 0, "node-x"));
+
+        runner.run_sync().await;
+
+        // The push DID happen and advanced the baseline — proving this was the
+        // non-empty delta-push arm, not the empty branch...
+        assert_eq!(
+            runner.push_frontiers.get(&peer_key),
+            Some(&hlc_ts(3000, 0, "node-x")),
+            "the non-empty delta push must have advanced the baseline to keep@3000"
+        );
+        // ...yet the evidence is withheld because the baseline sat below the
+        // floor when the scan ran.
+        assert!(
+            !runner.push_acked_wall_ms.contains_key(&peer_key),
+            "a non-empty push whose baseline sits below the pruned floor must \
+             not record push evidence"
+        );
+        server.abort();
     }
 
     /// T-13: an unchanged sample already delivered to the peer is
