@@ -712,8 +712,7 @@ pub async fn post_internal_frontiers(
         // self-id network report is no more powerful than a within-skew peer
         // report and is left alone; only the far-future pin is dropped.
         if state.self_node_id.as_ref() == Some(&frontier.authority_id)
-            && frontier.frontier_hlc.physical
-                > now_ms.saturating_add(crate::hlc::MAX_CLOCK_SKEW_MS)
+            && frontier.frontier_hlc.physical > now_ms.saturating_add(crate::hlc::MAX_CLOCK_SKEW_MS)
         {
             tracing::warn!(
                 authority = %frontier.authority_id.0,
