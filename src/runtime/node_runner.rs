@@ -2806,6 +2806,14 @@ impl NodeRunner {
                     crate::hlc::HlcTimestamp,
                 )> = api.store().delta_entries_since(&frontier);
                 let changed_count = entries_with_hlc.len();
+                // Captured under the SAME lock as the delta scan so it stays
+                // consistent with it: a concurrent compaction cannot move the
+                // floor between the scan and the empty-scan evidence check
+                // below. Pruning drops timestamps `ts <= pruned_floor`, so an
+                // empty scan over `ts > frontier` only proves "nothing new"
+                // when `frontier >= pruned_floor`; otherwise compaction may be
+                // hiding un-pushed keys in `(frontier, pruned_floor]`.
+                let pruned_floor = api.store().pruned_floor().cloned();
 
                 // Compute change rate and decide whether to use delta or full sync.
                 let change_rate = if total_keys > 0 {
@@ -3139,12 +3147,33 @@ impl NodeRunner {
                             }
                         }
                     } else {
-                        // Nothing above the push-only baseline: every local
-                        // entry was already conveyed by an earlier fully-
-                        // successful push, so the (empty) scan itself is
-                        // fresh push evidence for the GC peer gate.
-                        self.push_acked_wall_ms
-                            .insert(peer_key.clone(), scan_wall_ms);
+                        // Empty scan: nothing above the push-only baseline.
+                        // This is only honest push evidence when compaction
+                        // has NOT pruned timestamps above the baseline. If
+                        // `frontier < pruned_floor`, keys in
+                        // `(frontier, pruned_floor]` that were never pushed to
+                        // this peer are hidden from the scan, so recording the
+                        // (empty) scan as evidence would open the tombstone-GC
+                        // peer gate WITHOUT any request reaching the peer —
+                        // breaking the fail-closed promise for dead peers.
+                        // Fail-closed: withhold evidence in that case; a later
+                        // cycle whose baseline has caught up to the floor, or a
+                        // real non-empty push, supplies honest evidence.
+                        let floor_covered = match &pruned_floor {
+                            None => true,
+                            Some(floor) => frontier >= *floor,
+                        };
+                        if floor_covered {
+                            self.push_acked_wall_ms
+                                .insert(peer_key.clone(), scan_wall_ms);
+                        } else {
+                            tracing::debug!(
+                                peer = %peer.node_id.0,
+                                "empty delta scan sits below the pruned floor; \
+                                 withholding push evidence (compaction may hide \
+                                 un-pushed keys from this peer)"
+                            );
+                        }
                     }
                 }
             } else {
@@ -10372,6 +10401,83 @@ mod tests {
             "a delivered sample must be recorded for the peer"
         );
         server.abort();
+    }
+
+    /// P0-5: an empty delta scan whose push baseline sits BELOW the store's
+    /// pruned floor must NOT be recorded as push evidence. Compaction has
+    /// removed the timestamps of keys in `(baseline, pruned_floor]` — keys
+    /// that may never have been pushed to this peer — so the empty scan
+    /// proves nothing, and no request reaches the peer. Recording it would
+    /// open the tombstone-GC peer gate for a dead peer (fail-open).
+    #[tokio::test]
+    async fn empty_scan_below_pruned_floor_withholds_push_evidence() {
+        use crate::network::{PeerConfig, PeerRegistry};
+
+        let eventual = Arc::new(Mutex::new(EventualApi::new(node_id("node-x"))));
+        {
+            let mut api = eventual.lock().await;
+            let mut c = PnCounter::new();
+            c.increment(&node_id("node-x"));
+            api.store_mut().put_with_timestamp(
+                "k1".into(),
+                CrdtValue::Counter(c),
+                hlc_ts(1000, 0, "node-x"),
+            );
+            // Compact past the key: its timestamp leaves the delta index, but
+            // the value stays (total_keys == 1, scan since 500 is empty).
+            api.store_mut()
+                .prune_timestamps_before("", &hlc_ts(2000, 0, "node-x"));
+            assert!(api.store().pruned_floor().is_some());
+            assert!(
+                api.store()
+                    .delta_entries_since(&hlc_ts(500, 0, "node-x"))
+                    .is_empty(),
+                "compaction must have emptied the scan above the baseline"
+            );
+        }
+
+        let registry = PeerRegistry::new(
+            node_id("node-x"),
+            vec![PeerConfig {
+                node_id: node_id("peer-1"),
+                addr: "127.0.0.1:1".into(),
+            }],
+        )
+        .unwrap();
+        let sync_client = SyncClient::new(Arc::new(Mutex::new(registry)));
+        let config = NodeRunnerConfig {
+            sync_interval: Some(Duration::from_millis(50)),
+            ping_interval: None,
+            digest_sync_enabled: false,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::with_sync(
+            node_id("node-x"),
+            wrap_api(CertifiedApi::new(node_id("node-x"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            sync_client,
+            Arc::clone(&eventual),
+            default_metrics(),
+        )
+        .await;
+
+        let peer_key = "127.0.0.1:1".to_string();
+        // Enter the delta path (needs a known peer frontier) with a push
+        // baseline BELOW the pruned floor (a lagging/dead peer).
+        runner
+            .peer_frontiers
+            .insert(peer_key.clone(), hlc_ts(500, 0, "node-x"));
+        runner
+            .push_frontiers
+            .insert(peer_key.clone(), hlc_ts(500, 0, "node-x"));
+
+        runner.run_sync().await;
+
+        assert!(
+            !runner.push_acked_wall_ms.contains_key(&peer_key),
+            "an empty scan below the pruned floor must not record push evidence"
+        );
     }
 
     /// T-13: an unchanged sample already delivered to the peer is
