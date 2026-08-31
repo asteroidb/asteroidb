@@ -111,6 +111,29 @@ pub struct AckFrontierSet {
     /// GC authority gate stays fail-closed until fresh reports arrive.
     #[serde(skip)]
     advanced_at_ms: HashMap<FrontierScope, u64>,
+    /// Count of frontier reports dropped by [`update_at`](Self::update_at)
+    /// because their `frontier_hlc.physical` was more than
+    /// [`crate::hlc::MAX_CLOCK_SKEW_MS`] ahead of this node's local wall clock.
+    ///
+    /// `#[serde(skip)]`: observability only (keeps the serialized format
+    /// byte-identical). Surfaced through the attestation-pool metrics.
+    #[serde(skip)]
+    skew_rejected_total: u64,
+    /// This node's own authority id, when known. The future clock-skew
+    /// guard in [`update_at`](Self::update_at) is bypassed for reports whose
+    /// `authority_id` matches it: a node's own self-report carries its own
+    /// monotonic HLC, which after a clock-floor recovery
+    /// ([`Hlc::seed_recovered`]) may legitimately sit beyond
+    /// `wall + MAX_CLOCK_SKEW_MS` — exactly the case `seed_recovered` exists
+    /// to support. The guard's job is to reject far-future reports from
+    /// OTHER (peer) authorities, which is where the 1-of-N forgery lives.
+    ///
+    /// `#[serde(skip)]`: derived from the owning node's identity, re-set on
+    /// construction (keeps the serialized format byte-identical). `None`
+    /// (e.g. a bare `AckFrontierSet::new()`) applies the guard to every
+    /// authority.
+    #[serde(skip)]
+    local_authority: Option<NodeId>,
 }
 
 /// Custom serde for `HashMap<FrontierScope, AckFrontier>`.
@@ -178,7 +201,22 @@ impl AckFrontierSet {
             fenced_versions: HashSet::new(),
             fenced_at: HashMap::new(),
             advanced_at_ms: HashMap::new(),
+            skew_rejected_total: 0,
+            local_authority: None,
         }
+    }
+
+    /// Record this node's own authority id so its self-reports bypass the
+    /// future clock-skew guard (see the [`local_authority`](Self#structfield.local_authority)
+    /// field). Called on construction by the owning `CertifiedApi`.
+    pub fn set_local_authority(&mut self, authority_id: NodeId) {
+        self.local_authority = Some(authority_id);
+    }
+
+    /// Cumulative count of frontier reports dropped for exceeding the
+    /// future clock-skew bound (see [`update_at`](Self::update_at)).
+    pub fn skew_rejected_total(&self) -> u64 {
+        self.skew_rejected_total
     }
 
     /// Update the frontier for a scoped authority.
@@ -200,6 +238,32 @@ impl AckFrontierSet {
     pub fn update_at(&mut self, frontier: AckFrontier, now_ms: u64) -> bool {
         // Reject updates targeting a fenced (key_range, policy_version) pair.
         if self.is_version_fenced(&frontier.key_range, &frontier.policy_version) {
+            return false;
+        }
+
+        // Reject PEER reports whose physical time is more than
+        // MAX_CLOCK_SKEW_MS ahead of this node's local wall clock (`now_ms`).
+        // This mirrors `Hlc::update` exactly (strict `>`, `saturating_add`,
+        // physical only). Without it a partitioned or malicious authority
+        // reporting a far-future frontier would pin its slot forever under the
+        // monotone rule below, letting a single honest authority decide the
+        // majority frontier (a 1-of-N certified read). Fail-closed: the report
+        // is dropped (not clamped, which would keep a synthetic, unsigned
+        // physical time contributing to the quorum) without stamping an
+        // advancement receipt.
+        //
+        // A node's OWN self-report is exempt: it carries this node's monotonic
+        // HLC, which after a clock-floor recovery (`Hlc::seed_recovered`) may
+        // legitimately exceed `wall + MAX_CLOCK_SKEW_MS`. Suppressing it would
+        // silence the node's own reporting until the wall clock caught up,
+        // breaking the clock-floor liveness invariant. The 1-of-N forgery
+        // requires a DIFFERENT (peer) authority's slot to be pinned, so the
+        // exemption does not weaken the defense.
+        let is_self_report = self.local_authority.as_ref() == Some(&frontier.authority_id);
+        if !is_self_report
+            && frontier.frontier_hlc.physical > now_ms.saturating_add(crate::hlc::MAX_CLOCK_SKEW_MS)
+        {
+            self.skew_rejected_total = self.skew_rejected_total.saturating_add(1);
             return false;
         }
 
@@ -1198,6 +1262,124 @@ mod tests {
 
         // 180 is below order/ majority (1500) → certified in order/
         assert!(set.is_certified_at_for_scope(&ts_180, &kr("order/"), &pv(1), 3));
+    }
+
+    /// P0-6: a partitioned/malicious authority reporting a frontier far in
+    /// the future must be rejected, so it cannot pin its slot and let a
+    /// single honest authority decide the majority frontier (1-of-3).
+    #[test]
+    fn far_future_report_rejected_and_cannot_forge_majority() {
+        let mut set = AckFrontierSet::new();
+        let now_ms = 1_000_000_000_000u64;
+        let year_ms = 366u64 * 24 * 60 * 60 * 1000;
+
+        // Honest authority b reports within skew and is admitted.
+        assert!(set.update_at(make_frontier("b", now_ms, 0, "user/"), now_ms));
+
+        // Malicious authority a reports a year into the future.
+        assert!(
+            !set.update_at(make_frontier("a", now_ms + year_ms, 0, "user/"), now_ms),
+            "a report far beyond the clock-skew bound must be rejected"
+        );
+        // The far-future report never entered the frontier set.
+        assert!(set.get(&NodeId("a".into())).is_none());
+
+        // With 3 total authorities (majority 2) and only b admitted, b alone
+        // must NOT certify its own frontier — no 1-of-3 forgery.
+        let b_ts = make_ts(now_ms, 0, "b");
+        assert!(
+            !set.is_certified_at_for_scope(&b_ts, &kr("user/"), &pv(1), 3),
+            "a single honest authority must not certify a 3-authority scope"
+        );
+    }
+
+    /// P0-6: boundary mirrors `Hlc::update` — exactly `now + MAX_CLOCK_SKEW_MS`
+    /// is accepted (inclusive), one ms beyond is rejected.
+    #[test]
+    fn skew_boundary_accept_and_reject() {
+        let mut set = AckFrontierSet::new();
+        let now_ms = 1_000_000_000_000u64;
+
+        assert!(
+            set.update_at(
+                make_frontier("a", now_ms + crate::hlc::MAX_CLOCK_SKEW_MS, 0, "user/"),
+                now_ms
+            ),
+            "exactly now + MAX_CLOCK_SKEW_MS must be accepted"
+        );
+        assert!(
+            !set.update_at(
+                make_frontier("b", now_ms + crate::hlc::MAX_CLOCK_SKEW_MS + 1, 0, "user/"),
+                now_ms
+            ),
+            "one ms beyond the skew bound must be rejected"
+        );
+    }
+
+    /// P0-6: the skew-rejection counter increments on over-skew reports and
+    /// stays put for in-bounds reports.
+    #[test]
+    fn skew_rejection_counter_tracks_over_reports() {
+        let mut set = AckFrontierSet::new();
+        let now_ms = 1_000_000_000_000u64;
+        assert_eq!(set.skew_rejected_total(), 0);
+
+        set.update_at(make_frontier("a", now_ms, 0, "user/"), now_ms);
+        assert_eq!(
+            set.skew_rejected_total(),
+            0,
+            "in-bounds report must not count"
+        );
+
+        set.update_at(
+            make_frontier("b", now_ms + crate::hlc::MAX_CLOCK_SKEW_MS + 1, 0, "user/"),
+            now_ms,
+        );
+        assert_eq!(
+            set.skew_rejected_total(),
+            1,
+            "over-skew report must count once"
+        );
+    }
+
+    /// P0-6: a node's OWN self-report is exempt from the future-skew guard.
+    /// Its HLC may legitimately exceed `wall + MAX_CLOCK_SKEW_MS` after a
+    /// clock-floor recovery (`Hlc::seed_recovered`); a peer's equally
+    /// far-future report is still rejected.
+    #[test]
+    fn self_report_exempt_from_skew_guard() {
+        let mut set = AckFrontierSet::new();
+        set.set_local_authority(NodeId("me".into()));
+        let now_ms = 1_000_000_000_000u64;
+        let far = now_ms + crate::hlc::MAX_CLOCK_SKEW_MS * 5;
+
+        // Our own far-future report is accepted (recovered clock floor).
+        assert!(
+            set.update_at(make_frontier("me", far, 0, "user/"), now_ms),
+            "the node's own recovered-clock self-report must be accepted"
+        );
+        assert!(set.get(&NodeId("me".into())).is_some());
+
+        // A peer's equally far-future report is still rejected.
+        assert!(
+            !set.update_at(make_frontier("peer", far, 0, "user/"), now_ms),
+            "a peer's far-future report must still be rejected"
+        );
+        assert_eq!(set.skew_rejected_total(), 1);
+    }
+
+    /// P0-6: a rejected over-skew report must leave no advancement receipt.
+    #[test]
+    fn rejected_skew_report_leaves_no_receipt() {
+        let mut set = AckFrontierSet::new();
+        let now_ms = 1_000_000_000_000u64;
+        let f = make_frontier("a", now_ms + crate::hlc::MAX_CLOCK_SKEW_MS + 1, 0, "user/");
+        let scope = FrontierScope::from_frontier(&f);
+        assert!(!set.update_at(f, now_ms));
+        assert!(
+            set.advanced_at_for_scope(&scope).is_none(),
+            "a rejected report must not stamp an advancement receipt"
+        );
     }
 
     #[test]

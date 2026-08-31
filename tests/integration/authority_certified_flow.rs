@@ -248,8 +248,11 @@ fn end_to_end_certificate_signing_to_certified_api() {
     let (_sk3, _vk3) = make_key_pair(); // Authority 3 is slow/down
 
     let kr = key_range("user/");
+    // A high frontier that still sits within MAX_CLOCK_SKEW_MS of the wall
+    // clock, so the P0-6 future-skew guard admits these peer reports. (A
+    // fixed far-future physical like 2e12 would now be rejected.)
     let frontier_hlc = HlcTimestamp {
-        physical: 2_000_000_000_000,
+        physical: asteroidb_poc::hlc::wall_clock_ms() + 30_000,
         logical: 0,
         node_id: "auth-1".into(),
     };
@@ -424,8 +427,14 @@ fn certification_across_epoch_boundary() {
     // Epoch 2: Authority frontiers advance into the next epoch
     let next_epoch_ts = write_ts + epoch_ms;
 
-    api.update_frontier(make_frontier("auth-1", next_epoch_ts, 0, ""));
-    api.update_frontier(make_frontier("auth-2", next_epoch_ts + 1000, 0, ""));
+    // The peer frontier REPORTS must stay within MAX_CLOCK_SKEW_MS of this
+    // node's wall clock (P0-6): a peer cannot legitimately report 24h ahead of
+    // us. A high-but-in-skew frontier still sits past the write timestamp, so
+    // the write certifies exactly as before. (The epoch-2 certificate below
+    // keeps `next_epoch_ts` — a signed certificate is not skew-checked.)
+    let report_ts = write_ts + 30_000;
+    api.update_frontier(make_frontier("auth-1", report_ts, 0, ""));
+    api.update_frontier(make_frontier("auth-2", report_ts + 1000, 0, ""));
 
     api.process_certifications();
 
@@ -532,8 +541,11 @@ fn progressive_certification_of_multiple_writes() {
     // key-b and key-c may or may not be certified depending on timestamp ordering
     // (they could share the same physical timestamp due to logical counter)
 
-    // Now advance frontier past all writes
-    let far_future = ts_b + 100_000;
+    // Now advance frontier past all writes. The offset stays within
+    // MAX_CLOCK_SKEW_MS of the wall clock (writes are issued at ~wall) so the
+    // P0-6 future-skew guard admits these peer reports; +100s would now be
+    // rejected as an implausible far-future report.
+    let far_future = ts_b + 30_000;
     api.update_frontier(make_frontier("auth-1", far_future, 0, ""));
     api.update_frontier(make_frontier("auth-2", far_future, 0, ""));
     api.update_frontier(make_frontier("auth-3", far_future, 0, ""));

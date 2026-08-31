@@ -68,6 +68,18 @@ fn ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
     }
 }
 
+/// A frontier HLC high enough to cover every write issued in these tests, but
+/// within `MAX_CLOCK_SKEW_MS` of the wall clock so the P0-6 future-skew guard
+/// (`AckFrontierSet::update_at`) admits it as a PEER report. A `u64::MAX`
+/// sentinel would now be rejected as an implausible far-future report.
+fn far_frontier_hlc() -> HlcTimestamp {
+    ts(
+        asteroidb_poc::hlc::wall_clock_ms() + 30_000,
+        u32::MAX,
+        "zzz",
+    )
+}
+
 fn counter_value(n: i64) -> CrdtValue {
     let mut counter = PnCounter::new();
     for _ in 0..n {
@@ -157,7 +169,7 @@ async fn add_authority_while_writes_in_flight() {
     // Feed frontier acks using the PLACEMENT POLICY version that writes stored.
     // The writes were recorded with total_authorities=3 and policy_version=PolicyVersion(1).
     // Majority of 3-node set = 2 of 3.
-    let far_hlc = ts(u64::MAX - 1, u32::MAX, "zzz");
+    let far_hlc = far_frontier_hlc();
     let placement_pv = PolicyVersion(1);
     for auth in &["auth-1", "auth-2"] {
         api.update_frontier(AckFrontier {
@@ -211,7 +223,7 @@ async fn remove_authority_quorum_still_works() {
 
     // Feed frontier acks using the PLACEMENT POLICY version (PolicyVersion(1)).
     // The write was recorded with total_authorities=3, so majority = 2 of 3.
-    let far_hlc = ts(u64::MAX - 1, u32::MAX, "zzz");
+    let far_hlc = far_frontier_hlc();
     let placement_pv = PolicyVersion(1);
     for auth in &["auth-1", "auth-2"] {
         api.update_frontier(AckFrontier {
@@ -623,7 +635,7 @@ fn residual_frontier_does_not_unblock_compaction_for_an_emptied_authority_set() 
     let mut frontiers = AckFrontierSet::new();
     frontiers.update(AckFrontier {
         authority_id: node_id("auth-1"),
-        frontier_hlc: ts(u64::MAX - 1, u32::MAX, "zzz"),
+        frontier_hlc: far_frontier_hlc(),
         key_range: kr(""),
         policy_version: PolicyVersion(1),
         digest_hash: String::new(),
@@ -779,7 +791,7 @@ async fn partition_during_authority_change_then_converge() {
 
     // Phase 2: Simulate partition — auth-1 and auth-2 can communicate,
     // but auth-3 is isolated. Feed frontier acks only from auth-1 and auth-2.
-    let far_hlc = ts(u64::MAX - 1, u32::MAX, "zzz");
+    let far_hlc = far_frontier_hlc();
     let placement_pv = PolicyVersion(1);
 
     // auth-1 hears from auth-1 and auth-2 (but NOT auth-3)

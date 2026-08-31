@@ -738,11 +738,19 @@ impl MajorityCertificate {
     /// Returns an error if any signature fails verification.
     pub fn verify_signatures(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
         let mut valid_signers = Vec::new();
+        // Deduplicate by authority: a single authority's valid signature
+        // replayed N times must not inflate the verified-signer count that
+        // callers judge majority against. Each signature is still verified
+        // (invalid ones fail the whole certificate), only the collected count
+        // is made unique — mirroring `add_signature`/`unique_signer_count`.
+        let mut seen: HashSet<&NodeId> = HashSet::new();
         for sig in &self.signatures {
             sig.public_key
                 .verify(message, &sig.signature)
                 .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
-            valid_signers.push(sig.authority_id.clone());
+            if seen.insert(&sig.authority_id) {
+                valid_signers.push(sig.authority_id.clone());
+            }
         }
         Ok(valid_signers)
     }
@@ -762,6 +770,9 @@ impl MajorityCertificate {
         epoch_config: &EpochConfig,
     ) -> Result<Vec<NodeId>, CertError> {
         let mut valid_signers = Vec::new();
+        // Deduplicate by authority (see `verify_signatures`): replayed valid
+        // signatures from one authority must count once, not N times.
+        let mut seen: HashSet<&NodeId> = HashSet::new();
         for sig in &self.signatures {
             // Check that the keyset version is known and not expired.
             if !registry.is_version_valid(&sig.keyset_version, current_epoch, epoch_config) {
@@ -785,7 +796,9 @@ impl MajorityCertificate {
             verify_key
                 .verify(message, &sig.signature)
                 .map_err(|_| CertError::InvalidSignature(sig.authority_id.0.clone()))?;
-            valid_signers.push(sig.authority_id.clone());
+            if seen.insert(&sig.authority_id) {
+                valid_signers.push(sig.authority_id.clone());
+            }
         }
         Ok(valid_signers)
     }
@@ -1727,6 +1740,69 @@ mod tests {
 
         assert_eq!(cert.signature_count(), 2);
         assert!(cert.has_majority(3)); // 2 >= 3/2+1 = 2
+    }
+
+    /// P0-7: A single authority's valid signature replayed N times directly
+    /// into `signatures` (bypassing `add_signature`'s dedup, as a crafted
+    /// certificate handed to the independent verify API would) must not be
+    /// counted N times by `verify_signatures`.
+    #[test]
+    fn verify_signatures_dedups_replayed_authority() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+
+        let (sk, vk) = make_key_pair();
+        let sig = sign_message(&sk, &message);
+        for _ in 0..3 {
+            cert.signatures
+                .push(make_auth_sig(NodeId("auth-1".into()), vk, sig));
+        }
+
+        let verified = cert.verify_signatures(&message).unwrap();
+        assert_eq!(
+            verified.len(),
+            1,
+            "one authority's replayed signature must count once"
+        );
+        // 1 unique signer cannot reach a majority of 3 authorities.
+        assert!(!(verified.len() >= majority_threshold(3)));
+    }
+
+    /// P0-7 (registry path): same replay attack against
+    /// `verify_signatures_with_registry`.
+    #[test]
+    fn verify_signatures_with_registry_dedups_replayed_authority() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+
+        let (sk, vk) = make_key_pair();
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), vk)])
+            .unwrap();
+
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+        let sig = sign_message(&sk, &message);
+        for _ in 0..3 {
+            cert.signatures
+                .push(make_auth_sig_v(NodeId("auth-1".into()), vk, sig, 1));
+        }
+
+        let verified = cert
+            .verify_signatures_with_registry(&message, &registry, 0, &EpochConfig::default())
+            .unwrap();
+        assert_eq!(
+            verified.len(),
+            1,
+            "one registered authority's replayed signature must count once"
+        );
+        assert!(!(verified.len() >= majority_threshold(3)));
     }
 
     #[test]
