@@ -37,6 +37,7 @@
 //! crash at ANY point leaves "snapshot + retained segments ⊇ acked state"
 //! true — the worst case is harmless over-replay.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,7 +50,7 @@ use crate::api::eventual::EventualApi;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::store::Store;
 use crate::store::wal::{self, SyncPolicy, WalConfig, WalReadOutcome, WalSyncer, WalWriter};
-use crate::types::NodeId;
+use crate::types::{NodeId, PolicyVersion};
 
 /// Snapshot file name for the eventual store.
 const EVENTUAL_SNAPSHOT: &str = "eventual.snapshot.bin";
@@ -59,6 +60,19 @@ const CERTIFIED_SNAPSHOT: &str = "certified.snapshot.bin";
 const EVENTUAL_WAL_DIR: &str = "wal/eventual";
 /// WAL subdirectory for the certified store.
 const CERTIFIED_WAL_DIR: &str = "wal/certified";
+/// Sidecar file holding the write-time (origin) policy version of each
+/// still-uncertified certified-store key as of the last checkpoint.
+///
+/// The certified snapshot (a bincode `Store`) has no place for a per-key
+/// policy version, and once a checkpoint prunes the WAL the origin-carrying
+/// `WalRecord::CertifiedUpsert` records are gone. This sidecar preserves the
+/// origins so recovery can re-track a checkpointed-but-uncertified write
+/// under the version it was written with and re-derive its FR-009 fence
+/// (fix/fence-persistence-across-restart). It is a belt beside the WAL: it
+/// never changes the `Store` snapshot format, so an old data directory
+/// without it recovers exactly as before (empty origins = current-version
+/// fallback).
+const CERTIFIED_ORIGINS: &str = "certified.origins.bin";
 
 /// Per-store checkpoint serialization locks, shared by every clone of a
 /// [`PersistenceConfig`].
@@ -180,7 +194,12 @@ fn recover_store(
     snapshot_path: &Path,
     wal_cfg: WalConfig,
     recover_truncate: bool,
-) -> io::Result<(Store, WalWriter, WalReadOutcome)> {
+) -> io::Result<(
+    Store,
+    WalWriter,
+    WalReadOutcome,
+    HashMap<String, PolicyVersion>,
+)> {
     let started = std::time::Instant::now();
     // Sweep tmp files left by saves that failed (or crashed) before their
     // in-line cleanup (m-3). Startup-only: no concurrent save can be in
@@ -267,7 +286,20 @@ fn recover_store(
     }
 
     let replayed = read.records.len();
+    // Harvest write-time policy versions from certified-store records. A
+    // later record for the same key wins (writes are appended in order), so
+    // the map ends up with each key's most recent origin. The eventual store
+    // never emits `CertifiedUpsert`, so its map stays empty (and is ignored).
+    let mut origins: HashMap<String, PolicyVersion> = HashMap::new();
     for record in read.records {
+        if let wal::WalRecord::CertifiedUpsert {
+            key,
+            policy_version,
+            ..
+        } = &record
+        {
+            origins.insert(key.clone(), *policy_version);
+        }
         wal::replay_record(&mut store, record);
     }
 
@@ -280,7 +312,7 @@ fn recover_store(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "recovery complete"
     );
-    Ok((store, writer, read.outcome))
+    Ok((store, writer, read.outcome, origins))
 }
 
 /// Recover the eventual store and build its API + WAL syncer.
@@ -323,7 +355,9 @@ pub fn recover_eventual(
         api.install_recovery_fence().map_err(io::Error::other)?;
         return Ok((api, None));
     }
-    let (store, writer, outcome) = recover_store(
+    // The eventual store never emits `CertifiedUpsert`, so its origins map is
+    // always empty; certification-scope origins are a certified-store concept.
+    let (store, writer, outcome, _origins) = recover_store(
         "eventual",
         &cfg.data_dir.join(EVENTUAL_SNAPSHOT),
         cfg.wal_config(EVENTUAL_WAL_DIR),
@@ -370,17 +404,136 @@ pub fn recover_certified(
     }
     // No recovery-gap fence here: session tokens are an eventual-API-only
     // contract (api-reference.md), so the certified store needs no fence.
-    let (store, writer, _outcome) = recover_store(
+    let (store, writer, _outcome, wal_origins) = recover_store(
         "certified",
         &cfg.data_dir.join(CERTIFIED_SNAPSHOT),
         cfg.wal_config(CERTIFIED_WAL_DIR),
         cfg.recover_truncate,
     )?;
     let syncer = Arc::new(writer.syncer());
+
+    // Seed write-time policy versions from the checkpoint sidecar, then let
+    // retained-WAL origins (writes since the last checkpoint) override them:
+    // a post-checkpoint write is newer than the sidecar's snapshot-time view.
+    // These origins let `CertifiedApi::recovered` re-track each write under
+    // the version it was written with and re-derive the FR-009 fence a
+    // version bump installed only in memory (fix/fence-persistence-across-restart).
+    let origins_path = cfg.data_dir.join(CERTIFIED_ORIGINS);
+    // Sweep tmp files left by a sidecar save that crashed before its rename
+    // (symmetric with the snapshot sweep in `recover_store`). Startup-only, so
+    // any matching tmp is stale; best-effort — a failed sweep only leaves
+    // litter, never blocks recovery.
+    if let Err(e) = crate::store::backend::FileBackend::new(&origins_path).remove_stale_tmp_files()
+    {
+        tracing::warn!(
+            sidecar = %origins_path.display(),
+            error = %e,
+            "failed to sweep stale certified origins tmp files; continuing"
+        );
+    }
+    let mut origins = load_origins_sidecar(&origins_path);
+    origins.extend(wal_origins);
+
     Ok((
-        CertifiedApi::recovered(node_id, namespace, store, Some(writer)),
+        CertifiedApi::recovered(node_id, namespace, store, Some(writer), origins),
         Some(syncer),
     ))
+}
+
+/// Load the certified origins sidecar, or an empty map when it is absent
+/// (a fresh or pre-upgrade data directory) or unreadable.
+///
+/// Best-effort by design: the sidecar is a belt beside the WAL, never the
+/// sole copy of acked data (the values live in the snapshot + WAL). A
+/// missing or corrupt sidecar degrades to the current-version fallback in
+/// `rebuild_pending_from_store` rather than failing recovery, so an operator
+/// is never blocked by it. NotFound is the normal case for any data
+/// directory written before this feature.
+fn load_origins_sidecar(path: &Path) -> HashMap<String, PolicyVersion> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(
+                sidecar = %path.display(),
+                error = %e,
+                "failed to read certified origins sidecar; recovered writes fall back \
+                 to the current policy version"
+            );
+            return HashMap::new();
+        }
+    };
+    match bincode::serde::decode_from_slice::<Vec<(String, PolicyVersion)>, _>(
+        &bytes,
+        bincode::config::standard(),
+    ) {
+        Ok((entries, _)) => entries.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(
+                sidecar = %path.display(),
+                error = %e,
+                "certified origins sidecar is corrupt; recovered writes fall back to \
+                 the current policy version"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Atomically write the certified origins sidecar via [`FileBackend::save`]
+/// (tmp + fsync + rename + parent-dir fsync), the exact same crash-safe
+/// discipline as the snapshot — including the tmp naming that
+/// [`FileBackend::remove_stale_tmp_files`] sweeps at startup, so a crash
+/// between the tmp write and the rename leaves no orphan behind (symmetric
+/// with the snapshot's stale-tmp cleanup in `recover_certified`).
+fn save_origins_sidecar(path: &Path, origins: &HashMap<String, PolicyVersion>) -> io::Result<()> {
+    use crate::store::backend::StorageBackend;
+
+    let entries: Vec<(String, PolicyVersion)> =
+        origins.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let bytes = bincode::serde::encode_to_vec(&entries, bincode::config::standard())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    crate::store::backend::FileBackend::new(path).save(&bytes)
+}
+
+/// Collect the write-time policy version of every tracked certified write,
+/// keyed by store key (latest timestamp wins on collision).
+///
+/// EVERY tracked write is captured, `Certified` ones included. The WAL-only
+/// recovery path has no status to filter on — it harvests the origin of every
+/// `CertifiedUpsert` record regardless of whether the write was momentarily
+/// certified before the crash — so the sidecar must do the same or the two
+/// paths diverge: a write certified under v_old, then fenced when the policy
+/// bumps to v_new, would recover as v_old (Timeout) from the WAL but as v_new
+/// (re-certified off the newer frontier) from a pruned-WAL checkpoint. The
+/// certification state is deliberately volatile: on restart every write
+/// regresses to `Pending`, and a write whose origin trails the current
+/// version must stay pinned to that origin and re-fenced so it cannot
+/// re-certify off a newer frontier — exactly the restart-dependent
+/// certification this fix eliminates.
+fn certified_pending_origins(api: &CertifiedApi) -> HashMap<String, PolicyVersion> {
+    let mut origins: HashMap<String, (HlcOrigin, PolicyVersion)> = HashMap::new();
+    for pw in api.pending_writes() {
+        let stamp = HlcOrigin {
+            physical: pw.timestamp.physical,
+            logical: pw.timestamp.logical,
+        };
+        match origins.get(&pw.key) {
+            Some((existing, _)) if *existing >= stamp => {}
+            _ => {
+                origins.insert(pw.key.clone(), (stamp, pw.policy_version));
+            }
+        }
+    }
+    origins.into_iter().map(|(k, (_, v))| (k, v)).collect()
+}
+
+/// Comparable (physical, logical) prefix of an HLC, for picking the latest
+/// pending write per key when building the origins sidecar.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct HlcOrigin {
+    physical: u64,
+    logical: u32,
 }
 
 /// Write a snapshot off the API lock and, on success, drop sealed WAL
@@ -450,11 +603,26 @@ pub async fn checkpoint_certified(
 ) -> io::Result<()> {
     // Serialized for the same reason as `checkpoint_eventual`.
     let _serial = cfg.checkpoint_locks.certified.lock().await;
-    let (sealed, store) = {
+    let (sealed, store, origins) = {
         let mut api = api.lock().await;
         let sealed = api.wal_rotate()?;
-        (sealed, api.store().clone())
+        // Capture the origins under the SAME lock as the store clone so the
+        // sidecar and the snapshot describe the same set of writes.
+        let origins = certified_pending_origins(&api);
+        (sealed, api.store().clone(), origins)
     };
+
+    // Commit the origins sidecar BEFORE the snapshot: recovery only trusts
+    // the sidecar for writes the snapshot covers, and once the snapshot is
+    // durable the WAL segments carrying those writes' origin records may be
+    // pruned. Writing the sidecar first guarantees that whenever the snapshot
+    // exists, a consistent origins set is already on disk (retained WAL
+    // records still override it for post-checkpoint writes). A crash between
+    // the two leaves the previous snapshot in place with its WAL intact, so
+    // the fresh-but-unused sidecar is harmless. It is rewritten every
+    // checkpoint (empty included) so a stale origin can never linger.
+    save_origins_sidecar(&cfg.data_dir.join(CERTIFIED_ORIGINS), &origins)?;
+
     finish_checkpoint(
         "certified",
         store,
