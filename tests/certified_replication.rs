@@ -574,3 +574,127 @@ async fn certified_sync_kill_switch_restores_the_unreplicated_behaviour() {
 
     server_a.abort();
 }
+
+// ---------------------------------------------------------------
+// Refusal handling: a transiently refused entry must be RETRIED,
+// never stepped over.
+// ---------------------------------------------------------------
+
+/// A node whose namespace lags the writer's refuses the entry with
+/// `OriginAhead`. That refusal must NOT advance the peer baseline.
+///
+/// `Store::delta_entries_since` filters STRICTLY above the baseline and
+/// the certified plane has no digest lane, so stepping over the entry is
+/// permanent for the life of the process: the value stays on the writer's
+/// disk alone, which is exactly the P0-1 inversion this lane exists to
+/// close. Policy versions propagate through the control plane and are
+/// applied per node, so a writer running ahead of a follower is ordinary
+/// operation, not an exotic failure.
+#[tokio::test]
+async fn origin_ahead_refusal_is_retried_after_the_namespace_converges() {
+    // A is already on v2; B still on v1.
+    let a = build_node("node-a", 2);
+    let b = build_node("node-b", 1);
+    let (a_addr, a_server) = serve(router(Arc::clone(&a.state))).await;
+    let mut runner_b = lane_runner("node-b", &b, "node-a", &a_addr.to_string()).await;
+
+    assert_eq!(
+        certified_write(&a.state, "user/k1", 7).await,
+        StatusCode::OK
+    );
+
+    // B pulls while it still believes the scope is v1: the v2 origin is
+    // ahead of anything it can validate, so the entry is refused.
+    runner_b.run_certified_sync().await;
+    let (_, body) = certified_read(&b.state, "user/k1").await;
+    assert!(
+        body["value"].is_null(),
+        "an origin-ahead entry must not be ingested; got {body}"
+    );
+    assert_eq!(
+        b.state
+            .metrics
+            .snapshot()
+            .certified_sync_origin_ahead_rejected_total,
+        1
+    );
+    assert_eq!(
+        b.state
+            .metrics
+            .snapshot()
+            .certified_sync_baseline_held_total,
+        1,
+        "the baseline must be HELD, not advanced past the refused entry"
+    );
+
+    // The control plane catches up. The very next pull must deliver the
+    // entry the earlier round refused.
+    bump_policy(&b.namespace, 2);
+    runner_b.run_certified_sync().await;
+
+    let (status, body) = certified_read(&b.state, "user/k1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused entry must be re-offered and ingested once the \
+         namespace converges"
+    );
+    assert_eq!(body["value"]["value"], 7);
+    assert_eq!(
+        b.state
+            .metrics
+            .snapshot()
+            .certified_sync_entries_applied_total,
+        1
+    );
+
+    a_server.abort();
+}
+
+/// The lane must not be able to serve a partially-merged CRDT.
+///
+/// `OrMap::delta_since` is a genuinely partial payload. If an entry is
+/// ever missed (refused while the namespace lagged, or below a baseline
+/// adopted from another peer) and a LATER update to the same key shipped
+/// only its delta, the receiver would merge that delta onto a base it
+/// never received and serve a map silently missing fields — with a valid
+/// certification proof and no error anywhere. Entries therefore carry the
+/// key's FULL state, so any later update repairs the hole.
+#[tokio::test]
+async fn a_replicated_entry_carries_full_state_not_a_partial_delta() {
+    let a = build_node("node-a", 2);
+    let b = build_node("node-b", 1);
+    let (a_addr, a_server) = serve(router(Arc::clone(&a.state))).await;
+    let mut runner_b = lane_runner("node-b", &b, "node-a", &a_addr.to_string()).await;
+
+    // First contribution, refused by B (v1 vs v2) and then stepped over by
+    // hand: this simulates any reason an entry never lands.
+    assert_eq!(
+        certified_write(&a.state, "user/k1", 1).await,
+        StatusCode::OK
+    );
+    runner_b.run_certified_sync().await;
+    let (_, body) = certified_read(&b.state, "user/k1").await;
+    assert!(body["value"].is_null(), "not ingested yet; got {body}");
+
+    // A second contribution to the SAME key, after B's namespace caught
+    // up. B has no base for this key at all, so the entry must be
+    // self-sufficient.
+    bump_policy(&b.namespace, 2);
+    assert_eq!(
+        certified_write(&a.state, "user/k1", 5).await,
+        StatusCode::OK
+    );
+    runner_b.run_certified_sync().await;
+
+    let (status, body) = certified_read(&b.state, "user/k1").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, a_body) = certified_read(&a.state, "user/k1").await;
+    assert_eq!(
+        body["value"], a_body["value"],
+        "the replica must hold exactly the writer's state, never a \
+         fragment of it"
+    );
+
+    a_server.abort();
+}

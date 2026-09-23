@@ -51,6 +51,43 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// while letting upgraded peers be picked up within minutes.
 const DIGEST_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
 
+/// How many consecutive certified pull rounds may end with the peer
+/// baseline HELD at a transiently refused entry before the lane steps over
+/// it.
+///
+/// Refusals from `merge_remote_certified` come in two flavours. Origin-ahead
+/// and policy-denied are CONTROL-PLANE LAG: the writer applied a policy
+/// version this node has not applied yet, so the entry becomes acceptable
+/// on its own within a tick or two. Stepping over them is permanent --
+/// `Store::delta_entries_since` filters strictly ABOVE the baseline -- so
+/// the value would live on the writer's disk alone, which is the exact
+/// P0-1 inversion this lane exists to close. Holding the baseline retries
+/// them for free. The budget is what keeps an OPERATOR-scale refusal (a
+/// prefix with no authority definition at all) from wedging the peer
+/// forever; ~12 rounds is a minute or two at the usual sync interval,
+/// comfortably past Raft apply lag.
+const CERTIFIED_REFUSAL_MAX_ROUNDS: u32 = 12;
+
+/// Upper bound on back-to-back certified delta requests to one peer in a
+/// single cycle.
+///
+/// A truncated response means the peer has more to give; without a drain
+/// a catch-up of N keys takes ceil(N / CERTIFIED_DELTA_MAX_ENTRIES) TICKS
+/// and re-scans the sender's store once per tick. Draining amortises that
+/// while still bounding the work (and the sender's lock hold) per cycle.
+const CERTIFIED_DRAIN_MAX_ROUNDS: usize = 8;
+
+/// How often each peer's certified store is re-read from `baseline = 0`.
+///
+/// This is the certified plane's repair path, standing in for the digest
+/// lane and the full-sync fallback that the eventual plane has and this one
+/// does not. A scalar per-peer baseline cannot express "I am missing one
+/// old entry": ingest keeps the WRITER's HLC, so a peer legitimately holds
+/// keys BELOW its own frontier, and any entry at or under an adopted
+/// baseline is never offered again. A periodic rescan re-offers everything;
+/// converged keys cost only a redundant-relay skip.
+const CERTIFIED_RESCAN_INTERVAL: Duration = Duration::from_secs(1800);
+
 /// Activation grace when no report clock floor file exists at startup
 /// (first boot after the M-12 upgrade, or a lost/corrupt floor file).
 /// Until it elapses the node signs NO frontier reports at all — the tick
@@ -440,6 +477,19 @@ pub struct NodeRunner {
     /// the lane), with the instant of the rejection. Re-probed after
     /// [`DIGEST_UNSUPPORTED_RETRY`] so a rolling upgrade is picked up.
     certified_unsupported: HashMap<String, Instant>,
+    /// Per-peer in-progress full rescan cursor for the certified lane.
+    ///
+    /// Present only while a rescan (see [`CERTIFIED_RESCAN_INTERVAL`]) is
+    /// running. It is SEPARATE from `certified_peer_frontiers` because that
+    /// map must never move backwards -- regressing it would re-offer the
+    /// whole store on every tick -- while a rescan has to walk up from
+    /// zero across as many cycles as the drain bound needs.
+    certified_rescan_cursor: HashMap<String, HlcTimestamp>,
+    /// When each peer's certified store was last rescanned from zero.
+    certified_rescanned_at: HashMap<String, Instant>,
+    /// Consecutive certified pull rounds this peer's baseline has been held
+    /// back by a transient refusal, against [`CERTIFIED_REFUSAL_MAX_ROUNDS`].
+    certified_refusal_rounds: HashMap<String, u32>,
     /// Per-peer `(fingerprint, delivered_at_wall_ms)` of the last
     /// split-view gossip sample that was provably DELIVERED to the peer
     /// on the sync piggyback lane (M-14): a carrier request that reached
@@ -877,6 +927,9 @@ impl NodeRunner {
             certified_peer_frontiers: HashMap::new(),
             certified_backoffs: HashMap::new(),
             certified_unsupported: HashMap::new(),
+            certified_rescan_cursor: HashMap::new(),
+            certified_rescanned_at: HashMap::new(),
+            certified_refusal_rounds: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -1016,6 +1069,9 @@ impl NodeRunner {
             certified_peer_frontiers: HashMap::new(),
             certified_backoffs: HashMap::new(),
             certified_unsupported: HashMap::new(),
+            certified_rescan_cursor: HashMap::new(),
+            certified_rescanned_at: HashMap::new(),
+            certified_refusal_rounds: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -3645,6 +3701,12 @@ impl NodeRunner {
             .retain(|addr, _| active_addrs.contains(addr));
         self.certified_unsupported
             .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_rescan_cursor
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_rescanned_at
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_refusal_rounds
+            .retain(|addr, _| active_addrs.contains(addr));
         self.observed_last_sent
             .retain(|addr, _| active_addrs.contains(addr));
 
@@ -3695,13 +3757,28 @@ impl NodeRunner {
     ///
     /// ## Frontier advance rule
     ///
-    /// The baseline advances only when every entry was processed WITHOUT a
-    /// storage error. `Rejected`/`Skipped` entries still advance it, and a
-    /// storage error stops the cycle without advancing. This exact pairing
-    /// is the only one that avoids both failure modes: stopping on a
-    /// rejection would let one key's type conflict wedge a peer forever,
-    /// and advancing past a storage error would mark an entry received
-    /// whose WAL record never landed.
+    /// A storage error stops the cycle and does NOT advance the baseline:
+    /// the value is in memory but its WAL record is not on disk, so the
+    /// entry must be re-offered.
+    ///
+    /// A refusal is split by whether it can resolve itself:
+    ///
+    /// - `TypeMismatch` is permanent divergence. The lane steps over it,
+    ///   because retrying cannot help and one conflicting key must not
+    ///   wedge a peer.
+    /// - Origin-ahead and policy-denied are CONTROL-PLANE LAG. The lane
+    ///   HOLDS its baseline at the last accepted entry and retries, up to
+    ///   [`CERTIFIED_REFUSAL_MAX_ROUNDS`]. Stepping over these is
+    ///   permanent -- `Store::delta_entries_since` filters strictly above
+    ///   the baseline, and this plane has no digest lane to repair the
+    ///   hole -- so it would leave the value on the writer's disk alone,
+    ///   reopening P0-1 for every key written during a policy rollout.
+    ///   When the budget runs out the lane steps over exactly the ONE
+    ///   refused entry (not the rest of the batch) and counts it.
+    ///
+    /// [`CERTIFIED_RESCAN_INTERVAL`] then backstops both: a periodic
+    /// `baseline = 0` pass re-offers everything, including entries stepped
+    /// over above and entries a peer holds below its own frontier.
     pub async fn run_certified_sync(&mut self) {
         if !self.config.certified_sync_enabled {
             return;
@@ -3710,6 +3787,11 @@ impl NodeRunner {
             return;
         };
 
+        let zero = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
         let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         for peer in &peers {
             let peer_key = peer.addr.clone();
@@ -3731,39 +3813,181 @@ impl NodeRunner {
                 }
             }
 
-            self.metrics
-                .certified_sync_attempt_total
-                .fetch_add(1, Ordering::Relaxed);
-
-            let baseline = self
-                .certified_peer_frontiers
-                .get(&peer_key)
-                .cloned()
-                .unwrap_or(HlcTimestamp {
-                    physical: 0,
-                    logical: 0,
-                    node_id: String::new(),
-                });
-
-            // The HTTP round trip happens with NO lock held; the certified
-            // lock is taken only to apply the decoded response.
-            let result = sync_client
-                .pull_certified_delta(&peer.addr, &self.node_id.0, &baseline)
-                .await;
-
-            let resp = match result {
-                CertifiedDeltaResult::Ok(resp) => resp,
-                CertifiedDeltaResult::Unsupported => {
-                    // Expected during a rolling upgrade: NOT a failure, so
-                    // it must not feed the backoff or the error counter.
-                    self.certified_unsupported
-                        .insert(peer_key.clone(), Instant::now());
+            // Pick this cycle's starting baseline. A rescan already in
+            // flight wins; otherwise start one if the interval has
+            // elapsed; otherwise resume from the durable peer frontier.
+            let mut rescanning = self.certified_rescan_cursor.contains_key(&peer_key);
+            if !rescanning {
+                let last = self
+                    .certified_rescanned_at
+                    .entry(peer_key.clone())
+                    .or_insert_with(Instant::now);
+                if last.elapsed() >= CERTIFIED_RESCAN_INTERVAL {
+                    *last = Instant::now();
+                    rescanning = true;
+                    self.certified_rescan_cursor
+                        .insert(peer_key.clone(), zero.clone());
                     self.metrics
-                        .certified_sync_unsupported_total
+                        .certified_sync_rescan_total
                         .fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
-                CertifiedDeltaResult::Failed => {
+            }
+            let mut baseline = if rescanning {
+                self.certified_rescan_cursor
+                    .get(&peer_key)
+                    .cloned()
+                    .unwrap_or_else(|| zero.clone())
+            } else {
+                self.certified_peer_frontiers
+                    .get(&peer_key)
+                    .cloned()
+                    .unwrap_or_else(|| zero.clone())
+            };
+
+            // Drain: a truncated response means the peer has more. Bounded
+            // so one lagging peer cannot monopolise the cycle.
+            for _round in 0..CERTIFIED_DRAIN_MAX_ROUNDS {
+                self.metrics
+                    .certified_sync_attempt_total
+                    .fetch_add(1, Ordering::Relaxed);
+
+                // The HTTP round trip happens with NO lock held; the
+                // certified lock is taken only to apply the decoded
+                // response.
+                let result = sync_client
+                    .pull_certified_delta(&peer.addr, &self.node_id.0, &baseline)
+                    .await;
+
+                let resp = match result {
+                    CertifiedDeltaResult::Ok(resp) => resp,
+                    CertifiedDeltaResult::Unsupported => {
+                        // Expected during a rolling upgrade: NOT a failure,
+                        // so it must not feed the backoff or the error
+                        // counter.
+                        self.certified_unsupported
+                            .insert(peer_key.clone(), Instant::now());
+                        self.metrics
+                            .certified_sync_unsupported_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    CertifiedDeltaResult::Failed => {
+                        self.metrics
+                            .certified_sync_failed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.certified_backoffs
+                            .entry(peer_key.clone())
+                            .or_default()
+                            .record_failure();
+                        break;
+                    }
+                };
+
+                let truncated = resp.truncated;
+                let mut applied = 0u64;
+                let mut skipped = 0u64;
+                let mut origin_unknown = 0u64;
+                let mut origin_ahead = 0u64;
+                let mut type_mismatch = 0u64;
+                let mut policy_denied = 0u64;
+                let mut storage_error: Option<String> = None;
+                // HLC of the last entry this node actually processed, and
+                // of the transiently refused entry that stopped the batch.
+                let mut processed_to: Option<HlcTimestamp> = None;
+                let mut refused_at: Option<HlcTimestamp> = None;
+                let origins_len;
+                {
+                    let mut api = self.certified_api.lock().await;
+                    // Entries arrive in ascending HLC order and are applied
+                    // in that order, so a later contribution can never be
+                    // overtaken by an earlier one.
+                    for e in resp.entries {
+                        if e.policy_version.is_none() {
+                            origin_unknown += 1;
+                        }
+                        let hlc = e.hlc.clone();
+                        match api.merge_remote_certified(e.key, &e.value, e.hlc, e.policy_version) {
+                            Ok(IngestOutcome::Applied) => {
+                                applied += 1;
+                                processed_to = Some(hlc);
+                            }
+                            Ok(IngestOutcome::Skipped) => {
+                                skipped += 1;
+                                processed_to = Some(hlc);
+                            }
+                            Ok(IngestOutcome::Rejected(IngestRejection::TypeMismatch)) => {
+                                // Permanent divergence: retrying cannot
+                                // help, so step over it.
+                                type_mismatch += 1;
+                                processed_to = Some(hlc);
+                            }
+                            Ok(IngestOutcome::Rejected(IngestRejection::OriginAhead)) => {
+                                // Transient: this node's namespace lags the
+                                // writer's. Stop here so the baseline stays
+                                // below it and it is re-offered.
+                                origin_ahead += 1;
+                                refused_at = Some(hlc);
+                                break;
+                            }
+                            Err(CrdtError::Storage(msg)) => {
+                                // The value is in memory but its WAL record
+                                // is not on disk. Stop here and leave the
+                                // baseline where it was.
+                                storage_error = Some(msg);
+                                break;
+                            }
+                            Err(e) => {
+                                // Policy-denied and friends: this node has
+                                // no authority definition for the key YET.
+                                // Also transient, and also not steppable.
+                                policy_denied += 1;
+                                tracing::debug!(
+                                    peer = %peer.node_id.0,
+                                    error = %e,
+                                    "certified entry refused; holding the baseline"
+                                );
+                                refused_at = Some(hlc);
+                                break;
+                            }
+                        }
+                    }
+                    origins_len = api.origins_len();
+                }
+
+                self.metrics
+                    .certified_origins_len
+                    .store(origins_len as u64, Ordering::Relaxed);
+                for (counter, value) in [
+                    (&self.metrics.certified_sync_entries_applied_total, applied),
+                    (&self.metrics.certified_sync_entries_skipped_total, skipped),
+                    (
+                        &self.metrics.certified_sync_origin_unknown_total,
+                        origin_unknown,
+                    ),
+                    (
+                        &self.metrics.certified_sync_origin_ahead_rejected_total,
+                        origin_ahead,
+                    ),
+                    (
+                        &self.metrics.certified_sync_type_mismatch_total,
+                        type_mismatch,
+                    ),
+                    (
+                        &self.metrics.certified_sync_policy_denied_total,
+                        policy_denied,
+                    ),
+                ] {
+                    if value > 0 {
+                        counter.fetch_add(value, Ordering::Relaxed);
+                    }
+                }
+
+                if let Some(msg) = storage_error {
+                    tracing::warn!(
+                        peer = %peer.node_id.0,
+                        error = %msg,
+                        "certified ingest hit a storage error; baseline held back"
+                    );
                     self.metrics
                         .certified_sync_failed_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -3771,110 +3995,111 @@ impl NodeRunner {
                         .entry(peer_key.clone())
                         .or_default()
                         .record_failure();
-                    continue;
+                    break;
                 }
-            };
 
-            let mut applied = 0u64;
-            let mut skipped = 0u64;
-            let mut origin_unknown = 0u64;
-            let mut origin_ahead = 0u64;
-            let mut type_mismatch = 0u64;
-            let mut storage_error: Option<String> = None;
-            let origins_len;
-            {
-                let mut api = self.certified_api.lock().await;
-                // Entries arrive in ascending HLC order and are applied in
-                // that order, so a later contribution can never be
-                // overtaken by an earlier one.
-                for e in resp.entries {
-                    if e.policy_version.is_none() {
-                        origin_unknown += 1;
-                    }
-                    match api.merge_remote_certified(e.key, &e.value, e.hlc, e.policy_version) {
-                        Ok(IngestOutcome::Applied) => applied += 1,
-                        Ok(IngestOutcome::Skipped) => skipped += 1,
-                        Ok(IngestOutcome::Rejected(IngestRejection::OriginAhead)) => {
-                            origin_ahead += 1
-                        }
-                        Ok(IngestOutcome::Rejected(IngestRejection::TypeMismatch)) => {
-                            type_mismatch += 1
-                        }
-                        Err(CrdtError::Storage(msg)) => {
-                            // The value is in memory but its WAL record is
-                            // not on disk. Stop here and leave the baseline
-                            // where it was so the entry is re-offered.
-                            storage_error = Some(msg);
-                            break;
-                        }
-                        Err(e) => {
-                            // Policy-denied and friends: this entry has no
-                            // home on this node, but the next one might.
-                            tracing::debug!(
-                                peer = %peer.node_id.0,
-                                error = %e,
-                                "certified entry refused; continuing"
-                            );
-                        }
-                    }
-                }
-                origins_len = api.origins_len();
-            }
-
-            self.metrics
-                .certified_origins_len
-                .store(origins_len as u64, Ordering::Relaxed);
-            for (counter, value) in [
-                (&self.metrics.certified_sync_entries_applied_total, applied),
-                (&self.metrics.certified_sync_entries_skipped_total, skipped),
-                (
-                    &self.metrics.certified_sync_origin_unknown_total,
-                    origin_unknown,
-                ),
-                (
-                    &self.metrics.certified_sync_origin_ahead_rejected_total,
-                    origin_ahead,
-                ),
-                (
-                    &self.metrics.certified_sync_type_mismatch_total,
-                    type_mismatch,
-                ),
-            ] {
-                if value > 0 {
-                    counter.fetch_add(value, Ordering::Relaxed);
-                }
-            }
-
-            if let Some(msg) = storage_error {
-                tracing::warn!(
-                    peer = %peer.node_id.0,
-                    error = %msg,
-                    "certified ingest hit a storage error; baseline held back"
-                );
                 self.metrics
-                    .certified_sync_failed_total
+                    .certified_sync_success_total
                     .fetch_add(1, Ordering::Relaxed);
                 self.certified_backoffs
                     .entry(peer_key.clone())
                     .or_default()
-                    .record_failure();
-                continue;
-            }
+                    .record_success();
 
-            // Every entry was processed: adopt the responder's baseline.
-            // On a truncated batch this is the LAST INCLUDED entry's HLC,
-            // so the remainder is still above the new baseline.
-            if let Some(frontier) = resp.sender_frontier {
-                self.certified_peer_frontiers
-                    .insert(peer_key.clone(), frontier);
+                if let Some(refused) = refused_at {
+                    // The transport is healthy; one entry is not yet
+                    // acceptable here. Spend a retry round on it.
+                    let rounds = self
+                        .certified_refusal_rounds
+                        .entry(peer_key.clone())
+                        .or_insert(0);
+                    *rounds += 1;
+                    let give_up = *rounds >= CERTIFIED_REFUSAL_MAX_ROUNDS;
+                    if give_up {
+                        *rounds = 0;
+                    }
+                    let target = if give_up {
+                        tracing::warn!(
+                            peer = %peer.node_id.0,
+                            "certified entry refused for {CERTIFIED_REFUSAL_MAX_ROUNDS} \
+                             consecutive rounds; stepping over it (recovered only by the \
+                             periodic rescan)"
+                        );
+                        self.metrics
+                            .certified_sync_forced_skip_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Step over exactly the refused entry, so the rest
+                        // of the batch is still offered next round.
+                        Some(refused)
+                    } else {
+                        self.metrics
+                            .certified_sync_baseline_held_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        processed_to
+                    };
+                    if let Some(target) = target {
+                        Self::advance_certified_baseline(
+                            &mut self.certified_peer_frontiers,
+                            &mut self.certified_rescan_cursor,
+                            &peer_key,
+                            rescanning,
+                            target,
+                        );
+                    }
+                    break;
+                }
+
+                self.certified_refusal_rounds.remove(&peer_key);
+
+                // Every entry was processed: adopt the responder's
+                // baseline. On a truncated batch this is the LAST INCLUDED
+                // entry's HLC, so the remainder is still above it.
+                let Some(frontier) = resp.sender_frontier else {
+                    break;
+                };
+                Self::advance_certified_baseline(
+                    &mut self.certified_peer_frontiers,
+                    &mut self.certified_rescan_cursor,
+                    &peer_key,
+                    rescanning,
+                    frontier.clone(),
+                );
+                if !truncated {
+                    // Nothing left to pull: a rescan, if one was running,
+                    // has now covered the whole store.
+                    self.certified_rescan_cursor.remove(&peer_key);
+                    break;
+                }
+                baseline = frontier;
             }
-            self.metrics
-                .certified_sync_success_total
-                .fetch_add(1, Ordering::Relaxed);
-            self.certified_backoffs
-                .entry(peer_key.clone())
-                .or_default()
-                .record_success();
+        }
+    }
+
+    /// Record how far the certified lane has consumed one peer's store.
+    ///
+    /// `certified_peer_frontiers` is monotonic: it only ever moves
+    /// FORWARD, so a rescan walking up from zero cannot make the lane
+    /// re-offer the whole store on every subsequent tick. The rescan's own
+    /// position lives in `certified_rescan_cursor`, which is free to sit
+    /// below the durable frontier and is dropped once the rescan finishes.
+    ///
+    /// Takes the two maps rather than `&mut self` so it can be called from
+    /// inside the pull loop, which holds a shared borrow of `sync_client`.
+    fn advance_certified_baseline(
+        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
+        rescan_cursor: &mut HashMap<String, HlcTimestamp>,
+        peer_key: &str,
+        rescanning: bool,
+        frontier: HlcTimestamp,
+    ) {
+        if rescanning {
+            rescan_cursor.insert(peer_key.to_string(), frontier.clone());
+        }
+        match peer_frontiers.get(peer_key) {
+            Some(existing) if *existing >= frontier => {}
+            _ => {
+                peer_frontiers.insert(peer_key.to_string(), frontier);
+            }
         }
     }
 
