@@ -355,15 +355,19 @@ curl -s http://localhost:3000/api/slo | jq .
 |-----------|------|------|
 | `pending_count` | u64 | 現在の保留中 Certified Write 数 |
 | `certified_total` | u64 | Certified Write 累計 |
-| `certified_sync_attempt_total` | u64 | certified 複製レーンの pull 試行（peer × サイクル） |
+| `certified_sync_attempt_total` | u64 | certified 複製レーンの pull リクエスト数（1 ドレインラウンドにつき 1。1 サイクル 1 peer あたり最大 8） |
 | `certified_sync_success_total` | u64 | 適用まで完了した pull |
 | `certified_sync_failed_total` | u64 | ネットワーク/デコード失敗、または適用中のストレージエラー |
 | `certified_sync_unsupported_total` | u64 | レーン以前のノードからの 404/405。ローリングアップグレード**中**は正常。完了後も増え続けるなら未アップグレードノードがあり、そのノードの certified write は複製されていない |
 | `certified_sync_entries_applied_total` | u64 | ローカル certified ストアへ取り込んだエントリ数 |
 | `certified_sync_entries_skipped_total` | u64 | RR ゲートで落ちた冗長エントリ。収束済みレーンの定常値であり、増加は仕事ではない |
 | `certified_sync_origin_unknown_total` | u64 | origin バージョンを持たずに届いたエントリ（origin 永続化以前のキー）。受信側の現行バージョンにフォールバックする。全キーが書き直されれば頭打ちになる |
-| `certified_sync_origin_ahead_rejected_total` | u64 | origin が自ノードの現行バージョンより先だったため拒否。自ノードの namespace が書き手より遅れている。**継続的な増加は「そのエントリがこのノードに複製されていない」ことを意味する** |
-| `certified_sync_type_mismatch_total` | u64 | ローカル値との CRDT 型衝突で拒否。非ゼロは実際の乖離なので要調査（レーンは停止せず次へ進む） |
+| `certified_sync_origin_ahead_rejected_total` | u64 | origin が自ノードの現行バージョンより先だったため拒否。自ノードの namespace が書き手より遅れている。**一過性であり、レーンは baseline を進めずに再試行する**（下の `baseline_held` を参照）。継続的な増加は namespace の追随が止まっていることを意味する |
+| `certified_sync_type_mismatch_total` | u64 | ローカル値との CRDT 型衝突で拒否。非ゼロは実際の乖離なので要調査（恒久的な乖離なので、レーンは停止せず次へ進む） |
+| `certified_sync_policy_denied_total` | u64 | 受信側に当該キーの authority 定義がまだ無く拒否。ポリシー変更の伝播中は正常で一過性。**一過性なのでレーンは baseline を進めずに再試行する** |
+| `certified_sync_baseline_held_total` | u64 | 一過性の拒否（origin ahead / policy denied）により peer baseline を**進めずに保留**したラウンド数。定常的に 0 でなければ、その peer との間で namespace が揃っていない |
+| `certified_sync_forced_skip_total` | u64 | 保留を 12 ラウンド続けても解消せず、やむなく**そのエントリを飛ばした**回数。非ゼロは要調査（prefix に authority 定義が無い等の運用レベルの原因）。飛ばしたエントリは下記の定期リスキャンでのみ回収される |
+| `certified_sync_rescan_total` | u64 | peer の certified ストアを `baseline=0` から読み直した回数（30 分ごと）。certified プレーン唯一の修復パス |
 | `certified_origins_len` | u64 | ゲージ: 保持している per-key origin ピン数。certified キー数に比例して増える。RSS と併せて監視する |
 | `certification_latency_mean_us` | f64 | 証明レイテンシ平均 (us) |
 | `frontier_skew_ms` | u64 | Authority frontier 最大スキュー (ms) |
@@ -801,11 +805,36 @@ certified プレーンは専用の pull 型 anti-entropy レーン
 - 各ノードの certified ストアは**クラスタ全体の certified キー集合**になる。
   certified 側のディスク使用量とメモリが相応に増える（`certified_origins_len`
   ゲージで per-key ピン数を監視する）。
-- 全ノードが新版になった直後、各ノードは baseline=0 から**一度だけ全量転送**を
-  行う。1 レスポンス 512 件の上限と `sync_interval` のティックに分散されるが、
-  この期間はレーンのトラフィックが跳ねる。
+- 全ノードが新版になった直後、各ノードは baseline=0 から全量転送を行う。
+  1 レスポンス 512 件の上限があり、1 サイクル 1 peer あたり最大 8 ラウンドまで
+  連続して引く（ドレイン）ので、N キーの追いつきは `ceil(N/4096)` ティックで
+  完了する。この期間はレーンのトラフィックが跳ねる。
+- **エントリはキーの全状態を運ぶ**（CRDT の部分デルタではない）。certified
+  プレーンには digest 相当の段階的 diff が無く、取りこぼしたエントリを後から
+  要求する手段が無いため、部分ペイロードを土台無しにマージすると
+  「フィールドが静かに欠けた certified マップ」が有効な証明付きで配られてしまう。
+  全状態を運ぶことで、以降のどの更新でも穴が修復される。転送量はその分増える。
 - certified プレーンには digest 相当の段階的 diff が無い。ディスクを失って
   復帰したノードの修復は **certified 全件転送**になる。
+
+### 拒否されたエントリの扱いと定期リスキャン
+
+`Store::delta_entries_since` は baseline より**厳密に大きい**エントリしか返さない。
+したがって「あるエントリを飛ばして baseline を進める」ことは、そのノードにとって
+**恒久的な取りこぼし**を意味する（そのキーが再度書かれない限り二度と提供されない）。
+レーンはこれを踏まえて拒否理由を 2 つに分ける:
+
+- **一過性**（`origin ahead` / `policy denied` = 制御プレーンの適用遅れ）:
+  baseline を直前の成功エントリで**保留**し、次サイクルで再試行する。
+  12 ラウンド連続で解消しない場合のみ、**そのエントリ 1 件だけ**を飛ばして
+  `certified_sync_forced_skip_total` を上げる（1 キーが peer 全体を止めないため）。
+- **恒久**（CRDT 型衝突）: 再試行しても解決しないので次へ進む。
+
+さらに **30 分ごとに peer ごとの `baseline=0` フルリスキャン**が走る。これが
+certified プレーンの唯一の修復パスであり、(a) 上で飛ばしたエントリ、(b) スカラ
+baseline では表現できない取りこぼし（ingest は書き手の HLC を保持するため、peer は
+自分の frontier より**下**のキーを正当に持ちうる）の両方を回収する。収束済みのキーは
+RR ゲートで落ちるだけなので、コストは転送量と受信側の軽い照合に限られる。
 
 ### ローリングアップグレード
 
