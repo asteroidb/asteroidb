@@ -319,6 +319,74 @@ pub struct RuntimeMetrics {
     /// relative to the legacy full dump.
     pub digest_sync_keys_skipped_total: AtomicU64,
 
+    // --- Certified replication lane (P0-1) ---
+    /// Cumulative certified delta pull requests (one per drain round, so
+    /// up to `CERTIFIED_DRAIN_MAX_ROUNDS` per peer per cycle).
+    pub certified_sync_attempt_total: AtomicU64,
+    /// Cumulative certified pulls that completed and were applied.
+    pub certified_sync_success_total: AtomicU64,
+    /// Cumulative certified pulls that failed at the network/decode level,
+    /// or whose apply hit a storage error. Excludes `unsupported`.
+    pub certified_sync_failed_total: AtomicU64,
+    /// Cumulative certified pulls answered 404/405 by a peer that predates
+    /// the lane. Expected and harmless DURING a rolling upgrade; a value
+    /// that keeps climbing after one means a node was never upgraded and
+    /// its certified writes are not being replicated from it.
+    pub certified_sync_unsupported_total: AtomicU64,
+    /// Cumulative replicated certified entries merged into the local
+    /// certified store.
+    pub certified_sync_entries_applied_total: AtomicU64,
+    /// Cumulative replicated entries dropped by the redundant-relay gate
+    /// (local state already dominated them). The steady-state value of a
+    /// converged lane; growth here is not work.
+    pub certified_sync_entries_skipped_total: AtomicU64,
+    /// Cumulative replicated entries that arrived WITHOUT an origin policy
+    /// version (written before origins were persisted). These fall back to
+    /// the receiver's current version — the same fail-open fallback
+    /// recovery has always used, just decided earlier. Should drain to a
+    /// flat line once every pre-upgrade key has been rewritten.
+    pub certified_sync_origin_unknown_total: AtomicU64,
+    /// Cumulative replicated entries refused because their origin was
+    /// AHEAD of this node's current policy version. Non-zero means this
+    /// node's namespace lags the writer's; sustained growth means it is
+    /// stuck and the entries are not being replicated here.
+    pub certified_sync_origin_ahead_rejected_total: AtomicU64,
+    /// Cumulative replicated entries refused for a CRDT type conflict with
+    /// the locally stored value. Any non-zero value is a real divergence
+    /// worth investigating; the lane steps over them rather than wedging.
+    pub certified_sync_type_mismatch_total: AtomicU64,
+    /// Cumulative replicated entries refused because this node has no
+    /// authority definition for the key (`resolve_scope` denied it).
+    /// Normal and transient while a policy change propagates through the
+    /// control plane; sustained growth means this node's namespace is
+    /// stuck behind the writer's.
+    pub certified_sync_policy_denied_total: AtomicU64,
+    /// Cumulative pull rounds that ended with the peer baseline HELD at
+    /// the last accepted entry because a TRANSIENT refusal (origin ahead /
+    /// policy denied) blocked the batch. The lane retries instead of
+    /// stepping over the entry, because stepping over it is permanent:
+    /// `delta_entries_since` filters strictly above the baseline.
+    pub certified_sync_baseline_held_total: AtomicU64,
+    /// Cumulative entries the lane stepped over after holding its baseline
+    /// for `CERTIFIED_REFUSAL_MAX_ROUNDS` consecutive rounds. A refusal
+    /// this durable is an operator-scale condition (no authority defined
+    /// for the prefix), not control-plane lag, and one such key must not
+    /// wedge a peer. Any non-zero value needs investigating: those entries
+    /// are only recovered by the periodic rescan below.
+    pub certified_sync_forced_skip_total: AtomicU64,
+    /// Cumulative periodic full rescans (`baseline = 0`) of a peer's
+    /// certified store. The certified plane has no digest lane, so this is
+    /// its only repair path for entries that a scalar per-peer baseline
+    /// can otherwise never re-offer: entries a peer ingested BELOW its own
+    /// frontier, and entries this node stepped over above.
+    pub certified_sync_rescan_total: AtomicU64,
+    /// Gauge: per-key origin pins held by the certified API.
+    ///
+    /// Grows with the certified key set (see `CertifiedApi::origins`).
+    /// Watch it alongside process RSS; bounding it is deferred to the
+    /// roster/coverage work in core-semantics-v2.
+    pub certified_origins_len: AtomicU64,
+
     /// Gauge: per-node dot-floor walks stalled on a LEGACY HOLE at the
     /// latest EXECUTED tombstone-GC sweep (a dot the pre-floor sweep
     /// physically deleted cluster-wide). Mark-only and gate-blocked GC
@@ -563,6 +631,20 @@ impl Default for RuntimeMetrics {
             digest_sync_failed_total: AtomicU64::default(),
             digest_sync_keys_transferred_total: AtomicU64::default(),
             digest_sync_keys_skipped_total: AtomicU64::default(),
+            certified_sync_attempt_total: AtomicU64::default(),
+            certified_sync_success_total: AtomicU64::default(),
+            certified_sync_failed_total: AtomicU64::default(),
+            certified_sync_unsupported_total: AtomicU64::default(),
+            certified_sync_entries_applied_total: AtomicU64::default(),
+            certified_sync_entries_skipped_total: AtomicU64::default(),
+            certified_sync_origin_unknown_total: AtomicU64::default(),
+            certified_sync_origin_ahead_rejected_total: AtomicU64::default(),
+            certified_sync_type_mismatch_total: AtomicU64::default(),
+            certified_sync_policy_denied_total: AtomicU64::default(),
+            certified_sync_baseline_held_total: AtomicU64::default(),
+            certified_sync_forced_skip_total: AtomicU64::default(),
+            certified_sync_rescan_total: AtomicU64::default(),
+            certified_origins_len: AtomicU64::default(),
             gc_floor_stalled_hole_dots: AtomicU64::default(),
             gc_floor_stalled_uncandidated_dots: AtomicU64::default(),
             gc_floor_rejected_dots_total: AtomicU64::default(),
@@ -960,6 +1042,38 @@ impl RuntimeMetrics {
             digest_sync_keys_skipped_total: self
                 .digest_sync_keys_skipped_total
                 .load(Ordering::Relaxed),
+            certified_sync_attempt_total: self.certified_sync_attempt_total.load(Ordering::Relaxed),
+            certified_sync_success_total: self.certified_sync_success_total.load(Ordering::Relaxed),
+            certified_sync_failed_total: self.certified_sync_failed_total.load(Ordering::Relaxed),
+            certified_sync_unsupported_total: self
+                .certified_sync_unsupported_total
+                .load(Ordering::Relaxed),
+            certified_sync_entries_applied_total: self
+                .certified_sync_entries_applied_total
+                .load(Ordering::Relaxed),
+            certified_sync_entries_skipped_total: self
+                .certified_sync_entries_skipped_total
+                .load(Ordering::Relaxed),
+            certified_sync_origin_unknown_total: self
+                .certified_sync_origin_unknown_total
+                .load(Ordering::Relaxed),
+            certified_sync_origin_ahead_rejected_total: self
+                .certified_sync_origin_ahead_rejected_total
+                .load(Ordering::Relaxed),
+            certified_sync_type_mismatch_total: self
+                .certified_sync_type_mismatch_total
+                .load(Ordering::Relaxed),
+            certified_sync_policy_denied_total: self
+                .certified_sync_policy_denied_total
+                .load(Ordering::Relaxed),
+            certified_sync_baseline_held_total: self
+                .certified_sync_baseline_held_total
+                .load(Ordering::Relaxed),
+            certified_sync_forced_skip_total: self
+                .certified_sync_forced_skip_total
+                .load(Ordering::Relaxed),
+            certified_sync_rescan_total: self.certified_sync_rescan_total.load(Ordering::Relaxed),
+            certified_origins_len: self.certified_origins_len.load(Ordering::Relaxed),
             digest_push_probe_total: self.digest_push_probe_total.load(Ordering::Relaxed),
             digest_push_match_total: self.digest_push_match_total.load(Ordering::Relaxed),
             digest_push_keys_pushed_total: self
@@ -1119,6 +1233,37 @@ pub struct MetricsSnapshot {
     /// Keys whose transfer was avoided by digest sync (bandwidth saving
     /// relative to a full dump).
     pub digest_sync_keys_skipped_total: u64,
+
+    // --- Certified replication lane (P0-1) ---
+    /// Certified delta pull requests (one per drain round).
+    pub certified_sync_attempt_total: u64,
+    /// Certified pulls that completed and were applied.
+    pub certified_sync_success_total: u64,
+    /// Certified pulls that failed at the network/decode level, or whose
+    /// apply hit a storage error.
+    pub certified_sync_failed_total: u64,
+    /// Certified pulls answered 404/405 by a peer predating the lane.
+    pub certified_sync_unsupported_total: u64,
+    /// Replicated certified entries merged locally.
+    pub certified_sync_entries_applied_total: u64,
+    /// Replicated entries dropped by the redundant-relay gate.
+    pub certified_sync_entries_skipped_total: u64,
+    /// Replicated entries that arrived without an origin policy version.
+    pub certified_sync_origin_unknown_total: u64,
+    /// Replicated entries refused for an origin ahead of this node.
+    pub certified_sync_origin_ahead_rejected_total: u64,
+    /// Replicated entries refused for a CRDT type conflict.
+    pub certified_sync_type_mismatch_total: u64,
+    /// Replicated entries refused because no authority is defined here.
+    pub certified_sync_policy_denied_total: u64,
+    /// Pull rounds that held the peer baseline after a transient refusal.
+    pub certified_sync_baseline_held_total: u64,
+    /// Entries stepped over after the hold-back retry budget ran out.
+    pub certified_sync_forced_skip_total: u64,
+    /// Periodic full rescans of a peer's certified store.
+    pub certified_sync_rescan_total: u64,
+    /// Gauge: per-key origin pins held by the certified API.
+    pub certified_origins_len: u64,
     /// Digest push probes attempted before full-state pushes.
     pub digest_push_probe_total: u64,
     /// Digest push probes that matched (full push skipped).

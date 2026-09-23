@@ -22,6 +22,7 @@
 6. [Internal API](#internal-api)
    - [Sync](#sync)
    - [Delta Sync](#delta-sync)
+   - [Certified Replication](#certified-replication)
    - [Key Dump](#key-dump)
    - [Frontier](#frontier)
    - [Join / Leave](#join--leave)
@@ -625,6 +626,21 @@ curl -X POST http://localhost:3000/api/certified/write \
 | `status` | string | 認証ステータス: `"Pending"`, `"Certified"`, `"Rejected"`, `"Timeout"` のいずれか。`Rejected` は後から certification 評価で拒否された場合にのみ出現する |
 | `frontier` | FrontierJson \| null | HLC frontier（証明時のタイムスタンプ） |
 | `proof` | ProofBundleJson \| null | 検証可能な証明バンドル |
+
+**複製と `status` の関係（重要）**
+
+certified の値は `POST /api/internal/certified/delta` レーンで全ノードに複製される。
+これによる可視な変化:
+
+- **非ライターノードでも `value` が返るようになった。** 以前は自分が書いていない
+  certified キーは `value: null` だった。今は値が入り、`status` は（そのノードが
+  独自に attestation を集めるまで）`"Pending"` になる。
+- **`status` はノードローカルな観測であり、値の耐久性とは独立**。複製が運ぶのは値と
+  その origin バージョンだけで、認証の「判定」は運ばない。retention eviction の
+  タイミング差により、同じキーが A では `Certified`、B では `Pending` に見えることが
+  正常にありうる（fail-closed 方向なので安全側）。
+- 未知キーが永遠に `Pending` に見える件（`get_certification_status` の導出化）は
+  **この変更では解消していない**。
 
 **curl 例:**
 
@@ -1326,6 +1342,101 @@ curl -X POST http://localhost:3000/api/internal/sync/digest \
   -H "Content-Type: application/json" \
   -d '{"sender":"node-2","scheme_version":1,"root":['"$(python3 -c 'import hashlib;print(",".join(str(b) for b in hashlib.sha256(bytes(8192)).digest()))')"'],"buckets":[],"include_entries":true}'
 ```
+
+---
+
+### Certified Replication
+
+#### POST /api/internal/certified/delta
+
+**certified** ストアのエントリを、要求側のベースライン以降の分だけ返す。
+certified プレーン専用の anti-entropy レーン（pull 専用）。
+
+このレーンが入る前、certified write はそれを受理した 1 ノードのディスクにしか
+存在しなかった（`/api/internal/sync`、`/sync/delta`、`/sync/digest`、`/keys` は
+すべて **eventual** ストアを配信する）。そのノードを失うと値は恒久的に失われ、
+クライアントの手元には「どこにも存在しない値に対する検証可能な証明」だけが残った。
+同じキーを eventual で書いていれば失われなかったので、**強整合側が耐久性で劣る**
+倒立が起きていた。
+
+- **認証**: Bearer Token (設定時)
+- **Accept**: `application/json` または `application/octet-stream`
+
+**リクエストボディ:**
+
+```json
+{
+  "sender": "node-2",
+  "frontier": { "physical": 1700000000000, "logical": 3, "node_id": "node-1" }
+}
+```
+
+**レスポンスボディ:**
+
+```json
+{
+  "entries": [
+    {
+      "key": "user/alice",
+      "value": { "type": "counter", "value": 42 },
+      "hlc": { "physical": 1700000000001, "logical": 0, "node_id": "node-1" },
+      "policy_version": 1
+    }
+  ],
+  "sender_frontier": { "physical": 1700000000001, "logical": 0, "node_id": "node-1" },
+  "truncated": false
+}
+```
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `entries[].value` | CrdtValue | そのキーの**全状態**。CRDT の部分デルタではない。certified プレーンには取りこぼしを後から要求する手段が無く、部分ペイロードを土台無しにマージすると「フィールドが静かに欠けた certified マップ」が有効な証明付きで配られてしまうため |
+| `entries[].hlc` | FrontierJson | **書き手の** HLC。受信側はこれをそのまま記録する（ローカル時計で再スタンプすると収束後もレーンが静止しない） |
+| `entries[].policy_version` | u64 \| null | その書き込みが発行された **origin** ポリシーバージョン。`null` は origin 永続化以前に書かれたキー |
+| `sender_frontier` | FrontierJson \| null | 全エントリ適用後に要求側が採用してよいベースライン。**`truncated` のときは「最後に含めたエントリの HLC」**であり、応答側ストア全体の frontier ではない |
+| `truncated` | bool | バッチ上限（512 件）で打ち切ったか。要求側はこれが `true` の間、同一サイクル内で最大 8 ラウンドまで続けて引く（ドレイン） |
+
+**`policy_version` が load-bearing である理由**
+
+受信側の `resolve_scope` が返すのは**受信側の現行バージョン**であり、ingest は
+書き手の HLC をそのまま保持する。したがって origin をワイヤに載せないと、既に
+v2 に上がったノードは v1 で書かれた値を**自分の v2 frontier** で評価して
+Certified にしてしまう。`is_version_fenced` は attestation の admission しか
+止めないので、これは防げない。これは fence 永続化の修正
+(fix/fence-persistence-across-restart) が塞いだ穴そのものであり、複製によって
+**全非ライターノードに、クラッシュも再起動もなしに**広がることになる。
+`policy_version` はこれを閉じる。
+
+**バッチと帯域**
+
+1 レスポンス最大 512 件、1 サイクル 1 peer あたり最大 8 ラウンド。certified
+プレーンには digest 相当の段階的 diff が無いため、新規参加ノードやディスクを
+失って復帰したノードは certified キー集合の全量をこのエンドポイント経由で引く
+（`sync_interval` のティックに分散される）。
+
+**ベースラインの進め方（要求側の契約）**
+
+このエンドポイントは baseline より**厳密に大きい**エントリしか返さない。
+したがって要求側があるエントリを飛ばしてベースラインを進めることは、そのノードに
+とって恒久的な取りこぼしになる。要求側は拒否理由で扱いを分けなければならない:
+
+- 一過性（origin が自分より先 / authority 定義がまだ無い = 制御プレーンの適用
+  遅れ）: ベースラインを**進めず**、次サイクルで再試行する。
+- 恒久（CRDT 型衝突）: 次へ進む。
+
+加えて要求側は定期的に `frontier` をゼロにしてフルリスキャンする。ingest は
+書き手の HLC を保持するため、peer は自分の frontier より**下**のキーを正当に
+持ちうる——スカラのベースラインではこの取りこぼしを表現できない。
+
+**ingest 側のガード（重要）**
+
+このエンドポイントが供給する ingest は**クライアント面のポリシーゲートを経由しない**。
+internal token を持つ者は certified ストアへ値を注入しうる。緩和は次の 3 点:
+
+1. ローカル write と同じ `resolve_scope` を通す（authority 定義の無いキーは拒否）
+2. `policy_version` が受信側の現行バージョンより **先** のものは拒否
+3. ingest は `Pending` の追跡しか作れない。`certified_cache` / `attestations` /
+   frontier のいずれにも触れないため、**単独で `Certified` や proof を捏造できない**
 
 ---
 

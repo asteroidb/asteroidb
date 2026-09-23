@@ -11,6 +11,7 @@ use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, seria
 use crate::network::peer::PeerRegistry;
 use crate::store::digest::{DIGEST_LEN, DIGEST_SCHEME_VERSION, StoreDigest};
 use crate::store::kv::CrdtValue;
+use crate::types::PolicyVersion;
 
 /// Bulk sync request payload sent to `POST /api/internal/sync`.
 ///
@@ -85,6 +86,91 @@ pub struct DeltaEntry {
     pub key: String,
     pub value: CrdtValue,
     pub hlc: HlcTimestamp,
+}
+
+/// Maximum certified entries in one `POST /api/internal/certified/delta`
+/// response.
+///
+/// The certified lane has no digest/stepwise-diff counterpart, so a node
+/// joining (or returning with a lost disk) pulls the whole certified key
+/// set through this endpoint. Batching keeps any single response bounded
+/// and spreads the transfer over `sync_interval` ticks instead of
+/// producing one unbounded payload.
+pub const CERTIFIED_DELTA_MAX_ENTRIES: usize = 512;
+
+/// Request for a certified delta pull (`POST /api/internal/certified/delta`).
+///
+/// The certified plane's own anti-entropy lane (P0-1). Deliberately a
+/// SEPARATE endpoint from `/api/internal/sync/delta` rather than a new
+/// field on `DeltaSyncRequest`: those payloads are bincode-positional, so
+/// extending them breaks mixed-version decoding, and the delta/digest
+/// quiescence and golden tests are pinned to their current shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertifiedDeltaRequest {
+    /// Node ID of the requesting node.
+    pub sender: String,
+    /// The requester's baseline for this peer's certified store. Entries
+    /// strictly after this timestamp are returned.
+    pub frontier: HlcTimestamp,
+}
+
+/// One replicated certified entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertifiedDeltaEntry {
+    pub key: String,
+    pub value: CrdtValue,
+    /// The WRITER's HLC. The receiver records it verbatim — re-stamping
+    /// with the local clock would make the entry look new to the peer on
+    /// every round and the lane would never quiesce.
+    pub hlc: HlcTimestamp,
+    /// The policy version the write was issued under, on the node that
+    /// accepted it.
+    ///
+    /// This is the field that keeps replication from bypassing the FR-009
+    /// fence: without it a receiver would evaluate the entry against its
+    /// OWN current version's frontier (#342, cluster-wide). `None` means
+    /// the sender has no recorded origin for the key (data written before
+    /// origins were persisted); the receiver falls back to its current
+    /// version, matching today's recovery behaviour.
+    ///
+    /// NOTE for maintainers: bincode is positional. New fields may only be
+    /// appended at the end with `#[serde(default)]` and never
+    /// `skip_serializing_if` (same rule as `DeltaSyncResponse`).
+    pub policy_version: Option<PolicyVersion>,
+}
+
+/// Response for a certified delta pull.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertifiedDeltaResponse {
+    /// Entries after the requested frontier, in ascending HLC order.
+    pub entries: Vec<CertifiedDeltaEntry>,
+    /// The baseline the requester may adopt once it has applied every
+    /// entry above.
+    ///
+    /// When `truncated` is set this is the LAST INCLUDED entry's HLC, not
+    /// the responder's full frontier: adopting the full frontier after a
+    /// partial batch would skip every key in between, forever.
+    pub sender_frontier: Option<HlcTimestamp>,
+    /// Whether entries were withheld by the batch limit. Advisory: the
+    /// requester converges either way, this only says another round has
+    /// work waiting.
+    pub truncated: bool,
+}
+
+/// Result of a certified delta pull attempt.
+#[derive(Debug)]
+pub enum CertifiedDeltaResult {
+    /// Response received and decoded.
+    Ok(Box<CertifiedDeltaResponse>),
+    /// The peer's router has no certified delta route (404 from a node
+    /// predating the lane, 405 from a router that knows the path but not
+    /// the method). NOT a failure: during a rolling upgrade this is the
+    /// expected answer from not-yet-upgraded peers, so it must not feed
+    /// the backoff or the error counters.
+    Unsupported,
+    /// Network error, undecodable payload, or any other non-2xx status
+    /// (500/503/429/401 — plausibly transient on a lane-capable peer).
+    Failed,
 }
 
 /// Request for delta-based sync.
@@ -1305,6 +1391,98 @@ impl SyncClient {
             }
         }
     }
+
+    // ---------------------------------------------------------------
+    // Certified replication lane (P0-1)
+    // ---------------------------------------------------------------
+
+    /// Pull certified entries from a peer since the given baseline.
+    ///
+    /// Sends `POST /api/internal/certified/delta`. Mirrors `pull_delta`'s
+    /// bincode-then-JSON negotiation (so mixed-version peers still talk)
+    /// and `digest_sync`'s 404/405 -> `Unsupported` classification (so a
+    /// rolling upgrade does not look like a cluster of failures).
+    pub async fn pull_certified_delta(
+        &self,
+        peer_addr: &str,
+        sender: &str,
+        frontier: &HlcTimestamp,
+    ) -> CertifiedDeltaResult {
+        let url = format!("http://{peer_addr}/api/internal/certified/delta");
+        let req = CertifiedDeltaRequest {
+            sender: sender.to_string(),
+            frontier: frontier.clone(),
+        };
+
+        match self.send_with_json_fallback(&url, &req).await {
+            Ok(resp) if resp.status().is_success() => {
+                match Self::decode_response::<CertifiedDeltaResponse>(resp).await {
+                    Ok(delta) => CertifiedDeltaResult::Ok(Box::new(delta)),
+                    Err(e) => {
+                        // Same mixed-version rescue as `pull_delta`: an
+                        // older peer may answer with a bincode payload of a
+                        // different positional layout; JSON tolerates the
+                        // difference via serde defaults.
+                        tracing::warn!(
+                            error = %e,
+                            peer = %peer_addr,
+                            "failed to deserialize certified delta response; retrying with JSON"
+                        );
+                        match self
+                            .json_post(&url, &req)
+                            .header("accept", "application/json")
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => {
+                                match Self::decode_response::<CertifiedDeltaResponse>(resp).await {
+                                    Ok(delta) => CertifiedDeltaResult::Ok(Box::new(delta)),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            peer = %peer_addr,
+                                            "certified delta JSON retry undecodable"
+                                        );
+                                        CertifiedDeltaResult::Failed
+                                    }
+                                }
+                            }
+                            _ => CertifiedDeltaResult::Failed,
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                // `send_with_json_fallback` already retried with JSON on a
+                // non-success status. Only a status that proves the route
+                // is absent means the peer predates the lane; everything
+                // else is plausibly transient and must NOT be cached as
+                // unsupported (see `digest_sync`).
+                let status = resp.status();
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                {
+                    tracing::debug!(
+                        peer = %peer_addr,
+                        status = %status,
+                        "certified delta route absent (peer predates the lane?)"
+                    );
+                    CertifiedDeltaResult::Unsupported
+                } else {
+                    tracing::warn!(
+                        peer = %peer_addr,
+                        status = %status,
+                        "certified delta pull received non-success status (transient?)"
+                    );
+                    CertifiedDeltaResult::Failed
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, peer = %peer_addr, "certified delta pull failed");
+                CertifiedDeltaResult::Failed
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2370,5 +2548,73 @@ mod tests {
         assert_eq!(second.observed, vec![obs]);
         drop(captured);
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod certified_lane_tests {
+    use super::*;
+    use crate::crdt::pn_counter::PnCounter;
+    use crate::types::NodeId;
+
+    fn hlc(physical: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: "n1".into(),
+        }
+    }
+
+    fn entry(key: &str, origin: Option<u64>) -> CertifiedDeltaEntry {
+        let mut c = PnCounter::new();
+        c.increment(&NodeId("n1".into()));
+        CertifiedDeltaEntry {
+            key: key.into(),
+            value: CrdtValue::Counter(c),
+            hlc: hlc(10),
+            policy_version: origin.map(PolicyVersion),
+        }
+    }
+
+    /// The lane's payloads must survive both encodings the internal API
+    /// negotiates (bincode preferred, JSON on fallback/retry) with the
+    /// origin intact — an origin lost in transit silently degrades the
+    /// receiver to its own current version, which is the #342 bypass.
+    #[test]
+    fn certified_delta_payloads_round_trip_in_both_encodings() {
+        let req = CertifiedDeltaRequest {
+            sender: "n2".into(),
+            frontier: hlc(5),
+        };
+        let json: CertifiedDeltaRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(json.sender, "n2");
+        assert_eq!(json.frontier, hlc(5));
+        let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (bin, _): (CertifiedDeltaRequest, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(bin.frontier, hlc(5));
+
+        let resp = CertifiedDeltaResponse {
+            entries: vec![entry("a", Some(2)), entry("b", None)],
+            sender_frontier: Some(hlc(10)),
+            truncated: true,
+        };
+        let json: CertifiedDeltaResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(json.entries[0].policy_version, Some(PolicyVersion(2)));
+        assert_eq!(
+            json.entries[1].policy_version, None,
+            "an absent origin must stay absent, never become a sentinel version"
+        );
+        assert!(json.truncated);
+
+        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (bin, _): (CertifiedDeltaResponse, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(bin.entries.len(), 2);
+        assert_eq!(bin.entries[0].policy_version, Some(PolicyVersion(2)));
+        assert_eq!(bin.entries[1].policy_version, None);
+        assert_eq!(bin.sender_frontier, Some(hlc(10)));
     }
 }

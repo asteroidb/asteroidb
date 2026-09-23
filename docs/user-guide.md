@@ -429,6 +429,29 @@ curl -s http://localhost:3001/api/status/account/balance | jq .
 # => {"key":"account/balance","status":"certified"}
 ```
 
+#### Certified の値はどのノードからでも読める
+
+certified の値はノード間で複製されるため、**書き込んだノード以外からも値が
+読めます**。書き込みを受けたノードのディスクを失っても、値は他ノードに残ります。
+
+```bash
+# node-1 に書いて node-2 から読む
+curl -s http://localhost:3002/api/certified/account/balance | jq .
+# => {"key":"account/balance","value":{...},"status":"Pending","proof":null}
+```
+
+このとき `status` が `"Pending"` になるのは正常です。**複製が運ぶのは「値」と
+その origin ポリシーバージョンだけで、「認証済みという判定」は運びません。**
+各ノードは自分で Authority の attestation を集めて `Certified` に上げます。
+
+その結果、同じキーが同じ瞬間に、あるノードでは `Certified`、別のノードでは
+`Pending` に見えることがあります。**`status` はノードローカルな観測であり、値の
+耐久性とは独立**です（判定は常に安全側 = fail-closed に倒れます）。確定した
+認証状態が必要な場合は、`proof` が付いたレスポンスを使ってください。
+
+> **注意**: 一度も書き込まれたことのない未知のキーも `"Pending"` を返します。
+> `Pending` は「まだ認証されていない」であって「存在しない」ではありません。
+
 ステータスは以下の4種類です:
 
 | ステータス | 説明 |

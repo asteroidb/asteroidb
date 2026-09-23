@@ -38,8 +38,9 @@ use crate::types::NodeId;
 use crate::network::PeerRegistry;
 use crate::network::membership::{is_metadata_or_link_local, is_safe_peer_address};
 use crate::network::sync::{
-    DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, DigestSyncRequest, DigestSyncResponse,
-    KeyDumpResponse, SyncError, SyncRequest, SyncResponse,
+    CERTIFIED_DELTA_MAX_ENTRIES, CertifiedDeltaEntry, CertifiedDeltaRequest,
+    CertifiedDeltaResponse, DeltaEntry, DeltaSyncRequest, DeltaSyncResponse, DigestSyncRequest,
+    DigestSyncResponse, KeyDumpResponse, SyncError, SyncRequest, SyncResponse,
 };
 use crate::store::digest::{
     DIGEST_BUCKET_COUNT, DIGEST_LEN, DIGEST_SCHEME_VERSION, bucket_of, compute_store_digest,
@@ -1895,6 +1896,61 @@ pub async fn internal_delta_sync(
         pruned_floor,
         visible_origins,
         untracked_entries,
+    };
+    internal_response(&resp, accept)
+}
+
+/// `POST /api/internal/certified/delta`
+///
+/// Serve certified entries after the requester's baseline, each tagged
+/// with the policy version it was written under (P0-1).
+///
+/// The certified plane's anti-entropy lane. Before it existed, a certified
+/// write reached exactly one disk: `internal_sync`, `internal_delta_sync`,
+/// `internal_digest_sync` and `internal_keys` all serve
+/// `state.eventual`, so losing the accepting node lost the value
+/// permanently — while the same key written through the EVENTUAL path
+/// would have survived.
+///
+/// Locks `state.certified` and NOTHING else, taking the entries and the
+/// frontier in one scope so the frontier can never claim coverage of an
+/// entry that was not in this batch. It writes nothing, so no
+/// `wait_wal_durable` is needed.
+///
+/// Deliberately absent from the payload: `applied_origins` /
+/// `visible_origins` / `merge_failed_keys` / `pruned_floor`. Those are
+/// EVENTUAL session-guarantee metadata; session tokens are an
+/// eventual-API-only contract and the certified store keeps no such state.
+pub async fn internal_certified_delta(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, super::codec::SerializationError> {
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    let accept = headers.get("accept").and_then(|v| v.to_str().ok());
+
+    let req: CertifiedDeltaRequest = deserialize_internal(&body, content_type)?;
+
+    let api = state.certified.lock().await;
+    let (raw, sender_frontier) =
+        api.certified_delta_entries(&req.frontier, CERTIFIED_DELTA_MAX_ENTRIES);
+    drop(api);
+
+    let truncated = raw.len() >= CERTIFIED_DELTA_MAX_ENTRIES;
+    let entries: Vec<CertifiedDeltaEntry> = raw
+        .into_iter()
+        .map(|(key, value, hlc, policy_version)| CertifiedDeltaEntry {
+            key,
+            value,
+            hlc,
+            policy_version,
+        })
+        .collect();
+
+    let resp = CertifiedDeltaResponse {
+        entries,
+        sender_frontier,
+        truncated,
     };
     internal_response(&resp, accept)
 }

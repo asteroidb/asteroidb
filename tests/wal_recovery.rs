@@ -1456,3 +1456,242 @@ async fn fenced_certified_checkpointed_write_regresses_uncertified_across_restar
         &PolicyVersion(1)
     ));
 }
+
+// ---------------------------------------------------------------
+// RED-0 (P0-1 / C0): the certified origins sidecar must not be a
+// derivative of `pending_writes`.
+//
+// `pending_writes` is a BOUNDED, EXPIRING tracking cache: `run_cleanup`
+// (every 5s by default) marks entries older than `max_age_ms` (60s) as
+// `Timeout` and drops them. The checkpoint sidecar is rebuilt from that
+// cache on every checkpoint (default 300s) and simultaneously prunes the
+// WAL segments that carried the same origins. So ~60s after a write, the
+// only two carriers of its origin policy version are erased together and
+// the write falls back to `unwrap_or(current_version)` on restart — the
+// exact fence-bypass #342 closed, reopened by a timer.
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn origins_survive_cleanup_and_checkpoint() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, checkpoint_certified, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Off,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+
+    // Incarnation 1: write under v1, let the retention timer expire the
+    // tracking entry, then checkpoint (sidecar rewrite + WAL prune).
+    let write_ts = {
+        let (api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
+        let api = StdArc::new(TokioMutex::new(api));
+        let ts = {
+            let mut guard = api.lock().await;
+            let mut c = PnCounter::new();
+            c.increment(&node("node-a"));
+            guard
+                .certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
+                .unwrap();
+            let ts = guard.pending_writes()[0].timestamp.clone();
+            // The periodic cleanup tick: past max_age_ms, the tracking
+            // entry is expired and removed.
+            guard.cleanup(ts.physical + 61_000);
+            assert!(
+                guard.pending_writes().is_empty(),
+                "retention cleanup must have dropped the tracking entry (test premise)"
+            );
+            ts
+        };
+        checkpoint_certified(&api, &cfg).await.unwrap();
+        ts
+    };
+
+    // Incarnation 2: restart already under policy v2.
+    let (mut api, _s) = recover_certified(node("node-a"), user_namespace(2), &cfg).unwrap();
+
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("recovered write must be tracked");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "the origin policy version must survive retention cleanup + checkpoint; it is \
+         durable per-key state, not a projection of the expiring pending-write cache"
+    );
+
+    assert!(api.update_frontier(user_v2_frontier(write_ts.physical + 10_000)));
+    api.process_certifications_with_timeout(write_ts.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a v1 write must not certify off a v2 frontier just because its tracking entry \
+         expired before the checkpoint"
+    );
+    assert!(
+        api.is_version_fenced(
+            &KeyRange {
+                prefix: "user/".into()
+            },
+            &PolicyVersion(1)
+        ),
+        "the v1 fence must be re-derived from the persisted origin"
+    );
+}
+
+// ---------------------------------------------------------------
+// RED-4 (P0-1 / C1): a REPLICATED certified write must recover under the
+// origin version it was written with on the WRITER, not under the
+// receiver's current version.
+//
+// The symmetric counterpart of the four `fenced_*_across_restart` tests,
+// which cover locally-issued writes. Replication is the new way for a
+// write to enter a node's certified store, so it needs the same
+// durability for its origin pin: both when the origin rides the WAL
+// (un-checkpointed) and when it rides the sidecar (checkpointed, WAL
+// pruned).
+// ---------------------------------------------------------------
+
+fn replicated_counter() -> CrdtValue {
+    let mut c = PnCounter::new();
+    c.increment(&node("writer-node"));
+    CrdtValue::Counter(c)
+}
+
+#[test]
+fn replicated_certified_write_recovers_with_its_origin_wal_only() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Always,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+    let write_hlc = hlc(5_000, 0, "writer-node");
+
+    // Incarnation 1: a v1 write authored elsewhere arrives over the lane.
+    {
+        let (mut api, _s) = recover_certified(node("node-b"), user_namespace(1), &cfg).unwrap();
+        api.merge_remote_certified(
+            "user/x".into(),
+            &replicated_counter(),
+            write_hlc.clone(),
+            Some(PolicyVersion(1)),
+        )
+        .unwrap();
+    }
+
+    // Incarnation 2: restart already under policy v2.
+    let (mut api, _s) = recover_certified(node("node-b"), user_namespace(2), &cfg).unwrap();
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("the replicated write must be tracked after recovery");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "a replicated write must recover under the ORIGIN version it carried on the wire"
+    );
+    assert!(api.update_frontier(user_v2_frontier(write_hlc.physical + 10_000)));
+    api.process_certifications_with_timeout(write_hlc.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified,
+        "a replicated v1 write must not certify off a v2 frontier after a restart"
+    );
+    assert!(api.is_version_fenced(
+        &KeyRange {
+            prefix: "user/".into()
+        },
+        &PolicyVersion(1)
+    ));
+}
+
+#[tokio::test]
+async fn replicated_certified_write_recovers_with_its_origin_checkpointed() {
+    use asteroidb_poc::runtime::persistence::{
+        CheckpointLocks, PersistenceConfig, checkpoint_certified, recover_certified,
+    };
+    use asteroidb_poc::types::PolicyVersion;
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Off,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+    let write_hlc = hlc(5_000, 0, "writer-node");
+
+    {
+        let (api, _s) = recover_certified(node("node-b"), user_namespace(1), &cfg).unwrap();
+        let api = StdArc::new(TokioMutex::new(api));
+        {
+            let mut guard = api.lock().await;
+            guard
+                .merge_remote_certified(
+                    "user/x".into(),
+                    &replicated_counter(),
+                    write_hlc.clone(),
+                    Some(PolicyVersion(1)),
+                )
+                .unwrap();
+            // The retention timer expires the tracking entry before the
+            // checkpoint, exactly as the 5s cleanup tick does in production.
+            guard.cleanup(write_hlc.physical + 61_000);
+        }
+        // Checkpoint: snapshot written, WAL segments pruned. From here the
+        // origins sidecar is the only carrier.
+        checkpoint_certified(&api, &cfg).await.unwrap();
+    }
+
+    let (mut api, _s) = recover_certified(node("node-b"), user_namespace(2), &cfg).unwrap();
+    let pw = api
+        .pending_writes()
+        .iter()
+        .find(|p| p.key == "user/x")
+        .expect("the replicated write must be tracked after recovery");
+    assert_eq!(
+        pw.policy_version,
+        PolicyVersion(1),
+        "the sidecar must carry a replicated write's origin across a checkpoint too"
+    );
+    assert!(api.update_frontier(user_v2_frontier(write_hlc.physical + 10_000)));
+    api.process_certifications_with_timeout(write_hlc.physical + 30_000);
+    assert_ne!(
+        api.get_certification_status("user/x"),
+        CertificationStatus::Certified
+    );
+    assert!(api.is_version_fenced(
+        &KeyRange {
+            prefix: "user/".into()
+        },
+        &PolicyVersion(1)
+    ));
+}

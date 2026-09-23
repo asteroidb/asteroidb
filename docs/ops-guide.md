@@ -11,6 +11,7 @@
 2. [環境変数リファレンス](#2-環境変数リファレンス)
 3. [監視・アラート設定](#3-監視アラート設定)
 4. [SLO メトリクスの解釈とアラート基準](#4-slo-メトリクスの解釈とアラート基準)
+   - [4.5 certified replication レーンの運用](#45-certified-replication-レーンの運用)
 5. [バックアップ・リストア手順](#5-バックアップリストア手順)
 6. [ログ設定とログレベル](#6-ログ設定とログレベル)
 7. [パフォーマンスチューニング](#7-パフォーマンスチューニング)
@@ -180,6 +181,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。除外は 3 点で強制される: (1) HTTP 受信経路での検証時＋**apply 時の再チェック**（同一リクエスト内で告発が後続しても前方の attestation がすり抜けない）、(2) **告発時の attestation pool purge**（告発前にプール済みの最大 128 checkpoint 分の attestation を除去。`attestation_purged_total` で観測可能）、(3) **自己報告経路**（自ノードが告発された場合、自身の attestation も pool へ入れず、既存分を purge する）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in。**`0`（既定）では purge は発動せず、告発済み Authority の attestation は detect-only 契約どおり証明書に混入し続ける**。なお、告発**前**に組み立て済み・キャッシュ済みの証明書の遡及失効は行わない（証明書失効プロトコルは将来課題、`docs/followup-plan.md` 参照） |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
+| `ASTEROIDB_CERTIFIED_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で certified replication レーン（P0-1、同期 tick ごとの certified pull）を無効化し、レーン導入前の挙動へ切り戻す。pull は**一切発行されない**（結果を捨てるのではなくリクエスト自体を出さない）。有効化中は certified write がそれを受理したノードの喪失で失われうる（ops キルスイッチ、要再起動。4.5 を参照） |
 | `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | `info` | ログレベル（tracing-subscriber 形式）。**未設定・空文字列の場合は `info` 相当**（6.1 を参照）。値を明示した場合はその指定がそのまま尊重される（`RUST_LOG=error` で ERROR のみに絞ることもできる） |
@@ -354,6 +356,20 @@ curl -s http://localhost:3000/api/slo | jq .
 |-----------|------|------|
 | `pending_count` | u64 | 現在の保留中 Certified Write 数 |
 | `certified_total` | u64 | Certified Write 累計 |
+| `certified_sync_attempt_total` | u64 | certified 複製レーンの pull リクエスト数（1 ドレインラウンドにつき 1。1 サイクル 1 peer あたり最大 8） |
+| `certified_sync_success_total` | u64 | 適用まで完了した pull |
+| `certified_sync_failed_total` | u64 | ネットワーク/デコード失敗、または適用中のストレージエラー |
+| `certified_sync_unsupported_total` | u64 | レーン以前のノードからの 404/405。ローリングアップグレード**中**は正常。完了後も増え続けるなら未アップグレードノードがあり、そのノードの certified write は複製されていない |
+| `certified_sync_entries_applied_total` | u64 | ローカル certified ストアへ取り込んだエントリ数 |
+| `certified_sync_entries_skipped_total` | u64 | RR ゲートで落ちた冗長エントリ。収束済みレーンの定常値であり、増加は仕事ではない |
+| `certified_sync_origin_unknown_total` | u64 | origin バージョンを持たずに届いたエントリ（origin 永続化以前のキー）。受信側の現行バージョンにフォールバックする。全キーが書き直されれば頭打ちになる |
+| `certified_sync_origin_ahead_rejected_total` | u64 | origin が自ノードの現行バージョンより先だったため拒否。自ノードの namespace が書き手より遅れている。**一過性であり、レーンは baseline を進めずに再試行する**（下の `baseline_held` を参照）。継続的な増加は namespace の追随が止まっていることを意味する |
+| `certified_sync_type_mismatch_total` | u64 | ローカル値との CRDT 型衝突で拒否。非ゼロは実際の乖離なので要調査（恒久的な乖離なので、レーンは停止せず次へ進む） |
+| `certified_sync_policy_denied_total` | u64 | 受信側に当該キーの authority 定義がまだ無く拒否。ポリシー変更の伝播中は正常で一過性。**一過性なのでレーンは baseline を進めずに再試行する** |
+| `certified_sync_baseline_held_total` | u64 | 一過性の拒否（origin ahead / policy denied）により peer baseline を**進めずに保留**したラウンド数。定常的に 0 でなければ、その peer との間で namespace が揃っていない |
+| `certified_sync_forced_skip_total` | u64 | 保留を 12 ラウンド続けても解消せず、やむなく**そのエントリを飛ばした**回数。非ゼロは要調査（prefix に authority 定義が無い等の運用レベルの原因）。飛ばしたエントリは下記の定期リスキャンでのみ回収される |
+| `certified_sync_rescan_total` | u64 | peer の certified ストアを `baseline=0` から読み直した回数（30 分ごと）。certified プレーン唯一の修復パス |
+| `certified_origins_len` | u64 | ゲージ: 保持している per-key origin ピン数。certified キー数に比例して増える。RSS と併せて監視する |
 | `certification_latency_mean_us` | f64 | 証明レイテンシ平均 (us) |
 | `frontier_skew_ms` | u64 | Authority frontier 最大スキュー (ms) |
 | `sync_failure_rate` | f64 | 同期失敗率 (0.0-1.0) |
@@ -772,6 +788,97 @@ AsteroidDB は以下の 4 つの SLO をデフォルトで追跡します（1 �
 
 ---
 
+## 4.5 certified replication レーンの運用
+
+certified プレーンは専用の pull 型 anti-entropy レーン
+(`POST /api/internal/certified/delta`) を持つ。これが入る前、certified write は
+それを受理した 1 ノードのディスクにしか存在せず、そのノードを失うと値は恒久的に
+失われた（クライアントには「どこにも存在しない値に対する検証可能な証明」だけが
+残った）。同じキーを eventual で書いていれば失われなかったため、**強整合側が
+耐久性で劣る**という倒立が起きていた。
+
+**保証の範囲**: このレーンが提供するのは eventual プレーンと同じ
+**anti-entropy 耐久性**であって、同期クォーラム耐久性ではない。ack は依然として
+「このノードで durable」を意味し、pull が届く前にそのノードが死ねば値は失われうる。
+
+### 容量への影響
+
+- 各ノードの certified ストアは**クラスタ全体の certified キー集合**になる。
+  certified 側のディスク使用量とメモリが相応に増える（`certified_origins_len`
+  ゲージで per-key ピン数を監視する）。
+- 全ノードが新版になった直後、各ノードは baseline=0 から全量転送を行う。
+  1 レスポンス 512 件の上限があり、1 サイクル 1 peer あたり最大 8 ラウンドまで
+  連続して引く（ドレイン）ので、N キーの追いつきは `ceil(N/4096)` ティックで
+  完了する。この期間はレーンのトラフィックが跳ねる。
+- **エントリはキーの全状態を運ぶ**（CRDT の部分デルタではない）。certified
+  プレーンには digest 相当の段階的 diff が無く、取りこぼしたエントリを後から
+  要求する手段が無いため、部分ペイロードを土台無しにマージすると
+  「フィールドが静かに欠けた certified マップ」が有効な証明付きで配られてしまう。
+  全状態を運ぶことで、以降のどの更新でも穴が修復される。転送量はその分増える。
+- certified プレーンには digest 相当の段階的 diff が無い。ディスクを失って
+  復帰したノードの修復は **certified 全件転送**になる。
+
+### 拒否されたエントリの扱いと定期リスキャン
+
+`Store::delta_entries_since` は baseline より**厳密に大きい**エントリしか返さない。
+したがって「あるエントリを飛ばして baseline を進める」ことは、そのノードにとって
+**恒久的な取りこぼし**を意味する（そのキーが再度書かれない限り二度と提供されない）。
+レーンはこれを踏まえて拒否理由を 2 つに分ける:
+
+- **一過性**（`origin ahead` / `policy denied` = 制御プレーンの適用遅れ）:
+  baseline を直前の成功エントリで**保留**し、次サイクルで再試行する。
+  12 ラウンド連続で解消しない場合のみ、**そのエントリ 1 件だけ**を飛ばして
+  `certified_sync_forced_skip_total` を上げる（1 キーが peer 全体を止めないため）。
+- **恒久**（CRDT 型衝突）: 再試行しても解決しないので次へ進む。
+
+さらに **30 分ごとに peer ごとの `baseline=0` フルリスキャン**が走る。これが
+certified プレーンの唯一の修復パスであり、(a) 上で飛ばしたエントリ、(b) スカラ
+baseline では表現できない取りこぼし（ingest は書き手の HLC を保持するため、peer は
+自分の frontier より**下**のキーを正当に持ちうる）の両方を回収する。収束済みのキーは
+RR ゲートで落ちるだけなので、コストは転送量と受信側の軽い照合に限られる。
+
+### ローリングアップグレード
+
+レーンを持たないノードは 404 を返し、`Unsupported` として扱われる（backoff の
+失敗として数えない）。アップグレード**中**に
+`certified_sync_unsupported_total` が増えるのは正常。**完了後も増え続ける場合は
+未アップグレードノードが残っており、そのノードの certified write は複製されて
+いない。**
+
+### キルスイッチ
+
+`NodeRunnerConfig::certified_sync_enabled`（既定 `true`）を `false` にすると、
+certified の pull を**一切発行しない**（結果を捨てるのではなく、リクエスト自体を
+出さない）。挙動はレーン導入前と完全に一致する。
+出荷バイナリでは `ASTEROIDB_CERTIFIED_SYNC_DISABLED=1`（または `true`）を設定して
+再起動することで切り替える（`ASTEROIDB_DIGEST_SYNC_DISABLED` と同じ形式）。
+
+### セキュリティ上の注意
+
+このレーンの ingest は**クライアント面のポリシーゲートを経由しない**。internal
+token を持つ者は certified ストアへ値を注入しうる。したがって `/api/internal/*`
+の Bearer token を必ず設定すること（レーンのルートは他の internal ルートと同じ
+ミドルウェア配下にある）。緩和策は 3 点:
+
+1. ローカル write と同じ `resolve_scope` を通す（authority 定義の無いキーは拒否）
+2. origin が受信側の現行ポリシーバージョンより**先**のものは拒否
+3. **ingest は `Pending` の追跡しか作れない。** `certified_cache` / `attestations`
+   / frontier のいずれにも触れないため、**単独で `Certified` や proof を捏造できない**
+
+### origin バージョンについて
+
+複製されるエントリは、書き手のノードでの**書き込み時ポリシーバージョン（origin）**を
+ワイヤで運ぶ。受信側はこれをピン留めする。これは必須であって最適化ではない:
+origin が無いと、既に v2 に上がったノードが v1 で書かれた値を**自分の v2 frontier**で
+評価して Certified にしてしまう（`is_version_fenced` は attestation の admission
+しか止めないので防げない）。
+
+origin 永続化以前に書かれたキーは `policy_version: null` で送られ、受信側は現行
+バージョンにフォールバックする（復旧時の既存挙動と同値で、確定タイミングが早まる
+だけ）。`certified_sync_origin_unknown_total` で可視化される。
+
+---
+
 ## 5. バックアップ・リストア手順
 
 ### 5.1 バックアップ対象
@@ -1031,6 +1138,7 @@ AsteroidDB は単一ポートで全トラフィック（クライアント/内�
 |---------|------|------|
 | POST | `/api/internal/sync` | フルシンク |
 | POST | `/api/internal/sync/delta` | デルタシンク |
+| POST | `/api/internal/certified/delta` | certified 複製レーン（pull） |
 | GET | `/api/internal/keys` | 全キーダンプ |
 | POST/GET | `/api/internal/frontiers` | Frontier 送受信 |
 | POST | `/api/internal/join` | ノード参加 |
@@ -1691,7 +1799,7 @@ done
 > | パス | 内容 | ピアから再構築 |
 > |------|------|----------------|
 > | `eventual.snapshot.bin` + `wal/eventual/` | Eventual ストア | **可**（anti-entropy が再充填） |
-> | `certified.snapshot.bin` + `wal/certified/` | Certified ストア | **不可**（anti-entropy 経路が無い — 破棄は恒久喪失） |
+> | `certified.snapshot.bin` + `wal/certified/` | Certified ストア | **条件付きで可**（certified replication レーンが再充填する。ただし digest 相当の段階的 diff が無いため復旧は certified 全件転送になる。`certified_sync_enabled=false` で運用している場合は**不可** — 破棄は恒久喪失） |
 > | `raft/`（`hard_state.json` / `log.json`） | Control-plane Raft 投票状態・ログ | **不可**（白紙化は投票済み term での二重投票を再導入し得る — §14.5 の手順以外で消さない） |
 > | `equivocation_evidence.json` | Equivocation 証拠（否認不能な POM） | **不可**（消失した証拠は戻らない） |
 > | `frontier_report_clock.json` | frontier 報告 HLC の write-ahead floor（M-12） | **喪失は安全に劣化 / 復元は禁止**。喪失しても起動は成功するが、activation grace 180 秒の間この Authority の frontier 報告が停止する（恒久喪失なし）。**バックアップからの復元は絶対にしない**——古いリースは「全署名済み report を覆う」という floor の証拠性を偽り、誤検知（正当 Authority への偽 equivocation 証拠）を招き得る。data dir を復元する場合はこのファイルを削除してから起動する |
@@ -1721,7 +1829,16 @@ asteroidb-cli --host localhost:3000 slo
 
 ```bash
 # --- 破損したのが certified ストアの場合 ---
-# ピアからの再構築経路は無い。バックアップからの当該ファイルの復元が唯一の手段
+# certified replication レーンが有効（既定）で、かつ他ノードが同じキーを
+# 保持しているなら、eventual と同様にピアから再充填できる。ただし certified
+# プレーンには digest 相当の段階的 diff が無いため、復旧は certified 全件転送
+# になる（キー数によっては長時間かかる）。
+mv "$ASTEROIDB_DATA_DIR/certified.snapshot.bin" /tmp/quarantine/
+mv "$ASTEROIDB_DATA_DIR/wal/certified" /tmp/quarantine/
+# 再起動後、certified_sync_entries_applied_total の増加で再充填を確認する
+
+# レーンを無効化して運用している場合、または当該キーを持つノードが他に無い
+# 場合は、ピアからの再構築経路は無い。バックアップからの復元が唯一の手段
 cp /backup/.../certified.snapshot.bin "$ASTEROIDB_DATA_DIR/certified.snapshot.bin"
 # （バックアップが無い場合、破棄すればそのノードの certified 状態は恒久喪失する。
 #  破棄前に必ず破損ファイルを保全し、影響範囲を確認すること）
@@ -1737,7 +1854,8 @@ cp /backup/.../certified.snapshot.bin "$ASTEROIDB_DATA_DIR/certified.snapshot.bi
 # 選択肢 (a) 推奨: 当該ストアの snapshot+WAL をバックアップから復元する。
 # eventual ストアに限っては、その snapshot+WAL のみを退避してピアから
 # 再充填する方法も使える（症状 A の eventual の手順と同じ）。
-# certified ストアにはピア再構築経路が無いため、バックアップ復元のみ。
+# certified ストアも certified replication レーンが有効なら同様に退避 +
+# ピア再充填が使える（ただし全件転送になる）。レーン無効時はバックアップ復元のみ。
 # raft/ と equivocation_evidence.json はどちらの場合も必ず保持する
 
 # 選択肢 (b) 単一ノード運用などバックアップ・ピア再充填とも不可能な場合のみ:

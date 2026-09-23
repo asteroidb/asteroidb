@@ -941,6 +941,16 @@ async fn main() {
         })
         .unwrap_or(false);
 
+    // Ops kill switch for the certified replication lane (P0-1): when
+    // set, the sync loop issues no certified pulls at all, restoring the
+    // pre-lane behaviour exactly (see docs/ops-guide.md).
+    let certified_sync_enabled = !std::env::var("ASTEROIDB_CERTIFIED_SYNC_DISABLED")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+
     // Minimum age a tombstone-GC mark must reach before its sweep may
     // collect (see NodeRunner::run_gc). Collection additionally requires
     // every authority frontier and every registered peer's push frontier
@@ -987,6 +997,7 @@ async fn main() {
         // excludes them (m-7).
         exclude_accused_authorities,
         digest_sync_enabled,
+        certified_sync_enabled,
         gc_retention,
         gc_hole_jump_enabled,
         frontier_store_digest,
