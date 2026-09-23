@@ -7,11 +7,11 @@ use super::handlers::{
     AppState, certified_write, delete_equivocations, eventual_write, get_authority_definition,
     get_certification_status, get_certified, get_equivocations, get_eventual,
     get_internal_frontiers, get_metrics, get_policy, get_raft_status, get_slo, get_topology,
-    get_version_history, healthz, internal_announce, internal_delta_sync, internal_digest_sync,
-    internal_join, internal_keys, internal_leave, internal_ping, internal_sync, list_authorities,
-    list_policies, post_internal_frontiers, raft_append, raft_install_snapshot,
-    raft_namespace_snapshot, raft_vote, remove_policy, set_authority_definition,
-    set_placement_policy, verify_proof,
+    get_version_history, healthz, internal_announce, internal_certified_delta, internal_delta_sync,
+    internal_digest_sync, internal_join, internal_keys, internal_leave, internal_ping,
+    internal_sync, list_authorities, list_policies, post_internal_frontiers, raft_append,
+    raft_install_snapshot, raft_namespace_snapshot, raft_vote, remove_policy,
+    set_authority_definition, set_placement_policy, verify_proof,
 };
 
 /// Build the HTTP API router with all endpoints.
@@ -30,6 +30,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/internal/sync", post(internal_sync))
         .route("/api/internal/sync/delta", post(internal_delta_sync))
         .route("/api/internal/sync/digest", post(internal_digest_sync))
+        // Certified replication lane (P0-1). Registered HERE, inside the
+        // internal sub-router, so it inherits the Bearer-token middleware
+        // with every other internal route — the ingest path it feeds
+        // bypasses client-facing policy checks.
+        .route(
+            "/api/internal/certified/delta",
+            post(internal_certified_delta),
+        )
         .route("/api/internal/keys", get(internal_keys))
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))
@@ -2215,6 +2223,96 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The certified replication lane (P0-1) writes into the certified
+    /// store from the network. It MUST sit behind the internal Bearer
+    /// token like every other internal route — registering it on the
+    /// public router would expose an unauthenticated write path into the
+    /// strongly-consistent plane.
+    #[tokio::test]
+    async fn certified_delta_route_is_token_protected() {
+        let state = test_state_with_token(Some("test-secret".into()));
+        let app = router(state);
+        let body = r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/certified/delta")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "the certified lane must not be reachable without the internal token"
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/certified/delta")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-secret")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "and must be reachable with it"
+        );
+    }
+
+    /// The certified lane must serve the certified store, never the
+    /// eventual one, and must carry each entry's write-time origin.
+    #[tokio::test]
+    async fn certified_delta_serves_the_certified_plane_with_origins() {
+        let state = test_state();
+        let current_version = state
+            .namespace
+            .read()
+            .unwrap()
+            .get_placement_policy("")
+            .expect("test namespace has a catch-all policy")
+            .version;
+        {
+            let mut api = state.eventual.lock().await;
+            api.eventual_counter_inc("eventual-only").unwrap();
+        }
+        {
+            let mut api = state.certified.lock().await;
+            let mut counter = crate::crdt::pn_counter::PnCounter::new();
+            counter.increment(&crate::types::NodeId("test-node".into()));
+            api.certified_write(
+                "certified-only".into(),
+                crate::store::kv::CrdtValue::Counter(counter),
+                crate::api::certified::OnTimeout::Pending,
+            )
+            .unwrap();
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/internal/certified/delta")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#,
+            ))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp.into_body()).await;
+        let delta: crate::network::sync::CertifiedDeltaResponse =
+            serde_json::from_str(&body).unwrap();
+
+        assert_eq!(delta.entries.len(), 1, "exactly the certified key");
+        assert_eq!(delta.entries[0].key, "certified-only");
+        assert_eq!(
+            delta.entries[0].policy_version,
+            Some(current_version),
+            "every entry must carry its write-time origin version"
+        );
+        assert!(!delta.truncated);
+        assert!(delta.sender_frontier.is_some());
     }
 
     #[tokio::test]
