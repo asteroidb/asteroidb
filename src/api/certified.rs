@@ -30,6 +30,40 @@ pub enum OnTimeout {
     Pending,
 }
 
+/// One entry of a certified delta batch: `(key, delta value, HLC, write-time
+/// origin policy version)`.
+///
+/// `origin` is `None` only for keys written before origins were persisted.
+pub type CertifiedDeltaTuple = (String, CrdtValue, HlcTimestamp, Option<PolicyVersion>);
+
+/// Outcome of a replicated certified ingest ([`CertifiedApi::merge_remote_certified`]).
+///
+/// Only `Err(CrdtError::Storage(_))` means "stop and do not advance the
+/// peer frontier". Every variant here is a processed entry: the lane
+/// advances past it, because a single undeliverable key must not wedge
+/// replication for the whole peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// The contribution inflated local state; it was tracked and logged.
+    Applied,
+    /// Redundant-relay gate (M-6): local state already dominates the
+    /// contribution. Nothing written, nothing logged, no timestamp moved.
+    Skipped,
+    /// Refused on its merits; see [`IngestRejection`].
+    Rejected(IngestRejection),
+}
+
+/// Why a replicated certified entry was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestRejection {
+    /// The wire origin is ahead of this node's current policy version.
+    /// Accepting it would pin the entry to a frontier this node cannot
+    /// produce (permanent `Pending`).
+    OriginAhead,
+    /// The incoming CRDT type conflicts with the stored one.
+    TypeMismatch,
+}
+
 /// A verifiable proof bundle attached to a certified read response.
 ///
 /// Contains the metadata needed for an external client to independently
@@ -893,28 +927,7 @@ impl CertifiedApi {
     ) -> Result<CertificationStatus, CrdtError> {
         let (key_range, policy_version, total_authorities) = self.resolve_scope(&key)?;
 
-        // Auto-cleanup when capacity is exceeded.
-        if self.pending_writes.len() >= self.retention.max_entries {
-            self.cleanup_completed();
-        }
-
-        // Hard eviction: if still at capacity after removing completed entries,
-        // evict oldest pending writes (mark as Timeout then remove) to make room.
-        if self.pending_writes.len() >= self.retention.max_entries {
-            let evict_count = self.pending_writes.len() - self.retention.max_entries + 1;
-            let mut evicted = 0;
-            for pw in &mut self.pending_writes {
-                if evicted >= evict_count {
-                    break;
-                }
-                if pw.status == CertificationStatus::Pending {
-                    pw.status = CertificationStatus::Timeout;
-                    evicted += 1;
-                }
-            }
-            self.evicted_count += evicted as u64;
-            self.retain_pending(|pw| pw.status != CertificationStatus::Timeout);
-        }
+        self.enforce_pending_capacity();
 
         // Invalidate any stale certified cache entry for this key so that
         // subsequent reads trigger fresh certification instead of returning
@@ -1038,6 +1051,240 @@ impl CertifiedApi {
             OnTimeout::Error => Err(CrdtError::CertificationTimeout),
             OnTimeout::Pending => Ok(CertificationStatus::Pending),
         }
+    }
+
+    /// Make room for one more tracked write, enforcing `max_entries` as a
+    /// HARD limit.
+    ///
+    /// 1. Completed (non-`Pending`) entries are removed first.
+    /// 2. If still at capacity, the OLDEST `Pending` entries are evicted
+    ///    (marked `Timeout`, then removed).
+    ///
+    /// Shared verbatim by `certified_write` and `merge_remote_certified`:
+    /// a replicated write must not be able to grow the tracking list past
+    /// a bound that local writes respect, or a peer could drive this
+    /// node's memory and read-path cost from the outside.
+    fn enforce_pending_capacity(&mut self) {
+        // Auto-cleanup when capacity is exceeded.
+        if self.pending_writes.len() >= self.retention.max_entries {
+            self.cleanup_completed();
+        }
+
+        // Hard eviction: if still at capacity after removing completed entries,
+        // evict oldest pending writes (mark as Timeout then remove) to make room.
+        if self.pending_writes.len() >= self.retention.max_entries {
+            let evict_count = self.pending_writes.len() - self.retention.max_entries + 1;
+            let mut evicted = 0;
+            for pw in &mut self.pending_writes {
+                if evicted >= evict_count {
+                    break;
+                }
+                if pw.status == CertificationStatus::Pending {
+                    pw.status = CertificationStatus::Timeout;
+                    evicted += 1;
+                }
+            }
+            self.evicted_count += evicted as u64;
+            self.retain_pending(|pw| pw.status != CertificationStatus::Timeout);
+        }
+    }
+
+    /// Extract certified entries modified strictly after `since`, each
+    /// tagged with its write-time ORIGIN policy version, for the certified
+    /// replication lane (P0-1).
+    ///
+    /// Returns `(entries, sender_frontier)`. **`sender_frontier` is the HLC
+    /// of the LAST INCLUDED entry when the batch was truncated**, never the
+    /// store's full frontier: a receiver that adopted the full frontier
+    /// after a partial batch would skip everything between the last
+    /// delivered entry and that frontier, permanently. When the batch is
+    /// complete it is the store's own frontier, which lets the receiver
+    /// jump over keys it will never be offered.
+    ///
+    /// `origin` is `None` for keys written before origins were persisted;
+    /// the receiver resolves that to its current version (see
+    /// `merge_remote_certified`), matching today's recovery behaviour.
+    pub fn certified_delta_entries(
+        &self,
+        since: &HlcTimestamp,
+        max: usize,
+    ) -> (Vec<CertifiedDeltaTuple>, Option<HlcTimestamp>) {
+        let all = self.store.delta_entries_since(since);
+        let truncated = all.len() > max;
+        let entries: Vec<CertifiedDeltaTuple> = all
+            .into_iter()
+            .take(max)
+            .map(|(key, value, hlc)| {
+                let origin = self.origins.get(&key).copied();
+                (key, value, hlc, origin)
+            })
+            .collect();
+        let sender_frontier = if truncated {
+            entries.last().map(|(_, _, hlc, _)| hlc.clone())
+        } else {
+            self.store.current_frontier()
+        };
+        (entries, sender_frontier)
+    }
+
+    /// Ingest a certified entry replicated from a peer (P0-1).
+    ///
+    /// This is the receiving half of the certified lane: it makes a
+    /// certified write durable on more than the one node that accepted it,
+    /// which is what removes the inversion where the strongly-consistent
+    /// plane was LESS durable than the eventual one.
+    ///
+    /// `origin` is the policy version the write was issued under **on the
+    /// writer**, carried on the wire. Pinning it here is not a nicety: the
+    /// receiver's `resolve_scope` reports the receiver's CURRENT version,
+    /// and `merge_remote_with_hlc`-style ingest keeps the writer's HLC, so
+    /// a node that has already moved to v2 would otherwise evaluate a v1
+    /// write against its v2 frontier and certify it. `is_version_fenced`
+    /// only gates attestation ADMISSION -- it cannot stop a certify that
+    /// reads the current version's frontier. That is the #342 fence bypass,
+    /// and without the wire origin replication would spread it to every
+    /// non-writer node, with no crash or restart involved.
+    ///
+    /// Ingest can only ever produce `Pending` tracking: it never touches
+    /// `certified_cache` (except to INVALIDATE), `attestations` or the
+    /// frontiers, so an internal-token holder cannot forge a `Certified`
+    /// verdict or a proof through this path.
+    pub fn merge_remote_certified(
+        &mut self,
+        key: String,
+        value: &CrdtValue,
+        hlc: HlcTimestamp,
+        origin: Option<PolicyVersion>,
+    ) -> Result<IngestOutcome, CrdtError> {
+        // The same policy gate a local write passes: a key with no
+        // authority definition can never certify, so it has no business in
+        // the certified store.
+        let (key_range, current_version, total_authorities) = self.resolve_scope(&key)?;
+
+        // An origin AHEAD of this node pins the entry to a frontier this
+        // node cannot yet produce: it would sit `Pending` until the local
+        // namespace catches up, and it asserts a policy version this node
+        // cannot validate. Refuse it; the peer will re-offer it after the
+        // namespace converges.
+        if let Some(o) = origin
+            && o > current_version
+        {
+            return Ok(IngestOutcome::Rejected(IngestRejection::OriginAhead));
+        }
+
+        // Advisory only, exactly as in `EventualApi::merge_remote_with_hlc`:
+        // a ClockSkew/Overflow must never discard the merge, because the
+        // lane advances its peer frontier past entries it processed and
+        // would never re-request them.
+        let _ = self.clock.update(&hlc);
+
+        let prev_ts = self.store.timestamp_for(&key).cloned();
+        let changed = match self.store.merge_value(key.clone(), value) {
+            Ok(changed) => changed,
+            Err(CrdtError::TypeMismatch { .. }) => {
+                // A single conflicting key must not wedge the lane: report
+                // it so the caller can count it and keep going.
+                return Ok(IngestOutcome::Rejected(IngestRejection::TypeMismatch));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // RR gate (redundant-relay suppression, M-6). A no-op merge on an
+        // already-tracked key must not touch the change log or the WAL:
+        // otherwise every pull round re-stamps the key, makes it "new" for
+        // the peer, and the lane never quiesces.
+        if !changed && prev_ts.is_some() {
+            return Ok(IngestOutcome::Skipped);
+        }
+
+        // Keep the WRITER's HLC. Re-stamping with the local clock is the
+        // other way to lose quiescence, and it would also destroy the
+        // total order the origin resolution below relies on.
+        self.store.record_change_max(&key, hlc.clone());
+
+        // The origin follows the HIGHEST-HLC contribution. HLCs are totally
+        // ordered, so every replica converges on the same origin for a key
+        // regardless of the order entries arrive in.
+        let newer = prev_ts.as_ref().is_none_or(|prev| hlc > *prev);
+        let effective_origin = if newer {
+            // Pre-origin keys (`None`) resolve to the current version --
+            // identical to today's `rebuild_pending_from_store` fallback,
+            // just decided earlier. TODO(v2): core-semantics-v2 replaces
+            // this fail-open fallback with roster/coverage evidence.
+            let eo = origin.unwrap_or(current_version);
+            self.origins.insert(key.clone(), eo);
+            eo
+        } else {
+            self.origins.get(&key).copied().unwrap_or(current_version)
+        };
+
+        // The value changed, so a proof cached against the previous value
+        // must not be inherited (same rule as `certified_write`).
+        self.certified_cache.remove(&key);
+
+        // WAL-log the post-merge state with its origin BEFORE tracking it,
+        // so a crash cannot leave a tracked-but-unlogged entry. A failed
+        // append is a hard error: the caller must not advance its peer
+        // frontier past an entry whose record never reached disk.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let stored_ts = self
+                .store
+                .timestamp_for(&key)
+                .cloned()
+                .unwrap_or_else(|| hlc.clone());
+            if let Some(wal) = self.wal.as_mut() {
+                let post_state = self.store.get(&key).cloned().ok_or_else(|| {
+                    CrdtError::Internal(format!("no post-state for WAL key {key}"))
+                })?;
+                let record = WalRecord::CertifiedUpsert {
+                    key: key.clone(),
+                    value: post_state,
+                    hlc: stored_ts,
+                    policy_version: effective_origin,
+                };
+                match wal.append(&record) {
+                    Ok(pos) => self.last_wal_pos = Some(pos),
+                    Err(e) => return Err(CrdtError::Storage(format!("WAL append failed: {e}"))),
+                }
+            }
+        }
+
+        // Track it so it can certify here. Deliberately NOT skipped in
+        // favour of "record the origin only": a replica that never tracks
+        // replicated keys reports them `Pending` forever, which is the
+        // liveness failure the certified value-plane design names as
+        // unacceptable.
+        self.enforce_pending_capacity();
+        let timestamp = self
+            .store
+            .timestamp_for(&key)
+            .cloned()
+            .unwrap_or_else(|| hlc.clone());
+        let value = self
+            .store
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        self.push_pending(PendingWrite {
+            key,
+            value,
+            timestamp,
+            status: CertificationStatus::Pending,
+            key_range: key_range.clone(),
+            policy_version: effective_origin,
+            total_authorities,
+        });
+
+        // Same rule as `rebuild_pending_from_store`: an origin behind the
+        // current version means the version bump that superseded it also
+        // fenced its scope. Re-derive that fence here so late old-version
+        // attestations are refused on this node too.
+        if effective_origin < current_version {
+            self.fence_version(&key_range, effective_origin);
+        }
+
+        Ok(IngestOutcome::Applied)
     }
 
     /// Check the certification status of the latest write for a key.
@@ -3927,6 +4174,260 @@ mod tests {
             read.proof.unwrap().certificate.is_some(),
             "leading attestations must be available once the bump lands"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // P0-1 / C1: certified replication ingest (`merge_remote_certified`).
+    //
+    // The lane carries `(key, value, hlc, origin)`. The receiver must pin
+    // the ORIGIN policy version it was handed instead of stamping the
+    // entry with its own current version — otherwise a v1 write read on a
+    // node that has already moved to v2 is evaluated against the v2
+    // frontier, which is the #342 fence bypass reopened cluster-wide.
+    // ---------------------------------------------------------------
+
+    fn versioned_namespace(version: u64) -> Arc<RwLock<SystemNamespace>> {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr(""),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(version), kr(""), 3))
+            .unwrap();
+        wrap_ns(ns)
+    }
+
+    fn remote_hlc(physical: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: "remote".into(),
+        }
+    }
+
+    #[test]
+    fn merge_remote_certified_pins_origin_and_fences_old_version() {
+        // This node already runs v2; the arriving entry was written under v1.
+        let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(2));
+
+        let outcome = api
+            .merge_remote_certified(
+                "key1".into(),
+                &counter_value(3),
+                remote_hlc(1_000),
+                Some(PolicyVersion(1)),
+            )
+            .unwrap();
+        assert_eq!(outcome, IngestOutcome::Applied);
+
+        assert_eq!(api.origins().get("key1"), Some(&PolicyVersion(1)));
+        let pw = api
+            .pending_writes()
+            .iter()
+            .find(|p| p.key == "key1")
+            .expect("ingest must track the entry so it can certify later");
+        assert_eq!(
+            pw.policy_version,
+            PolicyVersion(1),
+            "the tracked write must carry the ORIGIN version, not this node's current one"
+        );
+        assert!(
+            api.is_version_fenced(&kr(""), &PolicyVersion(1)),
+            "an origin behind the current version must re-derive the FR-009 fence, \
+             exactly as `rebuild_pending_from_store` does on restart"
+        );
+
+        // A v2 frontier well past the write must NOT certify it.
+        api.update_frontier(make_frontier_v("auth-1", 9_000, 0, "", 2));
+        api.update_frontier(make_frontier_v("auth-2", 9_000, 0, "", 2));
+        api.process_certifications();
+        assert_ne!(
+            api.get_certification_status("key1"),
+            CertificationStatus::Certified
+        );
+    }
+
+    #[test]
+    fn merge_remote_certified_rejects_origin_ahead_of_current_version() {
+        // A peer that has already seen a version bump this node has not.
+        // Accepting the pin would park the entry on a frontier this node
+        // can never produce: permanent Pending (a liveness poison), and a
+        // claim about a policy version this node cannot validate.
+        let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(1));
+
+        let outcome = api
+            .merge_remote_certified(
+                "key1".into(),
+                &counter_value(3),
+                remote_hlc(1_000),
+                Some(PolicyVersion(2)),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IngestOutcome::Rejected(IngestRejection::OriginAhead)
+        );
+        assert!(
+            api.store().get("key1").is_none(),
+            "a rejected ingest must not touch the store"
+        );
+        assert!(api.origins().get("key1").is_none());
+        assert!(api.pending_writes().is_empty());
+    }
+
+    /// A counter contribution from `writer` alone, so two deliveries from
+    /// different writers BOTH inflate state regardless of arrival order.
+    fn counter_from(writer: &str) -> CrdtValue {
+        let mut counter = PnCounter::new();
+        counter.increment(&node(writer));
+        CrdtValue::Counter(counter)
+    }
+
+    #[test]
+    fn merge_remote_certified_keeps_origin_of_the_max_hlc_contribution() {
+        // Two independent contributions to one key, each inflating state,
+        // arriving in either order. HLCs are totally ordered, so every
+        // replica must converge on the origin of the HIGHEST HLC —
+        // otherwise replicas disagree about which policy scope the key
+        // belongs to, and the same read returns different verdicts
+        // depending on which node answered.
+        for reverse in [false, true] {
+            let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(2));
+            let mut deliveries = vec![
+                (remote_hlc(10), PolicyVersion(1), counter_from("w1")),
+                (remote_hlc(20), PolicyVersion(2), counter_from("w2")),
+            ];
+            if reverse {
+                deliveries.reverse();
+            }
+            for (hlc, origin, value) in deliveries {
+                assert_eq!(
+                    api.merge_remote_certified("key1".into(), &value, hlc, Some(origin))
+                        .unwrap(),
+                    IngestOutcome::Applied,
+                    "both contributions inflate state (reverse={reverse})"
+                );
+            }
+            assert_eq!(
+                api.origins().get("key1"),
+                Some(&PolicyVersion(2)),
+                "origin must follow the max-HLC contribution regardless of arrival order \
+                 (reverse={reverse})"
+            );
+            assert_eq!(
+                api.store().timestamp_for("key1").unwrap().physical,
+                20,
+                "the stored HLC is the max of the contributions (reverse={reverse})"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_remote_certified_is_a_noop_for_dominated_state() {
+        // The RR gate (M-6): re-offering an already-dominated contribution
+        // must not touch the change log. Without it the lane never
+        // quiesces — each round re-stamps the key and makes it "new" for
+        // the peer again.
+        let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(1));
+        api.merge_remote_certified(
+            "key1".into(),
+            &counter_value(3),
+            remote_hlc(1_000),
+            Some(PolicyVersion(1)),
+        )
+        .unwrap();
+        let ts_before = api.store().timestamp_for("key1").cloned().unwrap();
+        let tracked_before = api.pending_writes().len();
+
+        let outcome = api
+            .merge_remote_certified(
+                "key1".into(),
+                &counter_value(3),
+                remote_hlc(2_000),
+                Some(PolicyVersion(1)),
+            )
+            .unwrap();
+        assert_eq!(outcome, IngestOutcome::Skipped);
+        assert_eq!(
+            api.store().timestamp_for("key1").cloned().unwrap(),
+            ts_before,
+            "a dominated re-offer must not move the per-key HLC"
+        );
+        assert_eq!(
+            api.pending_writes().len(),
+            tracked_before,
+            "a dominated re-offer must not add a tracking entry"
+        );
+    }
+
+    #[test]
+    fn certified_delta_entries_truncates_at_the_last_included_entry() {
+        // A truncated batch must report the LAST INCLUDED entry's HLC as
+        // the sender frontier. Reporting the store's full frontier would
+        // make the receiver adopt a baseline covering entries it was never
+        // sent, and the pull path never re-requests below its baseline —
+        // the skipped keys would be lost on that replica forever.
+        let mut api = CertifiedApi::new(node("node-1"), default_namespace());
+        for i in 0..5 {
+            api.certified_write(format!("key{i}"), counter_value(1), OnTimeout::Pending)
+                .unwrap();
+        }
+        let zero = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
+
+        let (entries, frontier) = api.certified_delta_entries(&zero, 2);
+        assert_eq!(entries.len(), 2);
+        let frontier = frontier.expect("a truncated batch still reports a frontier");
+        assert_eq!(
+            frontier, entries[1].2,
+            "the truncation frontier is the last DELIVERED entry's HLC"
+        );
+        assert!(
+            frontier < api.store().current_frontier().unwrap(),
+            "and it must trail the store's own frontier"
+        );
+
+        // Resuming from it delivers exactly the remainder, once.
+        let (rest, rest_frontier) = api.certified_delta_entries(&frontier, 100);
+        assert_eq!(rest.len(), 3, "the remainder must not be skipped");
+        assert_eq!(rest_frontier, api.store().current_frontier());
+        let (empty, _) = api.certified_delta_entries(&rest_frontier.unwrap(), 100);
+        assert!(empty.is_empty(), "a complete pull must then quiesce");
+    }
+
+    #[test]
+    fn certified_delta_entries_tags_each_entry_with_its_origin() {
+        let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(3));
+        api.certified_write("key1".into(), counter_value(1), OnTimeout::Pending)
+            .unwrap();
+        let zero = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: String::new(),
+        };
+        let (entries, _) = api.certified_delta_entries(&zero, 100);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].3,
+            Some(PolicyVersion(3)),
+            "the wire must carry the write-time origin, not the reader's version"
+        );
+
+        // A key with no recorded origin (pre-upgrade data) goes out as
+        // `None`; the receiver resolves it to its own current version,
+        // matching today's recovery fallback.
+        let mut api = CertifiedApi::new(node("node-1"), versioned_namespace(3));
+        api.store
+            .merge_value("legacy".into(), &counter_value(1))
+            .unwrap();
+        api.store.record_change("legacy", remote_hlc(50));
+        let (entries, _) = api.certified_delta_entries(&zero, 100);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].3, None);
     }
 
     // ---------------------------------------------------------------
