@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, watch};
 
-use crate::api::certified::CertifiedApi;
+use crate::api::certified::{CertifiedApi, IngestOutcome, IngestRejection};
 use crate::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use crate::authority::bls::BlsKeypair;
@@ -22,13 +22,15 @@ use crate::authority::frontier_sig::{FrontierSignature, NodeSigner};
 use crate::compaction::CompactionEngine;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::crdt::gc::TombstoneGc;
+use crate::error::CrdtError;
 use crate::hlc::{Hlc, HlcTimestamp, MAX_CLOCK_SKEW_MS};
 use crate::network::PeerRegistry;
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    DEFAULT_BATCH_SIZE, DigestSyncRequest, DigestSyncResult, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff,
-    PullDeltaResult, SyncClient, should_fallback_to_full_sync,
+    CertifiedDeltaResult, DEFAULT_BATCH_SIZE, DigestSyncRequest, DigestSyncResult,
+    MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
+    should_fallback_to_full_sync,
 };
 use crate::node::Node;
 use crate::ops::metrics::RuntimeMetrics;
@@ -216,6 +218,19 @@ pub struct NodeRunnerConfig {
     /// Ops kill switch: set `false` to restore the legacy full-sync-only
     /// behaviour (`ASTEROIDB_DIGEST_SYNC_DISABLED=1` in the binary).
     pub digest_sync_enabled: bool,
+    /// Enable the certified replication lane (P0-1).
+    ///
+    /// When `true` (default), each sync tick also pulls certified entries
+    /// from every peer so a certified write survives the loss of the node
+    /// that accepted it. Set `false` to restore the pre-lane behaviour
+    /// exactly: no certified pulls are issued at all (not merely
+    /// discarded), so the only change is that certified values stop
+    /// replicating.
+    ///
+    /// Config-level only for now — unlike `digest_sync_enabled` there is
+    /// no `ASTEROIDB_*` env override, because wiring one means editing
+    /// `src/main.rs`, which this change deliberately leaves untouched.
+    pub certified_sync_enabled: bool,
     /// This node's signing key holder. When `Some` and this node is an
     /// authority, frontier reports are signed (FR-008 signing pipeline).
     pub node_signer: Option<Arc<NodeSigner>>,
@@ -281,6 +296,7 @@ impl Default for NodeRunnerConfig {
             frontier_gc_grace_period_secs: 300,
             full_sync_threshold: 0.5,
             digest_sync_enabled: true,
+            certified_sync_enabled: true,
             node_signer: None,
             keyset_registry: None,
             internal_token: None,
@@ -408,6 +424,22 @@ pub struct NodeRunner {
     /// up rolling upgrades). Cleaned together with `peer_frontiers` when
     /// peers leave the registry.
     digest_unsupported: HashMap<String, Instant>,
+    /// Per-peer baseline for the CERTIFIED replication lane (P0-1).
+    ///
+    /// A separate map from `peer_frontiers` on purpose: the two planes
+    /// have independent stores and independent HLC ranges, so sharing a
+    /// baseline would let progress on one plane skip entries on the other.
+    /// Advanced only after every entry in a response has been processed
+    /// without a storage error.
+    certified_peer_frontiers: HashMap<String, HlcTimestamp>,
+    /// Per-peer backoff for the certified lane, independent of
+    /// `peer_backoffs` so a certified-lane failure cannot throttle eventual
+    /// anti-entropy (or the reverse).
+    certified_backoffs: HashMap<String, PeerBackoff>,
+    /// Peers whose router has no certified delta route (nodes predating
+    /// the lane), with the instant of the rejection. Re-probed after
+    /// [`DIGEST_UNSUPPORTED_RETRY`] so a rolling upgrade is picked up.
+    certified_unsupported: HashMap<String, Instant>,
     /// Per-peer `(fingerprint, delivered_at_wall_ms)` of the last
     /// split-view gossip sample that was provably DELIVERED to the peer
     /// on the sync piggyback lane (M-14): a carrier request that reached
@@ -842,6 +874,9 @@ impl NodeRunner {
             gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
+            certified_peer_frontiers: HashMap::new(),
+            certified_backoffs: HashMap::new(),
+            certified_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -978,6 +1013,9 @@ impl NodeRunner {
             gc_gate_warn_last_ms: 0,
             peer_backoffs: HashMap::new(),
             digest_unsupported: HashMap::new(),
+            certified_peer_frontiers: HashMap::new(),
+            certified_backoffs: HashMap::new(),
+            certified_unsupported: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -2116,6 +2154,7 @@ impl NodeRunner {
                 }
                 _ = sync_interval.tick(), if sync_enabled => {
                     self.run_sync().await;
+                    self.run_certified_sync().await;
                     self.execute_rebalance_batch().await;
                     stats.sync_ticks += 1;
                 }
@@ -3600,6 +3639,12 @@ impl NodeRunner {
             .retain(|addr, _| active_addrs.contains(addr));
         self.digest_unsupported
             .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_peer_frontiers
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_backoffs
+            .retain(|addr, _| active_addrs.contains(addr));
+        self.certified_unsupported
+            .retain(|addr, _| active_addrs.contains(addr));
         self.observed_last_sent
             .retain(|addr, _| active_addrs.contains(addr));
 
@@ -3615,6 +3660,222 @@ impl NodeRunner {
             node = %self.node_id.0,
             "anti-entropy sync cycle completed (delta-based)"
         );
+    }
+
+    /// Run one cycle of the CERTIFIED replication lane (P0-1).
+    ///
+    /// Pull-only, additive, and strictly separate from [`run_sync`]:
+    /// it never locks `state.eventual`, never calls an `EventualApi`
+    /// method, and never touches the eventual store. That isolation is
+    /// what keeps `eventual.rs` at zero diff and leaves the delta/digest
+    /// quiescence and golden tests untouched.
+    ///
+    /// ## Why this exists
+    ///
+    /// `CertifiedApi` owns a private store that no anti-entropy path
+    /// touched: `internal_sync`, `internal_delta_sync`,
+    /// `internal_digest_sync` and `internal_keys` all serve
+    /// `state.eventual`. A certified write therefore lived on exactly one
+    /// disk — losing the accepting node lost the value permanently, and a
+    /// client was left holding a verifiable proof for a value that no
+    /// longer existed anywhere. The same key written through the EVENTUAL
+    /// path would have survived. This closes that inversion.
+    ///
+    /// The contract is anti-entropy durability (the eventual plane's
+    /// model), NOT synchronous quorum durability: an ack still means
+    /// "durable on this node", and a write can be lost if its node dies
+    /// before a pull reaches it.
+    ///
+    /// ## Why pull and not push
+    ///
+    /// A push would drag in `internal_sync`'s ack-durability contract and
+    /// require changes inside the 850-line `run_sync`. A pull is a
+    /// self-contained loop whose worst failure is "no progress this
+    /// cycle".
+    ///
+    /// ## Frontier advance rule
+    ///
+    /// The baseline advances only when every entry was processed WITHOUT a
+    /// storage error. `Rejected`/`Skipped` entries still advance it, and a
+    /// storage error stops the cycle without advancing. This exact pairing
+    /// is the only one that avoids both failure modes: stopping on a
+    /// rejection would let one key's type conflict wedge a peer forever,
+    /// and advancing past a storage error would mark an entry received
+    /// whose WAL record never landed.
+    pub async fn run_certified_sync(&mut self) {
+        if !self.config.certified_sync_enabled {
+            return;
+        }
+        let Some(sync_client) = &self.sync_client else {
+            return;
+        };
+
+        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+        for peer in &peers {
+            let peer_key = peer.addr.clone();
+
+            // Peers that predate the lane answer 404. Skip them for a
+            // while instead of paying a request per tick, but re-probe so
+            // a rolling upgrade is picked up without a restart.
+            if let Some(at) = self.certified_unsupported.get(&peer_key) {
+                if at.elapsed() < DIGEST_UNSUPPORTED_RETRY {
+                    continue;
+                }
+                self.certified_unsupported.remove(&peer_key);
+            }
+
+            {
+                let backoff = self.certified_backoffs.entry(peer_key.clone()).or_default();
+                if !backoff.is_ready() {
+                    continue;
+                }
+            }
+
+            self.metrics
+                .certified_sync_attempt_total
+                .fetch_add(1, Ordering::Relaxed);
+
+            let baseline = self
+                .certified_peer_frontiers
+                .get(&peer_key)
+                .cloned()
+                .unwrap_or(HlcTimestamp {
+                    physical: 0,
+                    logical: 0,
+                    node_id: String::new(),
+                });
+
+            // The HTTP round trip happens with NO lock held; the certified
+            // lock is taken only to apply the decoded response.
+            let result = sync_client
+                .pull_certified_delta(&peer.addr, &self.node_id.0, &baseline)
+                .await;
+
+            let resp = match result {
+                CertifiedDeltaResult::Ok(resp) => resp,
+                CertifiedDeltaResult::Unsupported => {
+                    // Expected during a rolling upgrade: NOT a failure, so
+                    // it must not feed the backoff or the error counter.
+                    self.certified_unsupported
+                        .insert(peer_key.clone(), Instant::now());
+                    self.metrics
+                        .certified_sync_unsupported_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                CertifiedDeltaResult::Failed => {
+                    self.metrics
+                        .certified_sync_failed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.certified_backoffs
+                        .entry(peer_key.clone())
+                        .or_default()
+                        .record_failure();
+                    continue;
+                }
+            };
+
+            let mut applied = 0u64;
+            let mut skipped = 0u64;
+            let mut origin_unknown = 0u64;
+            let mut origin_ahead = 0u64;
+            let mut type_mismatch = 0u64;
+            let mut storage_error: Option<String> = None;
+            let origins_len;
+            {
+                let mut api = self.certified_api.lock().await;
+                // Entries arrive in ascending HLC order and are applied in
+                // that order, so a later contribution can never be
+                // overtaken by an earlier one.
+                for e in resp.entries {
+                    if e.policy_version.is_none() {
+                        origin_unknown += 1;
+                    }
+                    match api.merge_remote_certified(e.key, &e.value, e.hlc, e.policy_version) {
+                        Ok(IngestOutcome::Applied) => applied += 1,
+                        Ok(IngestOutcome::Skipped) => skipped += 1,
+                        Ok(IngestOutcome::Rejected(IngestRejection::OriginAhead)) => {
+                            origin_ahead += 1
+                        }
+                        Ok(IngestOutcome::Rejected(IngestRejection::TypeMismatch)) => {
+                            type_mismatch += 1
+                        }
+                        Err(CrdtError::Storage(msg)) => {
+                            // The value is in memory but its WAL record is
+                            // not on disk. Stop here and leave the baseline
+                            // where it was so the entry is re-offered.
+                            storage_error = Some(msg);
+                            break;
+                        }
+                        Err(e) => {
+                            // Policy-denied and friends: this entry has no
+                            // home on this node, but the next one might.
+                            tracing::debug!(
+                                peer = %peer.node_id.0,
+                                error = %e,
+                                "certified entry refused; continuing"
+                            );
+                        }
+                    }
+                }
+                origins_len = api.origins_len();
+            }
+
+            self.metrics
+                .certified_origins_len
+                .store(origins_len as u64, Ordering::Relaxed);
+            for (counter, value) in [
+                (&self.metrics.certified_sync_entries_applied_total, applied),
+                (&self.metrics.certified_sync_entries_skipped_total, skipped),
+                (
+                    &self.metrics.certified_sync_origin_unknown_total,
+                    origin_unknown,
+                ),
+                (
+                    &self.metrics.certified_sync_origin_ahead_rejected_total,
+                    origin_ahead,
+                ),
+                (
+                    &self.metrics.certified_sync_type_mismatch_total,
+                    type_mismatch,
+                ),
+            ] {
+                if value > 0 {
+                    counter.fetch_add(value, Ordering::Relaxed);
+                }
+            }
+
+            if let Some(msg) = storage_error {
+                tracing::warn!(
+                    peer = %peer.node_id.0,
+                    error = %msg,
+                    "certified ingest hit a storage error; baseline held back"
+                );
+                self.metrics
+                    .certified_sync_failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.certified_backoffs
+                    .entry(peer_key.clone())
+                    .or_default()
+                    .record_failure();
+                continue;
+            }
+
+            // Every entry was processed: adopt the responder's baseline.
+            // On a truncated batch this is the LAST INCLUDED entry's HLC,
+            // so the remainder is still above the new baseline.
+            if let Some(frontier) = resp.sender_frontier {
+                self.certified_peer_frontiers
+                    .insert(peer_key.clone(), frontier);
+            }
+            self.metrics
+                .certified_sync_success_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.certified_backoffs
+                .entry(peer_key.clone())
+                .or_default()
+                .record_success();
+        }
     }
 
     /// Run one cycle of peer list exchange (membership gossip).
