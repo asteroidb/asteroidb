@@ -264,9 +264,8 @@ pub struct NodeRunnerConfig {
     /// discarded), so the only change is that certified values stop
     /// replicating.
     ///
-    /// Config-level only for now — unlike `digest_sync_enabled` there is
-    /// no `ASTEROIDB_*` env override, because wiring one means editing
-    /// `src/main.rs`, which this change deliberately leaves untouched.
+    /// Ops kill switch: `ASTEROIDB_CERTIFIED_SYNC_DISABLED=1` in the
+    /// binary.
     pub certified_sync_enabled: bool,
     /// This node's signing key holder. When `Some` and this node is an
     /// authority, frontier reports are signed (FR-008 signing pipeline).

@@ -181,6 +181,7 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
 | `ASTEROIDB_EXCLUDE_ACCUSED_AUTHORITIES` | いいえ | `false` | `1`/`true` で、equivocation 証拠が記録された Authority の attestation を**証明書組み立てから除外**する（frontier の前進自体は許容——frontier 値は単調 max 情報で毒性が低い）。除外は 3 点で強制される: (1) HTTP 受信経路での検証時＋**apply 時の再チェック**（同一リクエスト内で告発が後続しても前方の attestation がすり抜けない）、(2) **告発時の attestation pool purge**（告発前にプール済みの最大 128 checkpoint 分の attestation を除去。`attestation_purged_total` で観測可能）、(3) **自己報告経路**（自ノードが告発された場合、自身の attestation も pool へ入れず、既存分を purge する）。過半数のしきい値の分母は縮まないため除外は常に安全側（証明を難しくする方向）にしか働かないが、除外により当該 scope が過半数割れすると **certificate 生成が停止する可用性コスト**がある。デフォルトは検知のみ（警告ログ＋証拠保存＋メトリクス）で、除外は運用者の明示的な opt-in。**`0`（既定）では purge は発動せず、告発済み Authority の attestation は detect-only 契約どおり証明書に混入し続ける**。なお、告発**前**に組み立て済み・キャッシュ済みの証明書の遡及失効は行わない（証明書失効プロトコルは将来課題、`docs/followup-plan.md` 参照） |
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
+| `ASTEROIDB_CERTIFIED_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で certified replication レーン（P0-1、同期 tick ごとの certified pull）を無効化し、レーン導入前の挙動へ切り戻す。pull は**一切発行されない**（結果を捨てるのではなくリクエスト自体を出さない）。有効化中は certified write がそれを受理したノードの喪失で失われうる（ops キルスイッチ、要再起動。4.5 を参照） |
 | `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
 | `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
 | `RUST_LOG` | いいえ | `info` | ログレベル（tracing-subscriber 形式）。**未設定・空文字列の場合は `info` 相当**（6.1 を参照）。値を明示した場合はその指定がそのまま尊重される（`RUST_LOG=error` で ERROR のみに絞ることもできる） |
@@ -849,8 +850,8 @@ RR ゲートで落ちるだけなので、コストは転送量と受信側の�
 `NodeRunnerConfig::certified_sync_enabled`（既定 `true`）を `false` にすると、
 certified の pull を**一切発行しない**（結果を捨てるのではなく、リクエスト自体を
 出さない）。挙動はレーン導入前と完全に一致する。
-なお `digest_sync_enabled` と違い `ASTEROIDB_*` 環境変数による上書きは現時点で
-無く、設定レベルでのみ切り替えられる。
+出荷バイナリでは `ASTEROIDB_CERTIFIED_SYNC_DISABLED=1`（または `true`）を設定して
+再起動することで切り替える（`ASTEROIDB_DIGEST_SYNC_DISABLED` と同じ形式）。
 
 ### セキュリティ上の注意
 
