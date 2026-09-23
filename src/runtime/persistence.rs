@@ -496,44 +496,37 @@ fn save_origins_sidecar(path: &Path, origins: &HashMap<String, PolicyVersion>) -
     crate::store::backend::FileBackend::new(path).save(&bytes)
 }
 
-/// Collect the write-time policy version of every tracked certified write,
-/// keyed by store key (latest timestamp wins on collision).
+/// Snapshot the write-time policy version of every key in the certified
+/// store, for the origins sidecar.
 ///
-/// EVERY tracked write is captured, `Certified` ones included. The WAL-only
-/// recovery path has no status to filter on — it harvests the origin of every
-/// `CertifiedUpsert` record regardless of whether the write was momentarily
-/// certified before the crash — so the sidecar must do the same or the two
-/// paths diverge: a write certified under v_old, then fenced when the policy
-/// bumps to v_new, would recover as v_old (Timeout) from the WAL but as v_new
-/// (re-certified off the newer frontier) from a pruned-WAL checkpoint. The
-/// certification state is deliberately volatile: on restart every write
-/// regresses to `Pending`, and a write whose origin trails the current
-/// version must stay pinned to that origin and re-fenced so it cannot
-/// re-certify off a newer frontier — exactly the restart-dependent
-/// certification this fix eliminates.
-fn certified_pending_origins(api: &CertifiedApi) -> HashMap<String, PolicyVersion> {
-    let mut origins: HashMap<String, (HlcOrigin, PolicyVersion)> = HashMap::new();
-    for pw in api.pending_writes() {
-        let stamp = HlcOrigin {
-            physical: pw.timestamp.physical,
-            logical: pw.timestamp.logical,
-        };
-        match origins.get(&pw.key) {
-            Some((existing, _)) if *existing >= stamp => {}
-            _ => {
-                origins.insert(pw.key.clone(), (stamp, pw.policy_version));
-            }
-        }
-    }
-    origins.into_iter().map(|(k, (_, v))| (k, v)).collect()
-}
-
-/// Comparable (physical, logical) prefix of an HLC, for picking the latest
-/// pending write per key when building the origins sidecar.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct HlcOrigin {
-    physical: u64,
-    logical: u32,
+/// Reads `CertifiedApi::origins` — the API's first-class per-key pin map —
+/// rather than deriving the set from `pending_writes`.
+///
+/// It USED to derive it, and that was a durability hole. `pending_writes`
+/// is a bounded, EXPIRING tracking cache: `NodeRunner::run_cleanup` (5s by
+/// default) drops entries past `max_age_ms` (60s), while the checkpoint
+/// ticker runs on `snapshot_interval` (300s) and the checkpoint itself
+/// prunes the WAL segments holding the same origins. So ~60s after a write
+/// both carriers of its origin were erased in one step and the key
+/// silently fell back to `unwrap_or(current_version)` on the next restart
+/// — the FR-009 fence bypass that fix/fence-persistence-across-restart
+/// closed, reopened by a timer. (The four `fenced_*_across_restart`
+/// regression tests never caught it: they use `snapshot_interval: None`
+/// with a manual checkpoint and never run a cleanup tick.)
+///
+/// EVERY key is captured, including keys whose writes were certified and
+/// whose tracking entry is long gone. The WAL-only recovery path has no
+/// status to filter on — it harvests the origin of every `CertifiedUpsert`
+/// record regardless — so the sidecar must do the same or the two paths
+/// diverge: a write certified under v_old, then fenced when the policy
+/// bumps to v_new, would recover as v_old (Timeout) from the WAL but as
+/// v_new (re-certified off the newer frontier) from a pruned-WAL
+/// checkpoint. The certification state itself stays deliberately volatile:
+/// on restart every write regresses to `Pending`, and a write whose origin
+/// trails the current version stays pinned to that origin and re-fenced so
+/// it cannot re-certify off a newer frontier.
+fn certified_origins(api: &CertifiedApi) -> HashMap<String, PolicyVersion> {
+    api.origins().clone()
 }
 
 /// Write a snapshot off the API lock and, on success, drop sealed WAL
@@ -608,7 +601,7 @@ pub async fn checkpoint_certified(
         let sealed = api.wal_rotate()?;
         // Capture the origins under the SAME lock as the store clone so the
         // sidecar and the snapshot describe the same set of writes.
-        let origins = certified_pending_origins(&api);
+        let origins = certified_origins(&api);
         (sealed, api.store().clone(), origins)
     };
 

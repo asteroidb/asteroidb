@@ -279,6 +279,40 @@ pub struct CertifiedApi {
     frontiers: AckFrontierSet,
     namespace: Arc<RwLock<SystemNamespace>>,
     pending_writes: Vec<PendingWrite>,
+    /// Index of the LATEST `pending_writes` entry per key.
+    ///
+    /// `get_certified` / `get_certification_status` are on the certified
+    /// read path (`SLO_CERTIFIED_READ_P99`) and both want "the newest
+    /// tracked write for this key". A reverse linear scan was acceptable
+    /// while the certified store only ever held this node's own writes;
+    /// with replication it holds the CLUSTER's certified key set, so the
+    /// scan is now O(tracked writes) on every read. Kept in lockstep with
+    /// `pending_writes` by construction: pushes update it in place, and
+    /// every structural removal goes through `retain_pending`, which
+    /// rebuilds it.
+    pending_index: HashMap<String, usize>,
+    /// Write-time (ORIGIN) policy version per key -- first-class, durable
+    /// state rather than a projection of `pending_writes`.
+    ///
+    /// This is the pin that keeps a write being evaluated in the policy
+    /// scope it was issued under (FR-009 / #342). It CANNOT be derived
+    /// from `pending_writes`: that list is a bounded, EXPIRING tracking
+    /// cache (`cleanup_expired` drops entries past `max_age_ms`, ~60s by
+    /// default) while checkpoints run on a much slower cadence (~300s) and
+    /// prune the WAL segments carrying the same origins. Deriving the
+    /// checkpoint sidecar from it therefore erased both carriers of an
+    /// origin about a minute after the write, silently degrading the key
+    /// to the current-version fallback on the next restart -- the exact
+    /// fence bypass #342 closed, reopened by a timer.
+    ///
+    /// Seeded on recovery from the sidecar + retained WAL, extended by
+    /// every local `certified_write` and every replicated ingest, and
+    /// dumped verbatim by `checkpoint_certified`.
+    ///
+    /// Growth is O(certified keys) by design; `origins_len` exports it for
+    /// monitoring. TODO(v2): core-semantics-v2 replaces per-key pins with
+    /// roster/coverage proofs, collapsing this to O(policy versions).
+    origins: HashMap<String, PolicyVersion>,
     retention: RetentionPolicy,
     /// Cumulative count of pending writes evicted due to `max_entries` pressure.
     evicted_count: u64,
@@ -346,6 +380,8 @@ impl CertifiedApi {
             frontiers,
             namespace,
             pending_writes: Vec::new(),
+            pending_index: HashMap::new(),
+            origins: HashMap::new(),
             retention: RetentionPolicy::default(),
             evicted_count: 0,
             certified_cache: HashMap::new(),
@@ -405,6 +441,8 @@ impl CertifiedApi {
             frontiers,
             namespace,
             pending_writes: Vec::new(),
+            pending_index: HashMap::new(),
+            origins: HashMap::new(),
             retention: RetentionPolicy::default(),
             evicted_count: 0,
             certified_cache: HashMap::new(),
@@ -419,7 +457,14 @@ impl CertifiedApi {
             wal,
             last_wal_pos: None,
         };
-        api.rebuild_pending_from_store(&origins);
+        // The recovered origins are RETAINED, not consumed: they are the
+        // live pin map from here on, and the next `checkpoint_certified`
+        // dumps them back to the sidecar. Consuming them (the previous
+        // behaviour) meant the sidecar was rebuilt from the expiring
+        // `pending_writes` cache instead, which dropped every origin whose
+        // tracking entry had aged out -- see the `origins` field doc.
+        api.origins = origins;
+        api.rebuild_pending_from_store();
         api
     }
 
@@ -446,31 +491,60 @@ impl CertifiedApi {
     /// (pre-upgrade data, or non-certified keys) fall back to the current
     /// version — today's behaviour.
     #[cfg(not(target_arch = "wasm32"))]
-    fn rebuild_pending_from_store(&mut self, origins: &HashMap<String, PolicyVersion>) {
+    fn rebuild_pending_from_store(&mut self) {
+        // Pass 1 (unbounded, cheap): derive every fence and rank the keys
+        // by recency. Fences are safety state and must cover the WHOLE
+        // store -- capping them would let an old-version key certify off
+        // the current frontier, which is precisely what the cap must not
+        // buy. Only the TRACKING (pass 2) is bounded.
         let keys: Vec<String> = self.store.keys().into_iter().cloned().collect();
         let mut fences: Vec<(KeyRange, PolicyVersion)> = Vec::new();
+        let mut ranked: Vec<(HlcTimestamp, String)> = Vec::with_capacity(keys.len());
         for key in keys {
-            let (Some(value), Some(timestamp)) = (
-                self.store.get(&key).cloned(),
-                self.store.timestamp_for(&key).cloned(),
-            ) else {
+            let Some(timestamp) = self.store.timestamp_for(&key).cloned() else {
+                continue;
+            };
+            let Ok((key_range, current_version, _)) = self.resolve_scope(&key) else {
+                continue;
+            };
+            // Prefer the persisted origin version; fall back to the current
+            // one when it is unknown (pre-upgrade snapshot/WAL data).
+            let policy_version = self.origins.get(&key).copied().unwrap_or(current_version);
+            // A write issued under an older-than-current version was fenced at
+            // the version bump on the live node; that fence was in-memory
+            // only. Re-derive it so the recovered write stays isolated in its
+            // old scope (no re-certification off the current frontier).
+            if policy_version < current_version {
+                fences.push((key_range, policy_version));
+            }
+            ranked.push((timestamp, key));
+        }
+
+        // Pass 2: re-track at most `max_entries` keys, newest first.
+        //
+        // Replication makes this store hold the CLUSTER-wide certified key
+        // set, so an unbounded rebuild would let recovery install a
+        // `pending_writes` list far past the bound `certified_write`
+        // enforces on every other path -- an unbounded read-path scan and
+        // an unbounded allocation, both reachable from remote writes.
+        // Newest-first is the useful half: recent writes are the ones still
+        // being polled for certification, and an evicted entry degrades to
+        // `Pending` exactly like a cleanup-expired one.
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.truncate(self.retention.max_entries);
+        // Restore store order (ascending HLC) so tracking order matches the
+        // live path, where writes are appended in issue order.
+        ranked.reverse();
+        for (timestamp, key) in ranked {
+            let Some(value) = self.store.get(&key).cloned() else {
                 continue;
             };
             let Ok((key_range, current_version, total_authorities)) = self.resolve_scope(&key)
             else {
                 continue;
             };
-            // Prefer the persisted origin version; fall back to the current
-            // one when it is unknown (pre-upgrade snapshot/WAL data).
-            let policy_version = origins.get(&key).copied().unwrap_or(current_version);
-            // A write issued under an older-than-current version was fenced at
-            // the version bump on the live node; that fence was in-memory
-            // only. Re-derive it so the recovered write stays isolated in its
-            // old scope (no re-certification off the current frontier).
-            if policy_version < current_version {
-                fences.push((key_range.clone(), policy_version));
-            }
-            self.pending_writes.push(PendingWrite {
+            let policy_version = self.origins.get(&key).copied().unwrap_or(current_version);
+            self.push_pending(PendingWrite {
                 key,
                 value,
                 timestamp,
@@ -483,6 +557,48 @@ impl CertifiedApi {
         for (range, version) in fences {
             self.fence_version(&range, version);
         }
+    }
+
+    /// Append a tracked write and keep `pending_index` pointing at it.
+    fn push_pending(&mut self, pw: PendingWrite) {
+        self.pending_index
+            .insert(pw.key.clone(), self.pending_writes.len());
+        self.pending_writes.push(pw);
+    }
+
+    /// Structurally filter `pending_writes`, then rebuild `pending_index`.
+    ///
+    /// Every removal must go through here: a stale index would make the
+    /// read path report another key's status.
+    fn retain_pending<F: FnMut(&PendingWrite) -> bool>(&mut self, f: F) {
+        self.pending_writes.retain(f);
+        self.pending_index.clear();
+        for (i, pw) in self.pending_writes.iter().enumerate() {
+            self.pending_index.insert(pw.key.clone(), i);
+        }
+    }
+
+    /// The latest tracked write for `key`, via `pending_index`.
+    fn latest_pending(&self, key: &str) -> Option<&PendingWrite> {
+        self.pending_index
+            .get(key)
+            .and_then(|i| self.pending_writes.get(*i))
+    }
+
+    /// Write-time (ORIGIN) policy version of every key this node holds in
+    /// its certified store.
+    ///
+    /// The input to the certified origins sidecar (`checkpoint_certified`).
+    pub fn origins(&self) -> &HashMap<String, PolicyVersion> {
+        &self.origins
+    }
+
+    /// Number of per-key origin pins held in memory.
+    ///
+    /// Grows with the certified key set (see the `origins` field doc);
+    /// exported so operators can watch it.
+    pub fn origins_len(&self) -> usize {
+        self.origins.len()
     }
 
     /// Position of the most recent WAL append (for durability waits).
@@ -517,6 +633,8 @@ impl CertifiedApi {
             frontiers,
             namespace,
             pending_writes: Vec::new(),
+            pending_index: HashMap::new(),
+            origins: HashMap::new(),
             retention,
             evicted_count: 0,
             certified_cache: HashMap::new(),
@@ -685,12 +803,7 @@ impl CertifiedApi {
             .and_then(|(kr, pv, total)| self.frontiers.majority_frontier_for_scope(kr, pv, *total));
 
         // Look up status from pending_writes first; fall back to certified_cache.
-        let pending_status = self
-            .pending_writes
-            .iter()
-            .rev()
-            .find(|pw| pw.key == key)
-            .map(|pw| pw.status);
+        let pending_status = self.latest_pending(key).map(|pw| pw.status);
 
         let (status, proof) = match pending_status {
             Some(CertificationStatus::Certified) => {
@@ -800,8 +913,7 @@ impl CertifiedApi {
                 }
             }
             self.evicted_count += evicted as u64;
-            self.pending_writes
-                .retain(|pw| pw.status != CertificationStatus::Timeout);
+            self.retain_pending(|pw| pw.status != CertificationStatus::Timeout);
         }
 
         // Invalidate any stale certified cache entry for this key so that
@@ -850,6 +962,10 @@ impl CertifiedApi {
 
         self.store.merge_value(key.clone(), &value)?;
         self.store.record_change(&key, timestamp.clone());
+        // Pin the write to the version it was issued under. Durable via the
+        // `CertifiedUpsert` record appended below and via the origins
+        // sidecar at the next checkpoint.
+        self.origins.insert(key.clone(), policy_version);
 
         // WAL-log the post-write state before any acknowledgement. The
         // certified store has no anti-entropy fallback, so a failed append
@@ -906,7 +1022,7 @@ impl CertifiedApi {
             self.cache_certified_proof(&pw);
         }
 
-        self.pending_writes.push(pw);
+        self.push_pending(pw);
 
         if already_certified {
             return Ok(CertificationStatus::Certified);
@@ -929,10 +1045,7 @@ impl CertifiedApi {
     /// Returns `CertificationStatus::Pending` if no tracked write exists
     /// and the key is not in the certified proof cache.
     pub fn get_certification_status(&self, key: &str) -> CertificationStatus {
-        self.pending_writes
-            .iter()
-            .rev()
-            .find(|pw| pw.key == key)
+        self.latest_pending(key)
             .map(|pw| pw.status)
             .unwrap_or_else(|| {
                 if self.certified_cache.contains_key(key) {
@@ -1361,8 +1474,7 @@ impl CertifiedApi {
     /// This removes `Certified`, `Rejected`, and `Timeout` entries,
     /// keeping only writes that are still awaiting resolution.
     pub fn cleanup_completed(&mut self) {
-        self.pending_writes
-            .retain(|pw| pw.status == CertificationStatus::Pending);
+        self.retain_pending(|pw| pw.status == CertificationStatus::Pending);
     }
 
     /// Mark pending writes older than `max_age_ms` as `Timeout`,
@@ -3814,6 +3926,53 @@ mod tests {
         assert!(
             read.proof.unwrap().certificate.is_some(),
             "leading attestations must be available once the bump lands"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // P0-1 / C0: recovery tracking must respect the retention cap.
+    //
+    // Replication makes the certified store grow to the CLUSTER-wide
+    // certified key set, while `rebuild_pending_from_store` re-tracked
+    // every recovered key unconditionally. `pending_writes` is a bounded
+    // cache everywhere else (`certified_write` enforces `max_entries`
+    // hard); recovery must not be the one door that ignores the bound and
+    // makes `get_certified`'s reverse scan unbounded.
+    // ---------------------------------------------------------------
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn recovery_respects_pending_write_cap() {
+        let max_entries = RetentionPolicy::default().max_entries;
+        let mut store = Store::new();
+        for i in 0..(max_entries + 25) {
+            let key = format!("key{i}");
+            store.merge_value(key.clone(), &counter_value(1)).unwrap();
+            store.record_change(
+                &key,
+                HlcTimestamp {
+                    physical: 1_000 + i as u64,
+                    logical: 0,
+                    node_id: "writer".into(),
+                },
+            );
+        }
+
+        let api = CertifiedApi::recovered(
+            node("node-1"),
+            default_namespace(),
+            store,
+            None,
+            HashMap::new(),
+        );
+        assert!(
+            api.pending_writes().len() <= max_entries,
+            "recovery re-tracked {} entries, above the {max_entries} retention cap",
+            api.pending_writes().len()
+        );
+        assert!(
+            !api.pending_writes().is_empty(),
+            "the cap must bound tracking, not disable it"
         );
     }
 }
