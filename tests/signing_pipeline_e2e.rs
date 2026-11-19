@@ -388,7 +388,16 @@ async fn forged_frontiers_cannot_advance_certification() {
         );
         let proof = api.get_certified("user/bob").proof.unwrap();
         assert!(proof.certificate.is_some());
-        let verification = asteroidb_poc::authority::verifier::verify_proof(&proof, None, 0);
+        let verification = asteroidb_poc::authority::verifier::verify_proof(
+            &proof,
+            &[
+                (node_id("auth-1"), s1.verifying_key()),
+                (node_id("auth-2"), s2.verifying_key()),
+                (node_id("auth-3"), s3.verifying_key()),
+            ],
+            None,
+            0,
+        );
         assert!(verification.valid);
     }
 

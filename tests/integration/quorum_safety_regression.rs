@@ -15,6 +15,7 @@ use asteroidb_poc::authority::certificate::{
     AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
     sign_message,
 };
+use asteroidb_poc::authority::frontier_sig::{CHECKPOINT_INTERVAL_MS, NodeSigner};
 use asteroidb_poc::compaction::{CompactionConfig, CompactionEngine};
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -76,6 +77,36 @@ fn make_frontier_v(
         policy_version: PolicyVersion(version),
         digest_hash: format!("{authority}-{physical}-{logical}-v{version}"),
     }
+}
+
+#[cfg(feature = "native-crypto")]
+fn report_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = authority.bytes().fold(0u8, u8::wrapping_add);
+    NodeSigner::from_seed(node(authority), &seed, false)
+}
+
+#[cfg(not(feature = "native-crypto"))]
+fn report_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = authority.bytes().fold(0u8, u8::wrapping_add);
+    NodeSigner::from_seed(node(authority), &seed)
+}
+
+fn add_signed_covering_frontier(
+    api: &mut CertifiedApi,
+    authority: &str,
+    write_physical: u64,
+    prefix: &str,
+) {
+    let signer = report_signer(authority);
+    let report_time = (write_physical / CHECKPOINT_INTERVAL_MS + 1) * CHECKPOINT_INTERVAL_MS + 100;
+    let frontier = make_frontier(authority, report_time, 0, prefix);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    api.update_frontier_verified(
+        frontier.clone(),
+        Some(signer.self_verified(&frontier, &signature)),
+    );
 }
 
 fn counter_value(n: i64) -> CrdtValue {
@@ -867,12 +898,28 @@ fn compaction_eligibility_uses_scoped_frontier() {
     // is_compactable uses scoped is_certified_at_for_scope which only counts
     // entries matching the checkpoint's key_range + policy_version.
     // No "user/" frontiers exist, so this must NOT be compactable:
-    assert!(!engine.is_compactable("user/", &frontiers, 3));
+    assert!(!engine.is_compactable(
+        "user/",
+        &frontiers,
+        &[
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into())
+        ]
+    ));
 
     // With only 1 frontier entry (also wrong scope): still NOT compactable
     let mut frontiers_insufficient = AckFrontierSet::new();
     frontiers_insufficient.update(make_frontier("auth-1", 500, 0, "order/"));
-    assert!(!engine.is_compactable("user/", &frontiers_insufficient, 3));
+    assert!(!engine.is_compactable(
+        "user/",
+        &frontiers_insufficient,
+        &[
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into())
+        ]
+    ));
 }
 
 /// Compaction with scoped frontiers: when all authorities are in the correct
@@ -898,7 +945,15 @@ fn compaction_eligible_with_scoped_frontiers() {
     frontiers.update(make_frontier("auth-2", 400, 0, "sensor/"));
     frontiers.update(make_frontier("auth-3", 250, 0, "sensor/"));
 
-    assert!(engine.is_compactable("sensor/", &frontiers, 3));
+    assert!(engine.is_compactable(
+        "sensor/",
+        &frontiers,
+        &[
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into())
+        ]
+    ));
 }
 
 /// Compaction must not be eligible when frontier majority is below checkpoint.
@@ -926,7 +981,15 @@ fn compaction_ineligible_when_frontiers_behind_checkpoint() {
 
     // majority frontier = sorted [500, 600, 15000], idx=1 → 600 < 10000
     assert!(
-        !engine.is_compactable("log/", &frontiers, 3),
+        !engine.is_compactable(
+            "log/",
+            &frontiers,
+            &[
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into())
+            ]
+        ),
         "compaction allowed with majority behind checkpoint"
     );
 }
@@ -993,8 +1056,8 @@ fn retention_auto_cleanup_removes_completed_entries() {
     let ts_last = api.pending_writes().last().unwrap().timestamp.physical;
 
     // Certify all entries by advancing frontier well past all timestamps
-    api.update_frontier(make_frontier("auth-1", ts_last + 1, 0, ""));
-    api.update_frontier(make_frontier("auth-2", ts_last + 1, 0, ""));
+    add_signed_covering_frontier(&mut api, "auth-1", ts_last, "");
+    add_signed_covering_frontier(&mut api, "auth-2", ts_last, "");
     api.process_certifications();
 
     // All 5 should be certified now
@@ -1026,9 +1089,9 @@ fn retention_auto_cleanup_removes_completed_entries() {
     );
 }
 
-/// Expired pending writes are marked Timeout and removed by cleanup.
+/// Elapsed response waits do not remove pending writes.
 #[test]
-fn retention_expired_writes_marked_timeout_and_removed() {
+fn retention_elapsed_wait_keeps_pending_write() {
     let policy = RetentionPolicy {
         max_age_ms: 1_000,
         max_entries: 10_000,
@@ -1043,37 +1106,55 @@ fn retention_expired_writes_marked_timeout_and_removed() {
     api.cleanup_expired(write_ts + 999);
     assert_eq!(api.pending_writes().len(), 1);
 
-    // Now expired
+    // The wait threshold has elapsed, but certification work remains.
     api.cleanup_expired(write_ts + 1_000);
     assert_eq!(
         api.pending_writes().len(),
-        0,
-        "expired pending write was not cleaned up"
+        1,
+        "elapsed wait must not discard pending certification work"
     );
 }
 
-/// cleanup() performs full lifecycle: expire + remove completed.
+/// cleanup() removes completed entries and retains pending entries.
 #[test]
 fn retention_full_cleanup_lifecycle() {
     let policy = RetentionPolicy {
         max_age_ms: 5_000,
         max_entries: 100,
     };
-    let mut api = CertifiedApi::with_retention(node("node-1"), default_namespace(), policy);
+    let mut ns = SystemNamespace::new();
+    for prefix in ["cert/", "expire/"] {
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: key_range(prefix),
+            authority_nodes: vec![node("auth-1"), node("auth-2"), node("auth-3")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), key_range(prefix), 3))
+            .unwrap();
+    }
+    let mut api = CertifiedApi::with_retention(node("node-1"), wrap_ns(ns), policy);
 
     // Write entry A (will be certified)
-    api.certified_write("cert-me".into(), counter_value(1), OnTimeout::Pending)
+    api.certified_write("cert/me".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
     let ts_a = api.pending_writes()[0].timestamp.physical;
 
-    // Write entry B (will expire)
-    api.certified_write("expire-me".into(), counter_value(2), OnTimeout::Pending)
+    // Write B under another range, so its status cannot be certified by
+    // the signed majority that covers A.
+    api.certified_write("expire/me".into(), counter_value(2), OnTimeout::Pending)
         .unwrap();
 
-    // Certify A
-    api.update_frontier(make_frontier("auth-1", ts_a + 1, 0, ""));
-    api.update_frontier(make_frontier("auth-2", ts_a + 1, 0, ""));
+    add_signed_covering_frontier(&mut api, "auth-1", ts_a, "cert/");
+    add_signed_covering_frontier(&mut api, "auth-2", ts_a, "cert/");
     api.process_certifications();
+    assert_eq!(
+        api.get_certification_status("cert/me"),
+        CertificationStatus::Certified
+    );
+    assert_eq!(
+        api.get_certification_status("expire/me"),
+        CertificationStatus::Pending
+    );
 
     // Full cleanup at time well past max_age_ms
     let ts_b = api.pending_writes()[1].timestamp.physical;
@@ -1081,8 +1162,8 @@ fn retention_full_cleanup_lifecycle() {
 
     assert_eq!(
         api.pending_writes().len(),
-        0,
-        "entries remained after full cleanup"
+        1,
+        "pending entry should remain after cleanup"
     );
 }
 
@@ -1103,8 +1184,8 @@ fn retention_bounded_growth_under_sustained_writes() {
         // Certify every 3rd write
         if i % 3 == 0 {
             let last_ts = api.pending_writes().last().unwrap().timestamp.physical;
-            api.update_frontier(make_frontier("auth-1", last_ts + 100, 0, ""));
-            api.update_frontier(make_frontier("auth-2", last_ts + 100, 0, ""));
+            add_signed_covering_frontier(&mut api, "auth-1", last_ts, "");
+            add_signed_covering_frontier(&mut api, "auth-2", last_ts, "");
             api.process_certifications();
         }
     }

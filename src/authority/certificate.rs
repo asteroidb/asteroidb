@@ -100,6 +100,9 @@ pub enum CertError {
     #[error("invalid signature from {0}")]
     InvalidSignature(String),
 
+    #[error("invalid certificate metadata: {0}")]
+    InvalidCertificateMetadata(&'static str),
+
     #[error("keyset version too old: {0}")]
     StaleKeyset(u64),
 
@@ -117,6 +120,12 @@ pub enum CertError {
 
     #[error("authority {0} not found in keyset registry")]
     AuthorityNotInRegistry(String),
+
+    #[error("authority ID {0} appears more than once in a keyset")]
+    DuplicateAuthorityId(String),
+
+    #[error("authority {0} shares a public key with another authority in a keyset")]
+    DuplicateAuthorityKey(String),
 
     #[error("expired certificate format version {version} (grace period elapsed)")]
     ExpiredFormatVersion { version: u32 },
@@ -283,15 +292,39 @@ impl KeysetRegistry {
     ///
     /// The `version` must be strictly greater than the current version
     /// (monotonic increment). `registered_epoch` records when this keyset
-    /// became active.
+    /// became active. IDs and public keys must be unique within the batch;
+    /// a retained older keyset cannot assign the same public key to another
+    /// Authority ID while mixed-version signatures remain valid.
     pub fn register_keyset(
         &mut self,
         version: KeysetVersion,
         registered_epoch: u64,
         keys: Vec<(NodeId, VerifyingKey)>,
     ) -> Result<(), CertError> {
-        if version.0 <= self.current && self.current > 0 {
+        if !self.keysets.is_empty() && version.0 <= self.current {
             return Err(CertError::StaleKeyset(version.0));
+        }
+        // Quorum counts Authority IDs. A repeated ID is ambiguous, and one
+        // private key registered under two IDs can sign twice for a 2-of-3
+        // certificate (the checkpoint signature omits the Authority ID).
+        // Validate the entire batch before changing the registry.
+        let mut ids = HashSet::new();
+        let mut public_keys = HashSet::new();
+        for (id, key) in &keys {
+            if !ids.insert(id) {
+                return Err(CertError::DuplicateAuthorityId(id.0.clone()));
+            }
+            if !public_keys.insert(key.to_bytes()) {
+                return Err(CertError::DuplicateAuthorityKey(id.0.clone()));
+            }
+            if self.keysets.values().any(|entry| {
+                entry
+                    .keys
+                    .iter()
+                    .any(|(prior_id, prior_key)| prior_id != id && prior_key == key)
+            }) {
+                return Err(CertError::DuplicateAuthorityKey(id.0.clone()));
+            }
         }
         self.keysets.insert(
             version.0,
@@ -313,6 +346,21 @@ impl KeysetRegistry {
     /// Get the authority keys for a specific keyset version.
     pub fn get_keys(&self, version: &KeysetVersion) -> Option<&[(NodeId, VerifyingKey)]> {
         self.keysets.get(&version.0).map(|e| e.keys.as_slice())
+    }
+
+    /// Read-only Ed25519 keyset history, including registration epochs. This
+    /// lets an external trust anchor bind every version used by archived
+    /// operation evidence without exposing mutable registry internals.
+    pub fn ed25519_keysets(
+        &self,
+    ) -> impl Iterator<Item = (KeysetVersion, u64, &[(NodeId, VerifyingKey)])> {
+        self.keysets.iter().map(|(version, entry)| {
+            (
+                KeysetVersion(*version),
+                entry.registered_epoch,
+                entry.keys.as_slice(),
+            )
+        })
     }
 
     /// Check whether a keyset version is valid given the current epoch and config.
@@ -373,11 +421,10 @@ impl KeysetRegistry {
     /// `fast_aggregate_verify` sound against rogue-key attacks.
     ///
     /// The batch is atomic: with `native-crypto`, every PoP is verified
-    /// *before* any key is inserted, and a single failure rejects the whole
-    /// batch with [`CertError::InvalidProofOfPossession`]. Without
-    /// `native-crypto` the stub types cannot be verified; the keys are
-    /// inserted unchecked, which is harmless because non-native verification
-    /// ignores the BLS lane entirely.
+    /// before insertion. Every ID must also belong to the Ed25519 keyset,
+    /// and BLS public keys cannot be shared by different IDs in any retained
+    /// keyset. Without `native-crypto` the stub PoP cannot be verified;
+    /// non-native verification ignores the BLS lane entirely.
     pub fn register_bls_keys(
         &mut self,
         version: &KeysetVersion,
@@ -385,7 +432,7 @@ impl KeysetRegistry {
     ) -> Result<(), CertError> {
         let entry = self
             .keysets
-            .get_mut(&version.0)
+            .get(&version.0)
             .ok_or(CertError::UnknownKeyset(version.0))?;
 
         // Pass 1 (native only): verify every proof of possession before
@@ -397,7 +444,38 @@ impl KeysetRegistry {
             }
         }
 
+        // PoP proves possession of one private key; it does not prevent that
+        // key from being listed under two Authority IDs and counted twice in
+        // an aggregate quorum. Require every BLS ID to be an Ed25519 member
+        // of this keyset, and reject aliases or overwrites atomically.
+        let mut ids: HashSet<&str> = entry.bls_keys.keys().map(String::as_str).collect();
+        let mut public_keys: HashSet<String> =
+            entry.bls_keys.values().map(BlsPublicKey::to_hex).collect();
+        for (id, pk, _) in &bls_keys {
+            if !entry.keys.iter().any(|(member, _)| member.0 == *id) {
+                return Err(CertError::AuthorityNotInRegistry(id.clone()));
+            }
+            if !ids.insert(id.as_str()) {
+                return Err(CertError::DuplicateAuthorityId(id.clone()));
+            }
+            if !public_keys.insert(pk.to_hex()) {
+                return Err(CertError::DuplicateAuthorityKey(id.clone()));
+            }
+            if self.keysets.values().any(|keyset| {
+                keyset
+                    .bls_keys
+                    .iter()
+                    .any(|(prior_id, prior_key)| prior_id != id && prior_key == pk)
+            }) {
+                return Err(CertError::DuplicateAuthorityKey(id.clone()));
+            }
+        }
+
         // Pass 2: all proofs verified — insert.
+        let entry = self
+            .keysets
+            .get_mut(&version.0)
+            .expect("validated keyset exists");
         for (id, pk, _pop) in bls_keys {
             entry.bls_keys.insert(id, pk);
         }
@@ -737,6 +815,11 @@ impl MajorityCertificate {
     /// Returns the list of authority IDs whose signatures are valid.
     /// Returns an error if any signature fails verification.
     pub fn verify_signatures(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        if self.signature_algorithm != SignatureAlgorithm::Ed25519 {
+            return Err(CertError::InvalidCertificateMetadata(
+                "majority certificate must declare Ed25519 signatures",
+            ));
+        }
         let mut valid_signers = Vec::new();
         // Deduplicate by authority: a single authority's valid signature
         // replayed N times must not inflate the verified-signer count that
@@ -769,6 +852,11 @@ impl MajorityCertificate {
         current_epoch: u64,
         epoch_config: &EpochConfig,
     ) -> Result<Vec<NodeId>, CertError> {
+        if self.signature_algorithm != SignatureAlgorithm::Ed25519 {
+            return Err(CertError::InvalidCertificateMetadata(
+                "majority certificate must declare Ed25519 signatures",
+            ));
+        }
         let mut valid_signers = Vec::new();
         // Deduplicate by authority (see `verify_signatures`): replayed valid
         // signatures from one authority must count once, not N times.
@@ -979,6 +1067,14 @@ impl DualModeCertificate {
         self.signer_count() >= needed
     }
 
+    fn declared_mode_matches_algorithm(&self) -> bool {
+        matches!(
+            (&self.mode, self.signature_algorithm),
+            (CertificateMode::Ed25519, SignatureAlgorithm::Ed25519)
+                | (CertificateMode::Bls, SignatureAlgorithm::Bls12_381)
+        )
+    }
+
     /// Verify the certificate against the given message bytes.
     ///
     /// Dispatches to Ed25519 or BLS verification based on the `signature_algorithm`
@@ -993,6 +1089,11 @@ impl DualModeCertificate {
     /// for any certificate received from an untrusted source (the production
     /// proof-verification path does).
     pub fn verify(&self, message: &[u8]) -> Result<Vec<NodeId>, CertError> {
+        if !self.declared_mode_matches_algorithm() {
+            return Err(CertError::InvalidCertificateMetadata(
+                "dual certificate mode and signature algorithm disagree",
+            ));
+        }
         match self.signature_algorithm {
             SignatureAlgorithm::Ed25519 => self.verify_ed25519(message),
             SignatureAlgorithm::Bls12_381 => self.verify_bls(message),
@@ -1164,6 +1265,11 @@ impl DualModeCertificate {
         current_epoch: u64,
         epoch_config: &EpochConfig,
     ) -> Result<Vec<NodeId>, CertError> {
+        if !self.declared_mode_matches_algorithm() {
+            return Err(CertError::InvalidCertificateMetadata(
+                "dual certificate mode and signature algorithm disagree",
+            ));
+        }
         // Validate keyset version is known and not expired.
         if !registry.is_version_valid(&self.keyset_version, current_epoch, epoch_config) {
             if registry.get_keys(&self.keyset_version).is_none() {
@@ -1216,12 +1322,8 @@ impl DualModeCertificate {
 /// `http::handlers::verify_proof`) routes through it, so "zero authorities are
 /// unsatisfiable" holds on both sides of the protocol.
 ///
-/// Verification is NOT self-securing here: `verify_proof` takes the
-/// denominator from the bundle, and `contributing_count` is the length of the
-/// verified-signer list with no membership check against the authority set. A
-/// bundle carrying `total_authorities: 0` plus one valid signature therefore
-/// used to verify as a majority of nobody. Routing the verifier through this
-/// function is what closes that asymmetry.
+/// Verifiers derive the denominator from a caller-supplied trusted roster and
+/// check signer membership separately. The bundle's count is only a claim.
 pub(crate) fn majority_threshold(total: usize) -> usize {
     if total == 0 {
         return usize::MAX;
@@ -1880,6 +1982,138 @@ mod tests {
     }
 
     #[test]
+    fn one_key_cannot_register_as_two_authorities_in_a_three_member_roster() {
+        let mut registry = KeysetRegistry::new();
+        let (signer, shared_key) = make_key_pair();
+        let (_, third_key) = make_key_pair();
+        let aliased = vec![
+            (NodeId("auth-a".into()), shared_key),
+            (NodeId("auth-b".into()), shared_key),
+            (NodeId("auth-c".into()), third_key),
+        ];
+
+        // The certificate message does not include the Authority ID. One
+        // private key could otherwise occupy two signer slots in 2-of-3.
+        let message = b"same checkpoint";
+        let signature = sign_message(&signer, message);
+        let mut cert = MajorityCertificate::new(
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            HlcTimestamp {
+                physical: 1_000,
+                logical: 0,
+                node_id: String::new(),
+            },
+            PolicyVersion(1),
+            KeysetVersion(1),
+        );
+        for id in ["auth-a", "auth-b"] {
+            cert.add_signature(AuthoritySignature {
+                authority_id: NodeId(id.into()),
+                public_key: shared_key,
+                signature,
+                keyset_version: KeysetVersion(1),
+            });
+        }
+        assert!(cert.has_majority(3));
+        assert_eq!(cert.verify_signatures(message).unwrap().len(), 2);
+
+        assert!(matches!(
+            registry.register_keyset(KeysetVersion(1), 0, aliased),
+            Err(CertError::DuplicateAuthorityKey(_))
+        ));
+        assert!(registry.get_keys(&KeysetVersion(1)).is_none());
+    }
+
+    #[test]
+    fn rejected_duplicate_id_rotation_does_not_change_current_keyset() {
+        let mut registry = KeysetRegistry::new();
+        let (_, first_key) = make_key_pair();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(NodeId("auth-a".into()), first_key)],
+            )
+            .unwrap();
+        let (_, second_key) = make_key_pair();
+        let (_, third_key) = make_key_pair();
+        assert!(matches!(
+            registry.register_keyset(
+                KeysetVersion(2),
+                1,
+                vec![
+                    (NodeId("auth-a".into()), second_key),
+                    (NodeId("auth-a".into()), third_key),
+                ],
+            ),
+            Err(CertError::DuplicateAuthorityId(_))
+        ));
+        assert_eq!(registry.current_version(), KeysetVersion(1));
+        assert!(registry.get_keys(&KeysetVersion(2)).is_none());
+        registry
+            .register_keyset(
+                KeysetVersion(2),
+                1,
+                vec![(NodeId("auth-a".into()), second_key)],
+            )
+            .unwrap();
+        assert_eq!(registry.current_version(), KeysetVersion(2));
+    }
+
+    #[test]
+    fn mixed_version_key_alias_cannot_supply_two_of_three_signers() {
+        let mut registry = KeysetRegistry::new();
+        let (signer, shared_key) = make_key_pair();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(NodeId("auth-a".into()), shared_key)],
+            )
+            .unwrap();
+        let (_, third_key) = make_key_pair();
+        let message = b"one checkpoint in two keyset versions";
+        let signature = sign_message(&signer, message);
+        let mut cert = MajorityCertificate::new(
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            HlcTimestamp {
+                physical: 1_000,
+                logical: 0,
+                node_id: String::new(),
+            },
+            PolicyVersion(1),
+            KeysetVersion(2),
+        );
+        for (id, version) in [("auth-a", 1), ("auth-b", 2)] {
+            cert.add_signature(AuthoritySignature {
+                authority_id: NodeId(id.into()),
+                public_key: shared_key,
+                signature,
+                keyset_version: KeysetVersion(version),
+            });
+        }
+        assert!(cert.has_majority(3));
+        assert_eq!(cert.verify_signatures(message).unwrap().len(), 2);
+
+        assert!(matches!(
+            registry.register_keyset(
+                KeysetVersion(2),
+                1,
+                vec![
+                    (NodeId("auth-b".into()), shared_key),
+                    (NodeId("auth-c".into()), third_key),
+                ],
+            ),
+            Err(CertError::DuplicateAuthorityKey(_))
+        ));
+        assert_eq!(registry.current_version(), KeysetVersion(1));
+    }
+
+    #[test]
     fn keyset_registry_monotonic_version() {
         let mut registry = KeysetRegistry::new();
         let (_, vk) = make_key_pair();
@@ -1892,6 +2126,28 @@ mod tests {
         let (_, vk2) = make_key_pair();
         let result = registry.register_keyset(KeysetVersion(1), 1, vec![(NodeId("b".into()), vk2)]);
         assert!(matches!(result, Err(CertError::StaleKeyset(1))));
+    }
+
+    #[test]
+    fn keyset_version_zero_cannot_be_overwritten() {
+        let mut registry = KeysetRegistry::new();
+        let (_, first) = make_key_pair();
+        let (_, replacement) = make_key_pair();
+        registry
+            .register_keyset(KeysetVersion(0), 0, vec![(NodeId("auth-a".into()), first)])
+            .unwrap();
+        assert!(matches!(
+            registry.register_keyset(
+                KeysetVersion(0),
+                1,
+                vec![(NodeId("auth-a".into()), replacement)],
+            ),
+            Err(CertError::StaleKeyset(0))
+        ));
+        assert_eq!(
+            registry.get_key_for_authority(&KeysetVersion(0), &NodeId("auth-a".into())),
+            Some(&first)
+        );
     }
 
     #[test]
@@ -2121,6 +2377,62 @@ mod tests {
             .verify_signatures_with_registry(&message, &registry, 0, &config)
             .unwrap();
         assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn majority_certificate_rejects_bls_label_on_ed25519_signatures() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+        let (sk, vk) = make_key_pair();
+        let mut cert = MajorityCertificate::new(kr, hlc, pv, KeysetVersion(1));
+        cert.add_signature(make_auth_sig(
+            NodeId("auth-1".into()),
+            vk,
+            sign_message(&sk, &message),
+        ));
+        cert.signature_algorithm = SignatureAlgorithm::Bls12_381;
+        assert!(matches!(
+            cert.verify_signatures(&message),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), vk)])
+            .unwrap();
+        assert!(matches!(
+            cert.verify_signatures_with_registry(&message, &registry, 0, &EpochConfig::default()),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn dual_certificate_rejects_disagreeing_mode_and_algorithm() {
+        let kr = sample_key_range();
+        let hlc = sample_hlc();
+        let pv = sample_policy_version();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+        let (sk, vk) = make_key_pair();
+        let mut cert = DualModeCertificate::new_ed25519(kr, hlc, pv, KeysetVersion(1));
+        cert.add_ed25519_signature(make_auth_sig(
+            NodeId("auth-1".into()),
+            vk,
+            sign_message(&sk, &message),
+        ));
+        cert.signature_algorithm = SignatureAlgorithm::Bls12_381;
+        assert!(matches!(
+            cert.verify(&message),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(KeysetVersion(1), 0, vec![(NodeId("auth-1".into()), vk)])
+            .unwrap();
+        assert!(matches!(
+            cert.verify_with_registry(&message, &registry, 0, &EpochConfig::default()),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
     }
 
     #[test]
@@ -2816,6 +3128,140 @@ mod tests {
             registry.get_bls_key(&KeysetVersion(1), "auth-1"),
             Some(&kp.public_key)
         );
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_rejects_two_authority_aliases_atomically() {
+        let mut registry = KeysetRegistry::new();
+        let ed_keys = (0..3)
+            .map(|i| (NodeId(format!("auth-{i}")), make_key_pair().1))
+            .collect();
+        registry
+            .register_keyset(KeysetVersion(1), 0, ed_keys)
+            .unwrap();
+        let shared = make_bls_keypair(101);
+        let result = registry.register_bls_keys(
+            &KeysetVersion(1),
+            vec![
+                (
+                    "auth-0".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                ),
+                (
+                    "auth-1".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                ),
+            ],
+        );
+        assert!(matches!(result, Err(CertError::DuplicateAuthorityKey(_))));
+        assert!(registry.get_bls_key(&KeysetVersion(1), "auth-0").is_none());
+        assert!(registry.get_bls_key(&KeysetVersion(1), "auth-1").is_none());
+
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-0".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                )],
+            )
+            .unwrap();
+        let replacement = make_bls_keypair(103);
+        assert!(matches!(
+            registry.register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-0".into(),
+                    replacement.public_key.clone(),
+                    replacement.proof_of_possession(),
+                )],
+            ),
+            Err(CertError::DuplicateAuthorityId(_))
+        ));
+        assert!(matches!(
+            registry.register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-1".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                )],
+            ),
+            Err(CertError::DuplicateAuthorityKey(_))
+        ));
+        assert!(registry.get_bls_key(&KeysetVersion(1), "auth-1").is_none());
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_rejects_id_outside_ed25519_keyset() {
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(NodeId("auth-0".into()), make_key_pair().1)],
+            )
+            .unwrap();
+        let outsider = make_bls_keypair(102);
+        assert!(matches!(
+            registry.register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "outsider".into(),
+                    outsider.public_key.clone(),
+                    outsider.proof_of_possession(),
+                )],
+            ),
+            Err(CertError::AuthorityNotInRegistry(_))
+        ));
+    }
+
+    #[cfg(feature = "native-crypto")]
+    #[test]
+    fn register_bls_keys_rejects_cross_version_identity_alias() {
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(NodeId("auth-a".into()), make_key_pair().1)],
+            )
+            .unwrap();
+        let shared = make_bls_keypair(104);
+        registry
+            .register_bls_keys(
+                &KeysetVersion(1),
+                vec![(
+                    "auth-a".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                )],
+            )
+            .unwrap();
+        registry
+            .register_keyset(
+                KeysetVersion(2),
+                1,
+                vec![(NodeId("auth-b".into()), make_key_pair().1)],
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.register_bls_keys(
+                &KeysetVersion(2),
+                vec![(
+                    "auth-b".into(),
+                    shared.public_key.clone(),
+                    shared.proof_of_possession(),
+                )],
+            ),
+            Err(CertError::DuplicateAuthorityKey(_))
+        ));
+        assert!(registry.get_bls_key(&KeysetVersion(2), "auth-b").is_none());
     }
 
     #[cfg(feature = "native-crypto")]

@@ -23,9 +23,11 @@ use asteroidb_poc::http::routes::router;
 use asteroidb_poc::network::sync::{DigestSyncRequest, DigestSyncResponse, SyncClient};
 use asteroidb_poc::network::{PeerConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::runtime::persistence::{CheckpointLocks, PersistenceConfig, recover_eventual};
 use asteroidb_poc::runtime::{NodeRunner, NodeRunnerConfig};
 use asteroidb_poc::store::digest::{DIGEST_SCHEME_VERSION, bucket_of, compute_store_digest};
 use asteroidb_poc::store::kv::CrdtValue;
+use asteroidb_poc::store::wal::{SyncPolicy, WalConfig};
 use asteroidb_poc::types::{KeyRange, NodeId};
 
 use axum::body::Body;
@@ -89,6 +91,34 @@ fn test_state_with_token(name: &str, token: Option<String>) -> Arc<AppState> {
         eventual_wal: None,
         certified_wal: None,
     })
+}
+
+/// A real WAL-backed peer for tests that treat a digest or push reply as
+/// tombstone-GC evidence. The plain `test_state` deliberately has no durable
+/// storage and therefore must return `durable=false`.
+fn durable_state(
+    name: &str,
+) -> (
+    Arc<AppState>,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = PersistenceConfig {
+        enabled: true,
+        data_dir: dir.path().to_path_buf(),
+        sync: SyncPolicy::Always,
+        snapshot_interval: None,
+        segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        recover_truncate: false,
+        checkpoint_locks: CheckpointLocks::default(),
+    };
+    let (api, syncer) = recover_eventual(node_id(name), &config).unwrap();
+    let syncer = syncer.unwrap();
+    let flusher = tokio::spawn(Arc::clone(&syncer).run_flusher());
+    let mut state = shared_state(name, Arc::new(Mutex::new(api)));
+    Arc::get_mut(&mut state).unwrap().eventual_wal = Some(syncer);
+    (state, dir, flusher)
 }
 
 /// Snapshot a state's store data as a sorted map (digest input).
@@ -506,6 +536,93 @@ async fn serve(app: axum::Router) -> (std::net::SocketAddr, tokio::task::JoinHan
     // Give the listener a moment to start accepting.
     tokio::time::sleep(Duration::from_millis(20)).await;
     (addr, handle)
+}
+
+/// A complete push must carry floor-only values even after HLC compaction
+/// removed every per-key timestamp. The real sync endpoint must merge those
+/// floors into a peer that still holds the old live dots.
+#[tokio::test]
+async fn full_push_after_hlc_prune_delivers_empty_set_and_map_floors() {
+    let source = test_state("floor-source");
+    let peer = test_state("floor-peer");
+    let stale_entries = {
+        let mut api = source.eventual.lock().await;
+        api.eventual_set_add("set", "old".into()).unwrap();
+        api.eventual_map_set("map", "old".into(), "value".into())
+            .unwrap();
+        api.store()
+            .all_entries()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let dot_writer = match stale_entries.get("set") {
+        Some(CrdtValue::Set(set)) => set.counters().keys().next().unwrap().clone(),
+        other => panic!("expected set, got {other:?}"),
+    };
+    {
+        let mut api = peer.eventual.lock().await;
+        for (key, value) in &stale_entries {
+            api.merge_remote(key.clone(), value).unwrap();
+        }
+    }
+
+    let entries = {
+        let mut api = source.eventual.lock().await;
+        api.eventual_set_remove("set", "old").unwrap();
+        api.eventual_map_delete("map", "old").unwrap();
+        match api.store_mut().get_mut("set") {
+            Some(CrdtValue::Set(set)) => {
+                set.compact_deferred_certified(&set.deferred_dots());
+                assert_eq!(set.deferred_len(), 0);
+            }
+            other => panic!("expected set, got {other:?}"),
+        }
+        match api.store_mut().get_mut("map") {
+            Some(CrdtValue::Map(map)) => {
+                map.compact_deferred_certified(&map.deferred_dots());
+                assert_eq!(map.deferred_len(), 0);
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+        let frontier = api.store().current_frontier().unwrap();
+        assert_eq!(api.store_mut().prune_timestamps_before("", &frontier), 2);
+        assert!(api.store().current_frontier().is_none());
+        api.store()
+            .all_entries()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    assert_eq!(entries.len(), 2);
+
+    let (addr, server) = serve(router(peer.clone())).await;
+    let registry = PeerRegistry::new(node_id("floor-source"), vec![]).unwrap();
+    let client = SyncClient::new(Arc::new(Mutex::new(registry)));
+    let response = client
+        .push_full_state_to_peer(&addr.to_string(), entries, "floor-source")
+        .await
+        .expect("full push response");
+    assert_eq!(response.merged, 2);
+    assert!(response.errors.is_empty());
+
+    let mut api = peer.eventual.lock().await;
+    for (key, value) in &stale_entries {
+        api.merge_remote(key.clone(), value).unwrap();
+    }
+    match api.store().get("set") {
+        Some(CrdtValue::Set(set)) => {
+            assert!(!set.contains(&"old".to_string()));
+            assert_eq!(set.compaction_floor().get(&dot_writer), Some(&1));
+        }
+        other => panic!("expected set, got {other:?}"),
+    }
+    match api.store().get("map") {
+        Some(CrdtValue::Map(map)) => {
+            assert!(!map.contains_key(&"old".to_string()));
+            assert_eq!(map.compaction_floor().get(&dot_writer), Some(&1));
+        }
+        other => panic!("expected map, got {other:?}"),
+    }
+    server.abort();
 }
 
 /// Router with the pre-digest sync surface MINUS the delta endpoint, so
@@ -1114,7 +1231,8 @@ async fn runner_digest_push_subset_pushes_only_mismatched_buckets() {
 
 /// Push side, peer-only mismatch: every mismatched bucket is empty
 /// locally (the peer holds data we lack), so nothing is pushed, no full
-/// push runs, and the pull phase fetches the peer-only data.
+/// push runs, and the pull phase fetches the peer-only data. Later
+/// verification probes may see matching roots after convergence.
 #[tokio::test]
 async fn runner_digest_push_peer_only_mismatch_pushes_nothing() {
     let server = test_state("server");
@@ -1181,11 +1299,6 @@ async fn runner_digest_push_peer_only_mismatch_pushes_nothing() {
             .load(Ordering::Relaxed),
         0,
         "peer-only mismatches must push nothing"
-    );
-    assert_eq!(
-        metrics.digest_push_match_total.load(Ordering::Relaxed),
-        0,
-        "the roots must NOT have matched (this is the peer-only branch)"
     );
     assert_eq!(
         metrics.full_sync_fallback_count.load(Ordering::Relaxed),
@@ -1262,10 +1375,11 @@ async fn runner_digest_push_partial_merge_failure_still_delivers_later_batches()
     );
 }
 
-/// Pull side, rolling upgrade: a peer that answers `scheme_ok = false`
-/// (digest scheme version mismatch) is cached as digest-unsupported —
-/// the same cycle falls back to the legacy full sync (and converges),
-/// and NO further digest probe is sent within the retry TTL.
+/// Rolling upgrade: a peer that answers `scheme_ok = false` (digest
+/// scheme version mismatch) is cached as digest-unsupported. The
+/// complete-state push verification probes first, then the pull falls
+/// back to full sync and converges. No further digest probe is sent
+/// within the retry TTL.
 #[tokio::test]
 async fn runner_digest_scheme_mismatch_falls_back_and_caches() {
     let server = test_state("server");
@@ -1305,7 +1419,7 @@ async fn runner_digest_scheme_mismatch_falls_back_and_caches() {
         "scheme_ok = false must be recorded as digest-unsupported"
     );
     assert_eq!(
-        metrics.digest_sync_attempt_total.load(Ordering::Relaxed),
+        metrics.digest_push_probe_total.load(Ordering::Relaxed),
         1,
         "the scheme rejection must be cached: exactly one probe, no re-probe within the TTL"
     );
@@ -1314,6 +1428,11 @@ async fn runner_digest_scheme_mismatch_falls_back_and_caches() {
             + metrics.digest_sync_partial_total.load(Ordering::Relaxed),
         0,
         "no digest sync can succeed against a scheme-mismatched peer"
+    );
+    assert_eq!(
+        metrics.digest_sync_attempt_total.load(Ordering::Relaxed),
+        0,
+        "the pull must honour the cache set by the push verification probe"
     );
 
     // The same cycle converged through the legacy full sync.
@@ -1555,7 +1674,8 @@ async fn team_gc_state(api: &Arc<Mutex<EventualApi>>) -> Option<(usize, bool)> {
 /// once and never reaches a sweep), sweeps do not advance per-key HLCs
 /// (so A's post-sweep delta pushes carry nothing), and the delta pull
 /// route does not exist — B can lose its tombstone and gain a floor
-/// ONLY by inheriting them through a digest bucket transfer from A.
+/// ONLY by inheriting them through a digest bucket transfer from A,
+/// either through A's push verification or B's pull.
 /// Under v1 merge semantics that same transfer direction is exactly the
 /// one that reinjects tombstones, so this test fails if the
 /// covered-deferred rejection in `merge` regresses (verified by
@@ -1568,10 +1688,10 @@ async fn team_gc_state(api: &Arc<Mutex<EventualApi>>) -> Option<(usize, bool)> {
 /// while digest attempts keep running.
 #[tokio::test]
 async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
-    let api_a = Arc::new(Mutex::new(EventualApi::new(node_id("gc-a"))));
-    let api_b = Arc::new(Mutex::new(EventualApi::new(node_id("gc-b"))));
-    let state_a = shared_state("gc-a", api_a.clone());
-    let state_b = shared_state("gc-b", api_b.clone());
+    let (state_a, _dir_a, flusher_a) = durable_state("gc-a");
+    let (state_b, _dir_b, flusher_b) = durable_state("gc-b");
+    let api_a = state_a.eventual.clone();
+    let api_b = state_b.eventual.clone();
     // No delta endpoints: every pull falls back to the digest path.
     let (addr_a, server_a) = serve(no_delta_router(state_a.clone())).await;
     let (addr_b, server_b) = serve(no_delta_router(state_b.clone())).await;
@@ -1584,14 +1704,15 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
     }
     mirror_api(&api_a, &api_b).await;
 
-    // The remove whose tombstone must be collected cluster-wide. A's
-    // initial full push (taken before its first sweep can pass the
-    // retention gate) hands B the tombstone; from then on B's only way
-    // back to a clean state is inheriting A's floor via digest sync.
+    // Give B the tombstone before starting either runner. The first sync
+    // establishes A's durable push baseline before the later GC sweep.
     {
         let mut api = api_a.lock().await;
         api.eventual_set_remove("team", "bob").unwrap();
     }
+    mirror_api(&api_a, &api_b).await;
+    assert_eq!(team_gc_state(&api_a).await, Some((1, false)));
+    assert_eq!(team_gc_state(&api_b).await, Some((1, false)));
 
     // A sweeps quickly; B is configured so it CANNOT sweep in this test.
     let hour = Duration::from_secs(3600);
@@ -1601,7 +1722,7 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
         "gc-b",
         &addr_b.to_string(),
         Duration::from_millis(25),
-        Duration::from_millis(100),
+        Duration::from_secs(5),
     )
     .await;
     let (runner_b, metrics_b) = gc_runner(
@@ -1623,6 +1744,19 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
         let mut runner = runner_b;
         runner.run().await
     });
+
+    // Observe a durable root match before A can sweep. This pins the
+    // initial push baseline, so the floor created by the sweep has no new
+    // per-key HLC and must travel through a digest bucket transfer.
+    let baseline_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while metrics_a.digest_push_match_total.load(Ordering::Relaxed) == 0 {
+        assert!(
+            tokio::time::Instant::now() < baseline_deadline,
+            "A never established its pre-sweep digest baseline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(team_gc_state(&api_a).await, Some((1, false)));
 
     // Phase 1: GC convergence — zero tombstones on BOTH nodes and an
     // advanced floor on both. A's floor comes from its sweep; B's can
@@ -1647,8 +1781,9 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
     }
 
     // Regime asserts: this was actually the digest regime, not a delta
-    // or push side channel. Every sync cycle attempts a digest pull, and
-    // B's healing required at least one mismatched bucket transfer.
+    // or full-state push side channel. Every sync cycle attempts a digest
+    // pull, and B's healing required at least one mismatched bucket
+    // transfer through either digest direction.
     assert!(
         metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed) >= 2
             && metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed) >= 2,
@@ -1656,10 +1791,26 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
         metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed),
         metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed),
     );
-    assert!(
-        metrics_b.digest_sync_partial_total.load(Ordering::Relaxed) >= 1,
-        "B's floor can only arrive via a digest bucket transfer, so at \
-         least one partial (mismatched-bucket) sync must have happened"
+    // A push can merge the floor on B before A receives its HTTP response
+    // and increments `digest_push_keys_pushed_total`. Observe completion of
+    // that in-flight transfer before checking which route carried the floor.
+    let transfer_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while metrics_b.digest_sync_partial_total.load(Ordering::Relaxed) == 0
+        && metrics_a
+            .digest_push_keys_pushed_total
+            .load(Ordering::Relaxed)
+            == 0
+    {
+        assert!(
+            tokio::time::Instant::now() < transfer_deadline,
+            "B's floor had no completed digest bucket transfer"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        metrics_a.full_sync_fallback_count.load(Ordering::Relaxed),
+        0,
+        "a full-state push would bypass the digest healing channel"
     );
 
     // Removed element stays removed; the survivor survives.
@@ -1675,9 +1826,9 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
     }
 
     // Phase 2: fixed point. Canonical digests match (the root-match
-    // condition of the digest protocol) and the partial-transfer counter
-    // flat-lines over many further digest sync cycles — v1's livelock
-    // signature was this counter climbing forever. The attempt counter
+    // condition of the digest protocol) and transfer counters flat-line
+    // over many further digest sync cycles — v1's livelock signature
+    // was repeated transfers. The attempt counter
     // must KEEP growing over the same window (the digest regime is still
     // active; a flat-line by silence would prove nothing).
     let digest_a = compute_store_digest(&snapshot_data_api(&api_a).await);
@@ -1688,12 +1839,24 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
     );
 
     let partial_before = metrics_a.digest_sync_partial_total.load(Ordering::Relaxed)
-        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed);
+        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed)
+        + metrics_a
+            .digest_push_keys_pushed_total
+            .load(Ordering::Relaxed)
+        + metrics_b
+            .digest_push_keys_pushed_total
+            .load(Ordering::Relaxed);
     let attempts_before = metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed)
         + metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(750)).await; // ≳25 sync cycles
     let partial_after = metrics_a.digest_sync_partial_total.load(Ordering::Relaxed)
-        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed);
+        + metrics_b.digest_sync_partial_total.load(Ordering::Relaxed)
+        + metrics_a
+            .digest_push_keys_pushed_total
+            .load(Ordering::Relaxed)
+        + metrics_b
+            .digest_push_keys_pushed_total
+            .load(Ordering::Relaxed);
     let attempts_after = metrics_a.digest_sync_attempt_total.load(Ordering::Relaxed)
         + metrics_b.digest_sync_attempt_total.load(Ordering::Relaxed);
     assert!(
@@ -1713,6 +1876,8 @@ async fn runner_two_node_gc_converges_under_sustained_digest_fallback() {
     let _ = task_b.await;
     server_a.abort();
     server_b.abort();
+    flusher_a.abort();
+    flusher_b.abort();
 }
 
 /// Regression guard: the tombstoned-remove propagation test above
@@ -1739,7 +1904,7 @@ async fn digest_sync_floor_propagates_and_heals_receiver() {
         match api.store_mut().get_mut("team") {
             Some(CrdtValue::Set(s)) => {
                 let candidates = s.deferred_dots();
-                s.compact_deferred_certified(&candidates, None);
+                s.compact_deferred_certified(&candidates);
                 assert_eq!(s.deferred_len(), 0);
             }
             other => panic!("expected Set, got {other:?}"),
@@ -1935,7 +2100,7 @@ async fn legacy_full_sync_records_pull_reconciliation_evidence() {
 /// earlier than the pre-probe wall clock.
 #[tokio::test]
 async fn runner_digest_push_root_match_records_push_evidence() {
-    let server = test_state("server");
+    let (server, _dir, flusher) = durable_state("server");
     let (addr, server_handle) = serve(router(server.clone())).await;
 
     let mut harness = runner_against(&addr.to_string(), true).await;
@@ -1962,6 +2127,7 @@ async fn runner_digest_push_root_match_records_push_evidence() {
     })
     .await;
     server_handle.abort();
+    flusher.abort();
 
     let acked = runner
         .push_acked_for(&addr.to_string())
@@ -1977,7 +2143,7 @@ async fn runner_digest_push_root_match_records_push_evidence() {
 /// exactly the mismatched buckets, and advances the push evidence.
 #[tokio::test]
 async fn runner_digest_push_subset_stable_generation_advances_push_evidence() {
-    let server = test_state("server");
+    let (server, _dir, flusher) = durable_state("server");
     let (addr, server_handle) = serve(router(server.clone())).await;
 
     let mut harness = runner_against(&addr.to_string(), true).await;
@@ -2012,6 +2178,7 @@ async fn runner_digest_push_subset_stable_generation_advances_push_evidence() {
     })
     .await;
     server_handle.abort();
+    flusher.abort();
 
     assert!(
         runner.push_acked_for(&addr.to_string()).is_some(),

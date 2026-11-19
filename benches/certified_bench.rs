@@ -4,7 +4,7 @@
 use std::sync::{Arc, RwLock};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout, ProofBundle};
@@ -47,7 +47,7 @@ fn build_certified_api() -> CertifiedApi {
 }
 
 /// Build a signed ProofBundle with `n_signers` out of `total` authorities.
-fn make_signed_proof(n_signers: usize, total: usize) -> ProofBundle {
+fn make_signed_proof(n_signers: usize, total: usize) -> (ProofBundle, Vec<(NodeId, VerifyingKey)>) {
     let kr = KeyRange {
         prefix: "user/".into(),
     };
@@ -57,23 +57,25 @@ fn make_signed_proof(n_signers: usize, total: usize) -> ProofBundle {
     let message = create_certificate_message(&kr, &hlc, &pv);
     let mut cert = MajorityCertificate::new(kr.clone(), hlc.clone(), pv, KeysetVersion(1));
 
-    let authorities: Vec<NodeId> = (0..n_signers)
-        .map(|i| NodeId(format!("auth-{i}")))
-        .collect();
-
-    for auth in &authorities {
-        let sk = SigningKey::generate(&mut OsRng);
-        let vk = sk.verifying_key();
-        let sig = sign_message(&sk, &message);
-        cert.add_signature(AuthoritySignature {
-            authority_id: auth.clone(),
-            public_key: vk,
-            signature: sig,
-            keyset_version: KeysetVersion(1),
-        });
+    let mut authorities = Vec::with_capacity(n_signers);
+    let mut trusted_keys = Vec::with_capacity(total);
+    for i in 0..total {
+        let authority = node(&format!("auth-{i}"));
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        if i < n_signers {
+            authorities.push(authority.clone());
+            cert.add_signature(AuthoritySignature {
+                authority_id: authority.clone(),
+                public_key: verifying_key,
+                signature: sign_message(&signing_key, &message),
+                keyset_version: KeysetVersion(1),
+            });
+        }
+        trusted_keys.push((authority, verifying_key));
     }
 
-    ProofBundle {
+    let proof = ProofBundle {
         key_range: kr,
         frontier_hlc: hlc,
         policy_version: pv,
@@ -81,7 +83,8 @@ fn make_signed_proof(n_signers: usize, total: usize) -> ProofBundle {
         total_authorities: total,
         certificate: Some(cert),
         bls_certificate: None,
-    }
+    };
+    (proof, trusted_keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,11 +157,11 @@ fn bench_process_certifications(c: &mut Criterion) {
 
 fn bench_verify_proof(c: &mut Criterion) {
     // 3-of-5 signed proof.
-    let proof = make_signed_proof(3, 5);
+    let (proof, trusted_keys) = make_signed_proof(3, 5);
 
     c.bench_function("certified/verify_proof_3of5", |b| {
         b.iter(|| {
-            let result = verify_proof(&proof, None, 0);
+            let result = verify_proof(&proof, &trusted_keys, None, 0);
             std::hint::black_box(result.valid);
         });
     });
@@ -166,11 +169,11 @@ fn bench_verify_proof(c: &mut Criterion) {
 
 fn bench_verify_proof_large(c: &mut Criterion) {
     // 5-of-9 signed proof for heavier workload.
-    let proof = make_signed_proof(5, 9);
+    let (proof, trusted_keys) = make_signed_proof(5, 9);
 
     c.bench_function("certified/verify_proof_5of9", |b| {
         b.iter(|| {
-            let result = verify_proof(&proof, None, 0);
+            let result = verify_proof(&proof, &trusted_keys, None, 0);
             std::hint::black_box(result.valid);
         });
     });

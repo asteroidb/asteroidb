@@ -410,8 +410,10 @@ impl MembershipClient {
                 // link-local via is_safe_peer_address so that a node that binds
                 // to 0.0.0.0 without ASTEROIDB_ADVERTISE_ADDR cannot overwrite
                 // a peer's correct static IP with an unroutable wildcard.
-                if is_safe_peer_address(&peer_info.address) {
-                    registry.update_address(&peer_nid, &peer_info.address);
+                if is_safe_peer_address(&peer_info.address)
+                    && let Err(error) = registry.update_address(&peer_nid, &peer_info.address)
+                {
+                    tracing::warn!(peer = %peer_nid.0, %error, "peer address update rejected");
                 }
             } else if added < MAX_NEW_PEERS {
                 // New peer: require a valid IP:port. Hostnames pass

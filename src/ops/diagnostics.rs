@@ -324,6 +324,9 @@ mod tests {
 
     #[test]
     fn certification_summary_mixed_statuses() {
+        use crate::authority::certificate::KeysetVersion;
+        use crate::authority::frontier_sig::NodeSigner;
+
         let mut api = CertifiedApi::new(node("node-1"), default_namespace());
 
         // Create 3 pending writes.
@@ -334,17 +337,33 @@ mod tests {
         api.certified_write("key3".into(), counter_value(3), OnTimeout::Pending)
             .unwrap();
 
-        let write_ts = api.pending_writes()[0].timestamp.physical;
-
-        // Certify key1 via frontier advancement.
-        api.update_frontier(make_frontier("auth-1", write_ts + 1, 0, ""));
-        api.update_frontier(make_frontier("auth-2", write_ts + 1, 0, ""));
+        // A majority signs a checkpoint beyond all three writes.
+        let latest_ts = api
+            .pending_writes()
+            .iter()
+            .map(|w| w.timestamp.physical)
+            .max()
+            .unwrap();
+        let report_ts = (latest_ts / 1000 + 1) * 1000 + 100;
+        for (authority, seed) in [("auth-1", 1u8), ("auth-2", 2u8)] {
+            let mut key = [0u8; 32];
+            key[0] = seed;
+            #[cfg(feature = "native-crypto")]
+            let signer = NodeSigner::from_seed(node(authority), &key, true);
+            #[cfg(not(feature = "native-crypto"))]
+            let signer = NodeSigner::from_seed(node(authority), &key);
+            let frontier = make_frontier(authority, report_ts, 0, "");
+            let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+            api.update_frontier_verified(
+                frontier.clone(),
+                Some(signer.self_verified(&frontier, &signature)),
+            );
+        }
         api.process_certifications();
 
         let summary = collect_certification_summary(&api);
 
-        // key1 is certified, key2 and key3 may or may not be depending on timing.
-        assert!(summary.certified >= 1);
+        assert_eq!(summary.certified, 3);
         assert_eq!(summary.total, 3);
         assert_eq!(
             summary.pending + summary.certified + summary.rejected + summary.timeout,
@@ -443,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_summary_tracks_evictions() {
+    fn retention_summary_keeps_pending_at_capacity() {
         let policy = RetentionPolicy {
             max_age_ms: 60_000,
             max_entries: 2,
@@ -456,13 +475,15 @@ mod tests {
         api.certified_write("b".into(), counter_value(1), OnTimeout::Pending)
             .unwrap();
 
-        // This triggers eviction of the oldest.
-        api.certified_write("c".into(), counter_value(1), OnTimeout::Pending)
-            .unwrap();
+        // A full queue refuses new work before changing the store.
+        assert!(matches!(
+            api.certified_write("c".into(), counter_value(1), OnTimeout::Pending),
+            Err(crate::error::CrdtError::CertificationCapacity { max_entries: 2 })
+        ));
 
         let summary = collect_retention_summary(&api);
-        assert!(summary.evicted_count > 0);
-        assert!(summary.pending_writes_count <= 2);
+        assert_eq!(summary.evicted_count, 0);
+        assert_eq!(summary.pending_writes_count, 2);
     }
 
     // ---------------------------------------------------------------

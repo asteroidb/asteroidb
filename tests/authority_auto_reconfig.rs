@@ -11,6 +11,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
+use asteroidb_poc::authority::ack_frontier::AckFrontier;
+use asteroidb_poc::authority::certificate::KeysetVersion;
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -79,6 +82,44 @@ fn fast_config() -> NodeRunnerConfig {
         ping_interval: None,
         ..NodeRunnerConfig::default()
     }
+}
+
+fn submit_signed_checkpoint(api: &mut CertifiedApi, authority: &str, write_physical: u64) {
+    let mut seed = [0u8; 32];
+    seed[0] = 71;
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed, false);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed);
+    // The runner may already have accepted a later unsigned report. Sign a
+    // genuinely new report instead of trying to attach a stale signature to
+    // another report in the same checkpoint.
+    let latest_physical = api
+        .all_frontiers()
+        .into_iter()
+        .filter(|frontier| {
+            frontier.authority_id == node_id(authority)
+                && frontier.key_range == kr("")
+                && frontier.policy_version == PolicyVersion(1)
+        })
+        .map(|frontier| frontier.frontier_hlc.physical)
+        .max()
+        .unwrap_or(0);
+    let report_physical = (write_physical.max(latest_physical) / 1_000 + 1) * 1_000 + 100;
+    let frontier = AckFrontier {
+        authority_id: node_id(authority),
+        frontier_hlc: asteroidb_poc::hlc::HlcTimestamp {
+            physical: report_physical,
+            logical: 0,
+            node_id: authority.into(),
+        },
+        key_range: kr(""),
+        policy_version: PolicyVersion(1),
+        digest_hash: String::new(),
+    };
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let attestation = signer.self_verified(&frontier, &signature);
+    api.update_frontier_verified(frontier, Some(attestation));
 }
 
 // ===========================================================================
@@ -385,12 +426,29 @@ async fn certification_safe_during_reconfiguration() {
 
     runner.run().await;
 
-    // The pending write should be certified by the auto-frontier pipeline.
-    let api_lock = shared_api.lock().await;
+    // The runner's frontier report is unsigned in this test setup. Once the
+    // authority supplies a signed checkpoint, the pre-reconfiguration write
+    // can certify under its original policy version.
+    let mut api_lock = shared_api.lock().await;
+    let write_physical = api_lock.pending_writes()[0].timestamp.physical;
+    assert_eq!(
+        api_lock.pending_writes()[0].status,
+        CertificationStatus::Pending
+    );
+    submit_signed_checkpoint(&mut api_lock, "auth-1", write_physical);
+    api_lock.process_certifications();
     assert_eq!(
         api_lock.pending_writes()[0].status,
         CertificationStatus::Certified,
         "pending write should be certified even during reconfiguration"
+    );
+    assert!(
+        api_lock
+            .get_certified("key1")
+            .proof
+            .unwrap()
+            .certificate
+            .is_some()
     );
 }
 

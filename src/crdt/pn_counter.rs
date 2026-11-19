@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
+/// A PN-Counter component has no remaining `u64` increments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("PN-Counter component exhausted")]
+pub struct PnCounterExhausted;
+
 /// A PN-Counter (Positive-Negative Counter) CRDT.
 ///
 /// Composed of two G-Counters: one for increments (P) and one for decrements (N).
@@ -45,27 +50,54 @@ impl PnCounter {
 
     /// Increment the counter for the given node.
     pub fn increment(&mut self, node_id: &NodeId) {
-        *self.p.entry(node_id.clone()).or_insert(0) += 1;
+        self.try_increment(node_id)
+            .expect("PN-Counter positive component exhausted");
     }
 
     /// Decrement the counter for the given node.
     pub fn decrement(&mut self, node_id: &NodeId) {
-        *self.n.entry(node_id.clone()).or_insert(0) += 1;
+        self.try_decrement(node_id)
+            .expect("PN-Counter negative component exhausted");
+    }
+
+    /// Increment without changing the state if this component is exhausted.
+    pub fn try_increment(&mut self, node_id: &NodeId) -> Result<(), PnCounterExhausted> {
+        let next = self
+            .p
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(PnCounterExhausted)?;
+        self.p.insert(node_id.clone(), next);
+        Ok(())
+    }
+
+    /// Decrement without changing the state if this component is exhausted.
+    pub fn try_decrement(&mut self, node_id: &NodeId) -> Result<(), PnCounterExhausted> {
+        let next = self
+            .n
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(PnCounterExhausted)?;
+        self.n.insert(node_id.clone(), next);
+        Ok(())
     }
 
     /// Return the current counter value: `sum(P) - sum(N)`.
     ///
-    /// Uses saturating arithmetic to prevent overflow. If the difference exceeds
-    /// `i64::MAX` or is less than `i64::MIN`, the result is clamped to the
-    /// respective bound.
+    /// Accumulates exact component totals before clamping their difference
+    /// to the `i64` range. Saturating each total first would lose cancellation.
     pub fn value(&self) -> i64 {
-        let pos: u64 = self.p.values().fold(0u64, |acc, &v| acc.saturating_add(v));
-        let neg: u64 = self.n.values().fold(0u64, |acc, &v| acc.saturating_add(v));
+        let pos: u128 = self.p.values().map(|&v| u128::from(v)).sum();
+        let neg: u128 = self.n.values().map(|&v| u128::from(v)).sum();
         if pos >= neg {
-            (pos - neg).min(i64::MAX as u64) as i64
+            (pos - neg).min(i64::MAX as u128) as i64
         } else {
             let diff = neg - pos;
-            let min_mag = (i64::MAX as u64) + 1;
+            let min_mag = (i64::MAX as u128) + 1;
             if diff >= min_mag {
                 i64::MIN
             } else {
@@ -489,13 +521,9 @@ mod tests {
         let mut counter = PnCounter::new();
         counter.p.insert(na, u64::MAX / 2 + 1);
         counter.p.insert(nb, u64::MAX / 2 + 1);
-        // pos = u64::MAX / 2 + 1 + u64::MAX / 2 + 1 = u64::MAX + 1, but sum wraps to 0.
-        // Actually let's use values that sum to > i64::MAX but don't overflow u64::sum.
-        let mut counter2 = PnCounter::new();
-        counter2.p.insert(node("a"), i64::MAX as u64);
-        counter2.p.insert(node("b"), 1);
-        // pos = i64::MAX + 1 which is > i64::MAX
-        assert_eq!(counter2.value(), i64::MAX);
+        // The exact positive total is u64::MAX + 1 and the displayed
+        // difference is clamped only after aggregation.
+        assert_eq!(counter.value(), i64::MAX);
     }
 
     #[test]
@@ -505,6 +533,34 @@ mod tests {
         counter.n.insert(node("b"), 1);
         // neg = i64::MAX + 1, pos = 0, so result should saturate to i64::MIN
         assert_eq!(counter.value(), i64::MIN);
+    }
+
+    #[test]
+    fn value_cancels_large_positive_and_negative_components_before_clamping() {
+        let mut counter = PnCounter::new();
+        counter.p.insert(node("positive-a"), u64::MAX);
+        counter.p.insert(node("positive-b"), 2);
+        counter.n.insert(node("negative-a"), u64::MAX);
+        counter.n.insert(node("negative-b"), 1);
+
+        // Both totals exceed u64::MAX, but their exact difference is one.
+        assert_eq!(counter.value(), 1);
+    }
+
+    #[test]
+    fn exhausted_components_reject_without_wrap_or_mutation() {
+        let writer = node("writer");
+        let mut positive = PnCounter::new();
+        positive.p.insert(writer.clone(), u64::MAX);
+        let before = positive.clone();
+        assert_eq!(positive.try_increment(&writer), Err(PnCounterExhausted));
+        assert_eq!(positive, before);
+
+        let mut negative = PnCounter::new();
+        negative.n.insert(writer.clone(), u64::MAX);
+        let before = negative.clone();
+        assert_eq!(negative.try_decrement(&writer), Err(PnCounterExhausted));
+        assert_eq!(negative, before);
     }
 
     #[test]

@@ -194,7 +194,7 @@ fn torn_tail_recovers_all_complete_records() {
 }
 
 #[test]
-fn crc_corruption_at_tail_recovers_prefix() {
+fn crc_corruption_at_tail_fails_stop_with_prefix_available() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut api = open_eventual(dir.path(), "node-a");
@@ -210,15 +210,15 @@ fn crc_corruption_at_tail_recovers_prefix() {
     data[last] ^= 0x55;
     std::fs::write(&seg, &data).unwrap();
 
-    let api = open_eventual(dir.path(), "node-a");
-    assert!(
-        api.get_eventual("a").is_some(),
-        "intact prefix must survive"
+    let read = wal::read_all_segments(&dir.path().join("wal")).unwrap();
+    assert_eq!(read.outcome, WalReadOutcome::Corruption);
+    assert_eq!(
+        read.records.len(),
+        1,
+        "the intact prefix is still inspectable"
     );
-    assert!(
-        api.get_eventual("b").is_none(),
-        "the damaged final record must be discarded"
-    );
+    // A complete final frame might have been synced and acknowledged. Normal
+    // recovery must not discard it as a harmless torn tail.
 }
 
 // ---------------------------------------------------------------
@@ -468,24 +468,22 @@ fn open_certified(dir: &Path, node_id: &str) -> CertifiedApi {
     let read = wal::read_all_segments(&dir.join("wal-certified")).unwrap();
     assert_ne!(read.outcome, WalReadOutcome::Corruption);
     let mut origins = HashMap::new();
+    let mut scope_pins = HashMap::new();
     for record in read.records {
-        if let wal::WalRecord::CertifiedUpsert {
-            key,
-            policy_version,
-            ..
-        } = &record
-        {
-            origins.insert(key.clone(), *policy_version);
+        if let wal::WalRecord::CertifiedUpsertScoped { key, scope, .. } = &record {
+            origins.insert(key.clone(), scope.policy_version);
+            scope_pins.insert(key.clone(), scope.clone());
         }
         wal::replay_record(&mut store, record);
     }
     let writer = WalWriter::open(wal_cfg(&dir.join("wal-certified"))).unwrap();
-    CertifiedApi::recovered(
+    CertifiedApi::recovered_with_scope_pins(
         node(node_id),
         test_namespace(),
         store,
         Some(writer),
         origins,
+        scope_pins,
     )
 }
 
@@ -591,6 +589,28 @@ async fn sync_interval_flushes_on_tick() {
     tokio::time::timeout(std::time::Duration::from_secs(5), syncer.wait_durable(pos))
         .await
         .expect("interval flusher must sync within the timeout")
+        .unwrap();
+    flusher.abort();
+}
+
+#[tokio::test]
+async fn zero_interval_still_flushes_waiters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = WalWriter::open(WalConfig::new(
+        dir.path(),
+        SyncPolicy::Interval(std::time::Duration::ZERO),
+    ))
+    .unwrap();
+    let syncer = Arc::new(writer.syncer());
+    let flusher = tokio::spawn(Arc::clone(&syncer).run_flusher());
+    let pos = writer
+        .append(&wal::WalRecord::MergeFailed {
+            keys: vec!["zero-interval".into()],
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), syncer.wait_durable(pos))
+        .await
+        .expect("zero interval must be clamped to a running flusher")
         .unwrap();
     flusher.abort();
 }
@@ -958,6 +978,10 @@ fn orphan_segment_self_heals_without_restart() {
         // the directory is read-only (degrade) ...
         let err = api.eventual_counter_inc("denied").unwrap_err();
         assert!(matches!(err, CrdtError::Storage(_)));
+        // The failed local value was never published, even before restart.
+        assert!(api.get_eventual("denied").is_none());
+        assert!(api.store().timestamp_for("denied").is_none());
+        assert!(!api.store().merge_failed_contains("denied"));
         // ... reads keep working ...
         assert!(api.get_eventual("healed").is_some());
 
@@ -974,10 +998,10 @@ fn orphan_segment_self_heals_without_restart() {
             "acked write {key} must survive the crash"
         );
     }
-    // The un-acked write was never logged; its key stays poisoned
-    // (fail-closed) rather than resurrecting as data.
+    // The un-acked write was neither logged nor published. No poison is
+    // needed for a local value that never entered the store.
     assert!(api.get_eventual("denied").is_none());
-    assert!(api.store().merge_failed_contains("denied"));
+    assert!(!api.store().merge_failed_contains("denied"));
 }
 
 /// A crash can strike at any point of the (now self-healing) rotation:
@@ -1141,6 +1165,17 @@ fn user_namespace(version: u64) -> Arc<std::sync::RwLock<SystemNamespace>> {
     Arc::new(std::sync::RwLock::new(ns))
 }
 
+fn user_scope_pin(write_hlc: HlcTimestamp) -> asteroidb_poc::store::wal::CertifiedScopePin {
+    asteroidb_poc::store::wal::CertifiedScopePin {
+        write_hlc,
+        key_range: KeyRange {
+            prefix: "user/".into(),
+        },
+        policy_version: asteroidb_poc::types::PolicyVersion(1),
+        authority_nodes: vec![node("auth-1")],
+    }
+}
+
 fn user_frontier(
     version: u64,
     cover_physical: u64,
@@ -1158,6 +1193,23 @@ fn user_frontier(
 
 fn user_v2_frontier(cover_physical: u64) -> asteroidb_poc::authority::ack_frontier::AckFrontier {
     user_frontier(2, cover_physical)
+}
+
+/// Supply the one-authority certificate needed for a genuine v1 precondition.
+fn signed_user_frontier(api: &mut CertifiedApi, version: u64, write_physical: u64) {
+    use asteroidb_poc::authority::certificate::KeysetVersion;
+    use asteroidb_poc::authority::frontier_sig::NodeSigner;
+
+    let seed = [17u8; 32];
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node("auth-1"), &seed, true);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node("auth-1"), &seed);
+    let report_physical = (write_physical / 1000 + 1) * 1000 + 100;
+    let frontier = user_frontier(version, report_physical);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let verified = signer.self_verified(&frontier, &signature);
+    assert!(api.update_frontier_verified(frontier, Some(verified)));
 }
 
 /// WAL-only (un-checkpointed) write: the record itself must carry the
@@ -1335,7 +1387,7 @@ fn fenced_certified_wal_only_write_regresses_uncertified_across_restart() {
             .unwrap();
         let ts = api.pending_writes()[0].timestamp.clone();
         // Actually certify it under v1 (single authority, majority 1).
-        assert!(api.update_frontier(user_frontier(1, ts.physical + 10_000)));
+        signed_user_frontier(&mut api, 1, ts.physical);
         api.process_certifications();
         assert_eq!(
             api.get_certification_status("user/x"),
@@ -1410,7 +1462,7 @@ async fn fenced_certified_checkpointed_write_regresses_uncertified_across_restar
             .unwrap();
         write_ts = api.pending_writes()[0].timestamp.clone();
         // Drive the write to Certified under v1 BEFORE the bump.
-        assert!(api.update_frontier(user_frontier(1, write_ts.physical + 10_000)));
+        signed_user_frontier(&mut api, 1, write_ts.physical);
         api.process_certifications();
         assert_eq!(
             api.get_certification_status("user/x"),
@@ -1491,8 +1543,8 @@ async fn origins_survive_cleanup_and_checkpoint() {
         checkpoint_locks: CheckpointLocks::default(),
     };
 
-    // Incarnation 1: write under v1, let the retention timer expire the
-    // tracking entry, then checkpoint (sidecar rewrite + WAL prune).
+    // Incarnation 1: write under v1, run cleanup, then checkpoint
+    // (sidecar rewrite + WAL prune). Pending work survives cleanup.
     let write_ts = {
         let (api, _s) = recover_certified(node("node-a"), user_namespace(1), &cfg).unwrap();
         let api = StdArc::new(TokioMutex::new(api));
@@ -1504,12 +1556,11 @@ async fn origins_survive_cleanup_and_checkpoint() {
                 .certified_write("user/x".into(), CrdtValue::Counter(c), OnTimeout::Pending)
                 .unwrap();
             let ts = guard.pending_writes()[0].timestamp.clone();
-            // The periodic cleanup tick: past max_age_ms, the tracking
-            // entry is expired and removed.
+            // The periodic cleanup tick must keep unfinished work.
             guard.cleanup(ts.physical + 61_000);
             assert!(
-                guard.pending_writes().is_empty(),
-                "retention cleanup must have dropped the tracking entry (test premise)"
+                guard.pending_writes().iter().any(|p| p.key == "user/x"),
+                "retention cleanup must keep pending certification work"
             );
             ts
         };
@@ -1596,7 +1647,7 @@ fn replicated_certified_write_recovers_with_its_origin_wal_only() {
             "user/x".into(),
             &replicated_counter(),
             write_hlc.clone(),
-            Some(PolicyVersion(1)),
+            user_scope_pin(write_hlc.clone()),
         )
         .unwrap();
     }
@@ -1659,11 +1710,10 @@ async fn replicated_certified_write_recovers_with_its_origin_checkpointed() {
                     "user/x".into(),
                     &replicated_counter(),
                     write_hlc.clone(),
-                    Some(PolicyVersion(1)),
+                    user_scope_pin(write_hlc.clone()),
                 )
                 .unwrap();
-            // The retention timer expires the tracking entry before the
-            // checkpoint, exactly as the 5s cleanup tick does in production.
+            // Run the same periodic cleanup as production before checkpoint.
             guard.cleanup(write_hlc.physical + 61_000);
         }
         // Checkpoint: snapshot written, WAL segments pruned. From here the

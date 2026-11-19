@@ -212,6 +212,7 @@ mod tests {
                 key: "bad".into(),
                 error: "type mismatch".into(),
             }],
+            durable: true,
         };
 
         let (bytes, ct) = serialize_internal(&resp, Some(CONTENT_TYPE_BINCODE)).unwrap();

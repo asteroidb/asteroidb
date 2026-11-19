@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, watch};
@@ -28,8 +28,8 @@ use crate::network::PeerRegistry;
 use crate::network::frontier_sync::FrontierSyncClient;
 use crate::network::membership::MembershipClient;
 use crate::network::sync::{
-    CertifiedDeltaResult, DEFAULT_BATCH_SIZE, DigestSyncRequest, DigestSyncResult,
-    MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
+    CertifiedDeltaCursor, CertifiedDeltaResult, DEFAULT_BATCH_SIZE, DigestSyncRequest,
+    DigestSyncResult, MAX_DELTA_PAYLOAD_BYTES, PeerBackoff, PullDeltaResult, SyncClient,
     should_fallback_to_full_sync,
 };
 use crate::node::Node;
@@ -50,23 +50,6 @@ use crate::types::{CertificationStatus, KeyRange, NodeId, PolicyVersion};
 /// Bounds the per-cycle probe overhead against not-yet-upgraded peers
 /// while letting upgraded peers be picked up within minutes.
 const DIGEST_UNSUPPORTED_RETRY: Duration = Duration::from_secs(600);
-
-/// How many consecutive certified pull rounds may end with the peer
-/// baseline HELD at a transiently refused entry before the lane steps over
-/// it.
-///
-/// Refusals from `merge_remote_certified` come in two flavours. Origin-ahead
-/// and policy-denied are CONTROL-PLANE LAG: the writer applied a policy
-/// version this node has not applied yet, so the entry becomes acceptable
-/// on its own within a tick or two. Stepping over them is permanent --
-/// `Store::delta_entries_since` filters strictly ABOVE the baseline -- so
-/// the value would live on the writer's disk alone, which is the exact
-/// P0-1 inversion this lane exists to close. Holding the baseline retries
-/// them for free. The budget is what keeps an OPERATOR-scale refusal (a
-/// prefix with no authority definition at all) from wedging the peer
-/// forever; ~12 rounds is a minute or two at the usual sync interval,
-/// comfortably past Raft apply lag.
-const CERTIFIED_REFUSAL_MAX_ROUNDS: u32 = 12;
 
 /// Upper bound on back-to-back certified delta requests to one peer in a
 /// single cycle.
@@ -173,6 +156,9 @@ impl std::fmt::Debug for BlsConfig {
 /// Configuration for the background processing intervals of [`NodeRunner`].
 #[derive(Debug, Clone)]
 pub struct NodeRunnerConfig {
+    /// Run the old Eventual/Certified data-plane workers. Operation mode
+    /// keeps membership and epoch checks but uses its own data workers.
+    pub legacy_data_plane_enabled: bool,
     /// How often to re-evaluate pending writes against authority frontiers.
     pub certification_interval: Duration,
     /// How often to run cleanup (expire + remove completed pending writes).
@@ -206,18 +192,6 @@ pub struct NodeRunnerConfig {
     /// collect (`ASTEROIDB_GC_RETENTION_SECS` in the binary).
     /// Default: 300 seconds. See [`TombstoneGc::mark_and_sweep`].
     pub gc_retention: Duration,
-    /// Stage 2 tombstone-GC hole-jump (`ASTEROIDB_GC_HOLE_JUMP=1`).
-    /// Default: false (Stage 1, fail-closed on legacy holes).
-    ///
-    /// When enabled, a sweep whose INBOUND gate also holds (every
-    /// registry peer's complete state merged since the mark — see
-    /// [`NodeRunner::run_gc`]) may advance the per-value compaction floor
-    /// across legacy holes: dots that a pre-floor sweep physically
-    /// deleted cluster-wide. Enable only after a Stage 1 soak
-    /// (`gc_floor_stalled_hole_dots` identifies the stalled remainder);
-    /// see
-    /// docs/ops-guide.md.
-    pub gc_hole_jump_enabled: bool,
     /// Epoch configuration for key rotation (FR-008).
     /// Default: 24h epoch duration, 7 grace epochs.
     ///
@@ -315,6 +289,7 @@ pub struct NodeRunnerConfig {
 impl Default for NodeRunnerConfig {
     fn default() -> Self {
         Self {
+            legacy_data_plane_enabled: true,
             certification_interval: Duration::from_secs(1),
             cleanup_interval: Duration::from_secs(5),
             compaction_check_interval: Duration::from_secs(10),
@@ -324,7 +299,6 @@ impl Default for NodeRunnerConfig {
             epoch_check_interval: Duration::from_secs(60),
             gc_interval: Duration::from_secs(60),
             gc_retention: Duration::from_secs(300),
-            gc_hole_jump_enabled: false,
             epoch_config: EpochConfig::default(),
             bls_config: None,
             frontier_gc_interval: Duration::from_secs(60),
@@ -357,6 +331,12 @@ impl Default for NodeRunnerConfig {
 ///   `update_frontier` calls)
 ///
 /// Supports graceful shutdown via a watch channel.
+#[derive(Clone, Debug)]
+struct PushAck {
+    node_id: NodeId,
+    snapshot_wall_ms: u64,
+}
+
 pub struct NodeRunner {
     node_id: NodeId,
     certified_api: Arc<Mutex<CertifiedApi>>,
@@ -391,6 +371,10 @@ pub struct NodeRunner {
     /// for the push-evidence counterparts (tombstone-GC gate, delta push
     /// baseline).
     peer_frontiers: HashMap<String, HlcTimestamp>,
+    /// The node identity behind each address when its in-memory sync state
+    /// was last used. A replacement at the same address needs fresh push and
+    /// pull baselines; an ACK pinned to the new ID alone is insufficient.
+    peer_identities: HashMap<String, NodeId>,
     /// Per-peer PUSH-ONLY delta baseline: the highest HLC this node has
     /// provably conveyed to the peer through fully-successful pushes.
     ///
@@ -409,7 +393,7 @@ pub struct NodeRunner {
     /// behind the last fully-successful push to that peer.
     ///
     /// This is the freshness evidence consumed by the tombstone-GC peer
-    /// gate: `push_acked_wall_ms[peer] >= mark_ms` proves the peer merged
+    /// gate: an ACK for this node ID and address after the mark proves the peer merged
     /// (without per-key errors) everything this node's store held at a
     /// scan taken AFTER the mark — including every tombstone marked at or
     /// before it. Recorded at SNAPSHOT time (not push completion) so a
@@ -417,7 +401,16 @@ pub struct NodeRunner {
     /// claimed as conveyed, and measured on THIS node's clock so
     /// peer-clock skew propagated into data HLCs cannot forge freshness
     /// (both were possible with the previous `peer_frontiers`-based gate).
-    push_acked_wall_ms: HashMap<String, u64>,
+    /// The node ID prevents an ACK for an earlier occupant of the same
+    /// address from opening the gate after membership changes. The transport
+    /// still assumes the configured address reaches that registered node.
+    push_acked_wall_ms: HashMap<String, PushAck>,
+    /// Peers whose delta baseline fell below the local HLC pruned floor.
+    /// A later delta may advance the baseline past that floor without
+    /// conveying the hidden keys, so only a verified complete-state push
+    /// can clear this debt. All push evidence is memory-only, so a restart
+    /// resets this set together with the baselines and acknowledgement times.
+    push_prune_debt: std::collections::HashSet<String>,
     /// Per-peer verified received prefix for session guarantees.
     ///
     /// `pull_verified_frontiers[peer] = f` means this node has received
@@ -436,15 +429,10 @@ pub struct NodeRunner {
     /// root-matched, a digest pull whose every mismatched bucket merged
     /// cleanly, or a legacy full-dump pull that merged cleanly.
     ///
-    /// This is the INBOUND evidence consumed by the Stage 2 tombstone-GC
-    /// hole-jump gate (`gc_inbound_gate_passed`):
-    /// `pull_reconciled_wall_ms[peer] >= mark_ms` proves this node has
-    /// seen everything the peer held at some point after the mark, so a
-    /// dot that is still a hole (neither live nor deferred anywhere we
-    /// looked) is live on no registry peer — i.e. removed. Recorded at
-    /// request-START time (this node's clock, before the peer snapshots)
-    /// so it can never overstate freshness; symmetric counterpart of the
-    /// OUTBOUND `push_acked_wall_ms` evidence.
+    /// This was the Stage 2 inbound check for peers still in the registry.
+    /// It remains useful to inspect pull freshness, but cannot justify a
+    /// hole jump because evicted peers can still retain live dots. Recorded
+    /// at request start so it cannot overstate freshness for that peer.
     pull_reconciled_wall_ms: HashMap<String, u64>,
     /// Wall-clock ms of the last emitted "GC gate blocked" WARN. A blocked
     /// gate repeats on every tick, so the log line is throttled; the
@@ -467,7 +455,7 @@ pub struct NodeRunner {
     /// baseline would let progress on one plane skip entries on the other.
     /// Advanced only after every entry in a response has been processed
     /// without a storage error.
-    certified_peer_frontiers: HashMap<String, HlcTimestamp>,
+    certified_peer_frontiers: HashMap<String, CertifiedDeltaCursor>,
     /// Per-peer backoff for the certified lane, independent of
     /// `peer_backoffs` so a certified-lane failure cannot throttle eventual
     /// anti-entropy (or the reverse).
@@ -483,12 +471,9 @@ pub struct NodeRunner {
     /// map must never move backwards -- regressing it would re-offer the
     /// whole store on every tick -- while a rescan has to walk up from
     /// zero across as many cycles as the drain bound needs.
-    certified_rescan_cursor: HashMap<String, HlcTimestamp>,
+    certified_rescan_cursor: HashMap<String, Option<CertifiedDeltaCursor>>,
     /// When each peer's certified store was last rescanned from zero.
     certified_rescanned_at: HashMap<String, Instant>,
-    /// Consecutive certified pull rounds this peer's baseline has been held
-    /// back by a transient refusal, against [`CERTIFIED_REFUSAL_MAX_ROUNDS`].
-    certified_refusal_rounds: HashMap<String, u32>,
     /// Per-peer `(fingerprint, delivered_at_wall_ms)` of the last
     /// split-view gossip sample that was provably DELIVERED to the peer
     /// on the sync piggyback lane (M-14): a carrier request that reached
@@ -649,6 +634,9 @@ pub(crate) enum GcGateBlock {
     /// one report has not ADVANCED locally since the mark (receipt time —
     /// includes every frontier merely restored from persistence).
     ReportNotAdvanced { prefix: String },
+    /// Full frontier reports are present, but no verified quorum signed a
+    /// matching normalized checkpoint at or after the mark.
+    SignedQuorumMissing { prefix: String },
     /// A registered sync peer has missing or pre-mark push evidence
     /// (commonly a dead peer left in the registry).
     PeerEvidenceMissingOrStale { peer_addr: String },
@@ -867,7 +855,7 @@ impl NodeRunner {
                 api.store().max_known_hlc(),
             )
         };
-        let frontier_reporter = if reporter.is_authority() {
+        let frontier_reporter = if config.legacy_data_plane_enabled && reporter.is_authority() {
             Some(reporter)
         } else {
             None
@@ -916,8 +904,10 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            peer_identities: HashMap::new(),
             push_frontiers: HashMap::new(),
             push_acked_wall_ms: HashMap::new(),
+            push_prune_debt: std::collections::HashSet::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
             gc_gate_warn_last_ms: 0,
@@ -928,7 +918,6 @@ impl NodeRunner {
             certified_unsupported: HashMap::new(),
             certified_rescan_cursor: HashMap::new(),
             certified_rescanned_at: HashMap::new(),
-            certified_refusal_rounds: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -1006,7 +995,7 @@ impl NodeRunner {
                 api.store().max_known_hlc(),
             )
         };
-        let frontier_reporter = if reporter.is_authority() {
+        let frontier_reporter = if config.legacy_data_plane_enabled && reporter.is_authority() {
             Some(reporter)
         } else {
             None
@@ -1058,8 +1047,10 @@ impl NodeRunner {
             metrics,
             tracked_policy_versions: tracked_versions,
             peer_frontiers: HashMap::new(),
+            peer_identities: HashMap::new(),
             push_frontiers: HashMap::new(),
             push_acked_wall_ms: HashMap::new(),
+            push_prune_debt: std::collections::HashSet::new(),
             pull_verified_frontiers: HashMap::new(),
             pull_reconciled_wall_ms: HashMap::new(),
             gc_gate_warn_last_ms: 0,
@@ -1070,7 +1061,6 @@ impl NodeRunner {
             certified_unsupported: HashMap::new(),
             certified_rescan_cursor: HashMap::new(),
             certified_rescanned_at: HashMap::new(),
-            certified_refusal_rounds: HashMap::new(),
             observed_last_sent: HashMap::new(),
             cluster_nodes,
             self_node: None,
@@ -1369,8 +1359,7 @@ impl NodeRunner {
     }
 
     /// Inbound reconciliation evidence recorded for a peer, if any
-    /// (test observability for the Stage 2 hole-jump gate — see
-    /// `pull_reconciled_wall_ms`).
+    /// (test observability for complete pulls; see `pull_reconciled_wall_ms`).
     pub fn pull_reconciled_for(&self, peer_addr: &str) -> Option<u64> {
         self.pull_reconciled_wall_ms.get(peer_addr).copied()
     }
@@ -1379,7 +1368,9 @@ impl NodeRunner {
     /// observability for the tombstone-GC peer gate — see
     /// `push_acked_wall_ms`).
     pub fn push_acked_for(&self, peer_addr: &str) -> Option<u64> {
-        self.push_acked_wall_ms.get(peer_addr).copied()
+        self.push_acked_wall_ms
+            .get(peer_addr)
+            .map(|ack| ack.snapshot_wall_ms)
     }
 
     /// Push frontier recorded for a peer, if any (test observability —
@@ -1844,7 +1835,12 @@ impl NodeRunner {
                     .collect();
 
                 let push_result = sync_client
-                    .push_changed_keys(&peer.addr, entries, &self.node_id.0, DEFAULT_BATCH_SIZE)
+                    .push_changed_keys_with_durability(
+                        &peer.addr,
+                        entries,
+                        &self.node_id.0,
+                        DEFAULT_BATCH_SIZE,
+                    )
                     .await;
 
                 // Mark success PER KEY, not by count: `push_changed_keys`
@@ -1854,7 +1850,8 @@ impl NodeRunner {
                 // but later keys succeed, permanently skipping the failed key
                 // (silent under-replication reported as completed).
                 let failed_set: std::collections::HashSet<&str> = match &push_result {
-                    Ok(_) => std::collections::HashSet::new(),
+                    Ok((_, true)) => std::collections::HashSet::new(),
+                    Ok((_, false)) => resolved.iter().map(|(_, key, _)| key.as_str()).collect(),
                     Err(e) => e.failed_keys.iter().map(|s| s.as_str()).collect(),
                 };
                 for (batch_idx, key, _) in resolved.iter() {
@@ -2140,7 +2137,8 @@ impl NodeRunner {
             .config
             .sync_interval
             .unwrap_or(Duration::from_secs(3600));
-        let sync_enabled = self.config.sync_interval.is_some()
+        let sync_enabled = self.config.legacy_data_plane_enabled
+            && self.config.sync_interval.is_some()
             && self.sync_client.is_some()
             && self.eventual_api.is_some();
         let mut sync_interval = tokio::time::interval_at(start + sync_duration, sync_duration);
@@ -2178,20 +2176,20 @@ impl NodeRunner {
                         break;
                     }
                 }
-                _ = cert_interval.tick() => {
+                _ = cert_interval.tick(), if self.config.legacy_data_plane_enabled => {
                     self.detect_version_changes().await;
                     self.process_certifications().await;
                     stats.certification_ticks += 1;
                 }
-                _ = cleanup_interval.tick() => {
+                _ = cleanup_interval.tick(), if self.config.legacy_data_plane_enabled => {
                     self.run_cleanup().await;
                     stats.cleanup_ticks += 1;
                 }
-                _ = compaction_interval.tick() => {
+                _ = compaction_interval.tick(), if self.config.legacy_data_plane_enabled => {
                     self.check_compaction().await;
                     stats.compaction_check_ticks += 1;
                 }
-                _ = frontier_interval.tick(), if self.frontier_reporter.is_some() => {
+                _ = frontier_interval.tick(), if self.config.legacy_data_plane_enabled && self.frontier_reporter.is_some() => {
                     self.report_frontiers().await;
                     stats.frontier_report_ticks += 1;
                 }
@@ -2199,11 +2197,11 @@ impl NodeRunner {
                     self.check_epoch_rotation();
                     stats.epoch_check_ticks += 1;
                 }
-                _ = gc_interval.tick() => {
+                _ = gc_interval.tick(), if self.config.legacy_data_plane_enabled => {
                     self.run_gc().await;
                     stats.gc_ticks += 1;
                 }
-                _ = frontier_gc_interval.tick() => {
+                _ = frontier_gc_interval.tick(), if self.config.legacy_data_plane_enabled => {
                     self.run_frontier_gc().await;
                     stats.frontier_gc_ticks += 1;
                 }
@@ -2796,10 +2794,47 @@ impl NodeRunner {
     /// 3. Pull delta entries from the peer and apply locally.
     /// 4. On failure, fall back to full sync.
     /// 5. Update backoff state on success/failure.
+    fn observe_peer_identity(&mut self, addr: &str, node_id: &NodeId) {
+        let replaced = self
+            .peer_identities
+            .get(addr)
+            .is_some_and(|previous| previous != node_id)
+            || self
+                .push_acked_wall_ms
+                .get(addr)
+                .is_some_and(|ack| &ack.node_id != node_id);
+        if replaced {
+            // Every cursor below describes the previous occupant's state.
+            // Reusing its push baseline can turn an empty delta scan into a
+            // fresh GC ACK without sending the marked tombstone to this peer.
+            self.peer_frontiers.remove(addr);
+            self.push_frontiers.remove(addr);
+            self.push_acked_wall_ms.remove(addr);
+            self.push_prune_debt.remove(addr);
+            self.pull_verified_frontiers.remove(addr);
+            self.pull_reconciled_wall_ms.remove(addr);
+            self.peer_backoffs.remove(addr);
+            self.digest_unsupported.remove(addr);
+            self.certified_peer_frontiers.remove(addr);
+            self.certified_backoffs.remove(addr);
+            self.certified_unsupported.remove(addr);
+            self.certified_rescan_cursor.remove(addr);
+            self.certified_rescanned_at.remove(addr);
+            self.observed_last_sent.remove(addr);
+        }
+        self.peer_identities
+            .insert(addr.to_string(), node_id.clone());
+    }
+
     async fn run_sync(&mut self) {
-        let Some(sync_client) = &self.sync_client else {
-            return;
+        let peers = match &self.sync_client {
+            Some(sync_client) => sync_client.peer_registry().lock().await.all_peers_owned(),
+            None => return,
         };
+        for peer in &peers {
+            self.observe_peer_identity(&peer.addr, &peer.node_id);
+        }
+        let sync_client = self.sync_client.as_ref().expect("checked above");
         let Some(eventual_api) = &self.eventual_api else {
             return;
         };
@@ -2826,7 +2861,6 @@ impl NodeRunner {
             .unwrap_or_default();
         let sample_fp = Self::observed_sample_fingerprint(&gossip_sample);
 
-        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
         let mut any_success = false;
 
         for peer in &peers {
@@ -2886,9 +2920,6 @@ impl NodeRunner {
                             logical: 0,
                             node_id: String::new(),
                         });
-                // Wall-clock instant BEFORE the scan: recorded as the
-                // push-evidence time on success (see `push_acked_wall_ms`).
-                let scan_wall_ms = crate::hlc::wall_clock_ms();
                 let api = eventual_api.lock().await;
                 let total_keys = api.store().len();
                 // delta_entries_since returns delta-state entries sorted by
@@ -2917,12 +2948,17 @@ impl NodeRunner {
                 // surviving keys but still omits the pruned ones, so recording
                 // push evidence in that case would open the tombstone-GC peer
                 // gate without those keys ever reaching the peer, breaking the
-                // dead-peer fail-closed promise. Gate `push_acked_wall_ms` in
-                // every push arm below on this.
+                // dead-peer fail-closed promise. Remember this gap across
+                // cycles, because a successful delta can move the baseline
+                // above the floor without recovering the hidden keys.
                 let floor_covered = match &pruned_floor {
                     None => true,
                     Some(floor) => frontier >= *floor,
                 };
+                let repay_prune_debt = self.push_prune_debt.contains(&peer_key);
+                if !floor_covered {
+                    self.push_prune_debt.insert(peer_key.clone());
+                }
 
                 // Compute change rate and decide whether to use delta or full sync.
                 let change_rate = if total_keys > 0 {
@@ -2931,31 +2967,40 @@ impl NodeRunner {
                     0.0
                 };
 
-                if should_fallback_to_full_sync(
-                    changed_count,
-                    total_keys,
-                    self.config.full_sync_threshold,
-                ) {
-                    // High change rate: full-sync territory. Probe the
-                    // peer with a key-range digest first — if the states
-                    // already match (or only a few buckets differ) the
-                    // full-state push is avoided entirely.
+                if repay_prune_debt
+                    || should_fallback_to_full_sync(
+                        changed_count,
+                        total_keys,
+                        self.config.full_sync_threshold,
+                    )
+                {
+                    // High change rate or an earlier prune gap: use a
+                    // complete-state push. A digest may avoid it for high
+                    // change rate, but prune debt requires actual values.
                     drop(api);
 
-                    tracing::info!(
-                        peer = %peer.node_id.0,
-                        change_rate = %format!("{:.2}", change_rate),
-                        threshold = %format!("{:.2}", self.config.full_sync_threshold),
-                        changed_keys = changed_count,
-                        total_keys = total_keys,
-                        "change rate exceeds threshold, falling back to full sync push"
-                    );
+                    if repay_prune_debt {
+                        tracing::info!(
+                            peer = %peer.node_id.0,
+                            "repaying HLC prune gap with complete-state push"
+                        );
+                    } else {
+                        tracing::info!(
+                            peer = %peer.node_id.0,
+                            change_rate = %format!("{:.2}", change_rate),
+                            threshold = %format!("{:.2}", self.config.full_sync_threshold),
+                            changed_keys = changed_count,
+                            total_keys = total_keys,
+                            "change rate exceeds threshold, falling back to full sync push"
+                        );
+                    }
 
-                    let digest_handled = if Self::digest_sync_allowed(
-                        &self.digest_unsupported,
-                        self.config.digest_sync_enabled,
-                        &peer_key,
-                    ) {
+                    let digest_handled = if !self.push_prune_debt.contains(&peer_key)
+                        && Self::digest_sync_allowed(
+                            &self.digest_unsupported,
+                            self.config.digest_sync_enabled,
+                            &peer_key,
+                        ) {
                         // First carrier candidate for the relay sample.
                         let relay_observed = observed_pending.take().unwrap_or_default();
                         let relay_attached = !relay_observed.is_empty();
@@ -3001,7 +3046,15 @@ impl NodeRunner {
                             .all_entries()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        let snapshot_frontier = api.store().current_frontier();
+                        // A full dump covers pruned keys too. Its push
+                        // baseline must cover the floor even when every
+                        // per-key timestamp was removed by compaction.
+                        let snapshot_frontier = api
+                            .store()
+                            .current_frontier()
+                            .into_iter()
+                            .chain(api.store().pruned_floor().cloned())
+                            .max();
                         drop(api);
 
                         let push_resp = sync_client
@@ -3016,7 +3069,7 @@ impl NodeRunner {
                                     merged = resp.merged,
                                     "full sync push had per-key errors, not advancing frontier"
                                 );
-                            } else {
+                            } else if resp.durable {
                                 // After a clean full push, advance both
                                 // frontiers to the snapshot frontier and
                                 // record the push evidence (GC peer gate).
@@ -3025,13 +3078,20 @@ impl NodeRunner {
                                         .insert(peer_key.clone(), frontier.clone());
                                     self.push_frontiers.insert(peer_key.clone(), frontier);
                                 }
-                                self.push_acked_wall_ms
-                                    .insert(peer_key.clone(), snapshot_wall_ms);
+                                self.push_acked_wall_ms.insert(
+                                    peer_key.clone(),
+                                    PushAck {
+                                        node_id: peer.node_id.clone(),
+                                        snapshot_wall_ms,
+                                    },
+                                );
+                                self.push_prune_debt.remove(&peer_key);
                             }
                         }
                     }
                 } else {
                     drop(api);
+                    let mut delta_push_ok = false;
 
                     // Normal delta push path.
                     // Separate HLCs (cheap Copy-like fields) from owned key-value
@@ -3069,14 +3129,14 @@ impl NodeRunner {
                                 "delta payload exceeds size limit, falling back to full sync"
                             );
 
-                            // Digest probe first: skip the full push when
-                            // the peer already matches (or push only the
-                            // mismatched buckets).
-                            let digest_handled = if Self::digest_sync_allowed(
-                                &self.digest_unsupported,
-                                self.config.digest_sync_enabled,
-                                &peer_key,
-                            ) {
+                            // With no prune debt, a digest probe can avoid
+                            // the full push or limit it to mismatched buckets.
+                            let digest_handled = if !self.push_prune_debt.contains(&peer_key)
+                                && Self::digest_sync_allowed(
+                                    &self.digest_unsupported,
+                                    self.config.digest_sync_enabled,
+                                    &peer_key,
+                                ) {
                                 // Carrier candidate for the relay sample
                                 // (oversized-delta branch).
                                 let relay_observed = observed_pending.take().unwrap_or_default();
@@ -3121,7 +3181,12 @@ impl NodeRunner {
                                     .all_entries()
                                     .map(|(k, v)| (k.clone(), v.clone()))
                                     .collect();
-                                let snapshot_frontier = api.store().current_frontier();
+                                let snapshot_frontier = api
+                                    .store()
+                                    .current_frontier()
+                                    .into_iter()
+                                    .chain(api.store().pruned_floor().cloned())
+                                    .max();
                                 drop(api);
 
                                 let all_entries = tokio::task::spawn_blocking(move || {
@@ -3148,14 +3213,20 @@ impl NodeRunner {
                                             merged = resp.merged,
                                             "payload overflow full push had per-key errors"
                                         );
-                                    } else {
+                                    } else if resp.durable {
                                         if let Some(frontier) = snapshot_frontier {
                                             self.peer_frontiers
                                                 .insert(peer_key.clone(), frontier.clone());
                                             self.push_frontiers.insert(peer_key.clone(), frontier);
                                         }
-                                        self.push_acked_wall_ms
-                                            .insert(peer_key.clone(), snapshot_wall_ms);
+                                        self.push_acked_wall_ms.insert(
+                                            peer_key.clone(),
+                                            PushAck {
+                                                node_id: peer.node_id.clone(),
+                                                snapshot_wall_ms,
+                                            },
+                                        );
+                                        self.push_prune_debt.remove(&peer_key);
                                     }
                                 }
                             }
@@ -3175,6 +3246,7 @@ impl NodeRunner {
 
                             match push_result {
                                 Ok(pushed) => {
+                                    delta_push_ok = true;
                                     tracing::debug!(
                                         peer = %peer.node_id.0,
                                         pushed_keys = pushed,
@@ -3204,49 +3276,12 @@ impl NodeRunner {
                                             }
                                         }
                                     }
-                                    // Advance the push frontier to the max HLC
-                                    // of the pushed batch — NOT
-                                    // current_frontier(), which may have
-                                    // advanced past unpushed concurrent
-                                    // writes. `peer_frontiers` may already sit
-                                    // higher (pull-advanced), so it only
-                                    // advances max-monotonically.
-                                    if let Some(max_hlc) = hlc_vec.last() {
-                                        self.push_frontiers
-                                            .insert(peer_key.clone(), max_hlc.clone());
-                                        if self
-                                            .peer_frontiers
-                                            .get(&peer_key)
-                                            .is_none_or(|existing| *max_hlc > *existing)
-                                        {
-                                            self.peer_frontiers
-                                                .insert(peer_key.clone(), max_hlc.clone());
-                                        }
-                                    }
-                                    // Push evidence for the tombstone-GC peer
-                                    // gate: the scan (taken at scan_wall_ms)
-                                    // was fully conveyed with zero per-key
-                                    // errors (`Ok` implies no failed keys).
-                                    // Honest ONLY when the baseline covers the
-                                    // pruned floor — otherwise compaction hid
-                                    // pruned keys in `(frontier, pruned_floor]`
-                                    // from the scan, so they were never pushed
-                                    // even though this (non-empty) push
-                                    // succeeded. Fail-closed: withhold evidence
-                                    // until a later cycle whose baseline has
-                                    // caught up to the floor supplies it.
-                                    if floor_covered {
-                                        self.push_acked_wall_ms
-                                            .insert(peer_key.clone(), scan_wall_ms);
-                                    } else {
-                                        tracing::debug!(
-                                            peer = %peer.node_id.0,
-                                            "delta push baseline sits below the \
-                                             pruned floor; withholding push \
-                                             evidence (compaction may hide \
-                                             un-pushed keys from this peer)"
-                                        );
-                                    }
+                                    // HLC-only selection can miss a newly
+                                    // accepted CRDT contribution whose HLC is
+                                    // below this peer's frontier. A successful
+                                    // delta push is only an optimization; the
+                                    // complete-state verification below owns
+                                    // frontier and GC push evidence.
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -3274,29 +3309,83 @@ impl NodeRunner {
                             }
                         }
                     } else {
-                        // Empty scan: nothing above the push-only baseline.
-                        // This is only honest push evidence when compaction
-                        // has NOT pruned timestamps above the baseline (the
-                        // `floor_covered` gate computed with the scan). If
-                        // `frontier < pruned_floor`, keys in
-                        // `(frontier, pruned_floor]` that were never pushed to
-                        // this peer are hidden from the scan, so recording the
-                        // (empty) scan as evidence would open the tombstone-GC
-                        // peer gate WITHOUT any request reaching the peer —
-                        // breaking the fail-closed promise for dead peers.
-                        // Fail-closed: withhold evidence in that case; a later
-                        // cycle whose baseline has caught up to the floor, or a
-                        // real non-empty push, supplies honest evidence.
-                        if floor_covered {
-                            self.push_acked_wall_ms
-                                .insert(peer_key.clone(), scan_wall_ms);
+                        // An empty HLC scan is not complete-state evidence:
+                        // lower-HLC CRDT contributions can be hidden below
+                        // the baseline. Verify the whole state below.
+                        delta_push_ok = true;
+                    }
+
+                    if delta_push_ok {
+                        let digest_handled = if !self.push_prune_debt.contains(&peer_key)
+                            && Self::digest_sync_allowed(
+                                &self.digest_unsupported,
+                                self.config.digest_sync_enabled,
+                                &peer_key,
+                            ) {
+                            let relay_observed = observed_pending.clone().unwrap_or_default();
+                            let relay_attached = !relay_observed.is_empty();
+                            let outcome = Self::try_digest_push(
+                                sync_client,
+                                eventual_api,
+                                &self.metrics,
+                                &self.node_id.0,
+                                peer_id,
+                                &peer_key,
+                                &peer.addr,
+                                &mut self.peer_frontiers,
+                                &mut self.push_frontiers,
+                                &mut self.push_acked_wall_ms,
+                                &mut self.digest_unsupported,
+                                relay_observed,
+                            )
+                            .await;
+                            if relay_attached && matches!(outcome, DigestPushOutcome::Handled) {
+                                observed_pending = None;
+                                self.observed_last_sent.insert(
+                                    peer_key.clone(),
+                                    (sample_fp, crate::hlc::wall_clock_ms()),
+                                );
+                            }
+                            matches!(outcome, DigestPushOutcome::Handled)
                         } else {
-                            tracing::debug!(
-                                peer = %peer.node_id.0,
-                                "empty delta scan sits below the pruned floor; \
-                                 withholding push evidence (compaction may hide \
-                                 un-pushed keys from this peer)"
-                            );
+                            false
+                        };
+
+                        if !digest_handled {
+                            let snapshot_wall_ms = crate::hlc::wall_clock_ms();
+                            let api = eventual_api.lock().await;
+                            let all_entries: HashMap<String, crate::store::kv::CrdtValue> = api
+                                .store()
+                                .all_entries()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect();
+                            let snapshot_frontier = api
+                                .store()
+                                .current_frontier()
+                                .into_iter()
+                                .chain(api.store().pruned_floor().cloned())
+                                .max();
+                            drop(api);
+                            if let Some(resp) = sync_client
+                                .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
+                                .await
+                                && resp.errors.is_empty()
+                                && resp.durable
+                            {
+                                if let Some(frontier) = snapshot_frontier {
+                                    self.peer_frontiers
+                                        .insert(peer_key.clone(), frontier.clone());
+                                    self.push_frontiers.insert(peer_key.clone(), frontier);
+                                }
+                                self.push_acked_wall_ms.insert(
+                                    peer_key.clone(),
+                                    PushAck {
+                                        node_id: peer.node_id.clone(),
+                                        snapshot_wall_ms,
+                                    },
+                                );
+                                self.push_prune_debt.remove(&peer_key);
+                            }
                         }
                     }
                 }
@@ -3314,7 +3403,12 @@ impl NodeRunner {
                     .all_entries()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                let snapshot_frontier = api.store().current_frontier();
+                let snapshot_frontier = api
+                    .store()
+                    .current_frontier()
+                    .into_iter()
+                    .chain(api.store().pruned_floor().cloned())
+                    .max();
                 drop(api);
 
                 let all_entries = tokio::task::spawn_blocking(move || {
@@ -3336,7 +3430,7 @@ impl NodeRunner {
                         .push_full_state_to_peer(&peer.addr, all_entries, &self.node_id.0)
                         .await
                     {
-                        Some(sync_resp) if sync_resp.errors.is_empty() => {
+                        Some(sync_resp) if sync_resp.errors.is_empty() && sync_resp.durable => {
                             // All keys merged successfully: seed the
                             // push-only baseline and the push evidence
                             // (GC peer gate) from the snapshot. The
@@ -3345,8 +3439,20 @@ impl NodeRunner {
                             if let Some(frontier) = snapshot_frontier {
                                 self.push_frontiers.insert(peer_key.clone(), frontier);
                             }
-                            self.push_acked_wall_ms
-                                .insert(peer_key.clone(), snapshot_wall_ms);
+                            self.push_acked_wall_ms.insert(
+                                peer_key.clone(),
+                                PushAck {
+                                    node_id: peer.node_id.clone(),
+                                    snapshot_wall_ms,
+                                },
+                            );
+                            self.push_prune_debt.remove(&peer_key);
+                        }
+                        Some(sync_resp) if sync_resp.errors.is_empty() => {
+                            tracing::debug!(
+                                peer = %peer.node_id.0,
+                                "initial full push reached peer without durable GC evidence"
+                            );
                         }
                         Some(sync_resp) => {
                             // 2xx but per-key errors — log but still establish the
@@ -3639,7 +3745,7 @@ impl NodeRunner {
                     "full sync",
                 )
                 .await;
-                // Inbound evidence (Stage 2 hole-jump gate): a legacy
+                // Inbound reconciliation evidence: a legacy
                 // full dump is the peer's complete state; record only a
                 // clean, poison-free absorption (fail-closed).
                 if merge_errors == 0 {
@@ -3682,10 +3788,14 @@ impl NodeRunner {
             peers.iter().map(|p| &p.addr).collect();
         self.peer_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
+        self.peer_identities
+            .retain(|addr, _| active_addrs.contains(addr));
         self.push_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
         self.push_acked_wall_ms
             .retain(|addr, _| active_addrs.contains(addr));
+        self.push_prune_debt
+            .retain(|addr| active_addrs.contains(addr));
         self.pull_verified_frontiers
             .retain(|addr, _| active_addrs.contains(addr));
         self.pull_reconciled_wall_ms
@@ -3703,8 +3813,6 @@ impl NodeRunner {
         self.certified_rescan_cursor
             .retain(|addr, _| active_addrs.contains(addr));
         self.certified_rescanned_at
-            .retain(|addr, _| active_addrs.contains(addr));
-        self.certified_refusal_rounds
             .retain(|addr, _| active_addrs.contains(addr));
         self.observed_last_sent
             .retain(|addr, _| active_addrs.contains(addr));
@@ -3765,33 +3873,29 @@ impl NodeRunner {
     /// - `TypeMismatch` is permanent divergence. The lane steps over it,
     ///   because retrying cannot help and one conflicting key must not
     ///   wedge a peer.
-    /// - Origin-ahead and policy-denied are CONTROL-PLANE LAG. The lane
-    ///   HOLDS its baseline at the last accepted entry and retries, up to
-    ///   [`CERTIFIED_REFUSAL_MAX_ROUNDS`]. Stepping over these is
-    ///   permanent -- `Store::delta_entries_since` filters strictly above
-    ///   the baseline, and this plane has no digest lane to repair the
-    ///   hole -- so it would leave the value on the writer's disk alone,
-    ///   reopening P0-1 for every key written during a policy rollout.
-    ///   When the budget runs out the lane steps over exactly the ONE
-    ///   refused entry (not the rest of the batch) and counts it.
+    /// - A conflicting immutable dot assignment is also permanent. The
+    ///   receiver rejects it without mutation and steps over that entry;
+    ///   a periodic full rescan still rechecks the peer.
+    /// - Origin-ahead and policy-denied may resolve after control-plane
+    ///   changes. The lane HOLDS its baseline at the last accepted entry
+    ///   and retries until the entry can be ingested. Stepping over it
+    ///   would leave a gap until the next full rescan.
     ///
     /// [`CERTIFIED_RESCAN_INTERVAL`] then backstops both: a periodic
-    /// `baseline = 0` pass re-offers everything, including entries stepped
-    /// over above and entries a peer holds below its own frontier.
+    /// `baseline = 0` pass re-offers entries a peer holds below its own
+    /// frontier.
     pub async fn run_certified_sync(&mut self) {
         if !self.config.certified_sync_enabled {
             return;
         }
-        let Some(sync_client) = &self.sync_client else {
-            return;
+        let peers = match &self.sync_client {
+            Some(sync_client) => sync_client.peer_registry().lock().await.all_peers_owned(),
+            None => return,
         };
-
-        let zero = HlcTimestamp {
-            physical: 0,
-            logical: 0,
-            node_id: String::new(),
-        };
-        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
+        for peer in &peers {
+            self.observe_peer_identity(&peer.addr, &peer.node_id);
+        }
+        let sync_client = self.sync_client.as_ref().expect("checked above");
         for peer in &peers {
             let peer_key = peer.addr.clone();
 
@@ -3824,8 +3928,7 @@ impl NodeRunner {
                 if last.elapsed() >= CERTIFIED_RESCAN_INTERVAL {
                     *last = Instant::now();
                     rescanning = true;
-                    self.certified_rescan_cursor
-                        .insert(peer_key.clone(), zero.clone());
+                    self.certified_rescan_cursor.insert(peer_key.clone(), None);
                     self.metrics
                         .certified_sync_rescan_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -3835,12 +3938,9 @@ impl NodeRunner {
                 self.certified_rescan_cursor
                     .get(&peer_key)
                     .cloned()
-                    .unwrap_or_else(|| zero.clone())
+                    .unwrap_or(None)
             } else {
-                self.certified_peer_frontiers
-                    .get(&peer_key)
-                    .cloned()
-                    .unwrap_or_else(|| zero.clone())
+                self.certified_peer_frontiers.get(&peer_key).cloned()
             };
 
             // Drain: a truncated response means the peer has more. Bounded
@@ -3885,15 +3985,14 @@ impl NodeRunner {
                 let truncated = resp.truncated;
                 let mut applied = 0u64;
                 let mut skipped = 0u64;
-                let mut origin_unknown = 0u64;
+                let origin_unknown = 0u64;
                 let mut origin_ahead = 0u64;
                 let mut type_mismatch = 0u64;
                 let mut policy_denied = 0u64;
                 let mut storage_error: Option<String> = None;
-                // HLC of the last entry this node actually processed, and
-                // of the transiently refused entry that stopped the batch.
-                let mut processed_to: Option<HlcTimestamp> = None;
-                let mut refused_at: Option<HlcTimestamp> = None;
+                // HLC of the last entry this node actually processed.
+                let mut processed_to: Option<CertifiedDeltaCursor> = None;
+                let mut refused = false;
                 let origins_len;
                 {
                     let mut api = self.certified_api.lock().await;
@@ -3901,31 +4000,38 @@ impl NodeRunner {
                     // in that order, so a later contribution can never be
                     // overtaken by an earlier one.
                     for e in resp.entries {
-                        if e.policy_version.is_none() {
-                            origin_unknown += 1;
-                        }
-                        let hlc = e.hlc.clone();
-                        match api.merge_remote_certified(e.key, &e.value, e.hlc, e.policy_version) {
+                        let position = CertifiedDeltaCursor {
+                            hlc: e.hlc.clone(),
+                            key: e.key.clone(),
+                        };
+                        match api.merge_remote_certified(e.key, &e.value, e.hlc, e.scope) {
                             Ok(IngestOutcome::Applied) => {
                                 applied += 1;
-                                processed_to = Some(hlc);
+                                processed_to = Some(position);
                             }
                             Ok(IngestOutcome::Skipped) => {
                                 skipped += 1;
-                                processed_to = Some(hlc);
+                                processed_to = Some(position);
                             }
                             Ok(IngestOutcome::Rejected(IngestRejection::TypeMismatch)) => {
                                 // Permanent divergence: retrying cannot
                                 // help, so step over it.
                                 type_mismatch += 1;
-                                processed_to = Some(hlc);
+                                processed_to = Some(position);
+                            }
+                            Ok(IngestOutcome::Rejected(IngestRejection::DotAssignmentConflict)) => {
+                                tracing::warn!(
+                                    peer = %peer.node_id.0,
+                                    "certified entry has conflicting immutable CRDT dot; stepping over it"
+                                );
+                                processed_to = Some(position);
                             }
                             Ok(IngestOutcome::Rejected(IngestRejection::OriginAhead)) => {
                                 // Transient: this node's namespace lags the
                                 // writer's. Stop here so the baseline stays
                                 // below it and it is re-offered.
                                 origin_ahead += 1;
-                                refused_at = Some(hlc);
+                                refused = true;
                                 break;
                             }
                             Err(CrdtError::Storage(msg)) => {
@@ -3945,7 +4051,7 @@ impl NodeRunner {
                                     error = %e,
                                     "certified entry refused; holding the baseline"
                                 );
-                                refused_at = Some(hlc);
+                                refused = true;
                                 break;
                             }
                         }
@@ -4005,38 +4111,14 @@ impl NodeRunner {
                     .or_default()
                     .record_success();
 
-                if let Some(refused) = refused_at {
-                    // The transport is healthy; one entry is not yet
-                    // acceptable here. Spend a retry round on it.
-                    let rounds = self
-                        .certified_refusal_rounds
-                        .entry(peer_key.clone())
-                        .or_insert(0);
-                    *rounds += 1;
-                    let give_up = *rounds >= CERTIFIED_REFUSAL_MAX_ROUNDS;
-                    if give_up {
-                        *rounds = 0;
-                    }
-                    let target = if give_up {
-                        tracing::warn!(
-                            peer = %peer.node_id.0,
-                            "certified entry refused for {CERTIFIED_REFUSAL_MAX_ROUNDS} \
-                             consecutive rounds; stepping over it (recovered only by the \
-                             periodic rescan)"
-                        );
-                        self.metrics
-                            .certified_sync_forced_skip_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        // Step over exactly the refused entry, so the rest
-                        // of the batch is still offered next round.
-                        Some(refused)
-                    } else {
-                        self.metrics
-                            .certified_sync_baseline_held_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        processed_to
-                    };
-                    if let Some(target) = target {
+                if refused {
+                    // The transport succeeded, but destination admission
+                    // has not. Keep the refused entry above the baseline
+                    // for every later round, including after long policy lag.
+                    self.metrics
+                        .certified_sync_baseline_held_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(target) = processed_to {
                         Self::advance_certified_baseline(
                             &mut self.certified_peer_frontiers,
                             &mut self.certified_rescan_cursor,
@@ -4047,8 +4129,6 @@ impl NodeRunner {
                     }
                     break;
                 }
-
-                self.certified_refusal_rounds.remove(&peer_key);
 
                 // Every entry was processed: adopt the responder's
                 // baseline. On a truncated batch this is the LAST INCLUDED
@@ -4069,7 +4149,7 @@ impl NodeRunner {
                     self.certified_rescan_cursor.remove(&peer_key);
                     break;
                 }
-                baseline = frontier;
+                baseline = Some(frontier);
             }
         }
     }
@@ -4085,14 +4165,14 @@ impl NodeRunner {
     /// Takes the two maps rather than `&mut self` so it can be called from
     /// inside the pull loop, which holds a shared borrow of `sync_client`.
     fn advance_certified_baseline(
-        peer_frontiers: &mut HashMap<String, HlcTimestamp>,
-        rescan_cursor: &mut HashMap<String, HlcTimestamp>,
+        peer_frontiers: &mut HashMap<String, CertifiedDeltaCursor>,
+        rescan_cursor: &mut HashMap<String, Option<CertifiedDeltaCursor>>,
         peer_key: &str,
         rescanning: bool,
-        frontier: HlcTimestamp,
+        frontier: CertifiedDeltaCursor,
     ) {
         if rescanning {
-            rescan_cursor.insert(peer_key.to_string(), frontier.clone());
+            rescan_cursor.insert(peer_key.to_string(), Some(frontier.clone()));
         }
         match peer_frontiers.get(peer_key) {
             Some(existing) if *existing >= frontier => {}
@@ -4173,11 +4253,11 @@ impl NodeRunner {
     /// built in a single pass so the two can never drift apart.
     fn certifiable_population(
         ns: &SystemNamespace,
-    ) -> (Vec<(KeyRange, usize)>, Vec<PolicyVersion>) {
+    ) -> (Vec<(KeyRange, Vec<NodeId>)>, Vec<PolicyVersion>) {
         let mut defs = Vec::new();
         let mut policy_versions = Vec::new();
         for (def, version) in ns.certifiable_ranges() {
-            defs.push((def.key_range.clone(), def.authority_nodes.len()));
+            defs.push((def.key_range.clone(), def.authority_nodes.clone()));
             policy_versions.push(version);
         }
         (defs, policy_versions)
@@ -4199,59 +4279,68 @@ impl NodeRunner {
 
         // Phase 1: Acquire certified_api lock, read all needed data, then drop
         // the lock before any subsequent .await points.
-        let (defs, frontier_set, policy_versions) = {
+        let (
+            defs,
+            frontier_set,
+            policy_versions,
+            namespace,
+            snapshot_version,
+            range_ops,
+            unattributed_ops,
+        ) = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
+            let namespace = Arc::clone(api.namespace());
+            let ns = namespace.read().unwrap_or_else(|e| e.into_inner());
+            let snapshot_version = *ns.version();
 
             // Iterate over the certifiable key ranges (definition AND
             // policy), carrying each range's real policy version.
             let (defs, policy_versions) = Self::certifiable_population(&ns);
+            let mut range_ops: HashMap<String, u64> = HashMap::new();
+            let mut unattributed_ops = 0u64;
+            for (key, count) in &ops_by_key {
+                let matching_scope = ns
+                    .get_authorities_for_key(key)
+                    .zip(ns.get_placement_policy_for_key(key))
+                    .filter(|(def, policy)| def.key_range == policy.key_range)
+                    .and_then(|(def, _)| {
+                        defs.iter()
+                            .find(|(range, _)| *range == def.key_range)
+                            .map(|(range, _)| range.prefix.clone())
+                    });
+                if let Some(prefix) = matching_scope {
+                    *range_ops.entry(prefix).or_insert(0) += count;
+                } else {
+                    unattributed_ops += count;
+                }
+            }
+            drop(ns);
 
             let fs = api.frontier_set().clone();
 
             // Drop ns (RwLock read guard) and api (tokio Mutex guard) here.
-            (defs, fs, policy_versions)
+            (
+                defs,
+                fs,
+                policy_versions,
+                namespace,
+                snapshot_version,
+                range_ops,
+                unattributed_ops,
+            )
         };
 
-        // Phase 2: Aggregate per-key write ops into per-range counts by
-        // matching each written key against key range prefixes. Keys that
-        // match no certifiable range are NOT attributed to any range —
-        // they are counted on `compaction_unattributed_write_ops_total`
-        // instead. The old fallback charged them to `defs[0]`, i.e. to a
-        // prefix picked out of `HashMap` iteration order; the catch-all
-        // `""` definition (which matches every key) was the only reason
-        // that arbitrariness never surfaced.
-        if !ops_by_key.is_empty() && !defs.is_empty() {
-            let mut range_ops: HashMap<&str, u64> = HashMap::new();
-            for (key, count) in &ops_by_key {
-                let matched = defs
-                    .iter()
-                    .find(|(kr, _)| key.starts_with(&kr.prefix))
-                    .map(|(kr, _)| kr.prefix.as_str());
-                let Some(prefix) = matched else {
-                    self.metrics
-                        .compaction_unattributed_write_ops_total
-                        .fetch_add(*count, Ordering::Relaxed);
-                    continue;
-                };
-                *range_ops.entry(prefix).or_insert(0) += count;
+        // Phase 2: Charge writes to the exact longest-prefix assignment,
+        // including shadowing by a more specific noncertifiable policy.
+        for (key_range, _) in &defs {
+            for _ in 0..range_ops.get(&key_range.prefix).copied().unwrap_or(0) {
+                self.compaction_engine.record_op(key_range);
             }
-
-            for (key_range, _) in &defs {
-                let ops = range_ops
-                    .get(key_range.prefix.as_str())
-                    .copied()
-                    .unwrap_or(0);
-                for _ in 0..ops {
-                    self.compaction_engine.record_op(key_range);
-                }
-            }
-        } else if !ops_by_key.is_empty() {
-            // No certifiable range at all: every drained op is
-            // unattributable. Counted rather than silently discarded.
+        }
+        if unattributed_ops > 0 {
             self.metrics
                 .compaction_unattributed_write_ops_total
-                .fetch_add(ops_by_key.values().sum::<u64>(), Ordering::Relaxed);
+                .fetch_add(unattributed_ops, Ordering::Relaxed);
         }
 
         // Phase 3: Run compaction (checkpoint evaluation + pruning). Only
@@ -4259,32 +4348,53 @@ impl NodeRunner {
         // is nothing to checkpoint or prune, and creating checkpoints against
         // an empty store would accumulate stale entries.
         if let Some(ref eventual_api) = self.eventual_api {
-            // Evaluate checkpoint eligibility for each key range.
-            for (i, (key_range, _total_authorities)) in defs.iter().enumerate() {
-                if self.compaction_engine.should_checkpoint(key_range, &now) {
-                    let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
-                    self.compaction_engine.create_checkpoint(
-                        key_range.clone(),
-                        now.clone(),
-                        digest,
-                        policy_versions[i],
-                    );
-                }
-            }
-
-            // Prune old timestamps from the store.
             let mut ev_api = eventual_api.lock().await;
+            // Keep the verified attestation pool stable through pruning. A
+            // concurrent frontier report or accusation may change the signed
+            // quorum; `try_lock` avoids waiting with the store lock held.
+            let certified_guard = match self.certified_api.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            // The roster and policy used by the frontier gate must still be
+            // current when timestamps are removed. Do not wait for a writer
+            // while holding the store lock; retry the next cycle instead.
+            let namespace_guard = match namespace.try_read() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
+            if *namespace_guard.version() != snapshot_version {
+                return;
+            }
+            // Prune each retained checkpoint before creating its successor.
+            // The engine keeps a checkpoint pending until a signed floor
+            // reaches it, even if writes keep crossing the trigger threshold.
             let store = ev_api.store_mut();
-            for (i, (key_range, total_authorities)) in defs.iter().enumerate() {
+            for (i, (key_range, authority_nodes)) in defs.iter().enumerate() {
                 let digest = format!("digest-{}-{}", key_range.prefix, now.physical);
+                let signed_floor = certified_guard.signed_prune_floor(
+                    key_range,
+                    policy_versions[i],
+                    authority_nodes,
+                );
                 let pruned = self.compaction_engine.run_compaction(
                     key_range,
                     now.clone(),
                     digest,
                     policy_versions[i],
                     &frontier_set,
-                    *total_authorities,
+                    authority_nodes,
+                    signed_floor.as_ref(),
                     store,
+                    |key| {
+                        namespace_guard
+                            .get_authorities_for_key(key)
+                            .zip(namespace_guard.get_placement_policy_for_key(key))
+                            .is_some_and(|(def, policy)| {
+                                def.key_range == *key_range && policy.key_range == *key_range
+                            })
+                    },
                 );
                 if pruned > 0 {
                     tracing::info!(
@@ -4316,7 +4426,9 @@ impl NodeRunner {
     ///   stale pre-partition frontier could read as "past the mark"
     ///   throughout a partition. The receipt check is measured entirely
     ///   on this node's own clock and fails for any frontier that has
-    ///   not advanced since the mark.
+    ///   not advanced since the mark. A current-roster quorum must also have
+    ///   signed the same normalized checkpoint at or after the mark, with
+    ///   each signature matched to its exact locally accepted full frontier.
     /// - **Peer gate**: every peer in the sync registry has push
     ///   evidence (`push_acked_wall_ms`, recorded ONLY when a push
     ///   completes with zero per-key errors, stamped with the LOCAL
@@ -4343,23 +4455,10 @@ impl NodeRunner {
     /// stale live dots are killed/rejected by the floor on merge);
     /// majority-reach GC is an open design question.
     ///
-    /// **Stage 2 hole-jump** (`gc_hole_jump_enabled`, default off): in
-    /// addition to the dual OUTBOUND gate above, the sweep may cross
-    /// legacy holes (dots the pre-floor sweep physically deleted) when
-    /// the INBOUND gate holds — every registry peer has
-    /// `pull_reconciled_wall_ms` evidence (a complete, error-free pull
-    /// STARTED) at/after the mark. Having absorbed every known peer's
-    /// full state since the mark, a dot that was ALREADY a hole at mark
-    /// time and is still a hole is live nowhere known, i.e. removed. The
-    /// sweep enforces the "at mark time" part itself: the mark snapshots
-    /// each value's per-node counters and the walk only jumps holes at
-    /// or below that snapshot — a hole minted AFTER the mark by an
-    /// inbound partial delta (counters ride deltas in full while an
-    /// entry below the requested frontier is filtered out) may be live
-    /// on the pushing peer, and the pull evidence, taken earlier, proves
-    /// nothing about it (see the `TombstoneGc` module docs). Fail-closed:
-    /// a missing entry or a disabled flag keeps the walk stalled
-    /// (`gc_floor_stalled_hole_dots`).
+    /// Stage 2 hole-jump remains disabled. The old inbound check covered
+    /// only peers still in the registry; an evicted peer may retain a live
+    /// dot and later rejoin. The ordinary contiguous floor walk remains
+    /// available and stalls at undecided holes.
     ///
     /// **P1-10 note** (why the gate compares HLC *time*, never counters):
     /// dot counters are per-CRDT/per-writer small integers and no
@@ -4383,47 +4482,146 @@ impl NodeRunner {
         let Some(eventual_api) = self.eventual_api.clone() else {
             return;
         };
+        let peer_registry = self
+            .sync_client
+            .as_ref()
+            .map(|client| Arc::clone(client.peer_registry()));
+        let peer_generation_before = if let Some(registry) = &peer_registry {
+            Some(registry.lock().await.generation())
+        } else {
+            None
+        };
 
         // Evaluate the dual gate against the pending mark, if any (the
         // very first pass only marks, so the verdict is irrelevant then).
-        let (gates_passed, block) = match self.tombstone_gc.pending_mark_ms() {
+        let (gates_passed, block, authority_snapshot) = match self.tombstone_gc.pending_mark_ms() {
             Some(mark_ms) => {
-                let block = self.gc_gate_diagnosis(mark_ms).await;
-                (block.is_none(), block)
+                let (block, namespace, version) = self.gc_gate_diagnosis(mark_ms).await;
+                (block.is_none(), block, Some((namespace, version)))
             }
-            None => (false, None),
+            None => (false, None, None),
         };
         if let Some(block) = &block {
             self.record_gc_gate_block(block, now_ms);
         }
 
-        // Stage 2 hole-jump requires the ADDITIONAL inbound gate.
-        let allow_hole_jump = self.config.gc_hole_jump_enabled
-            && gates_passed
-            && match self.tombstone_gc.pending_mark_ms() {
-                Some(mark_ms) => {
-                    if let Some(sync_client) = &self.sync_client {
-                        let peers = sync_client.peer_registry().lock().await.all_peers_owned();
-                        Self::gc_inbound_gate_passed(&peers, &self.pull_reconciled_wall_ms, mark_ms)
-                    } else {
-                        // No sync layer — no peers exist to hold a hole
-                        // dot live (single-node case).
-                        true
-                    }
-                }
-                None => false,
-            };
-
+        // Current membership cannot certify holes: an evicted peer can retain
+        // a live dot and rejoin after a sweep.
+        // Freeze the peer population through the sweep. A join or replacement
+        // between the gate's registry snapshot and this lock makes the gate
+        // stale, even if an earlier peer used the same address.
+        let peer_guard = if let Some(registry) = &peer_registry {
+            Some(registry.lock().await)
+        } else {
+            None
+        };
+        let membership_stable = match (&peer_guard, peer_generation_before) {
+            (Some(guard), Some(before)) => guard.generation() == before,
+            (None, None) => true,
+            _ => false,
+        };
+        if gates_passed && !membership_stable {
+            self.record_gc_gate_block(
+                &GcGateBlock::PeerEvidenceMissingOrStale {
+                    peer_addr: "<membership changed>".into(),
+                },
+                now_ms,
+            );
+        }
         let mut api = eventual_api.lock().await;
+        // Signatures are a separate input from the accepted frontier set.
+        // Take a nonblocking certified lock while the store is held so the
+        // verified quorum cannot be purged between this check and sweep.
+        let certified_handle = Arc::clone(&self.certified_api);
+        let mut certified_guard = certified_handle.try_lock().ok();
+        let mark_before = self.tombstone_gc.pending_mark_ms();
+        // A fresh mark must invalidate old Authority receipts atomically with
+        // its store snapshot. If the certified lock is busy, retry the mark
+        // later instead of leaving pre-mark receipts eligible after a clock
+        // rollback.
+        if mark_before.is_none() && certified_guard.is_none() {
+            return;
+        }
+        // Freeze the control-plane population through the sweep. A roster or
+        // policy change after the gate snapshot invalidates its verdict even
+        // when the peer registry stayed fixed.
+        let namespace_guard =
+            authority_snapshot
+                .as_ref()
+                .and_then(|(namespace, _)| match namespace.try_read() {
+                    Ok(guard) => Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                });
+        let namespace_stable = match (&namespace_guard, &authority_snapshot) {
+            (Some(current), Some((_, version))) => current.version() == version,
+            (None, None) => true,
+            _ => false,
+        };
+        if gates_passed && !namespace_stable {
+            self.record_gc_gate_block(
+                &GcGateBlock::AuthorityUnderReported {
+                    prefix: "<namespace changed>".into(),
+                    reported: 0,
+                    required: 0,
+                },
+                now_ms,
+            );
+        }
+        let signed_missing = match (
+            certified_guard.as_ref(),
+            namespace_guard.as_ref(),
+            self.tombstone_gc.pending_mark_ms(),
+        ) {
+            (Some(certified), Some(namespace), Some(mark_ms)) => namespace
+                .certifiable_ranges()
+                .into_iter()
+                .find_map(|(definition, policy_version)| {
+                    let covered = certified
+                        .signed_prune_floor(
+                            &definition.key_range,
+                            policy_version,
+                            &definition.authority_nodes,
+                        )
+                        .is_some_and(|floor| floor.timestamp().physical >= mark_ms);
+                    (!covered).then(|| definition.key_range.prefix.clone())
+                }),
+            (_, _, None) => None,
+            _ => Some("<attestation state unavailable>".into()),
+        };
+        let signed_ready = signed_missing.is_none();
+        if gates_passed
+            && namespace_stable
+            && let Some(prefix) = signed_missing
+        {
+            self.record_gc_gate_block(&GcGateBlock::SignedQuorumMissing { prefix }, now_ms);
+        }
+        // Capture a new mark's time under the store lock. A timestamp from
+        // before the lock wait would let a pre-snapshot report look fresh.
+        let snapshot_wall_ms = crate::hlc::wall_clock_ms();
         let stats = self.tombstone_gc.mark_and_sweep(
             api.store_mut(),
-            now_ms,
-            gates_passed,
-            allow_hole_jump,
+            snapshot_wall_ms,
+            gates_passed && membership_stable && namespace_stable && signed_ready,
         );
+        if mark_before.is_none() || stats.swept {
+            // Both receipts are process-local. A wall-clock rollback can make
+            // a pre-mark timestamp numerically newer than this mark, so time
+            // comparison alone cannot establish causal order. run_sync is
+            // sequential with this runner, while the certified lock excludes
+            // concurrent frontier admission until the mark is complete.
+            self.push_acked_wall_ms.clear();
+            certified_guard
+                .as_mut()
+                .expect("a new GC mark holds the certified lock")
+                .clear_gc_frontier_receipts();
+        }
         let floor_fx = api.store_mut().take_floor_effects();
         let redundant_merge_skips = api.redundant_merge_skips();
         drop(api);
+        drop(namespace_guard);
+        drop(certified_guard);
+        drop(peer_guard);
 
         // Publish floor observability: stall gauges reflect the latest
         // EXECUTED sweep; merge-effect counters accumulate across ticks.
@@ -4432,7 +4630,7 @@ impl NodeRunner {
         // default 60s interval / 300s retention only ~1 tick in 5 sweeps,
         // and zeroing on the other ticks would flap a persistent hole
         // stall to 0 for most scrapes — the exact signal ops-guide 3.7
-        // uses to decide on Stage 2 (and 12.3 to diagnose blocked gates).
+        // uses to diagnose persistent holes and blocked gates.
         if stats.swept {
             // Top-level GC liveness. Stamped ONLY by passes that actually
             // swept, for the same reason as the stall gauges below — but
@@ -4485,7 +4683,8 @@ impl NodeRunner {
         match block {
             GcGateBlock::AuthorityUnderReported { .. }
             | GcGateBlock::FrontierBehindMark { .. }
-            | GcGateBlock::ReportNotAdvanced { .. } => {
+            | GcGateBlock::ReportNotAdvanced { .. }
+            | GcGateBlock::SignedQuorumMissing { .. } => {
                 self.metrics
                     .gc_gate_blocked_authority_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -4542,6 +4741,13 @@ impl NodeRunner {
                 peer_lane,
                 "tombstone GC gate blocked: no frontier report has advanced since the mark"
             ),
+            GcGateBlock::SignedQuorumMissing { prefix } => tracing::warn!(
+                node_id = %self.node_id.0,
+                reason = "signed_quorum_missing",
+                prefix = %prefix,
+                peer_lane,
+                "tombstone GC gate blocked: no matching signed checkpoint quorum covers the mark"
+            ),
             GcGateBlock::PeerEvidenceMissingOrStale { peer_addr } => tracing::warn!(
                 node_id = %self.node_id.0,
                 reason = "peer_evidence_missing_or_stale",
@@ -4550,22 +4756,6 @@ impl NodeRunner {
                 "tombstone GC gate blocked: peer has no push evidence from after the mark"
             ),
         }
-    }
-
-    /// Stage 2 INBOUND gate: every registered peer's complete state has
-    /// been absorbed by a clean pull STARTED at/after the mark (see
-    /// `pull_reconciled_wall_ms`). A peer without an entry fails the
-    /// gate (fail-closed). Vacuously true with an empty registry.
-    fn gc_inbound_gate_passed(
-        peers: &[crate::network::PeerConfig],
-        pull_reconciled_wall_ms: &HashMap<String, u64>,
-        mark_ms: u64,
-    ) -> bool {
-        peers.iter().all(|peer| {
-            pull_reconciled_wall_ms
-                .get(&peer.addr)
-                .is_some_and(|reconciled| *reconciled >= mark_ms)
-        })
     }
 
     /// Evaluate the tombstone-GC dual gate against `mark_ms` (see
@@ -4580,18 +4770,33 @@ impl NodeRunner {
     /// population is the set of ranges that can hold certified state at
     /// all (definition AND policy, see
     /// [`certifiable_population`](Self::certifiable_population)). Eventual
-    /// state is protected by the peer gate (and, for hole-jumps, the
-    /// inbound gate), neither of which consults authority definitions.
-    async fn gc_gate_diagnosis(&self, mark_ms: u64) -> Option<GcGateBlock> {
+    /// state is protected by the peer gate, which does not consult
+    /// authority definitions.
+    async fn gc_gate_diagnosis(
+        &self,
+        mark_ms: u64,
+    ) -> (
+        Option<GcGateBlock>,
+        Arc<RwLock<SystemNamespace>>,
+        PolicyVersion,
+    ) {
         // Same snapshot pattern as check_compaction Phase 1: read the
         // population + frontier set under the certified lock, evaluate off
         // the lock.
-        let (defs, frontier_set, policy_versions) = {
+        let (defs, frontier_set, policy_versions, namespace, version) = {
             let api = self.certified_api.lock().await;
-            let ns = api.namespace().read().unwrap_or_else(|e| e.into_inner());
-            let (defs, policy_versions) = Self::certifiable_population(&ns);
+            let namespace = Arc::clone(api.namespace());
+            let ns = namespace.read().unwrap_or_else(|e| e.into_inner());
+            let snapshot_version = *ns.version();
+            let mut defs = Vec::new();
+            let mut policy_versions = Vec::new();
+            for (def, version) in ns.certifiable_ranges() {
+                defs.push((def.key_range.clone(), def.authority_nodes.clone()));
+                policy_versions.push(version);
+            }
+            drop(ns);
             let fs = api.frontier_set().clone();
-            (defs, fs, policy_versions)
+            (defs, fs, policy_versions, namespace, snapshot_version)
         };
 
         // A node with no sync layer has no peers at all — the peer gate is
@@ -4604,14 +4809,15 @@ impl NodeRunner {
             .gc_gate_peer_population
             .store(peers.len() as u64, Ordering::Relaxed);
 
-        Self::gc_gate_diagnose(
+        let block = Self::gc_gate_diagnose(
             &defs,
             &policy_versions,
             &frontier_set,
             &peers,
             &self.push_acked_wall_ms,
             mark_ms,
-        )
+        );
+        (block, namespace, version)
     }
 
     /// Pure classifier for the dual gate: `None` iff both frozen
@@ -4621,39 +4827,57 @@ impl NodeRunner {
     /// Only when one of them says `false` is the population walked again,
     /// purely to name the offending range or peer for logs and metrics.
     fn gc_gate_diagnose(
-        defs: &[(KeyRange, usize)],
+        defs: &[(KeyRange, Vec<NodeId>)],
         policy_versions: &[PolicyVersion],
         frontier_set: &crate::authority::ack_frontier::AckFrontierSet,
         peers: &[crate::network::PeerConfig],
-        push_acked_wall_ms: &HashMap<String, u64>,
+        push_acked_wall_ms: &HashMap<String, PushAck>,
         mark_ms: u64,
     ) -> Option<GcGateBlock> {
         if !Self::gc_authority_gate_passed(defs, policy_versions, frontier_set, mark_ms) {
-            let named = defs.iter().enumerate().find_map(|(i, (key_range, total))| {
-                let version = &policy_versions[i];
-                let prefix = key_range.prefix.clone();
-                let scoped = frontier_set.all_for_scope(key_range, version);
-                if scoped.len() < *total {
-                    return Some(GcGateBlock::AuthorityUnderReported {
-                        prefix,
-                        reported: scoped.len(),
-                        required: *total,
-                    });
-                }
-                if !frontier_set
-                    .min_frontier_for_scope(key_range, version)
-                    .is_some_and(|min| min.physical >= mark_ms)
-                {
-                    return Some(GcGateBlock::FrontierBehindMark { prefix });
-                }
-                if !frontier_set
-                    .min_advanced_at_for_scope(key_range, version)
-                    .is_some_and(|received| received >= mark_ms)
-                {
-                    return Some(GcGateBlock::ReportNotAdvanced { prefix });
-                }
-                None
-            });
+            let named = defs
+                .iter()
+                .enumerate()
+                .find_map(|(i, (key_range, members))| {
+                    let version = &policy_versions[i];
+                    let prefix = key_range.prefix.clone();
+                    let scopes: Vec<_> = members
+                        .iter()
+                        .map(|member| {
+                            crate::authority::ack_frontier::FrontierScope::new(
+                                key_range.clone(),
+                                *version,
+                                member.clone(),
+                            )
+                        })
+                        .collect();
+                    let reported = scopes
+                        .iter()
+                        .filter(|scope| frontier_set.get_scoped(scope).is_some())
+                        .count();
+                    if reported < members.len() {
+                        return Some(GcGateBlock::AuthorityUnderReported {
+                            prefix,
+                            reported,
+                            required: members.len(),
+                        });
+                    }
+                    if scopes.iter().any(|scope| {
+                        frontier_set
+                            .get_scoped(scope)
+                            .is_none_or(|frontier| frontier.frontier_hlc.physical < mark_ms)
+                    }) {
+                        return Some(GcGateBlock::FrontierBehindMark { prefix });
+                    }
+                    if scopes.iter().any(|scope| {
+                        frontier_set
+                            .advanced_at_for_scope(scope)
+                            .is_none_or(|received| received <= mark_ms)
+                    }) {
+                        return Some(GcGateBlock::ReportNotAdvanced { prefix });
+                    }
+                    None
+                });
             // The gate already said "blocked"; the walk above must have
             // found the reason. The fallback exists only so that a future
             // divergence between predicate and classifier degrades into an
@@ -4666,12 +4890,14 @@ impl NodeRunner {
         }
 
         if !Self::gc_peer_gate_passed(peers, push_acked_wall_ms, mark_ms) {
+            let mut seen_addrs = std::collections::HashSet::new();
             let named = peers
                 .iter()
                 .find(|peer| {
-                    !push_acked_wall_ms
-                        .get(&peer.addr)
-                        .is_some_and(|acked| *acked >= mark_ms)
+                    !seen_addrs.insert(&peer.addr)
+                        || !push_acked_wall_ms.get(&peer.addr).is_some_and(|acked| {
+                            acked.node_id == peer.node_id && acked.snapshot_wall_ms > mark_ms
+                        })
                 })
                 .map(|peer| GcGateBlock::PeerEvidenceMissingOrStale {
                     peer_addr: peer.addr.clone(),
@@ -4688,7 +4914,7 @@ impl NodeRunner {
     /// definition has a frontier entry for the current scope, the scoped
     /// minimum frontier has consumed state as of the mark time (data
     /// time), AND every scoped frontier has ADVANCED at a local
-    /// wall-clock time at/after the mark (receipt time, this node's
+    /// wall-clock time strictly after the mark (receipt time, this node's
     /// clock). Vacuously true with no authority definitions (single-node
     /// case: no other replica exists to resurrect from).
     ///
@@ -4701,29 +4927,39 @@ impl NodeRunner {
     /// frontier merely restored from persistence (`advanced_at` is
     /// volatile) — fails the gate (fail-closed).
     fn gc_authority_gate_passed(
-        defs: &[(KeyRange, usize)],
+        defs: &[(KeyRange, Vec<NodeId>)],
         policy_versions: &[PolicyVersion],
         frontier_set: &crate::authority::ack_frontier::AckFrontierSet,
         mark_ms: u64,
     ) -> bool {
-        defs.iter().enumerate().all(|(i, (key_range, total))| {
-            let scoped = frontier_set.all_for_scope(key_range, &policy_versions[i]);
-            if scoped.len() < *total {
-                return false; // an authority has not reported this scope
-            }
-            frontier_set
-                .min_frontier_for_scope(key_range, &policy_versions[i])
-                .is_some_and(|min| min.physical >= mark_ms)
-                && frontier_set
-                    .min_advanced_at_for_scope(key_range, &policy_versions[i])
-                    .is_some_and(|received| received >= mark_ms)
+        defs.iter().enumerate().all(|(i, (key_range, members))| {
+            let mut distinct = std::collections::HashSet::new();
+            !members.is_empty()
+                && members.iter().all(|member| {
+                    if !distinct.insert(member) {
+                        return false;
+                    }
+                    let scope = crate::authority::ack_frontier::FrontierScope::new(
+                        key_range.clone(),
+                        policy_versions[i],
+                        member.clone(),
+                    );
+                    frontier_set
+                        .get_scoped(&scope)
+                        .is_some_and(|frontier| frontier.frontier_hlc.physical >= mark_ms)
+                        && frontier_set
+                            .advanced_at_for_scope(&scope)
+                            .is_some_and(|received| received > mark_ms)
+                })
         })
     }
 
     /// Peer half of the tombstone-GC gate: every registered peer has
     /// push evidence (`push_acked_wall_ms` — the LOCAL wall-clock time
     /// of the store scan behind the last push that completed with zero
-    /// per-key errors) from at/after the mark time. That scan saw every
+    /// per-key errors) from strictly after the mark time. Equal millisecond
+    /// stamps are ambiguous: the scan could have preceded the mark. A
+    /// later millisecond scan saw every
     /// tombstone marked at or before `mark_ms`, and the push conveyed
     /// the whole scan, so the peer can never re-offer a marked dot as
     /// live state.
@@ -4736,17 +4972,20 @@ impl NodeRunner {
     /// the mark" on this node's clock). Both were the C-2 resurrection
     /// holes this gate previously had.
     ///
-    /// A peer without an entry fails the gate (fail-closed). Vacuously
-    /// true with an empty registry.
+    /// A peer without an entry, with another node's ACK at its address, or
+    /// sharing an address with another registered node fails the gate.
+    /// Vacuously true with an empty registry.
     fn gc_peer_gate_passed(
         peers: &[crate::network::PeerConfig],
-        push_acked_wall_ms: &HashMap<String, u64>,
+        push_acked_wall_ms: &HashMap<String, PushAck>,
         mark_ms: u64,
     ) -> bool {
+        let mut seen_addrs = std::collections::HashSet::new();
         peers.iter().all(|peer| {
-            push_acked_wall_ms
-                .get(&peer.addr)
-                .is_some_and(|acked| *acked >= mark_ms)
+            seen_addrs.insert(&peer.addr)
+                && push_acked_wall_ms.get(&peer.addr).is_some_and(|acked| {
+                    acked.node_id == peer.node_id && acked.snapshot_wall_ms > mark_ms
+                })
         })
     }
 
@@ -5341,7 +5580,7 @@ impl NodeRunner {
                     "digest sync",
                 )
                 .await;
-                // Inbound evidence (Stage 2 hole-jump gate): a root match
+                // Inbound reconciliation evidence: a root match
                 // or a clean full-bucket merge absorbed the peer's
                 // complete state. Poisoned keys fail the record — a
                 // type-mismatched key may hide a live dot we could not
@@ -5426,7 +5665,7 @@ impl NodeRunner {
         peer_addr: &str,
         peer_frontiers: &mut HashMap<String, HlcTimestamp>,
         push_frontiers: &mut HashMap<String, HlcTimestamp>,
-        push_acked_wall_ms: &mut HashMap<String, u64>,
+        push_acked_wall_ms: &mut HashMap<String, PushAck>,
         digest_unsupported: &mut HashMap<String, Instant>,
         observed: Vec<crate::authority::equivocation::ObservedAttestation>,
     ) -> DigestPushOutcome {
@@ -5453,11 +5692,19 @@ impl NodeRunner {
                         peer = %peer_id,
                         "digest push probe: peer already matches, skipping full push"
                     );
-                    if let Some(frontier) = snapshot_frontier {
-                        peer_frontiers.insert(peer_key.to_string(), frontier.clone());
-                        push_frontiers.insert(peer_key.to_string(), frontier);
+                    if resp.durable {
+                        if let Some(frontier) = snapshot_frontier {
+                            peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                            push_frontiers.insert(peer_key.to_string(), frontier);
+                        }
+                        push_acked_wall_ms.insert(
+                            peer_key.to_string(),
+                            PushAck {
+                                node_id: NodeId(peer_id.to_string()),
+                                snapshot_wall_ms,
+                            },
+                        );
                     }
-                    push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                     return DigestPushOutcome::Handled;
                 }
 
@@ -5483,11 +5730,19 @@ impl NodeRunner {
                         peer = %peer_id,
                         "digest push probe: mismatches are peer-only data, nothing to push"
                     );
-                    if let Some(frontier) = snapshot_frontier {
-                        peer_frontiers.insert(peer_key.to_string(), frontier.clone());
-                        push_frontiers.insert(peer_key.to_string(), frontier);
+                    if resp.durable {
+                        if let Some(frontier) = snapshot_frontier {
+                            peer_frontiers.insert(peer_key.to_string(), frontier.clone());
+                            push_frontiers.insert(peer_key.to_string(), frontier);
+                        }
+                        push_acked_wall_ms.insert(
+                            peer_key.to_string(),
+                            PushAck {
+                                node_id: NodeId(peer_id.to_string()),
+                                snapshot_wall_ms,
+                            },
+                        );
                     }
-                    push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
                     return DigestPushOutcome::Handled;
                 }
 
@@ -5559,10 +5814,15 @@ impl NodeRunner {
 
                 let changed_count = changed.len();
                 match sync_client
-                    .push_changed_keys(peer_addr, changed, node_id, DEFAULT_BATCH_SIZE)
+                    .push_changed_keys_with_durability(
+                        peer_addr,
+                        changed,
+                        node_id,
+                        DEFAULT_BATCH_SIZE,
+                    )
                     .await
                 {
-                    Ok(pushed) => {
+                    Ok((pushed, batches_durable)) => {
                         metrics
                             .digest_push_keys_pushed_total
                             .fetch_add(pushed as u64, Ordering::Relaxed);
@@ -5572,12 +5832,18 @@ impl NodeRunner {
                             mismatched_buckets = resp.mismatched_buckets.len(),
                             "digest push: pushed mismatched buckets instead of full state"
                         );
-                        if evidence_valid {
+                        if evidence_valid && resp.durable && batches_durable {
                             if let Some(frontier) = snapshot_frontier {
                                 peer_frontiers.insert(peer_key.to_string(), frontier.clone());
                                 push_frontiers.insert(peer_key.to_string(), frontier);
                             }
-                            push_acked_wall_ms.insert(peer_key.to_string(), snapshot_wall_ms);
+                            push_acked_wall_ms.insert(
+                                peer_key.to_string(),
+                                PushAck {
+                                    node_id: NodeId(peer_id.to_string()),
+                                    snapshot_wall_ms,
+                                },
+                            );
                         } else {
                             tracing::debug!(
                                 peer = %peer_id,
@@ -5976,6 +6242,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_mode_runs_epoch_but_no_legacy_data_ticks() {
+        let api = wrap_api(CertifiedApi::new(node_id("node-1"), default_namespace()));
+        let config = NodeRunnerConfig {
+            legacy_data_plane_enabled: false,
+            certification_interval: Duration::from_millis(10),
+            cleanup_interval: Duration::from_millis(10),
+            compaction_check_interval: Duration::from_millis(10),
+            frontier_report_interval: Duration::from_millis(10),
+            gc_interval: Duration::from_millis(10),
+            frontier_gc_interval: Duration::from_millis(10),
+            epoch_check_interval: Duration::from_millis(10),
+            sync_interval: Some(Duration::from_millis(10)),
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        };
+        let peers = PeerRegistry::new(node_id("node-1"), vec![]).unwrap();
+        let mut runner = NodeRunner::with_sync(
+            node_id("node-1"),
+            api,
+            CompactionEngine::with_defaults(),
+            config,
+            SyncClient::new(Arc::new(Mutex::new(peers))),
+            Arc::new(Mutex::new(EventualApi::new(node_id("node-1")))),
+            default_metrics(),
+        )
+        .await;
+        let handle = runner.shutdown_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = handle.send(true);
+        });
+        let stats = runner.run().await;
+        assert!(stats.epoch_check_ticks >= 1);
+        assert_eq!(stats.certification_ticks, 0);
+        assert_eq!(stats.cleanup_ticks, 0);
+        assert_eq!(stats.compaction_check_ticks, 0);
+        assert_eq!(stats.frontier_report_ticks, 0);
+        assert_eq!(stats.gc_ticks, 0);
+        assert_eq!(stats.frontier_gc_ticks, 0);
+        assert_eq!(stats.sync_ticks, 0);
+    }
+
+    #[tokio::test]
     async fn node_runner_processes_certifications() {
         let mut api = CertifiedApi::new(node_id("node-1"), default_namespace());
 
@@ -5984,9 +6293,17 @@ mod tests {
             .unwrap();
         let write_ts = api.pending_writes()[0].timestamp.physical;
 
-        // Advance majority of frontiers past the write.
-        api.update_frontier(make_frontier("auth-1", write_ts + 100, ""));
-        api.update_frontier(make_frontier("auth-2", write_ts + 200, ""));
+        // Advance a signed majority to a common checkpoint past the write.
+        let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+        for (authority, seed) in [("auth-1", 1u8), ("auth-2", 2u8)] {
+            let signer = make_signer(authority, seed);
+            let frontier = make_frontier(authority, report_ts, "");
+            let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+            api.update_frontier_verified(
+                frontier.clone(),
+                Some(signer.self_verified(&frontier, &signature)),
+            );
+        }
 
         let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
@@ -6063,7 +6380,7 @@ mod tests {
         .await;
         let handle = runner.shutdown_handle();
 
-        // Run long enough for cleanup to expire the 10ms-TTL write.
+        // Run beyond the old response wait threshold.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(80)).await;
             let _ = handle.send(true);
@@ -6071,13 +6388,14 @@ mod tests {
 
         runner.run().await;
 
-        // The expired write should have been cleaned up.
+        // Cleanup must leave the accepted operation eligible to certify.
         let api = shared_api.lock().await;
         assert_eq!(
             api.pending_writes().len(),
-            0,
-            "expired writes should be cleaned up"
+            1,
+            "elapsed response wait must not discard pending work"
         );
+        assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
     }
 
     #[tokio::test]
@@ -6392,7 +6710,11 @@ mod tests {
 
         let shared_api = wrap_api(api);
         let engine = CompactionEngine::with_defaults();
+        let signer = make_signer("auth-1", 44);
+        let registry = shared_registry_with(&signer);
         let config = NodeRunnerConfig {
+            node_signer: Some(signer),
+            keyset_registry: Some(registry),
             certification_interval: Duration::from_millis(10),
             cleanup_interval: Duration::from_secs(60),
             compaction_check_interval: Duration::from_secs(60),
@@ -6413,7 +6735,7 @@ mod tests {
         let handle = runner.shutdown_handle();
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
             let _ = handle.send(true);
         });
 
@@ -8578,7 +8900,12 @@ mod tests {
             proof.certificate.is_some(),
             "self-signed majority (1-of-1) must attach a certificate"
         );
-        let verification = crate::authority::verifier::verify_proof(&proof, None, 0);
+        let verification = crate::authority::verifier::verify_proof(
+            &proof,
+            &[(node_id("auth-1"), signer.verifying_key())],
+            None,
+            0,
+        );
         assert!(
             verification.valid,
             "certificate must verify: {verification:?}"
@@ -8921,6 +9248,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maximum_persisted_lease_cannot_sign_a_reissued_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let floor_path = dir.path().join("frontier_report_clock.json");
+        std::fs::write(
+            &floor_path,
+            format!("{{\"version\":1,\"leased_physical_ms\":{}}}", u64::MAX),
+        )
+        .unwrap();
+
+        let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
+        let metrics = default_metrics();
+        let mut runner = NodeRunner::new(
+            node_id("auth-1"),
+            shared_api.clone(),
+            CompactionEngine::with_defaults(),
+            NodeRunnerConfig {
+                frontier_clock_floor_path: Some(floor_path.clone()),
+                ..NodeRunnerConfig::default()
+            },
+            metrics.clone(),
+        )
+        .await;
+        runner.set_eventual_api(eventual_with_keys("auth-1", &["user/x"]));
+
+        runner.report_frontiers().await;
+
+        assert!(shared_api.lock().await.all_frontiers().is_empty());
+        assert_eq!(metrics.snapshot().frontier_report_skipped_floor_total, 1);
+        let (persisted, existed) = ReportClockFloor::load(floor_path);
+        assert!(existed);
+        assert_eq!(persisted.leased(), u64::MAX);
+    }
+
+    #[tokio::test]
     async fn missing_floor_path_never_activates_store_digest() {
         let shared_api = wrap_api(CertifiedApi::new(node_id("auth-1"), default_namespace()));
         let mut runner = NodeRunner::new(
@@ -8970,7 +9331,7 @@ mod tests {
             NodeRunnerConfig {
                 frontier_clock_floor_path: Some(floor_path.clone()),
                 // No floor file at startup => the grace applies.
-                frontier_digest_activation_grace: Some(Duration::from_millis(300)),
+                frontier_digest_activation_grace: Some(Duration::from_secs(3600)),
                 ..NodeRunnerConfig::default()
             },
             default_metrics(),
@@ -8995,9 +9356,14 @@ mod tests {
              must restart the grace, not fake full-history coverage)"
         );
 
+        // Advance the test's two activation deadlines together. A short
+        // real-time grace could expire before the first assertion under a
+        // busy parallel test runner.
+        let elapsed = Instant::now() - Duration::from_secs(1);
+        runner.report_silence_until = Some(elapsed);
+        runner.store_digest_active_at = Some(elapsed);
         // After the grace: reporting resumes directly in sd2 format and
         // the first covered tick creates the floor file.
-        tokio::time::sleep(Duration::from_millis(400)).await;
         runner.report_frontiers().await;
         let api = shared_api.lock().await;
         let frontiers = api.all_frontiers();
@@ -9738,7 +10104,7 @@ mod tests {
             KeyRange {
                 prefix: "user/".into(),
             },
-            2usize,
+            vec![node_id("auth-1"), node_id("auth-2")],
         )];
         let versions = vec![PolicyVersion(1)];
         let mark_ms = 8_000;
@@ -9770,6 +10136,28 @@ mod tests {
             &defs, &versions, &set, mark_ms
         ));
 
+        // Replacing a member without changing the policy version must not
+        // let the old member stand in for the new one.
+        let replacement = vec![(
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            vec![node_id("auth-2"), node_id("auth-3")],
+        )];
+        assert!(!NodeRunner::gc_authority_gate_passed(
+            &replacement,
+            &versions,
+            &set,
+            mark_ms
+        ));
+        set.update(ack_frontier("auth-3", "user/", 1, 9_100));
+        assert!(NodeRunner::gc_authority_gate_passed(
+            &replacement,
+            &versions,
+            &set,
+            mark_ms
+        ));
+
         // No authority definitions (single-node deployment): vacuously
         // true — there is no other replica to resurrect from.
         assert!(NodeRunner::gc_authority_gate_passed(
@@ -9792,7 +10180,7 @@ mod tests {
             KeyRange {
                 prefix: "user/".into(),
             },
-            1usize,
+            vec![node_id("auth-1")],
         )];
         let versions = vec![PolicyVersion(1)];
         let mark_ms = 8_000;
@@ -9806,8 +10194,14 @@ mod tests {
             "a stale receipt must fail the gate regardless of the frontier's data time"
         );
 
-        // A strictly newer report received at/after the mark: pass.
-        set.update_at(ack_frontier("auth-1", "user/", 1, 10_001), 8_500);
+        // An equal millisecond receipt may have preceded the mark.
+        set.update_at(ack_frontier("auth-1", "user/", 1, 10_001), 8_000);
+        assert!(!NodeRunner::gc_authority_gate_passed(
+            &defs, &versions, &set, mark_ms
+        ));
+
+        // A strictly newer report received after the mark: pass.
+        set.update_at(ack_frontier("auth-1", "user/", 1, 10_002), 8_500);
         assert!(NodeRunner::gc_authority_gate_passed(
             &defs, &versions, &set, mark_ms
         ));
@@ -9826,7 +10220,7 @@ mod tests {
 
     /// The peer half of the GC gate: every registered peer must have
     /// push evidence (local wall-clock time of the scan behind the last
-    /// error-free push) at/after the mark — a peer with NO entry (never
+    /// error-free push) strictly after the mark — a peer with NO entry (never
     /// successfully pushed to, e.g. partitioned since before the mark)
     /// fails the gate rather than being ignored.
     #[test]
@@ -9836,23 +10230,327 @@ mod tests {
             addr: addr.into(),
         };
         let mark_ms = 8_000;
-        let mut acked: HashMap<String, u64> = HashMap::new();
+        let mut acked: HashMap<String, PushAck> = HashMap::new();
 
         // Empty registry (no peers): vacuously true.
         assert!(NodeRunner::gc_peer_gate_passed(&[], &acked, mark_ms));
 
         // A registered peer with no push evidence at all: fail-closed.
         let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
-        acked.insert("p1:9000".into(), 9_000);
+        acked.insert(
+            "p1:9000".into(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: 9_000,
+            },
+        );
         assert!(!NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
 
         // Push evidence from BEFORE the mark: fail.
-        acked.insert("p2:9000".into(), 7_999);
+        acked.insert(
+            "p2:9000".into(),
+            PushAck {
+                node_id: node_id("p2"),
+                snapshot_wall_ms: 7_999,
+            },
+        );
         assert!(!NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
 
-        // All peers pushed at/after the mark: pass.
-        acked.insert("p2:9000".into(), 8_000);
+        // Equal millisecond evidence could be from before the mark.
+        acked.insert(
+            "p2:9000".into(),
+            PushAck {
+                node_id: node_id("p2"),
+                snapshot_wall_ms: 8_000,
+            },
+        );
+        assert!(!NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
+
+        // All peers pushed after the mark: pass.
+        acked.insert(
+            "p2:9000".into(),
+            PushAck {
+                node_id: node_id("p2"),
+                snapshot_wall_ms: 8_001,
+            },
+        );
         assert!(NodeRunner::gc_peer_gate_passed(&peers, &acked, mark_ms));
+    }
+
+    #[test]
+    fn gc_peer_gate_does_not_reuse_another_nodes_address_ack() {
+        let peer = |name: &str| crate::network::PeerConfig {
+            node_id: node_id(name),
+            addr: "shared:9000".into(),
+        };
+        let mut acked = HashMap::new();
+        acked.insert(
+            "shared:9000".into(),
+            PushAck {
+                node_id: node_id("old"),
+                snapshot_wall_ms: 9_000,
+            },
+        );
+        assert!(NodeRunner::gc_peer_gate_passed(
+            &[peer("old")],
+            &acked,
+            8_000
+        ));
+        assert!(!NodeRunner::gc_peer_gate_passed(
+            &[peer("new")],
+            &acked,
+            8_000
+        ));
+        assert!(!NodeRunner::gc_peer_gate_passed(
+            &[peer("old"), peer("new")],
+            &acked,
+            8_000
+        ));
+        acked.insert(
+            "shared:9000".into(),
+            PushAck {
+                node_id: node_id("new"),
+                snapshot_wall_ms: 9_001,
+            },
+        );
+        assert!(NodeRunner::gc_peer_gate_passed(
+            &[peer("new")],
+            &acked,
+            8_000
+        ));
+        assert!(!NodeRunner::gc_peer_gate_passed(
+            &[peer("old"), peer("new")],
+            &acked,
+            8_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_gc_mark_discards_pre_mark_push_ack_even_if_its_clock_is_ahead() {
+        let (mut runner, eventual_api, peer_addr) =
+            legacy_hole_runner_with_ns(SystemNamespace::new(), false).await;
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
+
+        runner.run_gc().await;
+        let mark = runner.tombstone_gc.pending_mark_ms().expect("new mark");
+        assert!(!runner.push_acked_wall_ms.contains_key(&peer_addr));
+        assert!(!NodeRunner::gc_peer_gate_passed(
+            &[crate::network::PeerConfig {
+                node_id: node_id("p1"),
+                addr: peer_addr,
+            }],
+            &runner.push_acked_wall_ms,
+            mark,
+        ));
+
+        runner.run_gc().await;
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert!(floor.is_empty());
+        assert_eq!(deferred, 1, "a pre-mark ACK cannot release the tombstone");
+    }
+
+    #[tokio::test]
+    async fn new_gc_mark_discards_pre_mark_authority_receipt() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr("user/"), 1))
+            .expect("valid policy");
+        let (mut runner, _eventual_api, _peer_addr) = legacy_hole_runner_with_ns(ns, false).await;
+        let scope = crate::authority::ack_frontier::FrontierScope::new(
+            kr("user/"),
+            PolicyVersion(7),
+            node_id("auth-1"),
+        );
+        {
+            let mut certified = runner.certified_api.lock().await;
+            assert!(certified.update_frontier(ack_frontier(
+                "auth-1",
+                "user/",
+                7,
+                crate::hlc::wall_clock_ms(),
+            )));
+            assert!(
+                certified
+                    .frontier_set()
+                    .advanced_at_for_scope(&scope)
+                    .is_some()
+            );
+        }
+
+        runner.run_gc().await;
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+        let certified = runner.certified_api.lock().await;
+        assert_eq!(certified.frontier_set().advanced_at_for_scope(&scope), None);
+        assert!(certified.frontier_set().get_scoped(&scope).is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_discards_ack_before_its_immediate_next_mark() {
+        let (mut runner, eventual_api, peer_addr) =
+            legacy_hole_runner_with_ns(SystemNamespace::new(), false).await;
+        runner.run_gc().await;
+        let first_mark = runner.tombstone_gc.pending_mark_ms().expect("first mark");
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
+
+        runner.run_gc().await;
+        assert_eq!(runner.tombstone_gc.total_collected(), 1);
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+        assert!(!runner.push_acked_wall_ms.contains_key(&peer_addr));
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert_eq!(floor.get(&node_id("A")), Some(&1));
+        assert_eq!(deferred, 0);
+        assert!(runner.tombstone_gc.pending_mark_ms().unwrap() >= first_mark);
+    }
+
+    #[tokio::test]
+    async fn run_gc_blocks_before_sync_after_peer_id_changes_at_same_address() {
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner().await;
+        runner.run_gc().await;
+        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
+        let registry = runner.sync_client.as_ref().unwrap().peer_registry();
+        let mut peers = registry.lock().await;
+        peers.remove_peer(&node_id("p1")).unwrap();
+        peers
+            .add_peer(crate::network::PeerConfig {
+                node_id: node_id("p2"),
+                addr: peer_addr,
+            })
+            .unwrap();
+        drop(peers);
+
+        runner.run_gc().await;
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            runner
+                .metrics
+                .gc_gate_blocked_peer_total
+                .load(Ordering::Relaxed)
+                > 0
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_peer_gets_full_tombstone_before_new_gc_ack() {
+        use crate::crdt::or_set::OrSet;
+        use crate::network::PeerConfig;
+        use crate::network::sync::{SyncRequest, SyncResponse};
+        use axum::body::Bytes;
+        use axum::http::HeaderMap;
+
+        let (mut runner, source, old_addr) =
+            legacy_hole_runner_with_ns(SystemNamespace::new(), false).await;
+        let stale: OrSet<String> = serde_json::from_str(
+            r#"{"elements":{"y":[{"node_id":"A","counter":1}]},"counters":{"A":1}}"#,
+        )
+        .unwrap();
+        let replacement = Arc::new(Mutex::new(stale));
+        let delivered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receiver = Arc::clone(&replacement);
+        let delivered_for_handler = Arc::clone(&delivered);
+        let durable_for_handler = Arc::clone(&durable);
+        let app = axum::Router::new().route(
+            "/api/internal/sync",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let receiver = Arc::clone(&receiver);
+                let delivered = Arc::clone(&delivered_for_handler);
+                let durable = Arc::clone(&durable_for_handler);
+                async move {
+                    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+                    let request: SyncRequest =
+                        crate::http::codec::deserialize_internal(&body, content_type).unwrap();
+                    let CrdtValue::Set(incoming) = request.entries.get("myset").unwrap() else {
+                        panic!("replacement must receive the marked set")
+                    };
+                    receiver.lock().await.merge(incoming);
+                    delivered.fetch_add(1, Ordering::Relaxed);
+                    axum::Json(SyncResponse {
+                        merged: request.entries.len(),
+                        errors: Vec::new(),
+                        durable: durable.load(Ordering::Relaxed),
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let registry = runner.sync_client.as_ref().unwrap().peer_registry();
+        {
+            let mut peers = registry.lock().await;
+            peers.remove_peer(&node_id("p1")).unwrap();
+            peers
+                .add_peer(PeerConfig {
+                    node_id: node_id("p1"),
+                    addr: addr.clone(),
+                })
+                .unwrap();
+        }
+        // Model a clean push to the previous occupant at this exact address.
+        let frontier = source.lock().await.store().current_frontier().unwrap();
+        runner.peer_frontiers.insert(addr.clone(), frontier.clone());
+        runner.push_frontiers.insert(addr.clone(), frontier);
+        runner.peer_identities.insert(addr.clone(), node_id("p1"));
+        runner.push_acked_wall_ms.insert(
+            addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: crate::hlc::wall_clock_ms(),
+            },
+        );
+        {
+            let mut peers = registry.lock().await;
+            peers.remove_peer(&node_id("p1")).unwrap();
+            peers
+                .add_peer(PeerConfig {
+                    node_id: node_id("p2"),
+                    addr: addr.clone(),
+                })
+                .unwrap();
+        }
+
+        runner.run_sync().await;
+        assert!(delivered.load(Ordering::Relaxed) > 0);
+        assert!(!replacement.lock().await.contains(&"y".to_string()));
+        assert!(!runner.push_acked_wall_ms.contains_key(&addr));
+        assert!(!runner.push_frontiers.contains_key(&addr));
+
+        durable.store(true, Ordering::Relaxed);
+        runner.peer_backoffs.clear();
+        runner.run_sync().await;
+        assert_eq!(
+            runner.push_acked_wall_ms.get(&addr).unwrap().node_id,
+            node_id("p2")
+        );
+        assert!(!runner.peer_frontiers.contains_key(&old_addr));
+        server.abort();
     }
 
     /// C-2 regression (re-review): a successful PULL must NOT count as
@@ -9873,66 +10571,16 @@ mod tests {
         // push-evidence map stays empty. The gate must fail.
         let mut peer_frontiers: HashMap<String, HlcTimestamp> = HashMap::new();
         peer_frontiers.insert("p1:9000".into(), hlc_ts(9_999, 0, "p1"));
-        let push_acked: HashMap<String, u64> = HashMap::new();
+        let push_acked: HashMap<String, PushAck> = HashMap::new();
         assert!(
             !NodeRunner::gc_peer_gate_passed(&peers, &push_acked, mark_ms),
             "a pull-advanced peer frontier must not open the GC gate"
         );
     }
 
-    /// Stage 2 INBOUND gate: hole-jump requires reconciliation evidence
-    /// (a complete, error-free pull STARTED at/after the mark) from
-    /// EVERY registered peer — fail-closed on missing or stale entries.
-    #[test]
-    fn gc_inbound_gate_requires_all_registered_peers_reconciled_past_mark() {
-        let peer = |name: &str, addr: &str| crate::network::PeerConfig {
-            node_id: node_id(name),
-            addr: addr.into(),
-        };
-        let mark_ms = 8_000;
-        let mut reconciled: HashMap<String, u64> = HashMap::new();
-
-        // Empty registry: vacuously true (no peer can hold a hole dot live).
-        assert!(NodeRunner::gc_inbound_gate_passed(
-            &[],
-            &reconciled,
-            mark_ms
-        ));
-
-        // A registered peer with no reconciliation evidence: fail-closed.
-        let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
-        reconciled.insert("p1:9000".into(), 9_000);
-        assert!(!NodeRunner::gc_inbound_gate_passed(
-            &peers,
-            &reconciled,
-            mark_ms
-        ));
-
-        // Evidence from BEFORE the mark: fail (the peer's state as of the
-        // mark was never absorbed).
-        reconciled.insert("p2:9000".into(), 7_999);
-        assert!(!NodeRunner::gc_inbound_gate_passed(
-            &peers,
-            &reconciled,
-            mark_ms
-        ));
-
-        // All peers reconciled at/after the mark: pass.
-        reconciled.insert("p2:9000".into(), 8_000);
-        assert!(NodeRunner::gc_inbound_gate_passed(
-            &peers,
-            &reconciled,
-            mark_ms
-        ));
-    }
-
-    // -----------------------------------------------------------------
-    // run_gc Stage 2 wiring (config flag ∧ outbound gates ∧ inbound
-    // evidence against the PENDING mark) — exercised end-to-end so a
-    // future refactor (`&&` → `||`, comparing against the wrong
-    // timestamp, mis-keyed peer addresses, …) cannot silently turn the
-    // fail-closed hole-jump into a fail-open one.
-    // -----------------------------------------------------------------
+    // Runtime GC keeps the contiguous floor walk. A peer evicted from the
+    // current registry can still hold a live dot, so complete pulls from
+    // current peers cannot authorize crossing a hole.
 
     /// Build a runner whose store holds a legacy-hole OrSet — counters
     /// `A=2`, live `(A,2)` swept away by a remove into tombstone `(A,2)`,
@@ -9940,18 +10588,15 @@ mod tests {
     /// with one registered peer, an empty authority namespace (authority
     /// gate vacuous), a 1ms GC interval and zero retention so run_gc
     /// passes chain immediately (pass 1 marks, pass 2 may sweep).
-    async fn legacy_hole_runner(
-        hole_jump_enabled: bool,
-    ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
-        legacy_hole_runner_with_ns(hole_jump_enabled, SystemNamespace::new()).await
+    async fn legacy_hole_runner() -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
+        legacy_hole_runner_with_ns(SystemNamespace::new(), true).await
     }
 
     /// As [`legacy_hole_runner`], but with a caller-supplied namespace so a
-    /// test can put the GC authority gate under a REAL production-shaped
-    /// namespace instead of the empty (vacuous) one.
+    /// test can put the GC authority gate under a production-shaped namespace.
     async fn legacy_hole_runner_with_ns(
-        hole_jump_enabled: bool,
         ns: SystemNamespace,
+        with_hole: bool,
     ) -> (NodeRunner, Arc<Mutex<EventualApi>>, String) {
         use crate::api::eventual::EventualApi;
 
@@ -9959,7 +10604,6 @@ mod tests {
         let config = NodeRunnerConfig {
             gc_interval: Duration::from_millis(1),
             gc_retention: Duration::ZERO,
-            gc_hole_jump_enabled: hole_jump_enabled,
             sync_interval: None,
             ping_interval: None,
             ..NodeRunnerConfig::default()
@@ -9967,10 +10611,14 @@ mod tests {
         let eventual_api = Arc::new(Mutex::new(EventualApi::new(node_id("node-1"))));
         {
             let mut ea = eventual_api.lock().await;
-            let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
+            let json = if with_hole {
+                r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#
+            } else {
+                r#"{"elements":{"y":[{"node_id":"A","counter":1}]},"counters":{"A":1}}"#
+            };
             let mut set: crate::crdt::or_set::OrSet<String> =
                 serde_json::from_str(json).expect("legacy state");
-            set.remove(&"y".to_string()); // tombstone (A,2) above the hole (A,1)
+            set.remove(&"y".to_string()); // tombstone above the optional hole
             ea.eventual_write("myset".to_string(), CrdtValue::Set(set))
                 .expect("seed store");
         }
@@ -10007,26 +10655,28 @@ mod tests {
         }
     }
 
-    /// Stage 2 disabled: even with full outbound AND inbound evidence the
-    /// sweep must stall on the legacy hole (fail-closed) and report it on
-    /// the stall gauge — and a subsequent BLOCKED pass must not zero that
-    /// gauge (ops-guide 3.7's "persistently non-zero" Stage 2 signal).
+    /// Even with full outbound evidence, the sweep must stall on the
+    /// legacy hole and report it. A blocked pass must retain that gauge.
     #[tokio::test]
-    async fn run_gc_stage1_stalls_on_legacy_hole_despite_full_evidence() {
-        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(false).await;
+    async fn run_gc_stalls_on_hole_despite_full_push_evidence() {
+        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner().await;
 
         runner.run_gc().await; // pass 1: mark
         assert!(runner.tombstone_gc.pending_mark_ms().is_some());
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner
-            .pull_reconciled_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
 
-        runner.run_gc().await; // pass 2: sweep (gates pass, flag off)
+        runner.run_gc().await; // pass 2: sweep with gates passed
         let (floor, deferred) = hole_state(&eventual_api).await;
-        assert!(floor.is_empty(), "disabled flag must keep the walk stalled");
+        assert!(
+            floor.is_empty(),
+            "the contiguous walk must stop at the hole"
+        );
         assert_eq!(deferred, 1, "the tombstone above the hole must survive");
         assert_eq!(
             runner
@@ -10051,72 +10701,49 @@ mod tests {
         );
     }
 
-    /// Stage 2 enabled but the inbound evidence predates the mark: the
-    /// hole-jump must stay off (fail-closed) — the pull proves nothing
-    /// about state the peer held at the mark.
+    /// An evicted peer can retain a live dot outside the current registry.
+    /// GC must keep the hole even when the peer gate becomes vacuous.
     #[tokio::test]
-    async fn run_gc_stage2_requires_inbound_evidence_after_the_mark() {
-        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(true).await;
-
-        runner.run_gc().await; // pass 1: mark
-        let mark_ms = runner
-            .tombstone_gc
-            .pending_mark_ms()
-            .expect("mark must be pending");
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner
-            .pull_reconciled_wall_ms
-            .insert(peer_addr.clone(), mark_ms.saturating_sub(1)); // STALE
-
-        runner.run_gc().await; // pass 2: sweep, hole-jump must be denied
-        let (floor, deferred) = hole_state(&eventual_api).await;
-        assert!(
-            floor.is_empty(),
-            "stale inbound evidence must keep the hole-jump fail-closed"
+    async fn run_gc_does_not_jump_hole_after_peer_eviction() {
+        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner().await;
+        runner.run_gc().await;
+        let mark_ms = runner.tombstone_gc.pending_mark_ms().unwrap();
+        runner.push_acked_wall_ms.insert(
+            peer_addr,
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: mark_ms + 1,
+            },
         );
+        runner
+            .sync_client
+            .as_ref()
+            .unwrap()
+            .peer_registry()
+            .lock()
+            .await
+            .remove_peer(&NodeId("p1".into()))
+            .unwrap();
+
+        runner.run_gc().await;
+        let (floor, deferred) = hole_state(&eventual_api).await;
+        assert!(floor.is_empty());
         assert_eq!(deferred, 1);
-        assert_eq!(
-            runner
-                .metrics
-                .gc_floor_stalled_hole_dots
-                .load(Ordering::Relaxed),
-            1
-        );
-    }
 
-    /// Stage 2 enabled with post-mark inbound evidence from every
-    /// registry peer: the walk crosses the legacy hole, the floor reaches
-    /// the marked tombstone and collection proceeds.
-    #[tokio::test]
-    async fn run_gc_stage2_jumps_legacy_hole_with_fresh_inbound_evidence() {
-        let (mut runner, eventual_api, peer_addr) = legacy_hole_runner(true).await;
-
-        runner.run_gc().await; // pass 1: mark
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner
-            .pull_reconciled_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-
-        runner.run_gc().await; // pass 2: sweep with hole-jump authorised
-        let (floor, deferred) = hole_state(&eventual_api).await;
-        assert_eq!(
-            floor.get(&NodeId("A".into())),
-            Some(&2),
-            "the floor must cross the legacy hole and absorb the tombstone"
-        );
-        assert_eq!(deferred, 0, "the marked tombstone must be collected");
-        assert_eq!(
-            runner
-                .metrics
-                .gc_floor_stalled_hole_dots
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert!(runner.tombstone_gc.total_collected() >= 1);
+        // The evicted peer can return with an unremoved dot below A's
+        // mark-time counter. A may have learned counter 2 from a partial
+        // delta without ever receiving this live dot 1.
+        let retained: crate::crdt::or_set::OrSet<String> = serde_json::from_str(
+            r#"{"elements":{"x":[{"node_id":"A","counter":1}]},"counters":{"A":1}}"#,
+        )
+        .expect("peer's retained live dot");
+        let mut api = eventual_api.lock().await;
+        api.merge_remote("myset".to_string(), &CrdtValue::Set(retained))
+            .expect("merge returning peer");
+        let Some(CrdtValue::Set(merged)) = api.store().get("myset") else {
+            panic!("merged set missing");
+        };
+        assert!(merged.contains(&"x".to_string()), "live dot must survive");
     }
 
     // -----------------------------------------------------------------
@@ -10146,20 +10773,22 @@ mod tests {
         ns
     }
 
-    /// Drive a legacy-hole runner through mark → full outbound+inbound
-    /// evidence → sweep, and report whether the sweep actually collected.
-    async fn sweeps_with_full_evidence(ns: SystemNamespace) -> (bool, u64) {
-        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+    /// Drive a runner without holes through mark → push evidence → sweep.
+    /// Report whether the sweep collected its tombstone.
+    async fn sweeps_with_push_evidence(ns: SystemNamespace) -> (bool, u64) {
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(ns, false).await;
 
         runner.run_gc().await; // pass 1: mark
         assert!(runner.tombstone_gc.pending_mark_ms().is_some());
 
-        // Saturate BOTH peer-facing gates so the authority gate is the
-        // only thing left that can hold the sweep back.
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+        // Satisfy the peer gate so only the authority gate can block the sweep.
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
 
         runner.run_gc().await; // pass 2: sweep
         let collected = runner.tombstone_gc.total_collected();
@@ -10173,7 +10802,7 @@ mod tests {
     /// evidence for it is unsatisfiable, not strict.
     #[tokio::test]
     async fn production_seed_namespace_sweeps_tombstones() {
-        let (swept, last_sweep_ms) = sweeps_with_full_evidence(production_seed_namespace()).await;
+        let (swept, last_sweep_ms) = sweeps_with_push_evidence(production_seed_namespace()).await;
         assert!(
             swept,
             "the fresh-boot catch-all seed must not wedge tombstone GC shut"
@@ -10208,7 +10837,7 @@ mod tests {
                 .auto_generated,
             "the persisted seed stays MANUAL — demoting main.rs cannot reach it"
         );
-        let (swept, _) = sweeps_with_full_evidence(loaded).await;
+        let (swept, _) = sweeps_with_push_evidence(loaded).await;
         assert!(swept, "a persisted seed namespace must not wedge GC shut");
 
         // (b) an OLD-FORMAT file that predates the `auto_generated` field
@@ -10231,7 +10860,7 @@ mod tests {
                 .expect("def")
                 .auto_generated
         );
-        let (swept, _) = sweeps_with_full_evidence(legacy).await;
+        let (swept, _) = sweeps_with_push_evidence(legacy).await;
         assert!(swept, "an old-format namespace must not wedge GC shut");
     }
 
@@ -10246,7 +10875,7 @@ mod tests {
     #[tokio::test]
     async fn peer_gate_alone_blocks_sweep_on_seed_namespace() {
         let (mut runner, _eventual_api, _peer_addr) =
-            legacy_hole_runner_with_ns(true, production_seed_namespace()).await;
+            legacy_hole_runner_with_ns(production_seed_namespace(), false).await;
 
         runner.run_gc().await; // pass 1: mark
         runner.run_gc().await; // pass 2: no push evidence for the peer
@@ -10350,9 +10979,9 @@ mod tests {
             addr: addr.into(),
         };
         let mark_ms = 8_000u64;
-        let defs = vec![(kr("user/"), 2usize)];
+        let defs = vec![(kr("user/"), vec![node_id("auth-1"), node_id("auth-2")])];
         let versions = vec![PolicyVersion(1)];
-        let one_def = vec![(kr("user/"), 1usize)];
+        let one_def = vec![(kr("user/"), vec![node_id("auth-1")])];
         let one_version = vec![PolicyVersion(1)];
 
         // Authority-side fixtures.
@@ -10372,22 +11001,46 @@ mod tests {
 
         // Peer-side fixtures.
         let peers = vec![peer("p1", "p1:9000"), peer("p2", "p2:9000")];
-        let no_evidence: HashMap<String, u64> = HashMap::new();
-        let mut stale_evidence: HashMap<String, u64> = HashMap::new();
-        stale_evidence.insert("p1:9000".into(), 9_000);
-        stale_evidence.insert("p2:9000".into(), 7_999);
-        let mut fresh_evidence: HashMap<String, u64> = HashMap::new();
-        fresh_evidence.insert("p1:9000".into(), 9_000);
-        fresh_evidence.insert("p2:9000".into(), 8_000);
+        let no_evidence: HashMap<String, PushAck> = HashMap::new();
+        let mut stale_evidence: HashMap<String, PushAck> = HashMap::new();
+        stale_evidence.insert(
+            "p1:9000".into(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: 9_000,
+            },
+        );
+        stale_evidence.insert(
+            "p2:9000".into(),
+            PushAck {
+                node_id: node_id("p2"),
+                snapshot_wall_ms: 7_999,
+            },
+        );
+        let mut fresh_evidence: HashMap<String, PushAck> = HashMap::new();
+        fresh_evidence.insert(
+            "p1:9000".into(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: 9_000,
+            },
+        );
+        fresh_evidence.insert(
+            "p2:9000".into(),
+            PushAck {
+                node_id: node_id("p2"),
+                snapshot_wall_ms: 8_000,
+            },
+        );
 
         #[allow(clippy::type_complexity)]
         let cases: Vec<(
             &str,
-            &[(KeyRange, usize)],
+            &[(KeyRange, Vec<NodeId>)],
             &[PolicyVersion],
             &AckFrontierSet,
             &[crate::network::PeerConfig],
-            &HashMap<String, u64>,
+            &HashMap<String, PushAck>,
         )> = vec![
             (
                 "no reports",
@@ -10544,13 +11197,16 @@ mod tests {
         ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr("user/"), 2))
             .expect("valid policy");
 
-        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(ns, false).await;
 
         runner.run_gc().await; // pass 1: mark
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
 
         runner.run_gc().await; // pass 2: authority gate legitimately closed
 
@@ -10606,30 +11262,57 @@ mod tests {
         ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr("user/"), 1))
             .expect("valid policy");
 
-        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(true, ns).await;
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(ns, false).await;
 
         runner.run_gc().await; // pass 1: mark
-        assert!(runner.tombstone_gc.pending_mark_ms().is_some());
+        let mark_ms = runner.tombstone_gc.pending_mark_ms().expect("marked");
+
+        // Receipt time must be unambiguously after the millisecond that
+        // contains the mark, or it cannot prove a post-mark report.
+        while crate::hlc::wall_clock_ms() <= mark_ms {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
         // The authority reports through the real admission path, for the
         // scope it actually serves.
+        let high = crate::hlc::wall_clock_ms() + 30_000;
         {
             let mut api = runner.certified_api.lock().await;
             // A very high (but within clock-skew) frontier: high enough to
             // consume all state as of the mark, without tripping the P0-6
             // future-skew guard in `AckFrontierSet::update_at`.
-            let high = crate::hlc::wall_clock_ms() + 30_000;
             assert!(
                 api.update_frontier(ack_frontier("auth-1", "user/", 7, high)),
                 "a report at the range's current policy version is admissible"
             );
         }
-        // Saturate both peer-facing gates so the authority gate is the
-        // only thing that can still hold the sweep back.
-        runner
-            .push_acked_wall_ms
-            .insert(peer_addr.clone(), u64::MAX);
-        runner.pull_reconciled_wall_ms.insert(peer_addr, u64::MAX);
+        // Satisfy the peer gate so only the authority gate can block the sweep.
+        runner.push_acked_wall_ms.insert(
+            peer_addr.clone(),
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
+
+        // An accepted but unsigned frontier cannot authorize the sweep.
+        runner.run_gc().await;
+        assert_eq!(runner.tombstone_gc.total_collected(), 0);
+        let blocked_before_signed = runner
+            .metrics
+            .gc_gate_blocked_authority_total
+            .load(Ordering::Relaxed);
+        assert!(blocked_before_signed > 0);
+        let signer = make_signer("auth-1", 91);
+        {
+            let mut api = runner.certified_api.lock().await;
+            let frontier = ack_frontier("auth-1", "user/", 7, high);
+            let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+            api.update_frontier_verified(
+                frontier.clone(),
+                Some(signer.self_verified(&frontier, &signature)),
+            );
+        }
 
         runner.run_gc().await; // pass 2: sweep
 
@@ -10638,9 +11321,8 @@ mod tests {
                 .metrics
                 .gc_gate_blocked_authority_total
                 .load(Ordering::Relaxed),
-            0,
-            "a fully reported range must not block the authority gate — a gate \
-             evaluated at a fabricated PolicyVersion(1) sees no report at all"
+            blocked_before_signed,
+            "the newly signed report must not add another authority gate block"
         );
         assert!(
             runner.tombstone_gc.total_collected() >= 1,
@@ -10650,6 +11332,72 @@ mod tests {
             runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed) > 0,
             "an executed sweep must stamp gc_last_sweep_wall_ms"
         );
+    }
+
+    #[tokio::test]
+    async fn gc_gate_requires_current_roster_after_same_version_replacement() {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: kr("user/"),
+            authority_nodes: vec![node_id("auth-old")],
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(7), kr("user/"), 1))
+            .expect("valid policy");
+
+        let (mut runner, _eventual_api, peer_addr) = legacy_hole_runner_with_ns(ns, false).await;
+        runner.run_gc().await;
+        let mark_ms = runner.tombstone_gc.pending_mark_ms().expect("marked");
+        while crate::hlc::wall_clock_ms() <= mark_ms {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        {
+            let mut api = runner.certified_api.lock().await;
+            let high = crate::hlc::wall_clock_ms() + 30_000;
+            let frontier = ack_frontier("auth-old", "user/", 7, high);
+            let signer = make_signer("auth-old", 92);
+            let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+            assert!(api.update_frontier_verified(
+                frontier.clone(),
+                Some(signer.self_verified(&frontier, &signature))
+            ));
+            api.namespace()
+                .write()
+                .unwrap()
+                .set_authority_definition(AuthorityDefinition {
+                    key_range: kr("user/"),
+                    authority_nodes: vec![node_id("auth-new")],
+                    auto_generated: false,
+                });
+        }
+        runner.push_acked_wall_ms.insert(
+            peer_addr,
+            PushAck {
+                node_id: node_id("p1"),
+                snapshot_wall_ms: u64::MAX,
+            },
+        );
+
+        runner.run_gc().await;
+        assert_eq!(runner.tombstone_gc.total_collected(), 0);
+        assert_eq!(
+            runner.metrics.gc_last_sweep_wall_ms.load(Ordering::Relaxed),
+            0
+        );
+
+        {
+            let mut api = runner.certified_api.lock().await;
+            let high = crate::hlc::wall_clock_ms() + 30_000;
+            let frontier = ack_frontier("auth-new", "user/", 7, high);
+            let signer = make_signer("auth-new", 93);
+            let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+            assert!(api.update_frontier_verified(
+                frontier.clone(),
+                Some(signer.self_verified(&frontier, &signature))
+            ));
+        }
+        runner.run_gc().await;
+        assert!(runner.tombstone_gc.total_collected() >= 1);
     }
 
     /// Same requirement on the other consumer of the population: a
@@ -10703,6 +11451,116 @@ mod tests {
             "the checkpoint must carry the range's real policy version, not a \
              fabricated PolicyVersion(1)"
         );
+    }
+
+    #[tokio::test]
+    async fn check_compaction_charges_shadowed_writes_to_child_scope() {
+        let mut ns = SystemNamespace::new();
+        for (prefix, authority) in [("user/", "auth-parent"), ("user/private/", "auth-child")] {
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr(prefix),
+                authority_nodes: vec![node_id(authority)],
+                auto_generated: false,
+            });
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(prefix), 1))
+                .unwrap();
+        }
+        let metrics = default_metrics();
+        metrics.record_write_op("user/private/k");
+        let engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: u64::MAX,
+            ops_threshold: 1,
+        });
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+            engine,
+            NodeRunnerConfig::default(),
+            metrics,
+        )
+        .await;
+        runner.set_eventual_api(Arc::new(Mutex::new(
+            crate::api::eventual::EventualApi::new(node_id("node-1")),
+        )));
+
+        runner.check_compaction().await;
+        assert!(runner.compaction_engine().get_checkpoint("user/").is_none());
+        assert!(
+            runner
+                .compaction_engine()
+                .get_checkpoint("user/private/")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_signed_floor_does_not_prune_child_timestamp() {
+        let mut ns = SystemNamespace::new();
+        for (prefix, authority) in [("user/", "auth-parent"), ("user/private/", "auth-child")] {
+            ns.set_authority_definition(AuthorityDefinition {
+                key_range: kr(prefix),
+                authority_nodes: vec![node_id(authority)],
+                auto_generated: false,
+            });
+            ns.set_placement_policy(PlacementPolicy::new(PolicyVersion(1), kr(prefix), 1))
+                .unwrap();
+        }
+        let metrics = default_metrics();
+        metrics.record_write_op("user/public/k");
+        let eventual = Arc::new(Mutex::new(crate::api::eventual::EventualApi::new(node_id(
+            "node-1",
+        ))));
+        let old = hlc_ts(
+            crate::hlc::wall_clock_ms().saturating_sub(1_000),
+            0,
+            "node-1",
+        );
+        {
+            let mut api = eventual.lock().await;
+            for key in ["user/public/k", "user/private/k"] {
+                let mut value = PnCounter::new();
+                value.increment(&node_id("node-1"));
+                api.store_mut().put_with_timestamp(
+                    key.into(),
+                    CrdtValue::Counter(value),
+                    old.clone(),
+                );
+            }
+        }
+        let mut runner = NodeRunner::new(
+            node_id("node-1"),
+            wrap_api(CertifiedApi::new(node_id("node-1"), wrap_ns(ns))),
+            CompactionEngine::new(CompactionConfig {
+                time_threshold_ms: u64::MAX,
+                ops_threshold: 1,
+            }),
+            NodeRunnerConfig::default(),
+            metrics,
+        )
+        .await;
+        runner.set_eventual_api(Arc::clone(&eventual));
+
+        // The first cycle creates a parent checkpoint but has no signed floor.
+        runner.check_compaction().await;
+        assert!(runner.compaction_engine().get_checkpoint("user/").is_some());
+        assert_eq!(
+            eventual.lock().await.store().timestamp_for("user/public/k"),
+            Some(&old)
+        );
+
+        let signer = make_signer("auth-parent", 94);
+        let high = crate::hlc::wall_clock_ms() + 10_000;
+        let frontier = ack_frontier("auth-parent", "user/", 1, high);
+        let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+        assert!(runner.certified_api.lock().await.update_frontier_verified(
+            frontier.clone(),
+            Some(signer.self_verified(&frontier, &signature))
+        ));
+        runner.check_compaction().await;
+
+        let api = eventual.lock().await;
+        assert_eq!(api.store().timestamp_for("user/public/k"), None);
+        assert_eq!(api.store().timestamp_for("user/private/k"), Some(&old));
     }
 
     // -----------------------------------------------------------------
@@ -10887,6 +11745,160 @@ mod tests {
             .collect()
     }
 
+    /// A far-future remote HLC is merged even when it cannot advance the
+    /// local clock. A later valid local dot can therefore sit below the
+    /// peer's existing HLC baseline. An empty HLC scan must not acknowledge
+    /// that dot: a complete push must reach the peer first.
+    #[tokio::test]
+    async fn lower_hlc_local_dot_requires_complete_push_before_ack() {
+        use crate::crdt::or_map::OrMap;
+        use crate::network::sync::{SyncRequest, SyncResponse};
+        use crate::network::{PeerConfig, PeerRegistry};
+        use axum::body::Bytes;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+
+        let future = hlc_ts(
+            crate::hlc::wall_clock_ms() + crate::hlc::MAX_CLOCK_SKEW_MS + 1_000,
+            0,
+            "remote",
+        );
+        let field = "field".to_string();
+        let mut high_only = OrMap::new();
+        high_only.set(
+            field.clone(),
+            "high".to_string(),
+            future.clone(),
+            &node_id("remote"),
+        );
+        let mut high_delete = high_only.clone();
+        high_delete.delete(&field);
+
+        let source = Arc::new(Mutex::new(EventualApi::new(node_id("node-x"))));
+        {
+            let mut api = source.lock().await;
+            api.merge_remote_with_hlc(
+                "map".to_string(),
+                &CrdtValue::Map(high_only.clone()),
+                future.clone(),
+            )
+            .unwrap();
+            let local = api
+                .eventual_map_set("map", field.clone(), "low".to_string())
+                .unwrap();
+            assert!(local < future);
+            assert!(api.store().delta_entries_since(&future).is_empty());
+        }
+
+        let peer = Arc::new(Mutex::new(EventualApi::new(node_id("peer-1"))));
+        peer.lock()
+            .await
+            .store_mut()
+            .put("map".to_string(), CrdtValue::Map(high_only));
+        let allow_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_for_route = Arc::clone(&peer);
+        let allow_for_route = Arc::clone(&allow_full);
+        let app = axum::Router::new()
+            .route(
+                "/api/internal/sync",
+                axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                    let peer = Arc::clone(&peer_for_route);
+                    let allow = Arc::clone(&allow_for_route);
+                    async move {
+                        if !allow.load(Ordering::SeqCst) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        let content_type =
+                            headers.get("content-type").and_then(|v| v.to_str().ok());
+                        let request: SyncRequest =
+                            crate::http::codec::deserialize_internal(&body, content_type).unwrap();
+                        let mut api = peer.lock().await;
+                        for (key, value) in &request.entries {
+                            api.merge_remote(key.clone(), value).unwrap();
+                        }
+                        axum::Json(SyncResponse {
+                            merged: request.entries.len(),
+                            errors: vec![],
+                            durable: true,
+                        })
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/api/internal/sync/delta",
+                axum::routing::post(|| async {
+                    axum::Json(DeltaSyncResponse {
+                        entries: vec![],
+                        sender_frontier: None,
+                        applied_origins: HashMap::new(),
+                        merge_failed_keys: vec![],
+                        pruned_floor: None,
+                        visible_origins: HashMap::new(),
+                        untracked_entries: HashMap::new(),
+                    })
+                    .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let registry = PeerRegistry::new(
+            node_id("node-x"),
+            vec![PeerConfig {
+                node_id: node_id("peer-1"),
+                addr: addr.to_string(),
+            }],
+        )
+        .unwrap();
+        let config = NodeRunnerConfig {
+            sync_interval: Some(Duration::from_millis(50)),
+            ping_interval: None,
+            digest_sync_enabled: false,
+            ..NodeRunnerConfig::default()
+        };
+        let mut runner = NodeRunner::with_sync(
+            node_id("node-x"),
+            wrap_api(CertifiedApi::new(node_id("node-x"), default_namespace())),
+            CompactionEngine::with_defaults(),
+            config,
+            SyncClient::new(Arc::new(Mutex::new(registry))),
+            source,
+            default_metrics(),
+        )
+        .await;
+        let peer_key = addr.to_string();
+        runner
+            .peer_frontiers
+            .insert(peer_key.clone(), future.clone());
+        runner
+            .push_frontiers
+            .insert(peer_key.clone(), future.clone());
+
+        runner.run_sync().await;
+        assert!(!runner.push_acked_wall_ms.contains_key(&peer_key));
+        let Some(CrdtValue::Map(before)) = peer.lock().await.get_eventual("map").cloned() else {
+            panic!("peer map missing");
+        };
+        let mut after_remote_delete = before;
+        after_remote_delete.merge(&high_delete);
+        assert_eq!(after_remote_delete.get(&field), None);
+
+        allow_full.store(true, Ordering::SeqCst);
+        runner.run_sync().await;
+        assert!(runner.push_acked_wall_ms.contains_key(&peer_key));
+        let Some(CrdtValue::Map(after)) = peer.lock().await.get_eventual("map").cloned() else {
+            panic!("peer map missing after full push");
+        };
+        let mut after_remote_delete = after;
+        after_remote_delete.merge(&high_delete);
+        assert_eq!(after_remote_delete.get(&field), Some(&"low".to_string()));
+        server.abort();
+    }
+
     /// T-12: one cycle attaches the (bounded) sample to at most one
     /// request per peer, and records the delivery.
     #[tokio::test]
@@ -11046,16 +12058,38 @@ mod tests {
 
         // Mock peer that ACCEPTS the push (200 + empty per-key errors) and
         // returns an empty delta pull.
+        let reject_full_push = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reject_full_push_for_route = Arc::clone(&reject_full_push);
         let app = axum::Router::new()
             .route(
                 "/api/internal/sync",
-                axum::routing::post(|| async {
-                    axum::Json(crate::network::sync::SyncResponse {
-                        merged: 1,
-                        errors: vec![],
-                    })
-                    .into_response()
-                }),
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                        let reject = Arc::clone(&reject_full_push_for_route);
+                        async move {
+                            let content_type =
+                                headers.get("content-type").and_then(|v| v.to_str().ok());
+                            let request: crate::network::sync::SyncRequest =
+                                crate::http::codec::deserialize_internal(&body, content_type)
+                                    .unwrap();
+                            axum::Json(crate::network::sync::SyncResponse {
+                                merged: request.entries.len(),
+                                errors: if reject.load(Ordering::SeqCst)
+                                    && request.entries.len() > 1
+                                {
+                                    vec![crate::network::sync::SyncError {
+                                        key: "old-0".into(),
+                                        error: "test rejection".into(),
+                                    }]
+                                } else {
+                                    vec![]
+                                },
+                                durable: true,
+                            })
+                            .into_response()
+                        }
+                    },
+                ),
             )
             .route(
                 "/api/internal/sync/delta",
@@ -11116,20 +12150,56 @@ mod tests {
 
         runner.run_sync().await;
 
-        // The push DID happen and advanced the baseline — proving this was the
-        // non-empty delta-push arm, not the empty branch...
+        // The delta push conveyed `keep`, but the complete-state push was
+        // rejected. The HLC-only delta cannot advance the baseline or GC
+        // evidence without verification of every retained key.
         assert_eq!(
             runner.push_frontiers.get(&peer_key),
-            Some(&hlc_ts(3000, 0, "node-x")),
-            "the non-empty delta push must have advanced the baseline to keep@3000"
+            Some(&hlc_ts(500, 0, "node-x")),
+            "a delta alone must not advance the baseline"
         );
-        // ...yet the evidence is withheld because the baseline sat below the
-        // floor when the scan ran.
         assert!(
             !runner.push_acked_wall_ms.contains_key(&peer_key),
             "a non-empty push whose baseline sits below the pruned floor must \
              not record push evidence"
         );
+
+        // A second cycle still owes a complete push. A per-key error must
+        // preserve the debt and the old baseline.
+        runner.run_sync().await;
+        assert_eq!(
+            runner.push_frontiers.get(&peer_key),
+            Some(&hlc_ts(500, 0, "node-x"))
+        );
+        assert!(
+            !runner.push_acked_wall_ms.contains_key(&peer_key),
+            "an empty second scan with failed repayment must retain prune debt"
+        );
+
+        // A clean complete-state push conveys the pruned keys and may
+        // finally establish fresh GC push evidence.
+        reject_full_push.store(false, Ordering::SeqCst);
+        runner.run_sync().await;
+        assert!(runner.push_acked_wall_ms.contains_key(&peer_key));
+        assert!(!runner.push_prune_debt.contains(&peer_key));
+
+        // Even when all timestamps disappear, the complete-state push must
+        // move the baseline to the captured floor in the same cycle;
+        // otherwise the next empty scan recreates the debt.
+        {
+            let mut api = eventual.lock().await;
+            api.store_mut()
+                .prune_timestamps_before("", &hlc_ts(4000, 0, "node-x"));
+            assert!(api.store().current_frontier().is_none());
+        }
+        runner.run_sync().await;
+        assert!(!runner.push_prune_debt.contains(&peer_key));
+        assert_eq!(
+            runner.push_frontiers.get(&peer_key),
+            Some(&hlc_ts(4000, 0, "node-x"))
+        );
+        runner.run_sync().await;
+        assert!(!runner.push_prune_debt.contains(&peer_key));
         server.abort();
     }
 

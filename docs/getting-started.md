@@ -141,7 +141,20 @@ cargo run
 ASTEROIDB_INTERNAL_TOKEN=my-secret-token cargo run
 ```
 
-トークンが設定されている場合、ノード間通信 (SyncClient, FrontierSyncClient) は自動的に `Authorization: Bearer <token>` ヘッダを付与します。トークンが未設定の場合、認証なしで動作します (後方互換性あり)。
+トークンが設定されている場合、ノード間通信 (SyncClient, FrontierSyncClient) は自動的に `Authorization: Bearer <token>` ヘッダを付与します。トークンが未設定の場合、認証なしで動作します。
+
+### 操作 API の Create パケットを署名する
+
+操作 API を有効にしたノードへ Create を提出する場合は、ノードに設定した `ASTEROIDB_OPERATION_CREATION_POLICY` と同じ JSON manifest をローカルファイルに保存し、署名時に指定する。CLI は作成宣言を検証し、manifest の digest を署名済み作成証拠に含める。
+
+```bash
+asteroidb-cli operation-sign-create example writer-1 1 orders/1 \
+  --value-file value.bin --key-file writer.secret.hex \
+  --creation-policy-file creation-policy.json --mode enabled --output create.json
+asteroidb-cli operation-submit-certified create.json --wait-ms 5000
+```
+
+Add/Delete はこの `create.json` を入力に使い、作成時の宣言と証拠を引き継ぐ。ノード側の設定と操作 API の起動手順は [運用ガイド](ops-guide.md) を参照。
 
 ### HTTP API エンドポイント一覧
 

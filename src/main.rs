@@ -1,24 +1,71 @@
+use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
+use asteroidb_poc::api::certified::CertifiedApi;
+use asteroidb_poc::api::eventual::EventualApi;
 #[cfg(feature = "native-crypto")]
 use asteroidb_poc::authority::bls::{BlsProofOfPossession, BlsPublicKey};
 #[cfg(not(feature = "native-crypto"))]
 use asteroidb_poc::authority::bls_stub::{BlsProofOfPossession, BlsPublicKey};
 use asteroidb_poc::authority::certificate::{EpochManager, KeysetRegistry, KeysetVersion};
+use asteroidb_poc::authority::creation_policy::CreationPolicyManifest;
 use asteroidb_poc::authority::equivocation::EquivocationDetector;
 use asteroidb_poc::authority::frontier_sig::NodeSigner;
+use asteroidb_poc::authority::operation_evidence::EvidenceVerifier;
+use asteroidb_poc::authority::operation_merkle::OperationScope;
+use asteroidb_poc::authority::operation_worker::OperationAuthorityWorker;
+use asteroidb_poc::authority::static_operation_trust::StaticOperationEvidenceStore;
+use asteroidb_poc::authority::writer_auth::WriterRegistry;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
-use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
+use asteroidb_poc::control_plane::system_namespace::{
+    AuthorityDefinition, OperationAssignment, SystemNamespace,
+};
 use asteroidb_poc::http::handlers::AppState;
-use asteroidb_poc::http::routes::router;
+use asteroidb_poc::http::routes::router_with_operation_mode;
 use asteroidb_poc::network::membership::MembershipClient;
+use asteroidb_poc::network::operation_certificate_outbox::{
+    CertificateOutbox, spawn_certificate_retry_worker_with_auth,
+};
+use asteroidb_poc::network::operation_certificate_transport::{
+    AuthorityTrustCheckError, MultiOperationCertificateState, OperationCertificateState,
+    multi_certificate_router, multi_certified_submit_router, multi_public_operation_status_router,
+    public_operation_uncertified_router, static_read_trust_digest,
+};
+use asteroidb_poc::network::operation_link_auth::OperationLinkAuth;
+use asteroidb_poc::network::operation_neighbors::{
+    OperationNeighborManifest, OperationOwnedPrefixes,
+};
+use asteroidb_poc::network::operation_outbox::{
+    OperationOutbox, spawn_operation_retry_worker_with_auth,
+};
+use asteroidb_poc::network::operation_policy_outbox::OperationPolicyOutbox;
+use asteroidb_poc::network::operation_policy_transport::{
+    PolicyWitnessRelay, policy_route_digest, policy_witness_router_authenticated,
+    policy_witness_submit_router, spawn_policy_witness_retry_worker,
+};
+use asteroidb_poc::network::operation_routes::{
+    OperationRequiredDestinations, OperationRouteEdge, OperationRouteManifest,
+};
+use asteroidb_poc::network::operation_support_transport::{
+    SupportOutbox, spawn_support_retry_worker_with_auth,
+};
+use asteroidb_poc::network::operation_transport::{
+    AuthenticatedOperationAdmission, AuthorityTerminalRole, OperationInbox, OperationRelay,
+    relay_router, relay_router_authenticated, repair_routed_manifest_if_pristine,
+    routed_authority_manifest_digest, routed_custody_manifest_digest,
+    spawn_operation_completion_worker_with_auth, submit_router,
+    unified_operation_view_router_multi, validate_routed_relay_configuration,
+};
 use asteroidb_poc::network::sync::SyncClient;
 use asteroidb_poc::network::{NodeConfig, PeerRegistry};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
+use asteroidb_poc::runtime::persistence::PersistenceConfig;
 use asteroidb_poc::runtime::{BlsConfig, NodeRunner, NodeRunnerConfig};
+use asteroidb_poc::store::wal::WalSyncer;
 use asteroidb_poc::types::{KeyRange, NodeId};
 
 /// A parsed `ASTEROIDB_AUTHORITY_KEYS` entry: node ID, Ed25519 verifying key,
@@ -28,6 +75,439 @@ type AuthorityKeyEntry = (
     ed25519_dalek::VerifyingKey,
     Option<(BlsPublicKey, BlsProofOfPossession)>,
 );
+
+fn open_old_certified_for_mode(
+    node_id: NodeId,
+    namespace: Arc<RwLock<SystemNamespace>>,
+    config: &PersistenceConfig,
+    operation_mode: bool,
+) -> std::io::Result<(CertifiedApi, Option<Arc<WalSyncer>>)> {
+    if operation_mode {
+        Ok((CertifiedApi::new(node_id, namespace), None))
+    } else {
+        asteroidb_poc::runtime::persistence::recover_certified(node_id, namespace, config)
+    }
+}
+
+fn open_old_eventual_for_mode(
+    node_id: NodeId,
+    config: &PersistenceConfig,
+    operation_mode: bool,
+) -> std::io::Result<(EventualApi, Option<Arc<WalSyncer>>)> {
+    if operation_mode {
+        Ok((EventualApi::new(node_id), None))
+    } else {
+        asteroidb_poc::runtime::persistence::recover_eventual(node_id, config)
+    }
+}
+
+enum OperationAuthorityPassError {
+    Worker(String),
+    RetryableShared(String),
+    Shared(String),
+    Gc(String),
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfiguredCertificateScope {
+    #[serde(default)]
+    namespace_id: String,
+    key_prefix: String,
+    faults: usize,
+}
+
+fn parse_certificate_scopes(
+    multi: Option<&str>,
+    legacy_prefix: Option<&str>,
+    legacy_faults: Option<&str>,
+    default_namespace_id: &str,
+) -> Result<(Vec<ConfiguredCertificateScope>, bool), String> {
+    if let Some(raw) = multi {
+        if legacy_prefix.is_some() || legacy_faults.is_some() {
+            return Err(
+                "ASTEROIDB_OPERATION_CERT_SCOPES conflicts with legacy certificate scope variables"
+                    .into(),
+            );
+        }
+        let mut scopes: Vec<ConfiguredCertificateScope> = serde_json::from_str(raw)
+            .map_err(|error| format!("invalid ASTEROIDB_OPERATION_CERT_SCOPES: {error}"))?;
+        if scopes.is_empty() {
+            return Err("ASTEROIDB_OPERATION_CERT_SCOPES must contain at least one scope".into());
+        }
+        let mut prefixes = std::collections::BTreeSet::new();
+        for scope in &mut scopes {
+            if scope.namespace_id.is_empty() {
+                scope.namespace_id = default_namespace_id.into();
+            }
+            if !prefixes.insert((scope.namespace_id.clone(), scope.key_prefix.clone())) {
+                return Err(
+                    "ASTEROIDB_OPERATION_CERT_SCOPES contains a duplicate namespace and prefix"
+                        .into(),
+                );
+            }
+        }
+        return Ok((scopes, true));
+    }
+    match (legacy_prefix, legacy_faults) {
+        (Some(key_prefix), Some(faults)) => {
+            let faults = faults.parse().map_err(|_| "invalid ASTEROIDB_OPERATION_CERT_FAULTS")?;
+            Ok((vec![ConfiguredCertificateScope { namespace_id: default_namespace_id.into(), key_prefix: key_prefix.into(), faults }], false))
+        }
+        (None, None) => Ok((Vec::new(), false)),
+        _ => Err("ASTEROIDB_OPERATION_CERT_SCOPE_PREFIX and ASTEROIDB_OPERATION_CERT_FAULTS must be set together".into()),
+    }
+}
+
+fn required_operation_creation_policy(
+    json: Option<&str>,
+) -> Result<Arc<CreationPolicyManifest>, String> {
+    let json = json.ok_or("ASTEROIDB_WRITER_KEYS requires ASTEROIDB_OPERATION_CREATION_POLICY")?;
+    CreationPolicyManifest::from_json(json)
+        .map(Arc::new)
+        .map_err(|error| format!("invalid ASTEROIDB_OPERATION_CREATION_POLICY: {error}"))
+}
+
+fn policy_route_configuration(
+    edges_json: Option<&str>,
+    routes_json: Option<&str>,
+    destinations: Option<&OperationRequiredDestinations>,
+    data_routes: Option<&OperationRouteManifest>,
+) -> Result<Option<OperationRouteManifest>, String> {
+    let explicit = match (edges_json, routes_json) {
+        (None, None) => None,
+        (Some(edges_json), Some(routes_json)) => {
+            let edges: Vec<OperationRouteEdge> =
+                serde_json::from_str(edges_json).map_err(|error| {
+                    format!("invalid ASTEROIDB_OPERATION_POLICY_ROUTE_EDGES: {error}")
+                })?;
+            Some(
+                OperationRouteManifest::from_json(routes_json, &edges).map_err(|error| {
+                    format!("invalid ASTEROIDB_OPERATION_POLICY_ROUTES: {error}")
+                })?,
+            )
+        }
+        _ => {
+            return Err("ASTEROIDB_OPERATION_POLICY_ROUTE_EDGES and ASTEROIDB_OPERATION_POLICY_ROUTES must be set together".into());
+        }
+    };
+    if destinations.is_none() && explicit.is_some() {
+        return Err("policy routes require ASTEROIDB_OPERATION_POLICY_DESTINATIONS".into());
+    }
+    let routes = explicit.or_else(|| data_routes.cloned());
+    if destinations.is_some() && routes.is_none() {
+        return Err(
+            "policy-only delivery requires policy routes or routed operation configuration".into(),
+        );
+    }
+    Ok(routes)
+}
+
+/// Validate every existing operation pin before creating a missing one.
+/// In particular, an old `.routing` must reject a changed route without
+/// leaving new creation-policy or link-identity pins behind.
+// Keep each immutable startup digest explicit at this fail-closed boundary.
+#[allow(clippy::too_many_arguments)]
+fn pin_operation_startup_manifests(
+    inbox: &OperationInbox,
+    outbox: &mut OperationOutbox,
+    creation_digest: Option<[u8; 32]>,
+    link_digest: Option<[u8; 32]>,
+    route_digest: Option<[u8; 32]>,
+    owned_digest: [u8; 32],
+    authority_digest: Option<[u8; 32]>,
+    routed_configuration: Option<(
+        &OperationNeighborManifest,
+        &OperationRouteManifest,
+        &[AuthorityTerminalRole],
+        &SystemNamespace,
+    )>,
+) -> Result<(), String> {
+    if let Some((neighbors, routes, authorities, _)) = routed_configuration {
+        validate_routed_relay_configuration(neighbors, routes, authorities)
+            .map_err(|error| error.to_string())?;
+    }
+    match creation_digest {
+        Some(digest) => inbox
+            .verify_creation_policy_manifest(digest)
+            .map_err(|error| error.to_string())?,
+        None => inbox
+            .ensure_no_creation_policy_manifest()
+            .map_err(|error| error.to_string())?,
+    }
+    if let Some(digest) = link_digest {
+        inbox
+            .verify_link_manifest(digest)
+            .map_err(|error| error.to_string())?;
+        outbox
+            .verify_link_manifest(digest)
+            .map_err(|error| error.to_string())?;
+    }
+    inbox
+        .verify_owned_manifest(owned_digest)
+        .map_err(|error| error.to_string())?;
+    if let Some(digest) = authority_digest {
+        inbox
+            .verify_authority_manifest(digest)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(digest) = route_digest {
+        repair_routed_manifest_if_pristine(inbox, outbox, digest)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some((_, _, _, mounted_policy)) = routed_configuration {
+        inbox
+            .ensure_mounted_authority_policy(mounted_policy)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(digest) = creation_digest {
+        inbox
+            .ensure_creation_policy_manifest(digest)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(digest) = link_digest {
+        inbox
+            .ensure_link_manifest(digest)
+            .map_err(|error| error.to_string())?;
+        outbox
+            .ensure_link_manifest(digest)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn certificate_scope_root(
+    data_dir: &std::path::Path,
+    namespace_id: &str,
+    prefix: &str,
+) -> std::path::PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(b"asteroidb operation certificate scope v1\0");
+    hash.update((namespace_id.len() as u64).to_le_bytes());
+    hash.update(namespace_id.as_bytes());
+    hash.update((prefix.len() as u64).to_le_bytes());
+    hash.update(prefix.as_bytes());
+    data_dir
+        .join("operation_certificate_scopes")
+        .join(hex::encode(hash.finalize()))
+}
+
+const CERTIFICATE_SCOPE_USED_MAGIC: &[u8] = b"ASTSCOPE-USED-1";
+
+fn certificate_scope_used_marker(
+    data_dir: &std::path::Path,
+    scope_root: &std::path::Path,
+) -> std::path::PathBuf {
+    let name = scope_root
+        .file_name()
+        .expect("scope root is named by its digest")
+        .to_string_lossy();
+    data_dir.join(format!(".operation-certificate-scope-{name}.used"))
+}
+
+fn pin_certificate_scope_used(
+    data_dir: &std::path::Path,
+    scope_root: &std::path::Path,
+) -> Result<(), String> {
+    let marker = certificate_scope_used_marker(data_dir, scope_root);
+    if marker.exists() {
+        if std::fs::read(&marker).map_err(|error| error.to_string())?
+            != CERTIFICATE_SCOPE_USED_MAGIC
+        {
+            return Err("saved certificate scope marker is invalid".into());
+        }
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|error| error.to_string())?;
+    file.write_all(CERTIFICATE_SCOPE_USED_MAGIC)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::File::open(data_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn nonempty_directory(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => path.exists(),
+    }
+}
+
+fn validate_certificate_state_layout(
+    data_dir: &std::path::Path,
+    scopes: &[ConfiguredCertificateScope],
+    multi_scope_mode: bool,
+) -> Result<(), String> {
+    let mut evidence_used_marker = false;
+    if data_dir.exists() {
+        for entry in std::fs::read_dir(data_dir).map_err(|error| error.to_string())? {
+            let name = entry.map_err(|error| error.to_string())?.file_name();
+            if name.to_str().is_some_and(|name| {
+                name.starts_with(".operation-evidence-") && name.ends_with(".used")
+            }) {
+                evidence_used_marker = true;
+                break;
+            }
+        }
+    }
+    let legacy_state = [
+        "operation_evidence",
+        "operation_supports",
+        ".operation_supports.operation-supports.used",
+        "operation_support_outbox",
+        "operation_certificate_outbox",
+        "operation_authority",
+        ".operation_authority.operation-authority.used",
+    ]
+    .iter()
+    .any(|name| nonempty_directory(&data_dir.join(name)))
+        || evidence_used_marker;
+    if multi_scope_mode && legacy_state {
+        return Err("legacy certificate state exists; migrate it before enabling ASTEROIDB_OPERATION_CERT_SCOPES".into());
+    }
+    if !multi_scope_mode && scopes.is_empty() && legacy_state {
+        return Err("legacy certificate state exists; configure its scope before starting".into());
+    }
+    let multi_root = data_dir.join("operation_certificate_scopes");
+    let configured: std::collections::BTreeSet<_> = if multi_scope_mode {
+        scopes
+            .iter()
+            .map(|scope| certificate_scope_root(data_dir, &scope.namespace_id, &scope.key_prefix))
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let configured_markers: std::collections::BTreeSet<_> = configured
+        .iter()
+        .map(|scope_root| certificate_scope_used_marker(data_dir, scope_root))
+        .collect();
+    if data_dir.exists() {
+        for entry in std::fs::read_dir(data_dir).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(".operation-certificate-scope-") && name.ends_with(".used")
+                })
+            {
+                if !configured_markers.contains(&path) {
+                    return Err(
+                        "saved certificate scope is absent from current configuration".into(),
+                    );
+                }
+                if std::fs::read(&path).map_err(|error| error.to_string())?
+                    != CERTIFICATE_SCOPE_USED_MAGIC
+                {
+                    return Err("saved certificate scope marker is invalid".into());
+                }
+            }
+        }
+    }
+    for scope_root in &configured {
+        let marker = certificate_scope_used_marker(data_dir, scope_root);
+        if marker.exists() && !nonempty_directory(scope_root) {
+            return Err("previously used certificate scope directory is missing".into());
+        }
+    }
+    if !multi_root.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(&multi_root)
+        .map_err(|error| format!("cannot inspect certificate scope state: {error}"))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("cannot inspect certificate scope state: {error}"))?
+            .path();
+        if !configured.contains(&path) && nonempty_directory(&path) {
+            return Err(if multi_scope_mode {
+                "saved certificate scope is absent from ASTEROIDB_OPERATION_CERT_SCOPES"
+            } else {
+                "multi-scope certificate state exists; migrate it before enabling legacy certificate scope variables"
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn operation_scope_keyset(
+    registry: &KeysetRegistry,
+    authority_ids: &[NodeId],
+) -> Result<KeysetRegistry, String> {
+    let requested: std::collections::BTreeSet<_> = authority_ids.iter().cloned().collect();
+    if requested.is_empty() || requested.len() != authority_ids.len() {
+        return Err("operation scope has empty or duplicate Authority IDs".into());
+    }
+    let version = registry.current_version();
+    let epoch = registry
+        .registered_epoch(&version)
+        .ok_or("operation scope has no trusted Authority keyset")?;
+    let keys = registry
+        .get_keys(&version)
+        .ok_or("operation scope has no trusted Authority keyset")?;
+    let selected: Vec<_> = keys
+        .iter()
+        .filter(|(id, _)| requested.contains(id))
+        .cloned()
+        .collect();
+    let selected_ids: std::collections::BTreeSet<_> = selected.iter().map(|(id, _)| id).collect();
+    if selected.len() != requested.len() || selected_ids.len() != requested.len() {
+        return Err("operation Authority IDs are missing or duplicated in trusted keyset".into());
+    }
+    let mut scoped = KeysetRegistry::new();
+    scoped
+        .register_keyset(version, epoch, selected)
+        .map_err(|error| format!("cannot construct operation Authority keyset: {error}"))?;
+    Ok(scoped)
+}
+
+/// Check every configured certificate scope before startup writes any operation
+/// manifest or reconciles routed custody. Return the keysets used by recovery
+/// so the preflight and mounted stores use the same trusted inputs.
+fn preflight_certificate_scopes(
+    scopes: &[ConfiguredCertificateScope],
+    namespace: &SystemNamespace,
+    global_registry: &KeysetRegistry,
+    owned: &OperationOwnedPrefixes,
+) -> Result<Vec<KeysetRegistry>, String> {
+    scopes
+        .iter()
+        .map(|configured| {
+            let scope = OperationScope {
+                namespace_id: configured.namespace_id.clone(),
+                key_prefix: configured.key_prefix.clone(),
+            };
+            let authority = namespace
+                .operation_authority_definition(&scope.namespace_id, &scope.key_prefix)
+                .ok_or("operation scope has no exact Authority definition")?;
+            let scoped = operation_scope_keyset(global_registry, &authority.authority_nodes)?;
+            let version = scoped.current_version();
+            if scoped.registered_epoch(&version) != Some(0) {
+                return Err("static operation Authority keyset must register at epoch zero".into());
+            }
+            let n = scoped
+                .get_keys(&version)
+                .ok_or("operation scope has no trusted Authority keyset")?
+                .len();
+            if configured
+                .faults
+                .checked_mul(3)
+                .is_none_or(|triple| triple >= n)
+            {
+                return Err("operation scope requires n > 3f Authorities".into());
+            }
+            static_read_trust_digest(namespace, &scope, &scoped, owned)?;
+            Ok(scoped)
+        })
+        .collect()
+}
 
 /// Parse peer authority public keys from `ASTEROIDB_AUTHORITY_KEYS`.
 ///
@@ -363,6 +843,16 @@ async fn main() {
         .with_env_filter(log_env_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
+    if std::env::var("ASTEROIDB_GC_HOLE_JUMP")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+    {
+        eprintln!(
+            "error: ASTEROIDB_GC_HOLE_JUMP is unavailable: peer eviction can invalidate its inbound GC evidence"
+        );
+        std::process::exit(1);
+    }
+
     // Load configuration: either from a config file or from individual env vars.
     // `self_node` carries this node's real mode and tags; it used to be
     // discarded here, which left nothing in the process that knew them.
@@ -472,6 +962,18 @@ async fn main() {
     // Build shared runtime metrics.
     let metrics = Arc::new(RuntimeMetrics::default());
 
+    // Decide the data-plane mode before opening either old store. Operation
+    // mode has its own durable inbox and must not depend on old WAL files.
+    let writer_keys_json = match std::env::var("ASTEROIDB_WRITER_KEYS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("error: ASTEROIDB_WRITER_KEYS is not UTF-8");
+            std::process::exit(1);
+        }
+    };
+    let operation_mode = writer_keys_json.is_some();
+
     // Crash recovery: load each store's snapshot and replay its WAL, then
     // open fresh WAL writers. This must complete before the listener binds
     // and before any peer sync starts, so clients and peers only ever see
@@ -482,40 +984,33 @@ async fn main() {
 
     // Share a single CertifiedApi between HTTP handlers and NodeRunner
     // so that certification status updates are visible to both.
-    let (certified_recovered, certified_wal_syncer) =
-        match asteroidb_poc::runtime::persistence::recover_certified(
-            node_id.clone(),
-            Arc::clone(&namespace),
-            &persistence_cfg,
-        ) {
-            Ok(recovered) => recovered,
-            Err(e) => {
-                eprintln!(
-                    "error: certified store recovery failed: {e}\n\
-                     See docs/ops-guide.md (Crash recovery runbook) before retrying."
-                );
-                std::process::exit(1);
-            }
-        };
+    let (certified_recovered, certified_wal_syncer) = open_old_certified_for_mode(
+        node_id.clone(),
+        Arc::clone(&namespace),
+        &persistence_cfg,
+        operation_mode,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!(
+            "error: certified store recovery failed: {e}\n\
+             See docs/ops-guide.md (Crash recovery runbook) before retrying."
+        );
+        std::process::exit(1);
+    });
     let certified_api = Arc::new(Mutex::new(certified_recovered));
     let peer_persist_path = PeerRegistry::persist_path(&data_dir);
 
     // Share a single EventualApi between HTTP handlers and NodeRunner
     // so that HTTP writes are visible to the anti-entropy sync loop.
     let (eventual_recovered, eventual_wal_syncer) =
-        match asteroidb_poc::runtime::persistence::recover_eventual(
-            node_id.clone(),
-            &persistence_cfg,
-        ) {
-            Ok(recovered) => recovered,
-            Err(e) => {
+        open_old_eventual_for_mode(node_id.clone(), &persistence_cfg, operation_mode)
+            .unwrap_or_else(|e| {
                 eprintln!(
                     "error: eventual store recovery failed: {e}\n\
                      See docs/ops-guide.md (Crash recovery runbook) before retrying."
                 );
                 std::process::exit(1);
-            }
-        };
+            });
     let eventual_api = Arc::new(Mutex::new(eventual_recovered));
 
     // Build peer registry: if a config file provided peers, use those;
@@ -868,7 +1363,7 @@ async fn main() {
     // handler would have no keys to verify against and would either
     // silently accept everything (the historical fail-open) or reject
     // everything. Fail loudly at startup instead of degrading silently.
-    if require_signed_frontiers && keyset_registry.is_none() {
+    if !operation_mode && require_signed_frontiers && keyset_registry.is_none() {
         eprintln!(
             "error: ASTEROIDB_REQUIRE_SIGNED_FRONTIERS is set but no keyset registry could be \
              built. Set ASTEROIDB_BLS_SEED (signing key seed) and/or ASTEROIDB_AUTHORITY_KEYS \
@@ -884,9 +1379,9 @@ async fn main() {
     // is what makes evidence detected via HTTP ride the outgoing gossip.
     // Evidence is persisted next to the other node state so it survives
     // restarts (the attestation pool itself is volatile).
-    let equivocation = Arc::new(EquivocationDetector::new(Some(
-        data_dir.join("equivocation_evidence.json"),
-    )));
+    let equivocation = Arc::new(EquivocationDetector::new(
+        (!operation_mode).then(|| data_dir.join("equivocation_evidence.json")),
+    ));
     // Initialize the accused-authorities gauge from the restored evidence
     // store: without this, a restart resets the gauge to 0 until the next
     // *new* detection, while GET /api/authority/equivocations still reports
@@ -920,7 +1415,7 @@ async fn main() {
         cluster_nodes: Some(Arc::clone(&shared_cluster_nodes)),
         slo_tracker: Arc::clone(&slo_tracker),
         keyset_registry: keyset_registry.clone(),
-        epoch_config,
+        epoch_config: epoch_config.clone(),
         current_epoch: Arc::clone(&current_epoch),
         require_signed_frontiers,
         equivocation: Arc::clone(&equivocation),
@@ -929,7 +1424,820 @@ async fn main() {
         certified_wal: certified_wal_syncer.clone(),
     });
 
-    let app = router(state);
+    if std::env::var_os("ASTEROIDB_OPERATION_LEGACY_CREATION_POLICY").is_some() {
+        eprintln!(
+            "error: ASTEROIDB_OPERATION_LEGACY_CREATION_POLICY is unsupported; configure ASTEROIDB_OPERATION_CREATION_POLICY"
+        );
+        std::process::exit(1);
+    }
+    let mut app = router_with_operation_mode(state, operation_mode);
+    let mut operation_retry = None;
+    let mut operation_policy_retry = None;
+    let mut operation_support_retry = Vec::new();
+    let mut operation_certificate_retry = Vec::new();
+    let mut operation_authority = Vec::new();
+    // Operation ingest and public operation reads are enabled only with an
+    // explicit writer-key manifest, namespace scope, and internal bearer token.
+    // Operation mode fences the old HTTP data plane and does not open its WAL.
+    if let Some(writer_keys_json) = writer_keys_json {
+        let Some(token) = internal_token.clone() else {
+            eprintln!("error: ASTEROIDB_WRITER_KEYS requires ASTEROIDB_INTERNAL_TOKEN");
+            std::process::exit(1);
+        };
+        let namespace_id = std::env::var("ASTEROIDB_OPERATION_NAMESPACE_ID")
+            .ok()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| {
+                eprintln!("error: ASTEROIDB_WRITER_KEYS requires ASTEROIDB_OPERATION_NAMESPACE_ID");
+                std::process::exit(1);
+            });
+        let (certificate_scopes, multi_scope_mode) = parse_certificate_scopes(
+            std::env::var("ASTEROIDB_OPERATION_CERT_SCOPES")
+                .ok()
+                .as_deref(),
+            std::env::var("ASTEROIDB_OPERATION_CERT_SCOPE_PREFIX")
+                .ok()
+                .as_deref(),
+            std::env::var("ASTEROIDB_OPERATION_CERT_FAULTS")
+                .ok()
+                .as_deref(),
+            &namespace_id,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        });
+        if let Ok(raw) = std::env::var("ASTEROIDB_OPERATION_ASSIGNMENTS") {
+            let assignments: Vec<OperationAssignment> =
+                serde_json::from_str(&raw).unwrap_or_else(|error| {
+                    eprintln!("error: invalid ASTEROIDB_OPERATION_ASSIGNMENTS: {error}");
+                    std::process::exit(1);
+                });
+            let mut seen = std::collections::BTreeSet::new();
+            let mut control_plane = namespace.write().unwrap_or_else(|_| {
+                eprintln!("error: system namespace is poisoned");
+                std::process::exit(1);
+            });
+            for assignment in assignments {
+                let scope = (
+                    assignment.namespace_id.clone(),
+                    assignment.policy.key_range.prefix.clone(),
+                );
+                if !seen.insert(scope) {
+                    eprintln!("error: duplicate ASTEROIDB_OPERATION_ASSIGNMENTS scope");
+                    std::process::exit(1);
+                }
+                control_plane
+                    .set_operation_assignment(assignment)
+                    .unwrap_or_else(|error| {
+                        eprintln!("error: invalid ASTEROIDB_OPERATION_ASSIGNMENTS: {error}");
+                        std::process::exit(1);
+                    });
+            }
+        }
+        let operation_namespace_ids: std::collections::BTreeSet<_> =
+            std::iter::once(namespace_id.clone())
+                .chain(
+                    certificate_scopes
+                        .iter()
+                        .map(|scope| scope.namespace_id.clone()),
+                )
+                .collect();
+        let registry = WriterRegistry::from_json(&writer_keys_json).unwrap_or_else(|e| {
+            eprintln!("error: invalid ASTEROIDB_WRITER_KEYS: {e}");
+            std::process::exit(1);
+        });
+        let neighbors_json = std::env::var("ASTEROIDB_OPERATION_NEIGHBORS").unwrap_or_else(|_| {
+            eprintln!("error: ASTEROIDB_WRITER_KEYS requires ASTEROIDB_OPERATION_NEIGHBORS (use [] for a leaf node)");
+            std::process::exit(1);
+        });
+        let neighbors = OperationNeighborManifest::from_json(&neighbors_json, &node_id)
+            .unwrap_or_else(|e| {
+                eprintln!("error: invalid ASTEROIDB_OPERATION_NEIGHBORS: {e}");
+                std::process::exit(1);
+            });
+        let owned_json = std::env::var("ASTEROIDB_OPERATION_OWNED_PREFIXES").unwrap_or_else(|_| {
+            eprintln!("error: ASTEROIDB_WRITER_KEYS requires ASTEROIDB_OPERATION_OWNED_PREFIXES (use [] for a transit-only node)");
+            std::process::exit(1);
+        });
+        let owned = OperationOwnedPrefixes::from_json(&owned_json).unwrap_or_else(|e| {
+            eprintln!("error: invalid ASTEROIDB_OPERATION_OWNED_PREFIXES: {e}");
+            std::process::exit(1);
+        });
+        let writer_registry = Arc::new(registry);
+        let creation_policy_json = std::env::var("ASTEROIDB_OPERATION_CREATION_POLICY").ok();
+        let creation_policy = required_operation_creation_policy(creation_policy_json.as_deref())
+            .unwrap_or_else(|error| {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            });
+        let routed_config = match (
+            std::env::var("ASTEROIDB_OPERATION_ROUTE_EDGES").ok(),
+            std::env::var("ASTEROIDB_OPERATION_ROUTES").ok(),
+            std::env::var("ASTEROIDB_OPERATION_REQUIRED_DESTINATIONS").ok(),
+        ) {
+            (None, None, None) => None,
+            (Some(edges_json), Some(routes_json), Some(required_json)) => {
+                let edges: Vec<OperationRouteEdge> = serde_json::from_str(&edges_json)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: invalid ASTEROIDB_OPERATION_ROUTE_EDGES: {e}");
+                        std::process::exit(1);
+                    });
+                let routes = OperationRouteManifest::from_json(&routes_json, &edges)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: invalid ASTEROIDB_OPERATION_ROUTES: {e}");
+                        std::process::exit(1);
+                    });
+                let required = OperationRequiredDestinations::from_json(&required_json)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: invalid ASTEROIDB_OPERATION_REQUIRED_DESTINATIONS: {e}");
+                        std::process::exit(1);
+                    });
+                Some((routes, required))
+            }
+            _ => {
+                eprintln!(
+                    "error: routed custody requires ASTEROIDB_OPERATION_ROUTE_EDGES, ASTEROIDB_OPERATION_ROUTES and ASTEROIDB_OPERATION_REQUIRED_DESTINATIONS together"
+                );
+                std::process::exit(1);
+            }
+        };
+        let policy_destinations = std::env::var("ASTEROIDB_OPERATION_POLICY_DESTINATIONS")
+            .ok()
+            .map(|json| {
+                OperationRequiredDestinations::from_json(&json).unwrap_or_else(|error| {
+                    eprintln!("error: invalid ASTEROIDB_OPERATION_POLICY_DESTINATIONS: {error}");
+                    std::process::exit(1);
+                })
+            });
+        let policy_routes = policy_route_configuration(
+            std::env::var("ASTEROIDB_OPERATION_POLICY_ROUTE_EDGES")
+                .ok()
+                .as_deref(),
+            std::env::var("ASTEROIDB_OPERATION_POLICY_ROUTES")
+                .ok()
+                .as_deref(),
+            policy_destinations.as_ref(),
+            routed_config.as_ref().map(|(routes, _)| routes),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        });
+        let operation_link = if routed_config.is_some() || policy_destinations.is_some() {
+            let seed = std::env::var("ASTEROIDB_OPERATION_LINK_SEED").unwrap_or_else(|_| {
+                eprintln!("error: routed operation or policy-only delivery requires ASTEROIDB_OPERATION_LINK_SEED");
+                std::process::exit(1);
+            });
+            let keys = std::env::var("ASTEROIDB_OPERATION_LINK_KEYS").unwrap_or_else(|_| {
+                eprintln!("error: routed operation or policy-only delivery requires ASTEROIDB_OPERATION_LINK_KEYS");
+                std::process::exit(1);
+            });
+            Some(
+                OperationLinkAuth::from_manifest(node_id.clone(), &seed, &keys, &neighbors)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: invalid operation link identity: {e}");
+                        std::process::exit(1);
+                    }),
+            )
+        } else {
+            None
+        };
+        if policy_destinations.is_none()
+            && nonempty_directory(&data_dir.join("operation_policy_outbox"))
+        {
+            eprintln!(
+                "error: saved policy-only outbox requires ASTEROIDB_OPERATION_POLICY_DESTINATIONS"
+            );
+            std::process::exit(1);
+        }
+        let outbox = Arc::new(Mutex::new(
+            (if routed_config.is_some() {
+                OperationOutbox::open_routed_for_node(
+                    data_dir.join("operation_outbox"),
+                    node_id.clone(),
+                )
+            } else {
+                OperationOutbox::open_for_node(data_dir.join("operation_outbox"), node_id.clone())
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation outbox recovery failed: {e}");
+                std::process::exit(1);
+            }),
+        ));
+        let routed_operation_mode = routed_config.is_some();
+        if let Err(error) =
+            validate_certificate_state_layout(&data_dir, &certificate_scopes, multi_scope_mode)
+        {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        let scope_keysets = if certificate_scopes.is_empty() {
+            Vec::new()
+        } else {
+            let global_registry = keyset_registry.as_ref().unwrap_or_else(|| {
+                eprintln!("error: operation certificates require trusted Authority keys");
+                std::process::exit(1);
+            });
+            let global_guard = global_registry.read().unwrap_or_else(|_| {
+                eprintln!("error: Authority keyset registry is poisoned");
+                std::process::exit(1);
+            });
+            let namespace_guard = namespace.read().unwrap_or_else(|_| {
+                eprintln!("error: system namespace is poisoned");
+                std::process::exit(1);
+            });
+            preflight_certificate_scopes(
+                &certificate_scopes,
+                &namespace_guard,
+                &global_guard,
+                &owned,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: invalid operation certificate scope: {error}");
+                std::process::exit(1);
+            })
+        };
+        let mounted_namespace = routed_operation_mode.then(|| {
+            OperationInbox::read_mounted_authority_policy_at(&data_dir.join("operation_inbox"))
+                .unwrap_or_else(|error| {
+                    eprintln!("error: saved operation Authority policy recovery failed: {error}");
+                    std::process::exit(1);
+                })
+                .unwrap_or_else(|| {
+                    namespace
+                        .read()
+                        .unwrap_or_else(|_| {
+                            eprintln!("error: system namespace is poisoned");
+                            std::process::exit(1);
+                        })
+                        .clone()
+                })
+        });
+        let mut certificate_capacity_scopes: Vec<(OperationScope, KeysetRegistry)> =
+            certificate_scopes
+                .iter()
+                .zip(&scope_keysets)
+                .map(|(configured, keyset)| {
+                    (
+                        OperationScope {
+                            namespace_id: configured.namespace_id.clone(),
+                            key_prefix: configured.key_prefix.clone(),
+                        },
+                        keyset.clone(),
+                    )
+                })
+                .collect();
+        if let Some(mounted) = &mounted_namespace
+            && !mounted.all_operation_assignments().is_empty()
+        {
+            let global_registry = keyset_registry.as_ref().unwrap_or_else(|| {
+                eprintln!("error: routed operation certificates require trusted Authority keys");
+                std::process::exit(1);
+            });
+            let global_guard = global_registry.read().unwrap_or_else(|_| {
+                eprintln!("error: Authority keyset registry is poisoned");
+                std::process::exit(1);
+            });
+            for assignment in mounted.all_operation_assignments() {
+                let scope = OperationScope {
+                    namespace_id: assignment.namespace_id.clone(),
+                    key_prefix: assignment.policy.key_range.prefix.clone(),
+                };
+                if certificate_capacity_scopes
+                    .iter()
+                    .any(|(known, _)| known == &scope)
+                {
+                    continue;
+                }
+                let scoped =
+                    operation_scope_keyset(&global_guard, &assignment.authority.authority_nodes)
+                        .unwrap_or_else(|error| {
+                            eprintln!("error: invalid operation capacity scope: {error}");
+                            std::process::exit(1);
+                        });
+                certificate_capacity_scopes.push((scope, scoped));
+            }
+        }
+        let admission = Arc::new(
+            AuthenticatedOperationAdmission::new_for_namespaces_with_creation_policy(
+                Arc::clone(&writer_registry),
+                operation_namespace_ids,
+                Arc::clone(&creation_policy),
+            )
+            .with_certificate_capacity_scopes(certificate_capacity_scopes),
+        );
+        let recovered_inbox = OperationInbox::open(data_dir.join("operation_inbox"), admission)
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation inbox recovery failed: {e:?}");
+                std::process::exit(1);
+            });
+        let inbox = Arc::new(Mutex::new(recovered_inbox));
+        let authority_terminals: Vec<_> = if routed_operation_mode && node_signer.is_some() {
+            certificate_scopes
+                .iter()
+                .filter_map(|configured| {
+                    let namespace_snapshot = mounted_namespace.as_ref()?.clone();
+                    let authority_here = namespace_snapshot
+                        .operation_authority_definition(
+                            &configured.namespace_id,
+                            &configured.key_prefix,
+                        )
+                        .is_some_and(|definition| definition.authority_nodes.contains(&node_id));
+                    authority_here.then_some(AuthorityTerminalRole {
+                        namespace: namespace_snapshot,
+                        scope: OperationScope {
+                            namespace_id: configured.namespace_id.clone(),
+                            key_prefix: configured.key_prefix.clone(),
+                        },
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let route_digest = routed_config
+            .as_ref()
+            .map(|(routes, required)| routed_custody_manifest_digest(routes, required, &neighbors))
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("error: invalid operation route manifest: {error}");
+                std::process::exit(1);
+            });
+        let authority_digest = mounted_namespace
+            .as_ref()
+            .map(|mounted| {
+                routed_authority_manifest_digest(&node_id, &authority_terminals, Some(mounted))
+            })
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("error: invalid operation Authority assignment: {error}");
+                std::process::exit(1);
+            });
+        if let Some(policy_required) = &policy_destinations {
+            let routes = policy_routes
+                .as_ref()
+                .expect("policy-only delivery requires routes");
+            OperationPolicyOutbox::verify_pin(
+                data_dir.join("operation_policy_outbox"),
+                &node_id,
+                policy_route_digest(routes, policy_required, &neighbors),
+                operation_link
+                    .as_ref()
+                    .expect("routed configuration has link authentication")
+                    .manifest_digest(),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: policy-only outbox manifest recovery failed: {error}");
+                std::process::exit(1);
+            });
+        }
+        {
+            let inbox_guard = inbox.lock().await;
+            let mut outbox_guard = outbox.lock().await;
+            pin_operation_startup_manifests(
+                &inbox_guard,
+                &mut outbox_guard,
+                Some(creation_policy.digest()),
+                operation_link.as_ref().map(|link| link.manifest_digest()),
+                route_digest,
+                owned.digest(),
+                authority_digest,
+                routed_config.as_ref().map(|(routes, _)| {
+                    (
+                        &neighbors,
+                        routes,
+                        authority_terminals.as_slice(),
+                        mounted_namespace
+                            .as_ref()
+                            .expect("routed mode has a mounted namespace"),
+                    )
+                }),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("error: operation startup manifest recovery failed: {error}");
+                std::process::exit(1);
+            });
+        }
+        if let Some(policy_required) = policy_destinations {
+            let routes = policy_routes
+                .as_ref()
+                .expect("policy-only delivery requires routes");
+            let link = operation_link
+                .as_ref()
+                .expect("routed configuration has link authentication")
+                .clone();
+            let policy_outbox = Arc::new(Mutex::new(
+                OperationPolicyOutbox::open(
+                    data_dir.join("operation_policy_outbox"),
+                    node_id.clone(),
+                    policy_route_digest(routes, &policy_required, &neighbors),
+                    link.manifest_digest(),
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("error: policy-only outbox recovery failed: {error}");
+                    std::process::exit(1);
+                }),
+            ));
+            let policy_relay = PolicyWitnessRelay::new(
+                Arc::clone(&inbox),
+                policy_outbox,
+                neighbors.clone(),
+                owned.clone(),
+                routes.clone(),
+                policy_required,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("error: policy-only delivery reconciliation failed: {error}");
+                std::process::exit(1);
+            });
+            app = app.merge(policy_witness_submit_router(policy_relay.clone()));
+            app = app.merge(policy_witness_router_authenticated(
+                policy_relay.clone(),
+                token.clone(),
+                link.clone(),
+            ));
+            operation_policy_retry = Some((policy_relay, token.clone(), link));
+        }
+        // A reclaimed local origin may also have been this node's Authority
+        // signing input. Verify durable root/admission logs and seed the
+        // inbox's exact issuance witnesses before relay startup examines its
+        // root tombstones. The workers remain locked and are attached to
+        // certificate states below.
+        let mut preopened_authorities = Vec::with_capacity(certificate_scopes.len());
+        for (configured, scoped_registry) in certificate_scopes.iter().zip(&scope_keysets) {
+            let Some(signer) = node_signer.as_ref() else {
+                preopened_authorities.push(None);
+                continue;
+            };
+            let namespace_snapshot = namespace
+                .read()
+                .unwrap_or_else(|_| {
+                    eprintln!("error: system namespace is poisoned");
+                    std::process::exit(1);
+                })
+                .clone();
+            let scope = OperationScope {
+                namespace_id: configured.namespace_id.clone(),
+                key_prefix: configured.key_prefix.clone(),
+            };
+            let authority_here = namespace_snapshot
+                .operation_authority_definition(&scope.namespace_id, &scope.key_prefix)
+                .is_some_and(|definition| definition.authority_nodes.contains(&node_id));
+            if !authority_here {
+                preopened_authorities.push(None);
+                continue;
+            }
+            let worker_dir = if multi_scope_mode {
+                certificate_scope_root(&data_dir, &configured.namespace_id, &configured.key_prefix)
+                    .join("operation_authority")
+            } else {
+                data_dir.join("operation_authority")
+            };
+            let keyset_snapshot = scoped_registry.clone();
+            let keyset_version = keyset_snapshot.current_version();
+            let worker = OperationAuthorityWorker::open_with_creation_policy(
+                worker_dir,
+                namespace_snapshot,
+                configured.namespace_id.clone(),
+                scope,
+                Arc::clone(signer),
+                Arc::clone(&writer_registry),
+                Some(Arc::clone(&creation_policy)),
+                Arc::new(keyset_snapshot),
+                keyset_version,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation Authority recovery failed: {e}");
+                std::process::exit(1);
+            });
+            {
+                let mut guard = inbox.lock().await;
+                worker
+                    .seed_verified_local_issuance(&mut guard)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: operation Authority issuance recovery failed: {e}");
+                        std::process::exit(1);
+                    });
+            }
+            preopened_authorities.push(Some(worker));
+        }
+        let relay = match routed_config {
+            Some((routes, required)) => {
+                OperationRelay::new_routed_with_authorities_and_policy(
+                    inbox,
+                    Arc::clone(&outbox),
+                    neighbors.clone(),
+                    owned.clone(),
+                    routes,
+                    required,
+                    authority_terminals,
+                    mounted_namespace.expect("routed mode has a mounted namespace"),
+                    Arc::clone(&namespace),
+                )
+                .await
+            }
+            None => {
+                OperationRelay::new(inbox, Arc::clone(&outbox), neighbors.clone(), owned.clone())
+                    .await
+            }
+        }
+        .unwrap_or_else(|e| {
+            eprintln!("error: operation delivery reconciliation failed: {e}");
+            std::process::exit(1);
+        });
+        let certificate_inbox = relay.inbox();
+        let submit_relay = relay.clone();
+        let mut certificate_states = Vec::new();
+        // This also exposes public ordinary reads over the same owned inbox.
+        app = app.merge(submit_router(relay.clone()));
+        app = app.merge(match &operation_link {
+            Some(link) => relay_router_authenticated(relay, token.clone(), link.clone()),
+            None => relay_router(relay, token.clone()),
+        });
+        for (index, (configured, scoped_registry)) in certificate_scopes
+            .into_iter()
+            .zip(scope_keysets)
+            .enumerate()
+        {
+            let scope_namespace_id = configured.namespace_id;
+            let prefix = configured.key_prefix;
+            let faults = configured.faults;
+            let scope_root = multi_scope_mode
+                .then(|| certificate_scope_root(&data_dir, &scope_namespace_id, &prefix));
+            let scope_dir = |legacy: &str| {
+                scope_root
+                    .as_ref()
+                    .map_or_else(|| data_dir.join(legacy), |root| root.join(legacy))
+            };
+            let scope = OperationScope {
+                namespace_id: scope_namespace_id.clone(),
+                key_prefix: prefix,
+            };
+            let trusted_registry = Arc::new(std::sync::RwLock::new(scoped_registry));
+            let store = {
+                let keyset_guard = trusted_registry.read().unwrap_or_else(|_| {
+                    eprintln!("error: Authority keyset registry is poisoned");
+                    std::process::exit(1);
+                });
+                let namespace_guard = namespace.read().unwrap_or_else(|_| {
+                    eprintln!("error: system namespace is poisoned");
+                    std::process::exit(1);
+                });
+                let policy_digest =
+                    static_read_trust_digest(&namespace_guard, &scope, &keyset_guard, &owned)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: invalid static operation Authority scope: {e}");
+                            std::process::exit(1);
+                        });
+                let verifier = EvidenceVerifier {
+                    registry: &keyset_guard,
+                    scope: &scope,
+                    current_epoch: 0,
+                    epoch_config: &epoch_config,
+                    faults,
+                };
+                StaticOperationEvidenceStore::open(
+                    scope_dir("operation_evidence"),
+                    &verifier,
+                    policy_digest,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("error: operation evidence recovery failed: {e}");
+                    std::process::exit(1);
+                })
+            };
+            let supports = {
+                let keyset_guard = trusted_registry.read().unwrap_or_else(|_| {
+                    eprintln!("error: Authority keyset registry is poisoned");
+                    std::process::exit(1);
+                });
+                asteroidb_poc::authority::operation_support_store::OperationSupportStore::open(
+                    scope_dir("operation_supports"),
+                    &keyset_guard,
+                    &scope,
+                    &epoch_config,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("error: operation support recovery failed: {e}");
+                    std::process::exit(1);
+                })
+            };
+            supports
+                .check_neighbor_manifest(neighbors.digest())
+                .unwrap_or_else(|e| {
+                    eprintln!("error: operation support neighbor recovery failed: {e}");
+                    std::process::exit(1);
+                });
+            if let Some(root) = &scope_root {
+                pin_certificate_scope_used(&data_dir, root).unwrap_or_else(|error| {
+                    eprintln!("error: certificate scope marker failed: {error}");
+                    std::process::exit(1);
+                });
+            }
+            {
+                let inbox = certificate_inbox.lock().await;
+                for receipt in supports.compact_receipts() {
+                    if inbox.receipt(&receipt.subject).as_ref() != Some(receipt) {
+                        eprintln!(
+                            "error: compact operation support differs from authenticated ledger receipt"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let mut support_outbox = SupportOutbox::open(scope_dir("operation_support_outbox"))
+                .unwrap_or_else(|e| {
+                    eprintln!("error: operation support outbox recovery failed: {e}");
+                    std::process::exit(1);
+                });
+            if let Some(link) = &operation_link {
+                support_outbox
+                    .ensure_link_manifest(link.manifest_digest())
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: operation support link identity recovery failed: {e}");
+                        std::process::exit(1);
+                    });
+            }
+            for (operation, support) in supports.packets() {
+                let packet = asteroidb_poc::network::operation_support_transport::SupportPacket {
+                    operation,
+                    support,
+                };
+                for addr in neighbors.permitted_addrs_for(
+                    &packet.operation.operation.subject.namespace_id,
+                    &packet.operation.declaration.key,
+                ) {
+                    support_outbox
+                        .ensure_enqueued(addr, packet.clone())
+                        .unwrap_or_else(|e| {
+                            eprintln!(
+                                "error: operation support delivery reconciliation failed: {e}"
+                            );
+                            std::process::exit(1);
+                        });
+                }
+            }
+            let support_outbox = Arc::new(Mutex::new(support_outbox));
+            let mut store = store;
+            for subject in supports.subjects() {
+                let certificate = supports
+                    .assemble_certificate(subject, faults)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: operation support assembly failed: {e}");
+                        std::process::exit(1);
+                    });
+                if let Some(certificate) = certificate {
+                    let keyset_guard = trusted_registry.read().unwrap_or_else(|_| {
+                        eprintln!("error: Authority keyset registry is poisoned");
+                        std::process::exit(1);
+                    });
+                    let namespace_guard = namespace.read().unwrap_or_else(|_| {
+                        eprintln!("error: system namespace is poisoned");
+                        std::process::exit(1);
+                    });
+                    let digest =
+                        static_read_trust_digest(&namespace_guard, &scope, &keyset_guard, &owned)
+                            .unwrap_or_else(|e| {
+                                eprintln!("error: invalid static operation Authority scope: {e}");
+                                std::process::exit(1);
+                            });
+                    let verifier = EvidenceVerifier {
+                        registry: &keyset_guard,
+                        scope: &scope,
+                        current_epoch: 0,
+                        epoch_config: &epoch_config,
+                        faults,
+                    };
+                    store
+                        .record_and_sync(certificate, &verifier, digest)
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: operation evidence reconciliation failed: {e}");
+                            std::process::exit(1);
+                        });
+                }
+            }
+            let certificate_outbox = CertificateOutbox::open(scope_dir(
+                "operation_certificate_outbox",
+            ))
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation certificate outbox recovery failed: {e}");
+                std::process::exit(1);
+            });
+            if let Some(link) = &operation_link {
+                certificate_outbox
+                    .ensure_link_manifest(link.manifest_digest())
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "error: operation certificate link identity recovery failed: {e}"
+                        );
+                        std::process::exit(1);
+                    });
+            }
+            let certificate_outbox = Arc::new(Mutex::new(certificate_outbox));
+            let certificate_state = OperationCertificateState {
+                inbox: Arc::clone(&certificate_inbox),
+                store: Arc::new(Mutex::new(store)),
+                supports: Arc::new(Mutex::new(supports)),
+                support_outbox: Arc::clone(&support_outbox),
+                certificate_outbox: Arc::clone(&certificate_outbox),
+                neighbors: neighbors.clone(),
+                owned: owned.clone(),
+                registry: Arc::clone(&trusted_registry),
+                namespace: Arc::clone(&namespace),
+                scope: scope.clone(),
+                epoch_config: epoch_config.clone(),
+                faults,
+                link_auth: operation_link.clone(),
+            };
+            let startup_reconcile = certificate_state.clone();
+            tokio::task::spawn_blocking(move || {
+                startup_reconcile.reconcile_evidence_delivery_blocking()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation evidence delivery reconciliation task failed: {e}");
+                std::process::exit(1);
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("error: operation evidence delivery reconciliation failed: {e}");
+                std::process::exit(1);
+            });
+            if routed_operation_mode {
+                let gc_state = certificate_state.clone();
+                let gc_relay = submit_relay.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        let state = gc_state.clone();
+                        let relay = gc_relay.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            state.compact_ledger_bodies_blocking(&relay)
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => eprintln!("operation ledger GC failed: {error}"),
+                            Err(error) => eprintln!("operation ledger GC task failed: {error}"),
+                        }
+                    }
+                });
+            }
+            if let Some(worker) = preopened_authorities[index].take() {
+                operation_authority.push((
+                    worker,
+                    certificate_state.clone(),
+                    neighbors.clone(),
+                    Arc::clone(&support_outbox),
+                    routed_operation_mode,
+                ));
+            }
+            operation_support_retry.push((support_outbox, token.clone(), operation_link.clone()));
+            operation_certificate_retry.push((
+                certificate_outbox,
+                token.clone(),
+                operation_link.clone(),
+                certificate_state.clone(),
+            ));
+            certificate_states.push(certificate_state);
+        }
+        let view_certificates = if certificate_states.is_empty() {
+            app = app.merge(public_operation_uncertified_router(submit_relay.clone()));
+            None
+        } else {
+            let states =
+                MultiOperationCertificateState::new(certificate_states).unwrap_or_else(|error| {
+                    eprintln!("error: invalid operation certificate scopes: {error}");
+                    std::process::exit(1);
+                });
+            app = app.merge(multi_certified_submit_router(
+                submit_relay.clone(),
+                states.clone(),
+            ));
+            app = app.merge(multi_public_operation_status_router(states.clone()));
+            app = app.merge(multi_certificate_router(states.clone(), token.clone()));
+            Some(states)
+        };
+        app = app.merge(unified_operation_view_router_multi(
+            submit_relay.clone(),
+            view_certificates,
+        ));
+        operation_retry = Some((outbox, submit_relay.clone(), token, operation_link));
+    }
+    if operation_retry.is_none()
+        && (std::env::var("ASTEROIDB_OPERATION_CERT_SCOPE_PREFIX").is_ok()
+            || std::env::var("ASTEROIDB_OPERATION_CERT_FAULTS").is_ok()
+            || std::env::var("ASTEROIDB_OPERATION_CERT_SCOPES").is_ok())
+    {
+        eprintln!("error: operation certificates require ASTEROIDB_WRITER_KEYS");
+        std::process::exit(1);
+    }
+    if operation_retry.is_none() && std::env::var("ASTEROIDB_OPERATION_CREATION_POLICY").is_ok() {
+        eprintln!("error: operation creation policy requires ASTEROIDB_WRITER_KEYS");
+        std::process::exit(1);
+    }
 
     // Ops kill switch for digest-based anti-entropy: when set, the sync
     // loop skips the digest probe and uses the legacy full-sync fallbacks
@@ -962,17 +2270,6 @@ async fn main() {
             .unwrap_or(300),
     );
 
-    // Stage 2 tombstone-GC hole-jump (default off, fail-closed). Enable
-    // only after a Stage 1 soak: `gc_floor_stalled_hole_dots`
-    // persisting non-zero identifies legacy holes the pre-floor sweep
-    // left behind — see docs/ops-guide.md for the procedure.
-    let gc_hole_jump_enabled = std::env::var("ASTEROIDB_GC_HOLE_JUMP")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true"
-        })
-        .unwrap_or(false);
-
     // Ops kill switch for the store-digest frontier report format (M-12):
     // when set to 0/false, authority reports keep the legacy placeholder
     // digest_hash. Takes effect on restart, which is safe by construction —
@@ -986,6 +2283,7 @@ async fn main() {
         .unwrap_or(false);
 
     let runner_config = NodeRunnerConfig {
+        legacy_data_plane_enabled: !operation_mode,
         bls_config,
         node_signer,
         keyset_registry,
@@ -999,7 +2297,6 @@ async fn main() {
         digest_sync_enabled,
         certified_sync_enabled,
         gc_retention,
-        gc_hole_jump_enabled,
         frontier_store_digest,
         // Write-ahead floor for frontier report HLCs (M-12): lives next to
         // the other node state; without it the store-digest format never
@@ -1074,6 +2371,199 @@ async fn main() {
 
     let shutdown_handle = runner.shutdown_handle();
 
+    if let Some((outbox, relay, token, link)) = operation_retry {
+        spawn_operation_retry_worker_with_auth(
+            outbox,
+            token.clone(),
+            link.clone(),
+            shutdown_handle.subscribe(),
+        );
+        spawn_operation_completion_worker_with_auth(
+            relay,
+            token,
+            link,
+            shutdown_handle.subscribe(),
+        );
+    }
+    if let Some((relay, token, link)) = operation_policy_retry {
+        spawn_policy_witness_retry_worker(relay, token, link, shutdown_handle.subscribe());
+    }
+    for (support_outbox, token, link) in operation_support_retry {
+        spawn_support_retry_worker_with_auth(
+            support_outbox,
+            token,
+            link,
+            shutdown_handle.subscribe(),
+        );
+    }
+    for (certificate_outbox, token, link, state) in operation_certificate_retry {
+        spawn_certificate_retry_worker_with_auth(
+            certificate_outbox,
+            token,
+            link,
+            shutdown_handle.subscribe(),
+        );
+        let mut shutdown = shutdown_handle.subscribe();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => {
+                        if *shutdown.borrow() { break; }
+                        let state = state.clone();
+                        match tokio::task::spawn_blocking(move || state.reconcile_evidence_delivery_blocking()).await {
+                            Ok(Ok(())) => {}
+                            other => tracing::warn!(error = ?other, "operation evidence delivery reconciliation failed"),
+                        }
+                    }
+                }
+            }
+        });
+    }
+    for (worker, certificate_state, neighbors, support_outbox, routed) in operation_authority {
+        let mut shutdown = shutdown_handle.subscribe();
+        tokio::spawn(async move {
+            let recovery = worker.recovery_config();
+            let mut worker = Some(worker);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ticks = 0u64;
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => {
+                        if worker.is_none() {
+                            let config = recovery.clone();
+                            match tokio::task::spawn_blocking(move || config.open()).await {
+                                Ok(Ok(recovered)) => worker = Some(recovered),
+                                Ok(Err(error)) => {
+                                    eprintln!("error: operation Authority recovery failed; retrying: {error}");
+                                    continue;
+                                }
+                                Err(error) => {
+                                    eprintln!("error: operation Authority recovery task failed; retrying: {error}");
+                                    continue;
+                                }
+                            }
+                        }
+                        let mut current = worker.take().expect("Authority worker was recovered");
+                        let state = certificate_state.clone();
+                        let gc_neighbors = neighbors.clone();
+                        let gc_due = ticks.is_multiple_of(30);
+                        ticks = ticks.wrapping_add(1);
+                        let result = tokio::task::spawn_blocking(move || {
+                            let pass = (|| -> Result<_, OperationAuthorityPassError> {
+                                state.check_authority_trust_blocking().map_err(|error| match error {
+                                    AuthorityTrustCheckError::Retryable(message) => OperationAuthorityPassError::RetryableShared(message),
+                                    AuthorityTrustCheckError::Permanent(message) => OperationAuthorityPassError::Shared(message),
+                                })?;
+                                {
+                                    let mut inbox = state.inbox.blocking_lock();
+                                    if routed {
+                                        current.reconcile_routed(&mut inbox).map_err(|e| OperationAuthorityPassError::Worker(e.to_string()))?;
+                                    } else {
+                                        current.reconcile(&mut inbox).map_err(|e| OperationAuthorityPassError::Worker(e.to_string()))?;
+                                    }
+                                }
+                                let packets: Vec<_> = current.issued_supports().collect();
+                                for packet in &packets {
+                                    state.record_authority_support_blocking(packet.clone())
+                                        .map_err(|error| match error {
+                                            AuthorityTrustCheckError::Retryable(message) => OperationAuthorityPassError::RetryableShared(message),
+                                            AuthorityTrustCheckError::Permanent(message) => OperationAuthorityPassError::Shared(message),
+                                        })?;
+                                }
+                                if gc_due {
+                                    let receipts: Vec<_> = packets
+                                        .iter()
+                                        .map(|packet| asteroidb_poc::operation::OperationReceipt::from(&packet.operation))
+                                        .collect();
+                                    let verified = state.verified_receipt_subjects_blocking(&receipts)
+                                        .map_err(|error| match error {
+                                            AuthorityTrustCheckError::Retryable(message) => OperationAuthorityPassError::Gc(message),
+                                            AuthorityTrustCheckError::Permanent(message) => OperationAuthorityPassError::Shared(message),
+                                        })?;
+                                    let outbox = state.support_outbox.blocking_lock();
+                                    let mut releasable: Vec<_> = packets
+                                        .iter()
+                                        .zip(receipts)
+                                        .filter_map(|(packet, receipt)| {
+                                            (verified.contains(&receipt.subject)
+                                                && gc_neighbors
+                                                    .permitted_for(&receipt.subject.namespace_id, &receipt.declaration.key)
+                                                    .all(|neighbor| outbox.has_durable_receipt(&neighbor.addr, packet)))
+                                            .then_some(receipt)
+                                        })
+                                        .collect();
+                                    drop(outbox);
+                                    releasable.extend(current.retired_receipts().map_err(|e| OperationAuthorityPassError::Worker(e.to_string()))?);
+                                    if !releasable.is_empty() {
+                                        state.pin_support_neighbor_manifest_blocking()
+                                            .map_err(|error| match error {
+                                                AuthorityTrustCheckError::Retryable(message) => OperationAuthorityPassError::Gc(message),
+                                                AuthorityTrustCheckError::Permanent(message) => OperationAuthorityPassError::Shared(message),
+                                            })?;
+                                        current.compact_issued_receipted_and_sync(&releasable)
+                                            .map_err(|e| OperationAuthorityPassError::Worker(e.to_string()))?;
+                                    }
+                                }
+                                Ok(packets)
+                            })();
+                            (current, pass)
+                        }).await;
+                        let packets = match result {
+                            Ok((recovered_worker, Ok(packets))) => {
+                                worker = Some(recovered_worker);
+                                packets
+                            }
+                            Ok((failed_worker, Err(OperationAuthorityPassError::Worker(error)))) => {
+                                drop(failed_worker);
+                                eprintln!("error: operation Authority worker failed; reopening: {error}");
+                                continue;
+                            }
+                            Ok((failed_worker, Err(OperationAuthorityPassError::RetryableShared(error)))) => {
+                                drop(failed_worker);
+                                eprintln!("error: operation Authority shared state unavailable; retrying: {error}");
+                                continue;
+                            }
+                            Ok((failed_worker, Err(OperationAuthorityPassError::Gc(error)))) => {
+                                drop(failed_worker);
+                                eprintln!("error: operation Authority GC check failed; retrying: {error}");
+                                continue;
+                            }
+                            Ok((failed_worker, Err(OperationAuthorityPassError::Shared(error)))) => {
+                                drop(failed_worker);
+                                eprintln!("error: operation Authority shared state failed; worker stopped: {error}");
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!("error: operation Authority worker panicked: {error}");
+                                break;
+                            }
+                        };
+                        let mut outbox = support_outbox.lock().await;
+                        for packet in packets {
+                            for addr in neighbors.permitted_addrs_for(
+                                &packet.operation.operation.subject.namespace_id,
+                                &packet.operation.declaration.key,
+                            ) {
+                                if let Err(error) = outbox.ensure_enqueued(addr, packet.clone()) {
+                                    eprintln!("error: operation support enrollment failed; retrying: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Control-plane Raft driver: randomized election timer + heartbeats,
     // as an independent task (NodeRunner's select! stays clean), linked to
     // the runner's shutdown channel. No special shutdown persistence is
@@ -1085,13 +2575,15 @@ async fn main() {
 
     // Background persistence: WAL group-commit flushers + periodic
     // checkpoints (snapshot, then prune sealed WAL segments).
-    asteroidb_poc::runtime::persistence::spawn_persistence_tasks(
-        persistence_cfg.clone(),
-        Arc::clone(&eventual_api),
-        Arc::clone(&certified_api),
-        eventual_wal_syncer,
-        certified_wal_syncer,
-    );
+    if !operation_mode {
+        asteroidb_poc::runtime::persistence::spawn_persistence_tasks(
+            persistence_cfg.clone(),
+            Arc::clone(&eventual_api),
+            Arc::clone(&certified_api),
+            eventual_wal_syncer,
+            certified_wal_syncer,
+        );
+    }
 
     // Bind the TCP listener.
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -1164,12 +2656,11 @@ async fn main() {
             // only removes sealed segments), and in-flight HTTP handlers
             // can still append records after this point (no
             // with_graceful_shutdown yet, see the TODO above). WAL format
-            // upgrades therefore require the new binary to read the old
-            // format (versioned decode arm — see the WAL_FORMAT_VERSION
-            // maintainer warning); a graceful shutdown alone is not a
-            // format-upgrade path. Failures are non-fatal — the WAL
-            // already holds everything a restart needs.
-            if persistence_cfg.enabled {
+            // upgrades cannot rely on graceful shutdown alone. An older
+            // experimental WAL format is rejected on restart; moving its
+            // data requires an explicit migration. Checkpoint failures
+            // are non-fatal because the current WAL still holds the data.
+            if persistence_cfg.enabled && !operation_mode {
                 if let Err(e) = asteroidb_poc::runtime::persistence::checkpoint_eventual(
                     &eventual_api,
                     &persistence_cfg,
@@ -1199,6 +2690,481 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_mode_ignores_damaged_old_data_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eventual.snapshot.bin"), b"damaged").unwrap();
+        std::fs::write(dir.path().join("certified.snapshot.bin"), b"damaged").unwrap();
+        let mut config = PersistenceConfig::from_env(dir.path().to_path_buf());
+        config.enabled = true;
+        let node = NodeId("node-1".into());
+        let namespace = Arc::new(RwLock::new(SystemNamespace::new()));
+
+        let (_, certified_syncer) =
+            open_old_certified_for_mode(node.clone(), Arc::clone(&namespace), &config, true)
+                .unwrap();
+        let (_, eventual_syncer) = open_old_eventual_for_mode(node.clone(), &config, true).unwrap();
+        assert!(certified_syncer.is_none());
+        assert!(eventual_syncer.is_none());
+        assert!(open_old_certified_for_mode(node.clone(), namespace, &config, false).is_err());
+        assert!(open_old_eventual_for_mode(node, &config, false).is_err());
+    }
+
+    #[test]
+    fn operation_mode_requires_a_valid_creation_policy_manifest() {
+        assert!(required_operation_creation_policy(None).is_err());
+        assert!(required_operation_creation_policy(Some("{}")).is_err());
+        let manifest = r#"{"version":1,"ranges":[{"namespace_id":"ns","key_prefix":"","default_mode":"Disabled","override_writers":[]}]}"#;
+        assert!(required_operation_creation_policy(Some(manifest)).is_ok());
+    }
+
+    #[test]
+    fn policy_routes_can_be_configured_without_routed_data_delivery() {
+        let destinations =
+            OperationRequiredDestinations::from_json(r#"[{"key_prefix":"","destinations":["c"]}]"#)
+                .unwrap();
+        let edges = r#"[{"source":"a","receiver":"b","key_prefixes":[""]},
+                        {"source":"b","receiver":"c","key_prefixes":[""]}]"#;
+        let rows = r#"[{"source":"a","destination":"c","key_prefix":"","next_hop":"b","rank":2},
+                       {"source":"b","destination":"c","key_prefix":"","next_hop":"c","rank":1}]"#;
+        let routes = policy_route_configuration(Some(edges), Some(rows), Some(&destinations), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(routes.rows().len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let inbox =
+            OperationInbox::open(dir.path().join("inbox"), Arc::new(PermitOperation)).unwrap();
+        let mut outbox =
+            OperationOutbox::open_for_node(dir.path().join("outbox"), NodeId("a".into())).unwrap();
+        assert!(!outbox.is_routed());
+        pin_operation_startup_manifests(
+            &inbox,
+            &mut outbox,
+            Some([1; 32]),
+            Some([2; 32]),
+            None,
+            [3; 32],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(inbox.verify_link_manifest([2; 32]).is_ok());
+        assert!(outbox.verify_link_manifest([2; 32]).is_ok());
+        assert!(outbox.verify_link_manifest([4; 32]).is_err());
+        assert!(policy_route_configuration(None, None, Some(&destinations), None).is_err());
+        assert!(policy_route_configuration(Some(edges), None, Some(&destinations), None).is_err());
+        assert!(policy_route_configuration(Some(edges), Some(rows), None, None).is_err());
+    }
+
+    struct PermitOperation;
+
+    impl asteroidb_poc::network::operation_transport::OperationAdmission for PermitOperation {
+        fn admit(
+            &self,
+            _: &asteroidb_poc::authority::writer_auth::SignedBoundOperation,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn route_repin_checks_other_pins_before_mutating_pristine_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox_dir = dir.path().join("inbox");
+        let outbox_dir = dir.path().join("outbox");
+        let inbox = OperationInbox::open(&inbox_dir, Arc::new(PermitOperation)).unwrap();
+        let mut outbox =
+            OperationOutbox::open_routed_for_node(&outbox_dir, NodeId("a".into())).unwrap();
+        outbox.ensure_routed_manifest([1; 32]).unwrap();
+        inbox.ensure_owned_manifest([7; 32]).unwrap();
+        inbox.ensure_authority_manifest([8; 32]).unwrap();
+
+        assert!(
+            pin_operation_startup_manifests(
+                &inbox,
+                &mut outbox,
+                Some([3; 32]),
+                Some([4; 32]),
+                Some([2; 32]),
+                [5; 32],
+                Some([6; 32]),
+                None,
+            )
+            .is_err()
+        );
+        outbox.verify_routed_manifest([1; 32]).unwrap();
+        assert!(!inbox_dir.join(".creation-policy-manifest").exists());
+        assert!(!inbox_dir.join(".link-manifest").exists());
+        assert!(!outbox_dir.join(".link-manifest").exists());
+
+        assert!(
+            pin_operation_startup_manifests(
+                &inbox,
+                &mut outbox,
+                Some([3; 32]),
+                Some([4; 32]),
+                Some([1; 32]),
+                [5; 32],
+                Some([8; 32]),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            pin_operation_startup_manifests(
+                &inbox,
+                &mut outbox,
+                Some([3; 32]),
+                Some([4; 32]),
+                Some([1; 32]),
+                [7; 32],
+                Some([6; 32]),
+                None,
+            )
+            .is_err()
+        );
+        assert!(!inbox_dir.join(".creation-policy-manifest").exists());
+        assert!(!inbox_dir.join(".link-manifest").exists());
+        assert!(!outbox_dir.join(".link-manifest").exists());
+
+        pin_operation_startup_manifests(
+            &inbox,
+            &mut outbox,
+            Some([3; 32]),
+            Some([4; 32]),
+            Some([2; 32]),
+            [7; 32],
+            Some([8; 32]),
+            None,
+        )
+        .unwrap();
+        outbox.verify_routed_manifest([2; 32]).unwrap();
+        assert!(inbox_dir.join(".creation-policy-manifest").exists());
+        assert!(inbox_dir.join(".link-manifest").exists());
+        assert!(outbox_dir.join(".link-manifest").exists());
+    }
+
+    #[test]
+    fn invalid_local_route_does_not_leave_new_startup_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox_dir = dir.path().join("inbox");
+        let outbox_dir = dir.path().join("outbox");
+        let inbox = OperationInbox::open(&inbox_dir, Arc::new(PermitOperation)).unwrap();
+        let mut outbox =
+            OperationOutbox::open_routed_for_node(&outbox_dir, NodeId("a".into())).unwrap();
+        let edges = [
+            OperationRouteEdge {
+                source: NodeId("a".into()),
+                receiver: NodeId("b".into()),
+                namespace_id: None,
+                key_prefixes: vec!["x".into()],
+            },
+            OperationRouteEdge {
+                source: NodeId("b".into()),
+                receiver: NodeId("c".into()),
+                namespace_id: None,
+                key_prefixes: vec!["x".into()],
+            },
+        ];
+        let routes = OperationRouteManifest::from_json(
+            r#"[{"source":"a","destination":"c","key_prefix":"x","next_hop":"b","rank":2},{"source":"b","destination":"c","key_prefix":"x","next_hop":"c","rank":1}]"#,
+            &edges,
+        )
+        .unwrap();
+        let neighbors = OperationNeighborManifest::from_json(
+            r#"[{"node_id":"b","addr":"127.0.0.1:8001","key_prefixes":["y"]}]"#,
+            &NodeId("a".into()),
+        )
+        .unwrap();
+        assert!(
+            pin_operation_startup_manifests(
+                &inbox,
+                &mut outbox,
+                Some([3; 32]),
+                Some([4; 32]),
+                Some([1; 32]),
+                [5; 32],
+                Some([6; 32]),
+                Some((&neighbors, &routes, &[], &SystemNamespace::new())),
+            )
+            .is_err()
+        );
+        assert!(!inbox_dir.join(".creation-policy-manifest").exists());
+        assert!(!inbox_dir.join(".link-manifest").exists());
+        assert!(!outbox_dir.join(".link-manifest").exists());
+    }
+
+    #[test]
+    fn certificate_scope_config_allows_nested_ranges_and_rejects_duplicates() {
+        let valid = r#"[{"key_prefix":"orders/","faults":1},{"key_prefix":"users/","faults":0}]"#;
+        let (scopes, multi) = parse_certificate_scopes(Some(valid), None, None, "n").unwrap();
+        assert!(multi);
+        assert_eq!(scopes.len(), 2);
+        assert!(parse_certificate_scopes(Some(valid), Some("orders/"), Some("1"), "n").is_err());
+        assert!(
+            parse_certificate_scopes(
+                Some(
+                    r#"[{"key_prefix":"orders/","faults":1},{"key_prefix":"orders/x","faults":0}]"#
+                ),
+                None,
+                None,
+                "n",
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_certificate_scopes(
+                Some(
+                    r#"[{"key_prefix":"orders/","faults":1},{"key_prefix":"orders/","faults":0}]"#
+                ),
+                None,
+                None,
+                "n",
+            )
+            .is_err()
+        );
+        let (scopes, _) = parse_certificate_scopes(
+            Some(r#"[{"namespace_id":"n","key_prefix":"orders/","faults":1},{"namespace_id":"m","key_prefix":"orders/","faults":0}]"#),
+            None,
+            None,
+            "n",
+        )
+        .unwrap();
+        assert_eq!(scopes[1].namespace_id, "m");
+        assert!(parse_certificate_scopes(Some("[]"), None, None, "n").is_err());
+        let (_, multi) = parse_certificate_scopes(None, Some("orders/"), Some("1"), "n").unwrap();
+        assert!(!multi);
+        assert!(parse_certificate_scopes(None, None, Some("1"), "n").is_err());
+    }
+
+    #[test]
+    fn certificate_scope_directory_is_stable_and_distinct() {
+        let base = std::path::Path::new("/tmp/operation-cert-test");
+        assert_eq!(
+            certificate_scope_root(base, "n", "orders/"),
+            certificate_scope_root(base, "n", "orders/")
+        );
+        assert_ne!(
+            certificate_scope_root(base, "n", "orders/"),
+            certificate_scope_root(base, "n", "users/")
+        );
+        assert_ne!(
+            certificate_scope_root(base, "n", "orders/"),
+            certificate_scope_root(base, "m", "orders/")
+        );
+    }
+
+    #[test]
+    fn saved_certificate_scopes_cannot_be_silently_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let order = ConfiguredCertificateScope {
+            namespace_id: "n".into(),
+            key_prefix: "orders/".into(),
+            faults: 0,
+        };
+        let user = ConfiguredCertificateScope {
+            namespace_id: "n".into(),
+            key_prefix: "users/".into(),
+            faults: 0,
+        };
+        let saved = certificate_scope_root(temp.path(), "n", &user.key_prefix);
+        std::fs::create_dir_all(saved.join("operation_evidence")).unwrap();
+        std::fs::write(saved.join("operation_evidence/state"), b"saved").unwrap();
+        assert!(
+            validate_certificate_state_layout(temp.path(), std::slice::from_ref(&order), true)
+                .is_err()
+        );
+        assert!(
+            validate_certificate_state_layout(temp.path(), &[order.clone(), user], true).is_ok()
+        );
+        assert!(validate_certificate_state_layout(temp.path(), &[order], false).is_err());
+        assert!(validate_certificate_state_layout(temp.path(), &[], false).is_err());
+    }
+
+    #[test]
+    fn marked_certificate_scope_cannot_restart_after_parent_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = ConfiguredCertificateScope {
+            namespace_id: "n".into(),
+            key_prefix: "orders/".into(),
+            faults: 0,
+        };
+        let root = certificate_scope_root(temp.path(), &scope.namespace_id, &scope.key_prefix);
+        std::fs::create_dir_all(root.join("operation_evidence")).unwrap();
+        std::fs::write(root.join("operation_evidence/state"), b"saved").unwrap();
+        pin_certificate_scope_used(temp.path(), &root).unwrap();
+        assert!(
+            validate_certificate_state_layout(temp.path(), std::slice::from_ref(&scope), true)
+                .is_ok()
+        );
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        assert!(
+            validate_certificate_state_layout(temp.path(), std::slice::from_ref(&scope), true)
+                .is_err()
+        );
+        assert!(validate_certificate_state_layout(temp.path(), &[], true).is_err());
+    }
+
+    #[test]
+    fn missing_single_scope_state_directory_keeps_its_saved_layout() {
+        for (marker, bytes) in [
+            (
+                ".operation_supports.operation-supports.used",
+                b"ASTOS-USED-1".as_slice(),
+            ),
+            (
+                ".operation_authority.operation-authority.used",
+                b"ASTAUTH-USED-1".as_slice(),
+            ),
+            (".operation-evidence-deadbeef.used", b"".as_slice()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join(marker), bytes).unwrap();
+            let scope = ConfiguredCertificateScope {
+                namespace_id: "n".into(),
+                key_prefix: "orders/".into(),
+                faults: 0,
+            };
+            assert!(validate_certificate_state_layout(temp.path(), &[], false).is_err());
+            assert!(validate_certificate_state_layout(temp.path(), &[scope], true).is_err());
+        }
+    }
+
+    #[test]
+    fn operation_scopes_select_independent_authority_keysets() {
+        let mut global = KeysetRegistry::new();
+        let keys = ["a", "b", "c"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                (
+                    NodeId(id.into()),
+                    ed25519_dalek::SigningKey::from_bytes(&[(index + 1) as u8; 32]).verifying_key(),
+                )
+            })
+            .collect();
+        global.register_keyset(KeysetVersion(1), 0, keys).unwrap();
+        let first =
+            operation_scope_keyset(&global, &[NodeId("a".into()), NodeId("b".into())]).unwrap();
+        let second = operation_scope_keyset(&global, &[NodeId("c".into())]).unwrap();
+        assert_eq!(first.get_keys(&KeysetVersion(1)).unwrap().len(), 2);
+        assert_eq!(second.get_keys(&KeysetVersion(1)).unwrap().len(), 1);
+        assert!(operation_scope_keyset(&global, &[NodeId("missing".into())]).is_err());
+        assert!(
+            operation_scope_keyset(&global, &[NodeId("a".into()), NodeId("a".into())]).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_certificate_scope_is_rejected_before_startup_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox_dir = dir.path().join("inbox");
+        let outbox_dir = dir.path().join("outbox");
+        let inbox = OperationInbox::open(&inbox_dir, Arc::new(PermitOperation)).unwrap();
+        let mut outbox =
+            OperationOutbox::open_routed_for_node(&outbox_dir, NodeId("a".into())).unwrap();
+        let mut namespace = SystemNamespace::new();
+        namespace.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: "orders/".into(),
+            },
+            authority_nodes: vec![NodeId("a".into()), NodeId("b".into())],
+            auto_generated: false,
+        });
+        namespace
+            .set_placement_policy(
+                asteroidb_poc::placement::PlacementPolicy::new(
+                    asteroidb_poc::types::PolicyVersion(1),
+                    KeyRange {
+                        prefix: "orders/".into(),
+                    },
+                    2,
+                )
+                .with_certified(true),
+            )
+            .unwrap();
+        let scopes = vec![ConfiguredCertificateScope {
+            namespace_id: "n".into(),
+            key_prefix: "orders/".into(),
+            faults: 0,
+        }];
+        let owned = OperationOwnedPrefixes::from_json(r#"["orders/"]"#).unwrap();
+        let mut registry = KeysetRegistry::new();
+        registry
+            .register_keyset(
+                KeysetVersion(1),
+                0,
+                vec![(
+                    NodeId("a".into()),
+                    ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                )],
+            )
+            .unwrap();
+        let preflight = preflight_certificate_scopes(&scopes, &namespace, &registry, &owned);
+        assert!(preflight.is_err());
+        assert!(!inbox_dir.join(".authority-manifest").exists());
+        assert!(!inbox_dir.join(".creation-policy-manifest").exists());
+        assert!(!outbox_dir.join(".routing").exists());
+
+        registry
+            .register_keyset(
+                KeysetVersion(2),
+                0,
+                vec![
+                    (
+                        NodeId("a".into()),
+                        ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                    ),
+                    (
+                        NodeId("b".into()),
+                        ed25519_dalek::SigningKey::from_bytes(&[2; 32]).verifying_key(),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            preflight_certificate_scopes(&scopes, &namespace, &registry, &owned)
+                .unwrap()
+                .len(),
+            1
+        );
+        let too_many_faults = vec![ConfiguredCertificateScope {
+            faults: 1,
+            ..scopes[0].clone()
+        }];
+        assert!(
+            preflight_certificate_scopes(&too_many_faults, &namespace, &registry, &owned).is_err()
+        );
+        let mut later_epoch_registry = KeysetRegistry::new();
+        later_epoch_registry
+            .register_keyset(
+                KeysetVersion(1),
+                1,
+                registry.get_keys(&KeysetVersion(2)).unwrap().to_vec(),
+            )
+            .unwrap();
+        assert!(
+            preflight_certificate_scopes(&scopes, &namespace, &later_epoch_registry, &owned)
+                .is_err()
+        );
+        // Transport reachability is independent of certificate trust. A
+        // valid scope can serve a locally durable Pending operation even when
+        // no destination or route is currently configured.
+        assert!(preflight_certificate_scopes(&scopes, &namespace, &registry, &owned).is_ok());
+        pin_operation_startup_manifests(
+            &inbox,
+            &mut outbox,
+            None,
+            None,
+            None,
+            owned.digest(),
+            Some([6; 32]),
+            None,
+        )
+        .unwrap();
+    }
 
     // ---------------------------------------------------------------
     // Log filter defaults (P2-1)

@@ -16,11 +16,14 @@ use std::time::Duration;
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
+use asteroidb_poc::authority::certificate::{KeysetRegistry, KeysetVersion};
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::hlc::HlcTimestamp;
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
+use asteroidb_poc::network::frontier_sync::FrontierPushRequest;
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::store::kv::CrdtValue;
@@ -35,6 +38,37 @@ use tokio::task::JoinHandle;
 
 fn node_id(s: &str) -> NodeId {
     NodeId(s.into())
+}
+
+fn authority_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = *authority.as_bytes().last().unwrap();
+    #[cfg(feature = "native-crypto")]
+    {
+        NodeSigner::from_seed(node_id(authority), &seed, false)
+    }
+    #[cfg(not(feature = "native-crypto"))]
+    {
+        NodeSigner::from_seed(node_id(authority), &seed)
+    }
+}
+
+fn authority_registry() -> KeysetRegistry {
+    let mut registry = KeysetRegistry::new();
+    registry
+        .register_keyset(
+            KeysetVersion(1),
+            0,
+            ["auth-1", "auth-2", "auth-3"]
+                .iter()
+                .map(|name| {
+                    let signer = authority_signer(name);
+                    (node_id(name), signer.verifying_key())
+                })
+                .collect(),
+        )
+        .unwrap();
+    registry
 }
 
 fn default_namespace() -> SystemNamespace {
@@ -78,10 +112,10 @@ async fn spawn_node(name: &str) -> (Arc<AppState>, SocketAddr, JoinHandle<()>) {
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
-        keyset_registry: None,
+        keyset_registry: Some(Arc::new(RwLock::new(authority_registry()))),
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        require_signed_frontiers: false,
+        require_signed_frontiers: true,
         equivocation: Arc::new(
             asteroidb_poc::authority::equivocation::EquivocationDetector::new(None),
         ),
@@ -180,6 +214,36 @@ fn make_frontier(authority: &str, physical: u64, prefix: &str) -> AckFrontier {
         policy_version: PolicyVersion(1),
         digest_hash: format!("{authority}-{physical}"),
     }
+}
+
+/// Deliver a report through the HTTP verification path. Its checkpoint is
+/// strictly later than the write, including writes on a bucket boundary.
+async fn push_signed_frontier(
+    addr: SocketAddr,
+    authority: &str,
+    write_physical: u64,
+    client: &reqwest::Client,
+) {
+    let report_physical = (write_physical / 1_000 + 1) * 1_000 + 100;
+    let frontier = make_frontier(authority, report_physical, "");
+    let signature = authority_signer(authority).sign_frontier(&frontier, KeysetVersion(1));
+    let req = FrontierPushRequest {
+        frontiers: vec![frontier],
+        signatures: vec![Some(signature)],
+        observed: Vec::new(),
+    };
+    let resp = client
+        .post(format!("http://{addr}/api/internal/frontiers"))
+        .json(&req)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "signed push for {authority} failed"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["accepted"], 1, "signed frontier was not applied");
 }
 
 // ===========================================================================
@@ -306,7 +370,7 @@ async fn eventual_partition_recovery_three_nodes() {
 ///   1. Spin up 3 HTTP nodes.
 ///   2. Submit a certified_write with on_timeout=pending.
 ///   3. Check status: should be Pending.
-///   4. POST frontiers for 2 of 3 authorities (majority) to the node.
+///   4. POST signed frontiers for 2 of 3 authorities to the node.
 ///   5. The node processes certifications and the status should become Certified.
 #[tokio::test]
 async fn certified_partition_recovery_three_nodes() {
@@ -353,34 +417,8 @@ async fn certified_partition_recovery_three_nodes() {
         pw[0].timestamp.physical
     };
 
-    // --- Phase 4: POST frontiers for 2 of 3 authorities (majority) ---
-    // Simulate authority-1 frontier.
-    let frontier_body = serde_json::json!({
-        "frontiers": [
-            {
-                "authority_id": "auth-1",
-                "frontier_hlc": {
-                    "physical": write_ts + 1000,
-                    "logical": 0,
-                    "node_id": "auth-1"
-                },
-                "key_range": {"prefix": ""},
-                "policy_version": 1,
-                "digest_hash": format!("auth-1-{}", write_ts + 1000)
-            }
-        ]
-    });
-    let resp = client
-        .post(format!("http://{}/api/internal/frontiers", addr1))
-        .header("content-type", "application/json")
-        .json(&frontier_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "frontier push for auth-1 failed"
-    );
+    // --- Phase 4: POST a signed report from auth-1 (1 of 3) ---
+    push_signed_frontier(addr1, "auth-1", write_ts, &client).await;
 
     // Status should still be Pending (only 1 of 3 authorities).
     let resp = client
@@ -391,33 +429,8 @@ async fn certified_partition_recovery_three_nodes() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "Pending", "1/3 authority: still Pending");
 
-    // Simulate authority-2 frontier (now majority = 2/3).
-    let frontier_body = serde_json::json!({
-        "frontiers": [
-            {
-                "authority_id": "auth-2",
-                "frontier_hlc": {
-                    "physical": write_ts + 2000,
-                    "logical": 0,
-                    "node_id": "auth-2"
-                },
-                "key_range": {"prefix": ""},
-                "policy_version": 1,
-                "digest_hash": format!("auth-2-{}", write_ts + 2000)
-            }
-        ]
-    });
-    let resp = client
-        .post(format!("http://{}/api/internal/frontiers", addr1))
-        .header("content-type", "application/json")
-        .json(&frontier_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        resp.status().is_success(),
-        "frontier push for auth-2 failed"
-    );
+    // Recovery brings a signed report from auth-2 (now 2 of 3).
+    push_signed_frontier(addr1, "auth-2", write_ts, &client).await;
 
     // --- Phase 5: Trigger certification processing ---
     // The frontiers have been applied, but the CertifiedApi needs to
@@ -453,6 +466,13 @@ async fn certified_partition_recovery_three_nodes() {
     assert!(body["value"].is_object(), "should have a value");
     assert_eq!(body["status"], "Certified");
     assert!(body["frontier"].is_object(), "should have a frontier");
+    assert_eq!(
+        body["proof"]["certificate"]["signatures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Clean up.
     server1.abort();
@@ -608,18 +628,8 @@ async fn certified_pending_during_partition_certified_after_recovery() {
         api.pending_writes()[0].timestamp.physical
     };
 
-    // --- During partition: only auth-3 frontier arrives (1/3, no majority) ---
-    let frontier_body = serde_json::json!({
-        "frontiers": [make_frontier("auth-3", write_ts + 500, "")]
-    });
-    let resp = client
-        .post(format!("http://{}/api/internal/frontiers", addr1))
-        .header("content-type", "application/json")
-        .json(&frontier_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
+    // --- During partition: only auth-3's signed report arrives (1 of 3) ---
+    push_signed_frontier(addr1, "auth-3", write_ts, &client).await;
 
     {
         let mut api = state1.certified.lock().await;
@@ -637,18 +647,8 @@ async fn certified_pending_during_partition_certified_after_recovery() {
         "1/3 authorities: should remain Pending"
     );
 
-    // --- Recovery: auth-1 frontier arrives (now 2/3, majority!) ---
-    let frontier_body = serde_json::json!({
-        "frontiers": [make_frontier("auth-1", write_ts + 1000, "")]
-    });
-    let resp = client
-        .post(format!("http://{}/api/internal/frontiers", addr1))
-        .header("content-type", "application/json")
-        .json(&frontier_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
+    // --- Recovery: auth-1's signed report arrives (now 2 of 3) ---
+    push_signed_frontier(addr1, "auth-1", write_ts, &client).await;
 
     {
         let mut api = state1.certified.lock().await;
@@ -664,6 +664,19 @@ async fn certified_pending_during_partition_certified_after_recovery() {
     assert_eq!(
         body["status"], "Certified",
         "2/3 authorities: should be Certified after recovery"
+    );
+    let resp = client
+        .get(format!("http://{}/api/certified/isolated", addr1))
+        .send()
+        .await
+        .unwrap();
+    let read: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        read["proof"]["certificate"]["signatures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
     );
 
     // Clean up.

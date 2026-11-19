@@ -9,6 +9,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::types::NodeId;
 
+/// A writer has no unused `u64` dot left. Reusing a wrapped dot would merge
+/// unrelated updates and can revive a removed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("CRDT dot counter exhausted")]
+pub struct DotCounterExhausted;
+
 /// Effects of one CRDT merge that involved the per-value compaction floor
 /// (see [`or_set::OrSet::merge`] / [`or_map::OrMap::merge`]).
 ///
@@ -69,7 +75,7 @@ pub struct SweepOutcome {
     pub collected: u64,
     /// Per-node floor walks stopped by a hole: a dot that is neither live
     /// nor deferred below the node's counter (legacy pre-floor sweeps).
-    /// Stage 2 hole-jump (`hole_jump_ceilings`) resolves these.
+    /// The public GC path stops at these holes.
     pub stalled_holes: u64,
     /// Per-node floor walks stopped by a tombstone outside the marked
     /// candidate set (created after the mark; next cycle covers it).
@@ -104,8 +110,9 @@ pub(crate) fn covered(floor: &HashMap<NodeId, u64>, node_id: &NodeId, counter: u
 /// counter AS SNAPSHOTTED AT MARK TIME may be crossed — a hole minted
 /// AFTER the mark by an inbound partial delta, e.g. counters riding a
 /// delta whose old-origin-timestamp entry was filtered out, is not
-/// covered by the inbound gate's "complete pull since the mark" evidence
-/// and MUST stall the walk; see `NodeRunner::run_gc`). `None`, or a
+/// covered by "complete pull since the mark" evidence and MUST stall
+/// the walk. Public GC always supplies `None` because dynamic peer
+/// eviction leaves the remaining inbound evidence incomplete. `None`, or a
 /// missing/lower ceiling entry, is fail-closed: the walk stalls at the
 /// first hole (Stage 1).
 ///
@@ -123,12 +130,13 @@ pub(crate) fn advance_compaction_floor(
     counters: &HashMap<NodeId, u64>,
     compaction_floor: &mut HashMap<NodeId, u64>,
     candidates: &HashSet<(NodeId, u64)>,
+    mark_counter_caps: Option<&HashMap<NodeId, u64>>,
     hole_jump_ceilings: Option<&HashMap<NodeId, u64>>,
 ) -> SweepOutcome {
     /// Try to cross the hole span `[from, to]` (`from <= to`). Holes at
     /// or below `ceiling` are jumpable; `next` is left one past the last
     /// crossed hole. Returns `true` when the whole span was crossed.
-    fn jump_hole_span(from: u64, to: u64, ceiling: u64, next: &mut u64) -> bool {
+    fn jump_hole_span(from: u128, to: u128, ceiling: u128, next: &mut u128) -> bool {
         if ceiling >= to {
             *next = to + 1;
             true
@@ -160,13 +168,23 @@ pub(crate) fn advance_compaction_floor(
     }
 
     for node in nodes {
-        let max_counter = counters.get(&node).copied().unwrap_or(0);
+        let current_counter = counters.get(&node).copied().unwrap_or(0);
+        // A saved mark may be swept after later local writes or a merge.
+        // Neither post-mark live dots nor post-mark holes may advance this
+        // sweep's floor beyond the writer counter captured with the mark.
+        let max_counter = mark_counter_caps
+            .map(|caps| current_counter.min(caps.get(&node).copied().unwrap_or(0)))
+            .unwrap_or(current_counter);
         let start = compaction_floor.get(&node).copied().unwrap_or(0);
+        if start >= max_counter {
+            continue;
+        }
         let ceiling = hole_jump_ceilings
             .map(|m| m.get(&node).copied().unwrap_or(0))
             .unwrap_or(0);
-        // Next undecided counter; everything below `next` has a decided fate.
-        let mut next = start + 1;
+        // The cursor may need to stand one past `u64::MAX` after deciding
+        // the last possible dot. Keep it wider than stored dot counters.
+        let mut next = u128::from(start) + 1;
         let mut stalled_on_hole = false;
         let mut stalled_on_uncandidated = false;
 
@@ -178,14 +196,16 @@ pub(crate) fn advance_compaction_floor(
                 break;
             }
             // Hole span between the previous known counter and this one.
-            if k > next && !jump_hole_span(next, k - 1, ceiling, &mut next) {
+            if u128::from(k) > next
+                && !jump_hole_span(next, u128::from(k) - 1, u128::from(ceiling), &mut next)
+            {
                 stalled_on_hole = true;
                 break;
             }
             if live_dots.contains(&(&node, k)) {
-                next = k + 1; // fate decided: live
+                next = u128::from(k) + 1; // fate decided: live
             } else if candidates.contains(&(node.clone(), k)) {
-                next = k + 1; // fate decided: removed (gated)
+                next = u128::from(k) + 1; // fate decided: removed (gated)
             } else {
                 // A tombstone created after the mark; next cycle covers it.
                 stalled_on_uncandidated = true;
@@ -195,8 +215,13 @@ pub(crate) fn advance_compaction_floor(
         // Tail hole span up to counters[n].
         if !stalled_on_hole
             && !stalled_on_uncandidated
-            && next <= max_counter
-            && !jump_hole_span(next, max_counter, ceiling, &mut next)
+            && next <= u128::from(max_counter)
+            && !jump_hole_span(
+                next,
+                u128::from(max_counter),
+                u128::from(ceiling),
+                &mut next,
+            )
         {
             stalled_on_hole = true;
         }
@@ -207,11 +232,86 @@ pub(crate) fn advance_compaction_floor(
         if stalled_on_uncandidated {
             outcome.stalled_uncandidated += 1;
         }
-        let new_floor = next - 1;
+        let new_floor = u64::try_from(next - 1).expect("floor cannot exceed the writer counter");
         if new_floor > start {
             compaction_floor.insert(node, new_floor);
         }
     }
 
     outcome
+}
+
+#[cfg(test)]
+mod floor_walk_tests {
+    use super::*;
+
+    /// Exhaust the small, well-formed dot landscapes against the direct
+    /// Stage 1 rule: cross exactly the contiguous live or marked-deleted
+    /// prefix, stopping at the first hole or unmarked tombstone. This checks
+    /// the interval implementation's known-counter construction as well as
+    /// its mark-time cap.
+    #[test]
+    fn interval_floor_walk_matches_contiguous_reference() {
+        let node = NodeId("writer".into());
+        for max_counter in 0..=4u64 {
+            for start in 0..=max_counter {
+                for cap in start..=max_counter {
+                    for mut layout in 0..3u32.pow(max_counter as u32) {
+                        let mut kinds = vec![0u8; max_counter as usize + 1];
+                        for counter in 1..=max_counter {
+                            kinds[counter as usize] = (layout % 3) as u8;
+                            layout /= 3;
+                        }
+                        for mask in 0..(1u32 << max_counter) {
+                            let mut live = HashSet::new();
+                            let mut removed = HashSet::new();
+                            let mut marked = HashSet::new();
+                            for counter in 1..=max_counter {
+                                match kinds[counter as usize] {
+                                    1 => {
+                                        live.insert((&node, counter));
+                                    }
+                                    2 => {
+                                        removed.insert((&node, counter));
+                                        if mask & (1 << (counter - 1)) != 0 {
+                                            marked.insert((node.clone(), counter));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let mut expected = start;
+                            for counter in (start + 1)..=cap {
+                                let decided = kinds[counter as usize] == 1
+                                    || (kinds[counter as usize] == 2
+                                        && marked.contains(&(node.clone(), counter)));
+                                if !decided {
+                                    break;
+                                }
+                                expected = counter;
+                            }
+
+                            let counters = HashMap::from([(node.clone(), max_counter)]);
+                            let caps = HashMap::from([(node.clone(), cap)]);
+                            let mut floor = HashMap::from([(node.clone(), start)]);
+                            let _outcome = advance_compaction_floor(
+                                &live,
+                                &removed,
+                                &counters,
+                                &mut floor,
+                                &marked,
+                                Some(&caps),
+                                None,
+                            );
+                            assert_eq!(
+                                floor.get(&node).copied().unwrap_or(0),
+                                expected,
+                                "max={max_counter} start={start} cap={cap} kinds={kinds:?} mask={mask}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

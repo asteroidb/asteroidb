@@ -31,11 +31,23 @@ pub enum CrdtError {
     #[error("type mismatch: expected {expected}, got {actual}")]
     TypeMismatch { expected: String, actual: String },
 
+    /// A causal dot has a different immutable owner or payload in another state.
+    #[error("conflicting CRDT dot assignment: {0}")]
+    DotAssignmentConflict(String),
+
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
     #[error("stale version")]
     StaleVersion,
+
+    /// No new causal dot can be issued without reusing an old identity.
+    #[error("CRDT dot counter exhausted")]
+    DotCounterExhausted,
+
+    /// A PN-Counter component cannot be incremented without wrapping.
+    #[error("PN-Counter component exhausted")]
+    PnCounterExhausted,
 
     #[error("policy denied: {0}")]
     PolicyDenied(String),
@@ -53,6 +65,11 @@ pub enum CrdtError {
     /// without re-issuing the write.
     #[error("certification timeout: local write committed but certification did not complete")]
     CertificationTimeout,
+
+    /// The certified tracking queue is full. Nothing was written; retry
+    /// after older operations certify and leave the queue.
+    #[error("certified tracking capacity exhausted (limit: {max_entries})")]
+    CertificationCapacity { max_entries: usize },
 
     /// A session-token-guarded read could not be satisfied: the local
     /// replica has not (provably) applied all writes covered by the token.

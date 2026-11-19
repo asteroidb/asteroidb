@@ -22,6 +22,7 @@
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::authority::ack_frontier::AckFrontier;
 #[cfg(feature = "native-crypto")]
@@ -31,6 +32,8 @@ use crate::authority::bls_stub::{BlsPublicKey, BlsSignature};
 use crate::authority::certificate::{
     CertError, EpochConfig, KeysetRegistry, KeysetVersion, create_certificate_message, sign_message,
 };
+#[cfg(feature = "native-runtime")]
+use crate::authority::operation_merkle::{OperationMerkleTree, SignedOperationRoot};
 use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
@@ -42,9 +45,10 @@ pub const CHECKPOINT_INTERVAL_MS: u64 = 1_000;
 
 /// Domain separation tag for frontier report signatures.
 ///
-/// Guarantees that a report signature can never be confused with a
-/// certificate signature (which is not tagged), because the certificate
-/// message starts with a length-prefixed key range prefix instead.
+/// The raw report and certificate encoders can produce the same bytes for a
+/// noncanonical certificate checkpoint. Public certificate verification must
+/// also require [`checkpoint_hlc`] form (empty node ID, zero logical counter,
+/// bucket-aligned physical time) before a report signature is excluded.
 const FRONTIER_REPORT_DOMAIN: &[u8] = b"asteroidb/frontier-report/v1";
 
 /// Floor-normalise a frontier HLC to its certificate checkpoint.
@@ -118,15 +122,31 @@ pub struct FrontierSignature {
 #[derive(Debug, Clone)]
 pub struct VerifiedAttestation {
     /// The authority that produced the attestation.
-    pub authority_id: NodeId,
+    pub(crate) authority_id: NodeId,
     /// The keyset version the signatures were produced under.
-    pub keyset_version: KeysetVersion,
+    pub(crate) keyset_version: KeysetVersion,
     /// The checkpoint the certificate signature covers.
-    pub checkpoint_hlc: HlcTimestamp,
+    pub(crate) checkpoint_hlc: HlcTimestamp,
     /// Registry-trusted Ed25519 verifying key and the certificate signature.
-    pub ed25519: (VerifyingKey, Signature),
+    pub(crate) ed25519: (VerifyingKey, Signature),
     /// Optional BLS public key and certificate signature (native-crypto only).
-    pub bls: Option<(BlsPublicKey, BlsSignature)>,
+    pub(crate) bls: Option<(BlsPublicKey, BlsSignature)>,
+    /// Digest of the exact signed report. Kept private so callers cannot
+    /// attach this verified certificate signature to another frontier.
+    report_binding: [u8; 32],
+}
+
+impl VerifiedAttestation {
+    /// Whether this attestation came from verification of this exact report.
+    pub fn matches_frontier(&self, frontier: &AckFrontier) -> bool {
+        self.authority_id == frontier.authority_id
+            && self.checkpoint_hlc == checkpoint_hlc(&frontier.frontier_hlc)
+            && self.report_binding == frontier_report_binding(frontier)
+    }
+}
+
+fn frontier_report_binding(frontier: &AckFrontier) -> [u8; 32] {
+    Sha256::digest(create_frontier_report_message(frontier)).into()
 }
 
 /// Holder of this node's signing key material.
@@ -182,6 +202,24 @@ impl NodeSigner {
     /// Return the Ed25519 verifying key for this signer.
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    /// Sign a tree of durably admitted, exact operation commitments with this
+    /// node's Authority identity. The root's existing domain-separated wire
+    /// message is used unchanged. The caller must verify this key is
+    /// registered under `keyset_version` before publishing the signature.
+    #[cfg(feature = "native-runtime")]
+    pub fn sign_operation_root(
+        &self,
+        tree: &OperationMerkleTree,
+        keyset_version: KeysetVersion,
+    ) -> SignedOperationRoot {
+        SignedOperationRoot::sign(
+            tree,
+            keyset_version,
+            self.node_id.clone(),
+            &self.signing_key,
+        )
     }
 
     /// Return the BLS public key, if BLS signing is enabled.
@@ -250,8 +288,25 @@ impl NodeSigner {
         frontier: &AckFrontier,
         sig: &FrontierSignature,
     ) -> VerifiedAttestation {
+        assert_eq!(frontier.authority_id, self.node_id);
+        assert_eq!(sig.checkpoint_hlc, checkpoint_hlc(&frontier.frontier_hlc));
+        let report_sig = decode_signature(&sig.report_signature)
+            .expect("self-produced report signature must be well-formed");
+        self.verifying_key()
+            .verify(&create_frontier_report_message(frontier), &report_sig)
+            .expect("self-produced report signature must match the frontier");
         let cert_sig = decode_signature(&sig.cert_signature)
             .expect("self-produced certificate signature must be well-formed");
+        self.verifying_key()
+            .verify(
+                &create_certificate_message(
+                    &frontier.key_range,
+                    &sig.checkpoint_hlc,
+                    &frontier.policy_version,
+                ),
+                &cert_sig,
+            )
+            .expect("self-produced certificate signature must match the frontier");
         VerifiedAttestation {
             authority_id: frontier.authority_id.clone(),
             keyset_version: sig.keyset_version.clone(),
@@ -261,6 +316,7 @@ impl NodeSigner {
                 .bls_public_key
                 .clone()
                 .zip(sig.bls_cert_signature.clone()),
+            report_binding: frontier_report_binding(frontier),
         }
     }
 }
@@ -373,6 +429,7 @@ pub fn verify_frontier_signature(
                     checkpoint_hlc: expected_checkpoint,
                     ed25519: (*registry_key, cert_sig),
                     bls: None,
+                    report_binding: frontier_report_binding(frontier),
                 });
             };
             if embedded_pk != registry_bls {
@@ -406,6 +463,7 @@ pub fn verify_frontier_signature(
         checkpoint_hlc: expected_checkpoint,
         ed25519: (*registry_key, cert_sig),
         bls,
+        report_binding: frontier_report_binding(frontier),
     })
 }
 
@@ -596,6 +654,46 @@ mod tests {
         assert_eq!(self_att.checkpoint_hlc, reg_att.checkpoint_hlc);
         assert_eq!(self_att.ed25519.0, reg_att.ed25519.0);
         assert_eq!(self_att.ed25519.1.to_bytes(), reg_att.ed25519.1.to_bytes());
+        assert!(self_att.matches_frontier(&frontier));
+        assert!(reg_att.matches_frontier(&frontier));
+    }
+
+    #[test]
+    fn verified_attestation_is_bound_to_exact_frontier_report() {
+        let signer = make_signer("auth-1", 2, false);
+        let registry = registry_with(&[&signer]);
+        let frontier = make_frontier("auth-1", 9_876, 1);
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        let att = verify_frontier_signature(&frontier, &sig, &registry, 0, &EpochConfig::default())
+            .unwrap();
+        assert!(att.matches_frontier(&frontier));
+
+        let mut changed = frontier.clone();
+        changed.digest_hash.push('x');
+        assert!(!att.matches_frontier(&changed));
+        let mut changed = frontier.clone();
+        changed.frontier_hlc.logical += 1;
+        assert!(!att.matches_frontier(&changed));
+        let mut changed = frontier.clone();
+        changed.key_range.prefix.push('x');
+        assert!(!att.matches_frontier(&changed));
+        let mut changed = frontier.clone();
+        changed.policy_version.0 += 1;
+        assert!(!att.matches_frontier(&changed));
+        let mut changed = frontier;
+        changed.authority_id.0.push('x');
+        assert!(!att.matches_frontier(&changed));
+    }
+
+    #[test]
+    #[should_panic(expected = "self-produced report signature must match the frontier")]
+    fn self_verified_rejects_signature_from_another_report() {
+        let signer = make_signer("auth-1", 2, false);
+        let frontier = make_frontier("auth-1", 9_876, 1);
+        let sig = signer.sign_frontier(&frontier, KeysetVersion(1));
+        let mut changed = frontier;
+        changed.digest_hash.push('x');
+        signer.self_verified(&changed, &sig);
     }
 
     // ---------------------------------------------------------------

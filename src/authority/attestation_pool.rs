@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::authority::ack_frontier::AckFrontier;
 use crate::authority::certificate::{
     AuthoritySignature, DualModeCertificate, KeysetVersion, MajorityCertificate, majority_threshold,
 };
@@ -124,6 +125,22 @@ impl AttestationPool {
     /// Create an empty pool.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the retained verified signature belongs to this exact full
+    /// frontier, rather than merely to another report in its checkpoint.
+    pub(crate) fn has_attestation_for_frontier(&self, frontier: &AckFrontier) -> bool {
+        let scope = PoolScope {
+            key_range: frontier.key_range.clone(),
+            policy_version: frontier.policy_version,
+        };
+        let checkpoint =
+            crate::authority::frontier_sig::checkpoint_hlc(&frontier.frontier_hlc).physical;
+        self.entries
+            .get(&scope)
+            .and_then(|checkpoints| checkpoints.get(&checkpoint))
+            .and_then(|signers| signers.get(&frontier.authority_id))
+            .is_some_and(|attestation| attestation.matches_frontier(frontier))
     }
 
     /// Record a verified attestation for a scope.
@@ -304,6 +321,85 @@ impl AttestationPool {
         MajorityCertificate,
         Option<DualModeCertificate>,
     )> {
+        self.build_certificates_filtered(
+            key_range,
+            policy_version,
+            total_authorities,
+            min_ts,
+            None,
+            |_| true,
+        )
+    }
+
+    /// Assemble a certificate only from the current Authority roster. Pool
+    /// entries admitted before a roster replacement remain available, but a
+    /// removed signer must not contribute to the replacement scope.
+    pub fn build_certificates_for_members(
+        &self,
+        key_range: &KeyRange,
+        policy_version: PolicyVersion,
+        total_authorities: usize,
+        min_ts: &HlcTimestamp,
+        members: &[NodeId],
+    ) -> Option<(
+        HlcTimestamp,
+        MajorityCertificate,
+        Option<DualModeCertificate>,
+    )> {
+        if members.len() != total_authorities {
+            return None;
+        }
+        self.build_certificates_filtered(
+            key_range,
+            policy_version,
+            total_authorities,
+            min_ts,
+            Some(members),
+            |_| true,
+        )
+    }
+
+    /// Assemble a certificate from signatures whose full frontier still has
+    /// an accepted receipt at the issuing node.
+    pub(crate) fn build_certificates_for_members_matching(
+        &self,
+        key_range: &KeyRange,
+        policy_version: PolicyVersion,
+        total_authorities: usize,
+        min_ts: &HlcTimestamp,
+        members: &[NodeId],
+        matches: impl Fn(&VerifiedAttestation) -> bool,
+    ) -> Option<(
+        HlcTimestamp,
+        MajorityCertificate,
+        Option<DualModeCertificate>,
+    )> {
+        if members.len() != total_authorities {
+            return None;
+        }
+        self.build_certificates_filtered(
+            key_range,
+            policy_version,
+            total_authorities,
+            min_ts,
+            Some(members),
+            matches,
+        )
+    }
+
+    fn build_certificates_filtered(
+        &self,
+        key_range: &KeyRange,
+        policy_version: PolicyVersion,
+        total_authorities: usize,
+        min_ts: &HlcTimestamp,
+        members: Option<&[NodeId]>,
+        matches: impl Fn(&VerifiedAttestation) -> bool,
+    ) -> Option<(
+        HlcTimestamp,
+        MajorityCertificate,
+        Option<DualModeCertificate>,
+    )> {
         let scope = PoolScope {
             key_range: key_range.clone(),
             policy_version,
@@ -331,7 +427,15 @@ impl AttestationPool {
             }
 
             // Deterministic signer order for stable certificates.
-            let mut sorted: Vec<&VerifiedAttestation> = atts.values().collect();
+            let mut sorted: Vec<&VerifiedAttestation> = atts
+                .values()
+                .filter(|att| {
+                    members.is_none_or(|ids| ids.contains(&att.authority_id)) && matches(att)
+                })
+                .collect();
+            if sorted.len() < threshold {
+                continue;
+            }
             sorted.sort_by(|a, b| a.authority_id.0.cmp(&b.authority_id.0));
 
             // Certificate-level keyset version: the maximum among signatures.

@@ -21,14 +21,12 @@
 //! ```text
 //! offset  size  content
 //! 0       8     magic  = b"ADBWAL\x00\x01"
-//! 8       4     wal_format_version: u32 LE = 2
+//! 8       4     wal_format_version: u32 LE = 7
 //! 12      4     reserved: u32 LE = 0
 //! ```
 //!
-//! Version history: v1 predates the `compaction_floor` field on
-//! `OrSet`/`OrMap`; v1 segments are still readable (records decode via
-//! the frozen [`WalRecordV1`] shape and convert with empty floors), but
-//! writing is always v2 — the same one-way constraint as snapshot v4→v5.
+//! Version 7 uses immutable per-dot OR-Map values and validates CRDT payloads
+//! on recovery. Earlier experimental formats are rejected.
 //!
 //! followed by length-prefixed, CRC-protected record frames:
 //!
@@ -46,7 +44,9 @@
 //! * **Torn tail** (harmless): an incomplete or zero-filled frame at the
 //!   very end of the *last* segment. This is the expected shape of a crash
 //!   mid-append; only un-synced (hence un-acked) writes are lost. Recovery
-//!   logs a warning and stops there.
+//!   logs a warning and stops there. A complete frame with a bad CRC is
+//!   ambiguous: it may be a torn write or damage to a synced record, so
+//!   recovery must fail-stop.
 //! * **Mid-log corruption** (fail-stop): any invalid frame that is followed
 //!   by more data, or any invalid frame in a non-final segment. This means
 //!   acked data may be damaged; silently truncating would lose it, so the
@@ -65,37 +65,30 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::hlc::HlcTimestamp;
-use crate::store::backend::{create_dir_all_durable, fsync_dir};
+use crate::operation::{BoundOperation, OperationReceipt};
+use crate::store::backend::{FileBackend, StorageBackend, create_dir_all_durable, fsync_dir};
 use crate::store::kv::{CrdtValue, Store};
-use crate::types::PolicyVersion;
+use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 /// Segment file magic (8 bytes).
 pub const WAL_MAGIC: [u8; 8] = *b"ADBWAL\x00\x01";
 
 /// Current WAL segment format version.
 ///
-/// v2: `CrdtValue` payloads gained the `compaction_floor` field inside
-/// `OrSet`/`OrMap` (M-8). v1 segments decode via [`WalRecordV1`].
-///
-/// v3: added the tail variant [`WalRecord::CertifiedUpsert`], which carries
-/// the write's origin `policy_version` so recovery can re-track a certified
-/// write under the policy version it was WRITTEN with (not the current one)
-/// and re-derive its FR-009 fence across a restart. Because the new variant
-/// is appended at the END of the enum, the bincode variant indices of the
-/// existing variants are unchanged: a v2 segment (which never holds a
-/// `CertifiedUpsert`) decodes byte-for-byte identically through the current
-/// [`WalRecord`] shape, so v2 and v3 share the `_` decode arm in
-/// [`parse_segment`] and no frozen `WalRecordV2` shape is needed.
-///
-/// MAINTAINER WARNING: the record payload is bincode — positional and
-/// non-self-describing. A change to an EXISTING [`WalRecord`] variant's
-/// fields (not a tail-appended new variant) requires bumping this version
-/// and adding a versioned decode arm in [`parse_segment`] (as [`WalRecordV1`]
-/// does for v1, sharing the frozen v4 CRDT shapes with the snapshot path).
-pub const WAL_FORMAT_VERSION: u32 = 3;
+/// Bump this when the on-disk record or an embedded CRDT layout changes.
+/// Earlier experimental versions are deliberately unsupported.
+pub const WAL_FORMAT_VERSION: u32 = 7;
 
 /// Size of the segment header in bytes.
 const SEGMENT_HEADER_LEN: usize = 16;
+const WAL_INCARNATION_HIGH_WATER: &str = "wal-incarnation-high-water";
+const WAL_INCARNATION_MAGIC: &[u8; 8] = b"ADBWINC2";
+const WAL_WRITER_LOCK: &str = ".wal-writer.lock";
+
+/// Whether a WAL directory retains its durable incarnation reservation.
+pub(crate) fn has_incarnation_high_water(dir: &Path) -> bool {
+    dir.join(WAL_INCARNATION_HIGH_WATER).exists()
+}
 
 /// Size of a record frame header (`len` + `crc`) in bytes.
 const FRAME_HEADER_LEN: usize = 8;
@@ -104,15 +97,24 @@ const FRAME_HEADER_LEN: usize = 8;
 /// append and treated as corruption on read.
 pub const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 
+/// Scope observed when a certified write was accepted. For a local write it
+/// is the exact issue-time Authority set; replication carries the same pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertifiedScopePin {
+    pub write_hlc: HlcTimestamp,
+    pub key_range: KeyRange,
+    pub policy_version: PolicyVersion,
+    pub authority_nodes: Vec<NodeId>,
+}
+
 /// A single logical WAL record.
 ///
-/// All variants replay through idempotent CRDT merges and max-monotone
-/// metadata updates ([`replay_record`]), so duplicated or over-replayed
-/// records are harmless.
+/// CRDT variants replay through idempotent merges and max-monotone metadata
+/// updates ([`replay_record`]). Operation records rebuild their separate
+/// immutable ID ledger with [`OperationHistory::from_wal_records`](crate::operation::OperationHistory::from_wal_records).
 ///
-/// MAINTAINER WARNING: bincode is positional and non-self-describing —
-/// changing variants or fields requires a [`WAL_FORMAT_VERSION`] bump plus
-/// a versioned decode arm for the old layout.
+/// Bincode is positional and non-self-describing. Changing a variant or an
+/// embedded CRDT layout requires a [`WAL_FORMAT_VERSION`] bump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
     /// A locally-originated mutation or a push-path merge (`merge_remote`),
@@ -150,66 +152,27 @@ pub enum WalRecord {
     /// so [`CertifiedApi::recovered`](crate::api::certified::CertifiedApi)
     /// can re-track the write under the version it was written with and
     /// re-derive its FR-009 fence — instead of silently re-tagging it with
-    /// the current (post-bump) version. Tail variant: see the v3 note on
-    /// [`WAL_FORMAT_VERSION`].
+    /// the current (post-bump) version.
     CertifiedUpsert {
         key: String,
         value: CrdtValue,
         hlc: HlcTimestamp,
         policy_version: PolicyVersion,
     },
-}
-
-/// Frozen decode shape of [`WalRecord`] for WAL format v1 (pre-
-/// `compaction_floor` CRDT layouts, shared with the snapshot path via
-/// [`CrdtValueV4`](crate::store::kv)). Read-only: writing is always v2.
-#[derive(Debug, Deserialize)]
-enum WalRecordV1 {
-    UpsertApplied {
+    /// Immutable operation payload and ID receipt. Kept in a dedicated
+    /// operation ledger whose segments are never pruned by store checkpoints.
+    BoundOperation { bound: BoundOperation },
+    /// Small, durable ID receipt after the operation body has no remaining
+    /// local obligations. Replayed only by the separate operation ledger.
+    OperationReceipt { receipt: OperationReceipt },
+    /// Certified upsert with the scope pin in the same redo frame, so a
+    /// crash cannot retain the value but lose its issue-time roster.
+    CertifiedUpsertScoped {
         key: String,
-        value: crate::store::kv::CrdtValueV4,
+        value: CrdtValue,
         hlc: HlcTimestamp,
+        scope: CertifiedScopePin,
     },
-    UpsertVisible {
-        key: String,
-        value: crate::store::kv::CrdtValueV4,
-        hlc: HlcTimestamp,
-    },
-    MergeFailed {
-        keys: Vec<String>,
-    },
-    SessionClaims {
-        applied: HashMap<String, HlcTimestamp>,
-        visible: HashMap<String, HlcTimestamp>,
-        failed: Vec<String>,
-    },
-}
-
-impl From<WalRecordV1> for WalRecord {
-    fn from(old: WalRecordV1) -> Self {
-        match old {
-            WalRecordV1::UpsertApplied { key, value, hlc } => WalRecord::UpsertApplied {
-                key,
-                value: value.into(),
-                hlc,
-            },
-            WalRecordV1::UpsertVisible { key, value, hlc } => WalRecord::UpsertVisible {
-                key,
-                value: value.into(),
-                hlc,
-            },
-            WalRecordV1::MergeFailed { keys } => WalRecord::MergeFailed { keys },
-            WalRecordV1::SessionClaims {
-                applied,
-                visible,
-                failed,
-            } => WalRecord::SessionClaims {
-                applied,
-                visible,
-                failed,
-            },
-        }
-    }
 }
 
 /// When to fdatasync the WAL relative to acknowledging writes.
@@ -330,15 +293,32 @@ impl WalShared {
 pub struct WalWriter {
     shared: Arc<WalShared>,
     cfg: WalConfig,
+    boot_seq: u64,
+    _lock: Option<File>,
 }
 
 impl WalWriter {
     /// Open a WAL directory for appending.
     ///
-    /// Always starts a NEW segment (max existing sequence + 1); sealed
-    /// segments are never appended to, so recovery never needs to repair
-    /// or truncate an old file before reuse.
+    /// Always reserves a new durable boot incarnation and opens a segment
+    /// after the existing WAL tail. The two counters are independent: a
+    /// failed segment create must not leave a gap in operation-ledger WAL.
     pub fn open(cfg: WalConfig) -> io::Result<Self> {
+        Self::open_impl(cfg, 1, true)
+    }
+
+    /// Open a writer with a sequence floor supplied by a separately durable
+    /// checkpoint. A recovered torn final segment may have been removed;
+    /// without this floor, a now-empty directory could restart at sequence
+    /// 1 and place new acknowledged records below the checkpoint cutoff.
+    pub(crate) fn open_at_least(cfg: WalConfig, min_seq: u64) -> io::Result<Self> {
+        // OperationLedger holds its own directory lease across a poisoned
+        // reopen, including while the old WalWriter is still alive. Keep
+        // this short reservation lock only through open in that path.
+        Self::open_impl(cfg, min_seq, false)
+    }
+
+    fn open_impl(cfg: WalConfig, min_seq: u64, retain_lock: bool) -> io::Result<Self> {
         // Create the WAL directory and make the chain itself durable
         // (m-4): `create_segment` below fsyncs the segment file and the
         // WAL directory, but on a first boot the WAL directory's own
@@ -351,10 +331,55 @@ impl WalWriter {
         // traverse-only (`--x`) ancestor never fail-stops the boot of an
         // established node.
         create_dir_all_durable(&cfg.dir)?;
-        let next_seq = list_segments(&cfg.dir)?
-            .last()
-            .map(|(seq, _)| seq + 1)
-            .unwrap_or(1);
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(cfg.dir.join(WAL_WRITER_LOCK))?;
+        lock.try_lock()?;
+        let high_water_backend = FileBackend::new(cfg.dir.join(WAL_INCARNATION_HIGH_WATER));
+        high_water_backend.remove_stale_tmp_files()?;
+        let segments = list_segments(&cfg.dir)?;
+        let high_water = match high_water_backend.load() {
+            Ok(bytes)
+                if bytes.len() == 20
+                    && &bytes[..8] == WAL_INCARNATION_MAGIC
+                    && crc32fast::hash(&bytes[..16])
+                        == u32::from_le_bytes(bytes[16..20].try_into().unwrap()) =>
+            {
+                u64::from_le_bytes(bytes[8..16].try_into().unwrap())
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid WAL incarnation high-water",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && segments.is_empty() => 0,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL segments exist without incarnation high-water",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let boot_seq = high_water.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "WAL incarnation overflow")
+        })?;
+        let max_segment = segments.last().map(|(seq, _)| *seq).unwrap_or(0);
+        let next_seq = max_segment
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL sequence overflow"))?
+            .max(min_seq);
+        let mut high_water_bytes = Vec::with_capacity(20);
+        high_water_bytes.extend_from_slice(WAL_INCARNATION_MAGIC);
+        high_water_bytes.extend_from_slice(&boot_seq.to_le_bytes());
+        high_water_bytes.extend_from_slice(&crc32fast::hash(&high_water_bytes).to_le_bytes());
+        // Reserve the incarnation durably before it can be used by any
+        // operation. Even if recovery later discards this segment, a peer
+        // may have received an un-synced dot created under this sequence.
+        high_water_backend.save(&high_water_bytes)?;
         let file = create_segment(&cfg.dir, next_seq)?;
         Ok(Self {
             shared: Arc::new(WalShared {
@@ -375,7 +400,14 @@ impl WalWriter {
                 durable_tx: tokio::sync::watch::channel(0).0,
             }),
             cfg,
+            boot_seq,
+            _lock: retain_lock.then_some(lock),
         })
+    }
+
+    /// Durable, never-reused WAL open sequence for this process incarnation.
+    pub fn boot_sequence(&self) -> u64 {
+        self.boot_seq
     }
 
     /// The configured sync policy.
@@ -450,7 +482,9 @@ impl WalWriter {
         state.repair_if_tainted()?;
         state.file.sync_all()?;
         let sealed = state.seg_seq;
-        let next = sealed + 1;
+        let next = sealed
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WAL sequence overflow"))?;
         // `next` is only ever `seg_seq + 1`, so a colliding file can only
         // be our own torn create from an earlier failed rotation (ENOSPC
         // etc.) — reclaim it instead of failing with AlreadyExists until
@@ -563,7 +597,10 @@ impl WalSyncer {
                 self.sync_once().await;
             },
             SyncPolicy::Interval(d) => {
-                let mut ticker = tokio::time::interval(d);
+                // `tokio::time::interval(0)` panics and would leave every
+                // durability waiter blocked if a caller bypassed the env
+                // parser. Keep the writer's policy usable at this boundary.
+                let mut ticker = tokio::time::interval(d.max(Duration::from_millis(1)));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
@@ -643,8 +680,8 @@ thread_local! {
 ///
 /// Strict: an existing file at the target path is an error
 /// (`AlreadyExists`). Used by [`WalWriter::open`], where the sequence
-/// number comes from a fresh directory scan (max + 1), so a collision can
-/// only mean an unexpected concurrent writer — fail loud, never reclaim.
+/// number comes from a durable reservation and a directory scan, so a
+/// collision means unexpected external mutation — fail loud, never reclaim.
 fn create_segment(dir: &Path, seq: u64) -> io::Result<File> {
     let path = dir.join(segment_file_name(seq));
     let file = OpenOptions::new()
@@ -863,7 +900,32 @@ pub struct WalStopPoint {
 /// harmless torn tail from mid-log corruption. Records preceding the stop
 /// point are always returned (they are what a truncating recovery keeps).
 pub fn read_all_segments(dir: &Path) -> io::Result<WalReadResult> {
-    let segments = list_segments(dir)?;
+    read_segments_after(dir, 0)
+}
+
+/// Make every segment admitted by startup replay durable before the
+/// recovered store can answer a durable digest or sync acknowledgement.
+/// A clean frame read from the page cache may have been appended under an
+/// earlier `Off` policy (or before an `Always` acknowledgement) and still
+/// disappear on an OS crash unless recovery fsyncs its original file.
+pub(crate) fn sync_replayed_segments(dir: &Path) -> io::Result<()> {
+    for (_, path) in list_segments(dir)? {
+        OpenOptions::new().read(true).open(path)?.sync_all()?;
+    }
+    if dir.exists() {
+        fsync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Read only segments newer than a durable ledger checkpoint. The caller
+/// must validate that checkpoint before using its cutoff: old frames may
+/// contain bodies that the checkpoint has replaced with ID receipts.
+pub fn read_segments_after(dir: &Path, sealed_seq: u64) -> io::Result<WalReadResult> {
+    let segments: Vec<_> = list_segments(dir)?
+        .into_iter()
+        .filter(|(seq, _)| *seq > sealed_seq)
+        .collect();
     let mut records = Vec::new();
     let total = segments.len();
     for (idx, (seq, path)) in segments.iter().enumerate() {
@@ -954,6 +1016,33 @@ pub fn truncate_to_valid_prefix(dir: &Path, read: &WalReadResult) -> io::Result<
     Ok(())
 }
 
+/// Replace a torn, frame-free final segment with a valid empty segment at
+/// the same sequence. The rename is atomic: a crash leaves either the torn
+/// original or the valid replacement, never a missing sequence. This is
+/// needed by ledgers that reject gaps after a checkpoint on every restart.
+pub(crate) fn repair_torn_empty_tail(dir: &Path, read: &WalReadResult) -> io::Result<bool> {
+    let Some(stop) = &read.stop else {
+        return Ok(false);
+    };
+    if read.outcome != WalReadOutcome::TornTail || stop.valid_len != 0 {
+        return Ok(false);
+    }
+    let temp = dir.join(format!(".wal-repair-{:016x}.tmp", stop.seq));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp)?;
+    let mut header = [0u8; SEGMENT_HEADER_LEN];
+    header[..8].copy_from_slice(&WAL_MAGIC);
+    header[8..12].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    file.write_all(&header)?;
+    file.sync_all()?;
+    fs::rename(&temp, &stop.path)?;
+    fsync_dir(dir)?;
+    Ok(true)
+}
+
 /// Test-only trace of the physical operations `truncate_to_valid_prefix`
 /// performs, in order. Crash-during-recovery cannot be reproduced in
 /// process, so the durability ORDERING (unlinks fsynced before the stop
@@ -1005,7 +1094,7 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
     // on the write side). It holds no frames, hence no acked data: a
     // harmless torn tail, not corruption. valid_len = 0 sends it down the
     // remove path of `truncate_to_valid_prefix`; the next `WalWriter::open`
-    // then re-uses the SAME sequence number (remaining max + 1).
+    // reserves a newer incarnation even though this file is gone.
     if is_last && is_torn_create_len(data.len() as u64) && data.iter().all(|&b| b == 0) {
         return (WalReadOutcome::TornTail, 0);
     }
@@ -1013,9 +1102,9 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
         return (WalReadOutcome::Corruption, 0);
     }
     let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    if version == 0 || version > WAL_FORMAT_VERSION {
-        // Unknown version: refuse to guess at the layout. (v1 is decoded
-        // via the frozen WalRecordV1 shape below.)
+    if version != WAL_FORMAT_VERSION {
+        // Every earlier experimental format has a different or unverified
+        // embedded CRDT layout. Never guess at its meaning on recovery.
         return (WalReadOutcome::Corruption, 0);
     }
 
@@ -1056,27 +1145,14 @@ fn parse_segment(data: &[u8], is_last: bool, out: &mut Vec<WalRecord>) -> (WalRe
         }
         let payload = &data[off + FRAME_HEADER_LEN..off + FRAME_HEADER_LEN + len];
         if crc32fast::hash(payload) != crc {
-            // A CRC mismatch on the FINAL frame of the last segment is a
-            // torn write (partial payload flush); a mismatch with valid
-            // data after it means acked records were damaged in place.
-            if is_last && off + FRAME_HEADER_LEN + len == data.len() {
-                return (WalReadOutcome::TornTail, off as u64);
-            }
+            // Even the final frame may have been fdatasynced and ACKed.
+            // A full-length frame with a bad CRC cannot be distinguished
+            // from a torn payload, so never discard it automatically.
             return (WalReadOutcome::Corruption, off as u64);
         }
-        let decoded = match version {
-            // v1: pre-floor CRDT layouts — decode via the frozen shape.
-            1 => bincode::serde::decode_from_slice::<WalRecordV1, _>(
-                payload,
-                bincode::config::standard(),
-            )
-            .map(|(record, _)| WalRecord::from(record)),
-            _ => bincode::serde::decode_from_slice::<WalRecord, _>(
-                payload,
-                bincode::config::standard(),
-            )
-            .map(|(record, _)| record),
-        };
+        let decoded =
+            bincode::serde::decode_from_slice::<WalRecord, _>(payload, bincode::config::standard())
+                .map(|(record, _)| record);
         match decoded {
             Ok(record) => out.push(record),
             // Valid CRC but undecodable payload: a format-level problem,
@@ -1110,6 +1186,9 @@ pub fn replay_record(store: &mut Store, record: WalRecord) {
         // `recover_store`, not here (this arm only touches the store).
         WalRecord::CertifiedUpsert {
             key, value, hlc, ..
+        }
+        | WalRecord::CertifiedUpsertScoped {
+            key, value, hlc, ..
         } => {
             if let Err(e) = store.merge_value(key.clone(), &value) {
                 tracing::warn!(key = %key, error = %e, "WAL replay merge failed; poisoning key");
@@ -1140,6 +1219,8 @@ pub fn replay_record(store: &mut Store, record: WalRecord) {
             store.merge_visible_origins(&visible);
             store.merge_failed_extend(failed);
         }
+        // The operation ledger is recovered separately from CRDT state.
+        WalRecord::BoundOperation { .. } | WalRecord::OperationReceipt { .. } => {}
     }
 }
 
@@ -1175,6 +1256,75 @@ mod tests {
 
     fn cfg(dir: &Path) -> WalConfig {
         WalConfig::new(dir, SyncPolicy::Off)
+    }
+
+    #[test]
+    fn incarnation_survives_lost_last_segment_and_rejects_parallel_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = WalWriter::open(cfg(dir.path())).unwrap();
+        let first = writer.boot_sequence();
+        assert!(WalWriter::open(cfg(dir.path())).is_err());
+        drop(writer);
+
+        for (_, path) in list_segments(dir.path()).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        let recovered = WalWriter::open(cfg(dir.path())).unwrap();
+        assert!(recovered.boot_sequence() > first);
+    }
+
+    #[test]
+    fn existing_segment_without_incarnation_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = WalWriter::open(cfg(dir.path())).unwrap();
+        drop(writer);
+        fs::remove_file(dir.path().join(WAL_INCARNATION_HIGH_WATER)).unwrap();
+        assert_eq!(
+            WalWriter::open(cfg(dir.path())).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn corrupted_incarnation_number_is_rejected_before_opening_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = WalWriter::open(cfg(dir.path())).unwrap();
+        drop(writer);
+        let path = dir.path().join(WAL_INCARNATION_HIGH_WATER);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8] ^= 1;
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            WalWriter::open(cfg(dir.path())).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_open_advances_incarnation_without_skipping_segment_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = WalWriter::open_at_least(cfg(dir.path()), 1).unwrap();
+        assert_eq!(first.boot_sequence(), 1);
+        drop(first);
+
+        FAIL_SEGMENT_INIT.with(|cell| cell.set(Some(4)));
+        let error = WalWriter::open_at_least(cfg(dir.path()), 2).err().unwrap();
+        assert_eq!(error.raw_os_error(), Some(28));
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 1);
+
+        let recovered = WalWriter::open_at_least(cfg(dir.path()), 2).unwrap();
+        assert_eq!(recovered.boot_sequence(), 3);
+        assert_eq!(recovered.shared.state.lock().unwrap().seg_seq, 2);
+        assert_eq!(
+            list_segments(dir.path())
+                .unwrap()
+                .into_iter()
+                .map(|(seq, _)| seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     fn encode(record: &WalRecord) -> Vec<u8> {
@@ -1361,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn crc_flip_on_final_record_is_torn_tail() {
+    fn crc_flip_on_final_record_is_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_segment(dir.path(), 3);
         let mut data = fs::read(&path).unwrap();
@@ -1370,7 +1520,7 @@ mod tests {
         fs::write(&path, &data).unwrap();
 
         let read = read_all_segments(dir.path()).unwrap();
-        assert_eq!(read.outcome, WalReadOutcome::TornTail);
+        assert_eq!(read.outcome, WalReadOutcome::Corruption);
         assert_eq!(read.records.len(), 2);
     }
 
@@ -1563,6 +1713,9 @@ mod tests {
         wal.append(&upsert("a", 1, 1)).unwrap();
         wal.append(&upsert("b", 1, 2)).unwrap();
         drop(wal);
+        let torn = WalWriter::open(cfg(dir.path())).unwrap();
+        assert_eq!(torn.boot_sequence(), 2);
+        drop(torn);
         fs::write(
             dir.path().join(segment_file_name(2)),
             [0u8; SEGMENT_HEADER_LEN],
@@ -1580,11 +1733,11 @@ mod tests {
         assert_eq!(stop.seq, 2);
         assert_eq!(stop.valid_len, 0, "nothing in the torn create is valid");
 
-        // Full recovery path: truncation drops the zero-header file, the
-        // next open re-uses the SAME sequence number (remaining max + 1),
-        // and everything replays.
+        // Full recovery path: truncation drops the zero-header file. The
+        // next open reserves a fresh incarnation, and everything replays.
         truncate_to_valid_prefix(dir.path(), &read).unwrap();
         let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
+        assert_eq!(wal.boot_sequence(), 3);
         wal.append(&upsert("c", 1, 3)).unwrap();
         drop(wal);
         assert_eq!(read_keys(dir.path()), ["a", "b", "c"]);
@@ -1596,7 +1749,8 @@ mod tests {
         // torn create (torn creates are always the maximum sequence
         // number): it means acked data was damaged — fail-stop.
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path()).unwrap();
+        let wal = WalWriter::open(cfg(dir.path())).unwrap();
+        drop(wal);
         fs::write(
             dir.path().join(segment_file_name(1)),
             [0u8; SEGMENT_HEADER_LEN],
@@ -1918,6 +2072,18 @@ mod tests {
     }
 
     #[test]
+    fn rotate_rejects_sequence_overflow_without_reusing_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = WalWriter::open_at_least(cfg(dir.path()), u64::MAX).unwrap();
+        wal.append(&upsert("last", 1, 1)).unwrap();
+
+        let error = wal.rotate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 1);
+        assert!(!dir.path().join(segment_file_name(0)).exists());
+    }
+
+    #[test]
     fn rotate_reclaims_orphan_torn_creates() {
         // Every on-disk residue an ENOSPC'd create can leave: nothing
         // written yet is covered by the clean-create path, so seed the
@@ -2043,136 +2209,28 @@ mod tests {
         assert!(msg.contains("aborting"));
     }
 
-    // ---------------------------------------------------------------
-    // WAL v1 compatibility (pre-compaction_floor CRDT layouts)
-    // ---------------------------------------------------------------
-
-    /// Serialisable mirrors of the exact WAL v1 record layout (OrSet
-    /// without `compaction_floor`). Variant order pins the bincode
-    /// variant indexes of `WalRecord` / `CrdtValue`.
-    #[derive(serde::Serialize)]
-    struct V1Dot {
-        node_id: NodeId,
-        counter: u64,
-    }
-
-    #[derive(serde::Serialize)]
-    struct V1OrSet {
-        elements: HashMap<String, Vec<V1Dot>>,
-        counters: HashMap<NodeId, u64>,
-        deferred: Vec<V1Dot>,
-    }
-
-    #[derive(serde::Serialize)]
-    #[allow(dead_code)]
-    enum V1CrdtValue {
-        Counter(PnCounter),
-        Set(V1OrSet),
-        Map(()),
-        Register(()),
-    }
-
-    #[derive(serde::Serialize)]
-    #[allow(dead_code)]
-    enum V1Record {
-        UpsertApplied {
-            key: String,
-            value: V1CrdtValue,
-            hlc: HlcTimestamp,
-        },
-        UpsertVisible {
-            key: String,
-            value: V1CrdtValue,
-            hlc: HlcTimestamp,
-        },
-        MergeFailed {
-            keys: Vec<String>,
-        },
-    }
-
-    /// Write a raw v1 segment: v1 header + framed v1-layout records.
-    fn write_v1_segment(dir: &Path, records: &[V1Record]) {
-        let mut data = Vec::new();
+    #[test]
+    fn older_wal_version_is_rejected_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
         let mut header = [0u8; SEGMENT_HEADER_LEN];
         header[..8].copy_from_slice(&WAL_MAGIC);
-        header[8..12].copy_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&header);
-        for record in records {
-            let payload =
-                bincode::serde::encode_to_vec(record, bincode::config::standard()).unwrap();
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-            data.extend_from_slice(&payload);
-        }
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join(segment_file_name(1)), data).unwrap();
-    }
-
-    /// A v1 segment (pre-floor CRDT layouts) replays through the frozen
-    /// `WalRecordV1` decode shape: elements, tombstones and session
-    /// metadata survive; floors come up empty.
-    #[test]
-    fn v1_segment_replays_via_frozen_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        let n = NodeId("A".into());
-        let set = V1OrSet {
-            elements: HashMap::from([(
-                "alice".to_string(),
-                vec![V1Dot {
-                    node_id: n.clone(),
-                    counter: 1,
-                }],
-            )]),
-            counters: HashMap::from([(n.clone(), 2)]),
-            deferred: vec![V1Dot {
-                node_id: n.clone(),
-                counter: 2,
-            }],
-        };
-        write_v1_segment(
-            dir.path(),
-            &[
-                V1Record::UpsertApplied {
-                    key: "users".into(),
-                    value: V1CrdtValue::Set(set),
-                    hlc: ts(100, 0, "A"),
-                },
-                V1Record::MergeFailed {
-                    keys: vec!["bad".into()],
-                },
-            ],
-        );
-
+        header[8..12].copy_from_slice(&(WAL_FORMAT_VERSION - 1).to_le_bytes());
+        fs::write(dir.path().join(segment_file_name(1)), header).unwrap();
         let read = read_all_segments(dir.path()).unwrap();
-        assert_eq!(read.outcome, WalReadOutcome::Clean);
-        assert_eq!(read.records.len(), 2);
-
-        let mut store = Store::new();
-        for record in read.records {
-            replay_record(&mut store, record);
-        }
-        match store.get("users") {
-            Some(CrdtValue::Set(s)) => {
-                assert!(s.contains(&"alice".to_string()));
-                assert_eq!(s.deferred_len(), 1, "v1 tombstone must survive replay");
-                assert!(s.compaction_floor().is_empty(), "floor defaults to empty");
-            }
-            other => panic!("expected Set, got {other:?}"),
-        }
-        assert!(store.merge_failed_contains("bad"));
-        assert_eq!(store.applied_origin("A"), Some(&ts(100, 0, "A")));
+        assert_eq!(read.outcome, WalReadOutcome::Corruption);
+        assert!(read.records.is_empty());
     }
 
-    /// v2 writers stamp the new version; v2 round trips preserve the
+    /// Current writers stamp the current version; round trips preserve the
     /// compaction floor inside CRDT payloads.
     #[test]
-    fn v2_round_trip_preserves_compaction_floor() {
+    fn current_round_trip_preserves_compaction_floor() {
         let dir = tempfile::tempdir().unwrap();
         let n = NodeId("A".into());
         let mut set = crate::crdt::or_set::OrSet::new();
         set.add("x".to_string(), &n);
         set.remove(&"x".to_string());
-        set.compact_deferred_certified(&set.deferred_dots(), None);
+        set.compact_deferred_certified(&set.deferred_dots());
         assert_eq!(set.compaction_floor().get(&n), Some(&1));
 
         let mut wal = WalWriter::open(cfg(dir.path())).unwrap();
@@ -2184,13 +2242,12 @@ mod tests {
         .unwrap();
         drop(wal);
 
-        // Header carries the current writer version (v3 since the tail
-        // `CertifiedUpsert` variant was added; v2 and v3 share a decode arm).
+        // Header identifies the current CRDT payload layout.
         let (_, path) = list_segments(dir.path()).unwrap().pop().unwrap();
         let data = fs::read(&path).unwrap();
         let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         assert_eq!(version, WAL_FORMAT_VERSION);
-        assert_eq!(version, 3);
+        assert_eq!(version, 7);
 
         let read = read_all_segments(dir.path()).unwrap();
         assert_eq!(read.outcome, WalReadOutcome::Clean);
@@ -2207,55 +2264,7 @@ mod tests {
         }
     }
 
-    /// Write a raw segment with an explicit header version and current-shape
-    /// framed records (used to forge an "old writer" v2 segment).
-    fn write_segment_versioned(dir: &Path, header_version: u32, records: &[WalRecord]) {
-        let mut data = Vec::new();
-        let mut header = [0u8; SEGMENT_HEADER_LEN];
-        header[..8].copy_from_slice(&WAL_MAGIC);
-        header[8..12].copy_from_slice(&header_version.to_le_bytes());
-        data.extend_from_slice(&header);
-        for record in records {
-            let payload = encode(record);
-            data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            data.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-            data.extend_from_slice(&payload);
-        }
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join(segment_file_name(1)), data).unwrap();
-    }
-
-    /// A v2 segment written before the v3 tail variant existed must still
-    /// decode after the bump: the existing variants keep their bincode
-    /// indices, so v2 and v3 share the current [`WalRecord`] decode arm.
-    #[test]
-    fn v2_segment_still_decodes_after_v3_bump() {
-        let dir = tempfile::tempdir().unwrap();
-        write_segment_versioned(
-            dir.path(),
-            2,
-            &[
-                upsert("k0", 3, 100),
-                WalRecord::MergeFailed {
-                    keys: vec!["bad".into()],
-                },
-            ],
-        );
-        let read = read_all_segments(dir.path()).unwrap();
-        assert_eq!(read.outcome, WalReadOutcome::Clean);
-        assert_eq!(read.records.len(), 2);
-        let mut store = Store::new();
-        for record in read.records {
-            replay_record(&mut store, record);
-        }
-        match store.get("k0") {
-            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 3),
-            other => panic!("expected Counter, got {other:?}"),
-        }
-        assert!(store.merge_failed_contains("bad"));
-    }
-
-    /// A `CertifiedUpsert` round-trips through a v3 segment, carrying the
+    /// A `CertifiedUpsert` round-trips through a current segment, carrying the
     /// origin policy version, and replays into the store like `UpsertApplied`.
     #[test]
     fn certified_upsert_round_trips_with_policy_version() {

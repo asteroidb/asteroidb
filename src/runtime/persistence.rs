@@ -49,7 +49,9 @@ use crate::api::certified::CertifiedApi;
 use crate::api::eventual::EventualApi;
 use crate::control_plane::system_namespace::SystemNamespace;
 use crate::store::Store;
-use crate::store::wal::{self, SyncPolicy, WalConfig, WalReadOutcome, WalSyncer, WalWriter};
+use crate::store::wal::{
+    self, CertifiedScopePin, SyncPolicy, WalConfig, WalReadOutcome, WalSyncer, WalWriter,
+};
 use crate::types::{NodeId, PolicyVersion};
 
 /// Snapshot file name for the eventual store.
@@ -73,6 +75,15 @@ const CERTIFIED_WAL_DIR: &str = "wal/certified";
 /// without it recovers exactly as before (empty origins = current-version
 /// fallback).
 const CERTIFIED_ORIGINS: &str = "certified.origins.bin";
+/// Versioned, checksummed scope pins for certified writes. The marker makes
+/// a missing sidecar fail-stop after the first checkpoint that relies on it.
+const CERTIFIED_SCOPE_PINS: &str = "certified.scope-pins.bin";
+const CERTIFIED_SCOPE_PINS_REQUIRED: &str = "certified.scope-pins.required";
+const CERTIFIED_ORIGINS_PENDING: &str = "certified.origins.pending.bin";
+const CERTIFIED_SCOPE_PINS_PENDING: &str = "certified.scope-pins.pending.bin";
+const SCOPE_PINS_MAGIC: [u8; 8] = *b"ADBSCOPE";
+const SCOPE_PINS_VERSION: u32 = 1;
+const SCOPE_PINS_MARKER: &[u8] = b"asteroidb-certified-scope-pins-v1\n";
 
 /// Per-store checkpoint serialization locks, shared by every clone of a
 /// [`PersistenceConfig`].
@@ -145,10 +156,9 @@ impl PersistenceConfig {
             .to_ascii_lowercase()
             .as_str()
         {
-            "interval" => SyncPolicy::Interval(Duration::from_millis(env_u64(
-                "ASTEROIDB_WAL_SYNC_INTERVAL_MS",
-                100,
-            ))),
+            "interval" => SyncPolicy::Interval(Duration::from_millis(
+                env_u64("ASTEROIDB_WAL_SYNC_INTERVAL_MS", 100).max(1),
+            )),
             "off" => SyncPolicy::Off,
             "always" | "" => SyncPolicy::Always,
             other => {
@@ -189,17 +199,20 @@ impl PersistenceConfig {
 /// (input to the recovery-gap fence decision in [`recover_eventual`]).
 /// Fail-stop errors: damaged snapshot, or mid-log corruption without the
 /// truncate escape hatch.
+type RecoveredStore = (
+    Store,
+    WalWriter,
+    WalReadOutcome,
+    HashMap<String, PolicyVersion>,
+    HashMap<String, Option<CertifiedScopePin>>,
+);
+
 fn recover_store(
     label: &str,
     snapshot_path: &Path,
     wal_cfg: WalConfig,
     recover_truncate: bool,
-) -> io::Result<(
-    Store,
-    WalWriter,
-    WalReadOutcome,
-    HashMap<String, PolicyVersion>,
-)> {
+) -> io::Result<RecoveredStore> {
     let started = std::time::Instant::now();
     // Sweep tmp files left by saves that failed (or crashed) before their
     // in-line cleanup (m-3). Startup-only: no concurrent save can be in
@@ -291,19 +304,49 @@ fn recover_store(
     // the map ends up with each key's most recent origin. The eventual store
     // never emits `CertifiedUpsert`, so its map stays empty (and is ignored).
     let mut origins: HashMap<String, PolicyVersion> = HashMap::new();
+    let mut scope_updates: HashMap<String, Option<CertifiedScopePin>> = HashMap::new();
     for record in read.records {
-        if let wal::WalRecord::CertifiedUpsert {
-            key,
-            policy_version,
-            ..
-        } = &record
-        {
-            origins.insert(key.clone(), *policy_version);
+        match &record {
+            wal::WalRecord::CertifiedUpsert {
+                key,
+                policy_version,
+                ..
+            } => {
+                origins.insert(key.clone(), *policy_version);
+                scope_updates.insert(key.clone(), None);
+            }
+            wal::WalRecord::CertifiedUpsertScoped {
+                key, hlc, scope, ..
+            } => {
+                validate_scope_pin(key, scope)?;
+                if scope.write_hlc != *hlc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "certified WAL scope pin HLC does not match upsert HLC",
+                    ));
+                }
+                origins.insert(key.clone(), scope.policy_version);
+                scope_updates.insert(key.clone(), Some(scope.clone()));
+            }
+            _ => {}
         }
         wal::replay_record(&mut store, record);
     }
 
+    if snapshot_path.exists() && !wal::has_incarnation_high_water(&wal_cfg.dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} snapshot exists without WAL incarnation high-water"),
+        ));
+    }
+    let wal_dir = wal_cfg.dir.clone();
     let writer = WalWriter::open(wal_cfg)?;
+    // Replayed frames may have come only from the previous process's page
+    // cache. The new writer's own durable segment does not fsync older
+    // segment bodies. Fence them before exposing the recovered state: a
+    // subsequent digest with no new WAL position may otherwise claim that
+    // an unflushed tombstone is durable and authorize a peer's GC sweep.
+    wal::sync_replayed_segments(&wal_dir)?;
     tracing::info!(
         store = label,
         snapshot = %snapshot_path.display(),
@@ -312,7 +355,7 @@ fn recover_store(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "recovery complete"
     );
-    Ok((store, writer, read.outcome, origins))
+    Ok((store, writer, read.outcome, origins, scope_updates))
 }
 
 /// Recover the eventual store and build its API + WAL syncer.
@@ -357,7 +400,7 @@ pub fn recover_eventual(
     }
     // The eventual store never emits `CertifiedUpsert`, so its origins map is
     // always empty; certification-scope origins are a certified-store concept.
-    let (store, writer, outcome, _origins) = recover_store(
+    let (store, writer, outcome, _origins, _scope_updates) = recover_store(
         "eventual",
         &cfg.data_dir.join(EVENTUAL_SNAPSHOT),
         cfg.wal_config(EVENTUAL_WAL_DIR),
@@ -404,7 +447,7 @@ pub fn recover_certified(
     }
     // No recovery-gap fence here: session tokens are an eventual-API-only
     // contract (api-reference.md), so the certified store needs no fence.
-    let (store, writer, _outcome, wal_origins) = recover_store(
+    let (store, writer, _outcome, wal_origins, wal_scope_updates) = recover_store(
         "certified",
         &cfg.data_dir.join(CERTIFIED_SNAPSHOT),
         cfg.wal_config(CERTIFIED_WAL_DIR),
@@ -431,11 +474,47 @@ pub fn recover_certified(
             "failed to sweep stale certified origins tmp files; continuing"
         );
     }
-    let mut origins = load_origins_sidecar(&origins_path);
+    let (mut origins, _) = load_origins_sidecar(&origins_path);
     origins.extend(wal_origins);
+    let mut scope_pins = load_scope_pins_sidecar(&cfg.data_dir)?;
+    for (key, update) in wal_scope_updates {
+        match update {
+            Some(pin) => {
+                scope_pins.insert(key, pin);
+            }
+            None => {
+                scope_pins.remove(&key);
+            }
+        }
+    }
+    // A sidecar may have been saved just before a crash that left the old
+    // snapshot in place. Replay has already reconstructed the final store;
+    // only pins naming that exact write can establish its origin. This also
+    // lets a valid pin recover a missing origins sidecar.
+    scope_pins.retain(|key, pin| store.timestamp_for(key) == Some(&pin.write_hlc));
+    for (key, pin) in &scope_pins {
+        origins.insert(key.clone(), pin.policy_version);
+    }
+    if store
+        .keys()
+        .into_iter()
+        .any(|key| !scope_pins.contains_key(key))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certified store contains a key without a write-time scope pin",
+        ));
+    }
 
     Ok((
-        CertifiedApi::recovered(node_id, namespace, store, Some(writer), origins),
+        CertifiedApi::recovered_with_scope_pins(
+            node_id,
+            namespace,
+            store,
+            Some(writer),
+            origins,
+            scope_pins,
+        ),
         Some(syncer),
     ))
 }
@@ -443,16 +522,15 @@ pub fn recover_certified(
 /// Load the certified origins sidecar, or an empty map when it is absent
 /// (a fresh or pre-upgrade data directory) or unreadable.
 ///
-/// Best-effort by design: the sidecar is a belt beside the WAL, never the
-/// sole copy of acked data (the values live in the snapshot + WAL). A
-/// missing or corrupt sidecar degrades to the current-version fallback in
-/// `rebuild_pending_from_store` rather than failing recovery, so an operator
-/// is never blocked by it. NotFound is the normal case for any data
-/// directory written before this feature.
-fn load_origins_sidecar(path: &Path) -> HashMap<String, PolicyVersion> {
+/// Legacy directories may lack this sidecar and fall back to the current
+/// policy version. Once a scope-pin checkpoint has been marked, recovery
+/// may use matching pins and retained WAL origins to reconstruct missing
+/// entries; it fails closed if any checkpointed key has neither. NotFound is
+/// normal for data directories written before the origins feature.
+fn load_origins_sidecar(path: &Path) -> (HashMap<String, PolicyVersion>, bool) {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (HashMap::new(), false),
         Err(e) => {
             tracing::warn!(
                 sidecar = %path.display(),
@@ -460,14 +538,18 @@ fn load_origins_sidecar(path: &Path) -> HashMap<String, PolicyVersion> {
                 "failed to read certified origins sidecar; recovered writes fall back \
                  to the current policy version"
             );
-            return HashMap::new();
+            return (HashMap::new(), false);
         }
     };
     match bincode::serde::decode_from_slice::<Vec<(String, PolicyVersion)>, _>(
         &bytes,
         bincode::config::standard(),
     ) {
-        Ok((entries, _)) => entries.into_iter().collect(),
+        Ok((entries, used)) if used == bytes.len() => (entries.into_iter().collect(), true),
+        Ok(_) => {
+            tracing::warn!(sidecar = %path.display(), "certified origins sidecar has trailing bytes");
+            (HashMap::new(), false)
+        }
         Err(e) => {
             tracing::warn!(
                 sidecar = %path.display(),
@@ -475,7 +557,7 @@ fn load_origins_sidecar(path: &Path) -> HashMap<String, PolicyVersion> {
                 "certified origins sidecar is corrupt; recovered writes fall back to \
                  the current policy version"
             );
-            HashMap::new()
+            (HashMap::new(), false)
         }
     }
 }
@@ -494,6 +576,124 @@ fn save_origins_sidecar(path: &Path, origins: &HashMap<String, PolicyVersion>) -
     let bytes = bincode::serde::encode_to_vec(&entries, bincode::config::standard())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     crate::store::backend::FileBackend::new(path).save(&bytes)
+}
+
+fn validate_scope_pin(key: &str, pin: &CertifiedScopePin) -> io::Result<()> {
+    if !key.starts_with(&pin.key_range.prefix)
+        || pin.authority_nodes.is_empty()
+        || pin
+            .authority_nodes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid certified scope pin for key {key}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A modern checkpoint promises a durable scope sidecar. Legacy directories
+/// have neither the sidecar nor the marker and keep their old recovery path.
+fn load_scope_pins_sidecar(data_dir: &Path) -> io::Result<HashMap<String, CertifiedScopePin>> {
+    let marker_path = data_dir.join(CERTIFIED_SCOPE_PINS_REQUIRED);
+    let marked = match std::fs::read(&marker_path) {
+        Ok(bytes) if bytes == SCOPE_PINS_MARKER => true,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "certified scope pin marker has invalid contents",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let path = data_dir.join(CERTIFIED_SCOPE_PINS);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !marked => {
+            return Ok(HashMap::new());
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "required certified scope pin sidecar {}: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    if bytes.len() < 16 || bytes[..8] != SCOPE_PINS_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certified scope pin sidecar has invalid magic or length",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let payload = &bytes[16..];
+    if version != SCOPE_PINS_VERSION || crc32fast::hash(payload) != expected_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certified scope pin sidecar version or checksum mismatch",
+        ));
+    }
+    let (entries, used): (Vec<(String, CertifiedScopePin)>, usize) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if used != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certified scope pin sidecar has trailing bytes",
+        ));
+    }
+    let mut pins = HashMap::with_capacity(entries.len());
+    for (key, pin) in entries {
+        validate_scope_pin(&key, &pin)?;
+        if pins.insert(key, pin).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "certified scope pin sidecar has duplicate keys",
+            ));
+        }
+    }
+    Ok(pins)
+}
+
+fn save_scope_pins_sidecar(
+    path: &Path,
+    pins: &HashMap<String, CertifiedScopePin>,
+) -> io::Result<()> {
+    use crate::store::backend::StorageBackend;
+
+    let mut entries: Vec<(String, CertifiedScopePin)> = pins
+        .iter()
+        .map(|(key, pin)| (key.clone(), pin.clone()))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (key, pin) in &entries {
+        validate_scope_pin(key, pin)?;
+    }
+    let payload = bincode::serde::encode_to_vec(&entries, bincode::config::standard())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut bytes = Vec::with_capacity(16 + payload.len());
+    bytes.extend_from_slice(&SCOPE_PINS_MAGIC);
+    bytes.extend_from_slice(&SCOPE_PINS_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    crate::store::backend::FileBackend::new(path).save(&bytes)
+}
+
+fn promote_sidecar(pending: &Path, active: &Path) -> io::Result<()> {
+    std::fs::rename(pending, active)?;
+    crate::store::backend::fsync_dir(active.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sidecar has no parent directory",
+        )
+    })?)
 }
 
 /// Snapshot the write-time policy version of every key in the certified
@@ -596,34 +796,53 @@ pub async fn checkpoint_certified(
 ) -> io::Result<()> {
     // Serialized for the same reason as `checkpoint_eventual`.
     let _serial = cfg.checkpoint_locks.certified.lock().await;
-    let (sealed, store, origins) = {
+    let (sealed, store, origins, scope_pins) = {
         let mut api = api.lock().await;
         let sealed = api.wal_rotate()?;
         // Capture the origins under the SAME lock as the store clone so the
         // sidecar and the snapshot describe the same set of writes.
         let origins = certified_origins(&api);
-        (sealed, api.store().clone(), origins)
+        (
+            sealed,
+            api.store().clone(),
+            origins,
+            api.scope_pins().clone(),
+        )
     };
 
-    // Commit the origins sidecar BEFORE the snapshot: recovery only trusts
-    // the sidecar for writes the snapshot covers, and once the snapshot is
-    // durable the WAL segments carrying those writes' origin records may be
-    // pruned. Writing the sidecar first guarantees that whenever the snapshot
-    // exists, a consistent origins set is already on disk (retained WAL
-    // records still override it for post-checkpoint writes). A crash between
-    // the two leaves the previous snapshot in place with its WAL intact, so
-    // the fresh-but-unused sidecar is harmless. It is rewritten every
-    // checkpoint (empty included) so a stale origin can never linger.
-    save_origins_sidecar(&cfg.data_dir.join(CERTIFIED_ORIGINS), &origins)?;
+    // Stage both sidecars without overwriting the active generation. If a
+    // crash occurs before the snapshot rename, the old snapshot still needs
+    // the old active pin for a same-key write whose earlier WAL was pruned.
+    let pending_origins = cfg.data_dir.join(CERTIFIED_ORIGINS_PENDING);
+    let pending_scopes = cfg.data_dir.join(CERTIFIED_SCOPE_PINS_PENDING);
+    save_origins_sidecar(&pending_origins, &origins)?;
+    save_scope_pins_sidecar(&pending_scopes, &scope_pins)?;
 
-    finish_checkpoint(
-        "certified",
-        store,
-        cfg.data_dir.join(CERTIFIED_SNAPSHOT),
-        cfg.data_dir.join(CERTIFIED_WAL_DIR),
-        sealed,
-    )
-    .await
+    let snapshot_path = cfg.data_dir.join(CERTIFIED_SNAPSHOT);
+    let path = snapshot_path.clone();
+    tokio::task::spawn_blocking(move || store.save_snapshot_bincode(&path))
+        .await
+        .map_err(io::Error::other)??;
+
+    // After the snapshot is durable, promote both sidecars. A crash between
+    // promotions leaves the sealed WAL intact, so replay restores any newer
+    // same-key write that the older sidecar does not yet describe.
+    promote_sidecar(&pending_origins, &cfg.data_dir.join(CERTIFIED_ORIGINS))?;
+    promote_sidecar(&pending_scopes, &cfg.data_dir.join(CERTIFIED_SCOPE_PINS))?;
+    use crate::store::backend::StorageBackend;
+    crate::store::backend::FileBackend::new(cfg.data_dir.join(CERTIFIED_SCOPE_PINS_REQUIRED))
+        .save(SCOPE_PINS_MARKER)?;
+
+    // Only now can sealed WAL segments be removed. Deletion failure leaves
+    // harmless over-replay work for the next boot.
+    if let Some(sealed_seq) = sealed
+        && let Err(error) =
+            wal::remove_segments_up_to(&cfg.data_dir.join(CERTIFIED_WAL_DIR), sealed_seq)
+    {
+        tracing::warn!(sealed_seq, error = %error, "failed to prune certified WAL after checkpoint");
+    }
+    tracing::debug!(snapshot = %snapshot_path.display(), "certified checkpoint complete");
+    Ok(())
 }
 
 /// Spawn the background persistence tasks: one WAL flusher per store and
@@ -663,6 +882,278 @@ pub fn spawn_persistence_tasks(
 }
 
 #[cfg(test)]
+mod scope_pin_tests {
+    use super::*;
+    use crate::api::certified::OnTimeout;
+    use crate::control_plane::system_namespace::AuthorityDefinition;
+    use crate::crdt::pn_counter::PnCounter;
+    use crate::placement::PlacementPolicy;
+    use crate::store::kv::CrdtValue;
+    use crate::types::KeyRange;
+    use std::sync::RwLock;
+
+    fn namespace(members: &[&str]) -> Arc<RwLock<SystemNamespace>> {
+        let mut ns = SystemNamespace::new();
+        ns.set_authority_definition(AuthorityDefinition {
+            key_range: KeyRange {
+                prefix: "user/".into(),
+            },
+            authority_nodes: members.iter().map(|id| NodeId((*id).into())).collect(),
+            auto_generated: false,
+        });
+        ns.set_placement_policy(PlacementPolicy::new(
+            PolicyVersion(1),
+            KeyRange {
+                prefix: "user/".into(),
+            },
+            members.len(),
+        ))
+        .unwrap();
+        Arc::new(RwLock::new(ns))
+    }
+
+    fn config(dir: &Path) -> PersistenceConfig {
+        PersistenceConfig {
+            enabled: true,
+            data_dir: dir.to_path_buf(),
+            sync: SyncPolicy::Off,
+            snapshot_interval: None,
+            segment_max_bytes: WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+            recover_truncate: false,
+            checkpoint_locks: CheckpointLocks::default(),
+        }
+    }
+
+    fn counter(value: u64) -> CrdtValue {
+        let mut counter = PnCounter::new();
+        for _ in 0..value {
+            counter.increment(&NodeId("writer".into()));
+        }
+        CrdtValue::Counter(counter)
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restores_original_roster_after_live_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let (mut api, _) = recover_certified(NodeId("writer".into()), ns.clone(), &cfg).unwrap();
+        api.certified_write("user/x".into(), counter(1), OnTimeout::Pending)
+            .unwrap();
+        let original = api.pending_writes()[0].authority_nodes.clone();
+        let held = Arc::new(Mutex::new(api));
+        checkpoint_certified(&held, &cfg).await.unwrap();
+        drop(held);
+
+        ns.write()
+            .unwrap()
+            .set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "user/".into(),
+                },
+                authority_nodes: vec![NodeId("a".into()), NodeId("d".into()), NodeId("e".into())],
+                auto_generated: false,
+            });
+        ns.write()
+            .unwrap()
+            .set_placement_policy(PlacementPolicy::new(
+                PolicyVersion(2),
+                KeyRange {
+                    prefix: "user/".into(),
+                },
+                3,
+            ))
+            .unwrap();
+        // The modern pin carries the origin version as well as the roster.
+        // Recovery must not fall back to current v2 if the old origins
+        // sidecar is missing after the checkpoint WAL was pruned.
+        std::fs::remove_file(dir.path().join(CERTIFIED_ORIGINS)).unwrap();
+        let (recovered, _) = recover_certified(NodeId("writer".into()), ns, &cfg).unwrap();
+        assert_eq!(recovered.pending_writes()[0].authority_nodes, original);
+        assert_eq!(
+            recovered.pending_writes()[0].policy_version,
+            PolicyVersion(1)
+        );
+        assert_eq!(recovered.scope_pins()["user/x"].authority_nodes, original);
+    }
+
+    #[tokio::test]
+    async fn marked_checkpoint_fails_if_scope_sidecar_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let (mut api, _) = recover_certified(NodeId("writer".into()), ns.clone(), &cfg).unwrap();
+        api.certified_write("user/x".into(), counter(1), OnTimeout::Pending)
+            .unwrap();
+        let held = Arc::new(Mutex::new(api));
+        checkpoint_certified(&held, &cfg).await.unwrap();
+        drop(held);
+        std::fs::remove_file(dir.path().join(CERTIFIED_SCOPE_PINS)).unwrap();
+        assert!(recover_certified(NodeId("writer".into()), ns, &cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn staged_same_key_sidecars_do_not_replace_old_snapshot_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let (mut api, _) = recover_certified(NodeId("writer".into()), ns.clone(), &cfg).unwrap();
+        api.certified_write("user/x".into(), counter(1), OnTimeout::Pending)
+            .unwrap();
+        let old_pin = api.scope_pins()["user/x"].clone();
+        let held = Arc::new(Mutex::new(api));
+        checkpoint_certified(&held, &cfg).await.unwrap();
+
+        ns.write()
+            .unwrap()
+            .set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "user/".into(),
+                },
+                authority_nodes: vec![NodeId("a".into()), NodeId("d".into()), NodeId("e".into())],
+                auto_generated: false,
+            });
+        {
+            let mut api = held.lock().await;
+            api.certified_write("user/x".into(), counter(2), OnTimeout::Pending)
+                .unwrap();
+            save_origins_sidecar(&dir.path().join(CERTIFIED_ORIGINS_PENDING), api.origins())
+                .unwrap();
+            save_scope_pins_sidecar(
+                &dir.path().join(CERTIFIED_SCOPE_PINS_PENDING),
+                api.scope_pins(),
+            )
+            .unwrap();
+        }
+        drop(held);
+        // Simulate loss of the un-synced second write before snapshot rename.
+        for (_, path) in wal::list_segments(&dir.path().join(CERTIFIED_WAL_DIR)).unwrap() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let (recovered, _) = recover_certified(NodeId("writer".into()), ns, &cfg).unwrap();
+        assert_eq!(recovered.scope_pins()["user/x"], old_pin);
+        assert_eq!(
+            recovered.pending_writes()[0].authority_nodes,
+            old_pin.authority_nodes
+        );
+    }
+
+    #[tokio::test]
+    async fn new_snapshot_with_old_sidecars_recovers_new_pin_from_retained_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let (mut api, _) = recover_certified(NodeId("writer".into()), ns.clone(), &cfg).unwrap();
+        api.certified_write("user/x".into(), counter(1), OnTimeout::Pending)
+            .unwrap();
+        let held = Arc::new(Mutex::new(api));
+        checkpoint_certified(&held, &cfg).await.unwrap();
+
+        ns.write()
+            .unwrap()
+            .set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "user/".into(),
+                },
+                authority_nodes: vec![NodeId("a".into()), NodeId("d".into()), NodeId("e".into())],
+                auto_generated: false,
+            });
+        let new_pin;
+        {
+            let mut api = held.lock().await;
+            api.certified_write("user/x".into(), counter(2), OnTimeout::Pending)
+                .unwrap();
+            new_pin = api.scope_pins()["user/x"].clone();
+            // Stop a checkpoint after snapshot save but before sidecar
+            // promotion. The sealed WAL must remain available for replay.
+            api.wal_rotate().unwrap();
+            api.store()
+                .save_snapshot_bincode(&dir.path().join(CERTIFIED_SNAPSHOT))
+                .unwrap();
+        }
+        drop(held);
+        let (recovered, _) = recover_certified(NodeId("writer".into()), ns, &cfg).unwrap();
+        assert_eq!(recovered.scope_pins()["user/x"], new_pin);
+        assert_eq!(
+            recovered.pending_writes()[0].authority_nodes,
+            new_pin.authority_nodes
+        );
+    }
+
+    #[test]
+    fn wal_only_restart_keeps_local_scope_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let (mut api, _) = recover_certified(NodeId("writer".into()), ns.clone(), &cfg).unwrap();
+        api.certified_write("user/x".into(), counter(1), OnTimeout::Pending)
+            .unwrap();
+        let pin = api.scope_pins()["user/x"].clone();
+        drop(api);
+        ns.write()
+            .unwrap()
+            .set_authority_definition(AuthorityDefinition {
+                key_range: KeyRange {
+                    prefix: "user/".into(),
+                },
+                authority_nodes: vec![NodeId("d".into()), NodeId("e".into()), NodeId("f".into())],
+                auto_generated: false,
+            });
+        let (recovered, _) = recover_certified(NodeId("writer".into()), ns, &cfg).unwrap();
+        assert_eq!(recovered.scope_pins()["user/x"], pin);
+        assert_eq!(
+            recovered.pending_writes()[0].authority_nodes,
+            pin.authority_nodes
+        );
+    }
+
+    #[test]
+    fn certified_wal_without_scope_pin_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let ns = namespace(&["a", "b", "c"]);
+        let mut writer = WalWriter::open(cfg.wal_config(CERTIFIED_WAL_DIR)).unwrap();
+        writer
+            .append(&wal::WalRecord::CertifiedUpsert {
+                key: "user/x".into(),
+                value: counter(1),
+                hlc: crate::hlc::HlcTimestamp {
+                    physical: 100,
+                    logical: 0,
+                    node_id: "writer".into(),
+                },
+                policy_version: PolicyVersion(1),
+            })
+            .unwrap();
+        drop(writer);
+        assert!(recover_certified(NodeId("writer".into()), ns, &cfg).is_err());
+    }
+
+    #[test]
+    fn certified_snapshot_without_scope_pin_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mut store = Store::new();
+        store.merge_value("user/x".into(), &counter(1)).unwrap();
+        store.record_change(
+            "user/x",
+            crate::hlc::HlcTimestamp {
+                physical: 100,
+                logical: 0,
+                node_id: "writer".into(),
+            },
+        );
+        store
+            .save_snapshot_bincode(&dir.path().join(CERTIFIED_SNAPSHOT))
+            .unwrap();
+
+        assert!(
+            recover_certified(NodeId("writer".into()), namespace(&["a", "b", "c"]), &cfg).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::kv::CrdtValue;
@@ -677,6 +1168,51 @@ mod tests {
             recover_truncate: false,
             checkpoint_locks: CheckpointLocks::default(),
         }
+    }
+
+    #[test]
+    fn lost_wal_dot_cannot_be_reused_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = cfg(dir.path());
+        let identity = NodeId("origin".into());
+        let (mut first, _) = recover_eventual(identity.clone(), &config).unwrap();
+        first
+            .eventual_map_set("map", "old".into(), "first".into())
+            .unwrap();
+        first.eventual_set_add("set", "old".into()).unwrap();
+        let peer_map = first.get_eventual("map").unwrap().clone();
+        let peer_set = first.get_eventual("set").unwrap().clone();
+        drop(first);
+
+        // An unsynced WAL tail is lost on the origin while another node
+        // already holds the two dots. The durable incarnation reservation
+        // remains even when the final segment itself disappears.
+        for (_, path) in wal::list_segments(&dir.path().join(EVENTUAL_WAL_DIR)).unwrap() {
+            std::fs::remove_file(path).unwrap();
+        }
+        let (mut restarted, _) = recover_eventual(identity, &config).unwrap();
+        restarted
+            .eventual_map_set("map", "new".into(), "second".into())
+            .unwrap();
+        restarted.eventual_set_add("set", "new".into()).unwrap();
+
+        let mut merged_map = restarted.get_eventual("map").unwrap().clone();
+        merged_map.validate_dot_assignments(&peer_map).unwrap();
+        merged_map.merge_delta(&peer_map).unwrap();
+        let CrdtValue::Map(map) = merged_map else {
+            panic!("expected map");
+        };
+        assert_eq!(map.get(&"old".to_string()), Some(&"first".to_string()));
+        assert_eq!(map.get(&"new".to_string()), Some(&"second".to_string()));
+
+        let mut merged_set = restarted.get_eventual("set").unwrap().clone();
+        merged_set.validate_dot_assignments(&peer_set).unwrap();
+        merged_set.merge_delta(&peer_set).unwrap();
+        let CrdtValue::Set(set) = merged_set else {
+            panic!("expected set");
+        };
+        assert!(set.contains(&"old".to_string()));
+        assert!(set.contains(&"new".to_string()));
     }
 
     #[tokio::test]

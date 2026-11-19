@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crdt::MergeEffects;
 use crate::crdt::lww_register::LwwRegister;
-use crate::crdt::or_map::{OrMap, OrMapV4Layout};
-use crate::crdt::or_set::{OrSet, OrSetV4Layout};
+use crate::crdt::or_map::OrMap;
+use crate::crdt::or_set::OrSet;
 use crate::crdt::pn_counter::PnCounter;
 use crate::error::CrdtError;
 use crate::hlc::HlcTimestamp;
@@ -16,16 +16,12 @@ use crate::hlc::HlcTimestamp;
 use crate::store::backend::FileBackend;
 use crate::store::backend::StorageBackend;
 use crate::store::digest::{DigestCache, DigestColdResults, DigestColdWork, StoreDigest};
-use crate::store::migration;
 
 /// Current persistence format version written by this code.
 ///
-/// v5: `OrSet`/`OrMap` gained the `compaction_floor` field (M-8 tombstone
-/// GC convergence). bincode is positional, so every pre-v5 snapshot must
-/// be decoded through the frozen [`CrdtValueV4`] shape (empty floor on
-/// conversion); the WAL has the parallel v1→v2 bump (`store::wal`).
-/// Upgrade is one-way: a v5 snapshot cannot be read by pre-v5 binaries
-/// (same constraint as v3→v4).
+/// v6: `OrMap` stores an immutable value and timestamp per live dot. The
+/// project is experimental, so only snapshots written by this version load.
+/// Earlier layouts are rejected instead of being migrated.
 ///
 /// v4: added an end-to-end CRC32 checksum to both snapshot encodings
 /// (bincode: a 4-byte LE checksum between the version prefix and the
@@ -38,28 +34,19 @@ use crate::store::migration;
 /// would then poison every peer via anti-entropy max-merges. Load-time
 /// verification is fail-stop, the same discipline as the WAL.
 ///
-/// v3: added the session-guarantee fields (`applied_origins`,
-/// `merge_failed_keys`, `pruned_floor`, `visible_origins`) to [`Store`].
-/// v3 snapshots carry no checksum and are decoded via [`StoreV3Layout`]
-/// (bincode is positional — the v3 struct layout is frozen there).
-/// v1/v2 snapshots contain only `data` + `timestamps` and are migrated on
-/// load (JSON via the migration registry, bincode via [`StoreV2Layout`]).
-pub const CURRENT_FORMAT_VERSION: u32 = 5;
+pub const CURRENT_FORMAT_VERSION: u32 = 6;
 
 /// Versioned envelope for persisted store data.
 ///
 /// All snapshots written by this code include a `format_version` field.
-/// On load, the version is checked and migrations are applied as needed.
+/// On load, the version must match the current format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedStore {
     format_version: u32,
     /// CRC32 over the canonical JSON serialization of `store`
     /// (`serde_json::to_string` of the `store` value — deterministic:
-    /// object keys are BTreeMap-ordered). `None` only in pre-v4
-    /// snapshots; v4+ snapshots always carry it and it is verified
-    /// fail-stop on load.
-    #[serde(default)]
-    crc32: Option<u32>,
+    /// object keys are BTreeMap-ordered).
+    crc32: u32,
     store: serde_json::Value,
 }
 
@@ -81,6 +68,25 @@ pub enum CrdtValue {
 }
 
 impl CrdtValue {
+    /// Check the immutable assignment of live dots before merging two CRDT
+    /// states. A conflict remains invalid even when one value would lose an
+    /// LWW comparison or a floor would remove it during the merge.
+    pub fn validate_dot_assignments(&self, incoming: &Self) -> Result<(), CrdtError> {
+        match (self, incoming) {
+            (CrdtValue::Set(held), CrdtValue::Set(other))
+                if held.has_conflicting_live_dot(other) =>
+            {
+                Err(CrdtError::DotAssignmentConflict(
+                    "OR-Set dot is live under different elements across states".into(),
+                ))
+            }
+            (CrdtValue::Map(held), CrdtValue::Map(other)) => held
+                .validate_merge_compatible(other)
+                .map_err(|conflict| CrdtError::DotAssignmentConflict(conflict.to_string())),
+            _ => Ok(()),
+        }
+    }
+
     /// Returns a human-readable type name for error reporting.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -109,6 +115,7 @@ impl CrdtValue {
     ///
     /// Returns `Err` if the delta type does not match the existing value type.
     pub fn merge_delta(&mut self, delta: &CrdtValue) -> Result<(), CrdtError> {
+        self.validate_dot_assignments(delta)?;
         match (self, delta) {
             (CrdtValue::Counter(a), CrdtValue::Counter(b)) => {
                 a.merge_delta(b);
@@ -257,8 +264,7 @@ pub struct Store {
     ///   on its contract "`Ok(false)` ⟹ the stored value is physically
     ///   unchanged" (see its doc + debug oracle). Weakening that
     ///   contract breaks digest correctness, not just RR suppression.
-    /// - Structural wholesale construction (deserialize, the frozen
-    ///   `StoreV*Layout` migrations, `Clone`) must carry a cache that is
+    /// - Structural wholesale construction (deserialize, `Clone`) must carry a cache that is
     ///   either `invalid` (default) or cloned together with `data`.
     /// - Metadata-only mutations (`timestamps`, session origin maps,
     ///   `merge_failed_keys`, `recovery_gaps`, `floor_effects`) are NOT
@@ -290,139 +296,6 @@ pub struct RecoveryGap {
     pub ceiling: HlcTimestamp,
 }
 
-/// Frozen decode shape of [`CrdtValue`] as persisted before the
-/// `compaction_floor` field was added to `OrSet`/`OrMap` (snapshot
-/// formats v1–v4, WAL format v1). bincode is positional, so every pre-v5
-/// payload embedding CRDT values must decode through this enum and
-/// convert (`From`, empty floor).
-#[derive(Debug, Deserialize)]
-pub(crate) enum CrdtValueV4 {
-    Counter(PnCounter),
-    Set(OrSetV4Layout<String>),
-    Map(OrMapV4Layout<String, String>),
-    Register(LwwRegister<String>),
-}
-
-impl From<CrdtValueV4> for CrdtValue {
-    fn from(old: CrdtValueV4) -> Self {
-        match old {
-            CrdtValueV4::Counter(c) => CrdtValue::Counter(c),
-            CrdtValueV4::Set(s) => CrdtValue::Set(s.into()),
-            CrdtValueV4::Map(m) => CrdtValue::Map(m.into()),
-            CrdtValueV4::Register(r) => CrdtValue::Register(r),
-        }
-    }
-}
-
-fn upgrade_v4_data(data: BTreeMap<String, CrdtValueV4>) -> BTreeMap<String, CrdtValue> {
-    data.into_iter().map(|(k, v)| (k, v.into())).collect()
-}
-
-/// Structural layout of `Store` persisted by format versions 1 and 2
-/// (bincode is positional and non-self-describing, so old snapshots must
-/// be decoded with the exact old field layout — `#[serde(default)]` on
-/// the current struct cannot rescue missing trailing fields).
-#[derive(Debug, Deserialize)]
-struct StoreV2Layout {
-    data: BTreeMap<String, CrdtValueV4>,
-    #[serde(default)]
-    timestamps: HashMap<String, HlcTimestamp>,
-}
-
-impl From<StoreV2Layout> for Store {
-    fn from(old: StoreV2Layout) -> Self {
-        let mut store = Store {
-            data: upgrade_v4_data(old.data),
-            timestamps: old.timestamps,
-            applied_origins: HashMap::new(),
-            merge_failed_keys: HashSet::new(),
-            pruned_floor: None,
-            visible_origins: HashMap::new(),
-            recovery_gaps: Vec::new(),
-            floor_effects: MergeEffects::default(),
-            digest_cache: DigestCache::default(),
-        };
-        store.rebuild_visible_origins();
-        store
-    }
-}
-
-/// Structural layout of `Store` persisted by format version 3 (frozen —
-/// v4 appended `recovery_gaps`, and bincode cannot default a missing
-/// trailing field, so v3 snapshots must be decoded with exactly this
-/// layout).
-#[derive(Debug, Deserialize)]
-struct StoreV3Layout {
-    data: BTreeMap<String, CrdtValueV4>,
-    #[serde(default)]
-    timestamps: HashMap<String, HlcTimestamp>,
-    #[serde(default)]
-    applied_origins: HashMap<String, HlcTimestamp>,
-    #[serde(default)]
-    merge_failed_keys: HashSet<String>,
-    #[serde(default)]
-    pruned_floor: Option<HlcTimestamp>,
-    #[serde(default)]
-    visible_origins: HashMap<String, HlcTimestamp>,
-}
-
-impl From<StoreV3Layout> for Store {
-    fn from(old: StoreV3Layout) -> Self {
-        let mut store = Store {
-            data: upgrade_v4_data(old.data),
-            timestamps: old.timestamps,
-            applied_origins: old.applied_origins,
-            merge_failed_keys: old.merge_failed_keys,
-            pruned_floor: old.pruned_floor,
-            visible_origins: old.visible_origins,
-            recovery_gaps: Vec::new(),
-            floor_effects: MergeEffects::default(),
-            digest_cache: DigestCache::default(),
-        };
-        store.rebuild_visible_origins();
-        store
-    }
-}
-
-/// Structural layout of `Store` persisted by format version 4 (frozen —
-/// v5 changed the embedded `OrSet`/`OrMap` layouts by appending
-/// `compaction_floor`, so v4 snapshots must decode their CRDT values
-/// through [`CrdtValueV4`]).
-#[derive(Debug, Deserialize)]
-struct StoreV4Layout {
-    data: BTreeMap<String, CrdtValueV4>,
-    #[serde(default)]
-    timestamps: HashMap<String, HlcTimestamp>,
-    #[serde(default)]
-    applied_origins: HashMap<String, HlcTimestamp>,
-    #[serde(default)]
-    merge_failed_keys: HashSet<String>,
-    #[serde(default)]
-    pruned_floor: Option<HlcTimestamp>,
-    #[serde(default)]
-    visible_origins: HashMap<String, HlcTimestamp>,
-    #[serde(default)]
-    recovery_gaps: Vec<RecoveryGap>,
-}
-
-impl From<StoreV4Layout> for Store {
-    fn from(old: StoreV4Layout) -> Self {
-        let mut store = Store {
-            data: upgrade_v4_data(old.data),
-            timestamps: old.timestamps,
-            applied_origins: old.applied_origins,
-            merge_failed_keys: old.merge_failed_keys,
-            pruned_floor: old.pruned_floor,
-            visible_origins: old.visible_origins,
-            recovery_gaps: old.recovery_gaps,
-            floor_effects: MergeEffects::default(),
-            digest_cache: DigestCache::default(),
-        };
-        store.rebuild_visible_origins();
-        store
-    }
-}
-
 /// Max-merge `hlc` into a per-origin frontier map.
 ///
 /// Entries with an empty node id (e.g. zero sentinel frontiers) are
@@ -446,17 +319,22 @@ fn max_merge_origin(map: &mut HashMap<String, HlcTimestamp>, hlc: &HlcTimestamp)
 
 /// Compute the exclusive upper bound for a BTreeMap range scan.
 ///
-/// Increments the last byte of `prefix` to produce a string that is
+/// Increments the last Unicode scalar of `prefix` to produce a string that is
 /// lexicographically just past all strings that start with `prefix`.
-/// Returns `None` if the prefix consists entirely of `0xFF` bytes.
+/// UTF-8 byte increments can produce an invalid string whose lossy conversion
+/// includes unrelated keys in the range. Returns `None` when every scalar is
+/// the maximum Unicode scalar.
 fn prefix_upper_bound(prefix: &str) -> Option<String> {
-    let mut bytes = prefix.as_bytes().to_vec();
-    while let Some(last) = bytes.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return Some(String::from_utf8_lossy(&bytes).into_owned());
+    let mut upper = prefix.to_owned();
+    while let Some(last) = upper.pop() {
+        let mut next = last as u32 + 1;
+        if next == 0xD800 {
+            next = 0xE000;
         }
-        bytes.pop();
+        if let Some(next) = char::from_u32(next) {
+            upper.push(next);
+            return Some(upper);
+        }
     }
     None
 }
@@ -572,7 +450,7 @@ impl Store {
                 .map(|(k, _)| k)
                 .collect()
         } else {
-            // Fallback: prefix is all 0xFF bytes -- scan from prefix to end.
+            // Fallback: prefix has no Unicode successor -- scan to the end.
             self.data
                 .range::<String, _>(prefix.to_string()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
@@ -657,7 +535,7 @@ impl Store {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let envelope = PersistedStore {
             format_version: CURRENT_FORMAT_VERSION,
-            crc32: Some(crc32fast::hash(store_json.as_bytes())),
+            crc32: crc32fast::hash(store_json.as_bytes()),
             store: store_value,
         };
         let json = serde_json::to_string(&envelope)
@@ -680,7 +558,7 @@ impl Store {
 
     /// Save the store to an arbitrary [`StorageBackend`] using bincode.
     ///
-    /// v4 layout: `[format_version: u32 LE][crc32: u32 LE][payload]`
+    /// Layout: `[format_version: u32 LE][crc32: u32 LE][payload]`
     /// where `crc32` covers the bincode payload. The checksum closes the
     /// WAL/snapshot asymmetry: WAL frames have been CRC32-protected since
     /// their introduction, but the same data became unprotected the
@@ -730,7 +608,7 @@ impl Store {
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if version > CURRENT_FORMAT_VERSION {
+        if version != CURRENT_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 crate::error::CrdtError::IncompatibleVersion {
@@ -739,55 +617,15 @@ impl Store {
                 },
             ));
         }
-        // MAINTAINER WARNING — bincode is positional and non-self-describing:
-        // `#[serde(default)]` cannot rescue fields missing from an old
-        // snapshot. Every persisted format version whose STRUCT LAYOUT
-        // differs from the current one needs its own versioned decode type
-        // below (see `StoreV2Layout` for v1/v2 and `StoreV3Layout` for
-        // v3). When you add a field to `Store`, bump
-        // `CURRENT_FORMAT_VERSION`, freeze the previous layout in a new
-        // decode type, and add a decode arm here.
-        let mut store: Self = match version {
-            // v1 and v2 share the {data, timestamps} layout; the session
-            // fields introduced in v3 are filled with defaults. No
-            // checksum in these formats (read compatibility only — every
-            // snapshot written by this code is v4 and checksummed).
-            1 | 2 => {
-                let (old, _len): (StoreV2Layout, _) =
-                    bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                old.into()
-            }
-            // v3 added the session-guarantee fields but no checksum.
-            3 => {
-                let (old, _len): (StoreV3Layout, _) =
-                    bincode::serde::decode_from_slice(&bytes[4..], bincode::config::standard())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                old.into()
-            }
-            // v4: checksummed envelope, pre-floor CRDT layouts — decode
-            // through the frozen StoreV4Layout (empty floors).
-            4 => {
-                let payload = Self::verify_checksummed_payload(&bytes)?;
-                let (old, _len): (StoreV4Layout, _) =
-                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                old.into()
-            }
-            // v5+: `[version][crc32][payload]`, current layout.
-            _ => {
-                let payload = Self::verify_checksummed_payload(&bytes)?;
-                let (store, _len): (Self, _) =
-                    bincode::serde::decode_from_slice(payload, bincode::config::standard())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                store
-            }
-        };
+        let payload = Self::verify_checksummed_payload(&bytes)?;
+        let (mut store, _len): (Self, _) =
+            bincode::serde::decode_from_slice(payload, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         store.rebuild_visible_origins();
         Ok(store)
     }
 
-    /// Verify the `[version][crc32][payload]` envelope of a v4+ bincode
+    /// Verify the `[version][crc32][payload]` envelope of a bincode
     /// snapshot and return the payload slice.
     ///
     /// The CRC is verified BEFORE decoding. Fail-stop on mismatch: a
@@ -820,10 +658,8 @@ impl Store {
 
     /// Load a store from a versioned JSON snapshot at the given path.
     ///
-    /// Uses a [`FileBackend`] internally. Detects the format version and
-    /// applies migrations if the data was written by an older version.
-    /// Returns an error if the data version is newer than what this code
-    /// supports (forward incompatibility).
+    /// Uses a [`FileBackend`] internally. The format version must match
+    /// this build exactly; older and newer layouts are rejected.
     ///
     /// Not available on `wasm32-unknown-unknown` (no filesystem access).
     #[cfg(not(target_arch = "wasm32"))]
@@ -840,85 +676,44 @@ impl Store {
         Self::deserialize_snapshot(&raw)
     }
 
-    /// Deserialize a snapshot from a JSON string, applying migrations as needed.
+    /// Deserialize a snapshot from the current checksummed JSON envelope.
     fn deserialize_snapshot(raw: &str) -> io::Result<Self> {
         let parsed: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Detect version: if format_version is missing, treat as v1 (legacy).
         let data_version = parsed
             .get("format_version")
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(1);
-
-        if data_version > CURRENT_FORMAT_VERSION {
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing snapshot format version",
+                )
+            })?;
+        if data_version != u64::from(CURRENT_FORMAT_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 CrdtError::IncompatibleVersion {
-                    data_version,
+                    data_version: u32::try_from(data_version).unwrap_or(u32::MAX),
                     code_version: CURRENT_FORMAT_VERSION,
                 },
             ));
         }
-
-        // Verify the envelope checksum when present (v4+ snapshots always
-        // carry one; pre-v4 snapshots are accepted without — read
-        // compatibility only). The CRC covers the canonical JSON of the
-        // `store` value; re-serializing the parsed value reproduces the
-        // exact bytes hashed at save time (object keys are
-        // BTreeMap-ordered, so `Value → String` is deterministic).
-        if let Some(expected_crc) = parsed.get("crc32").and_then(|v| v.as_u64()) {
-            let store_field = parsed.get("store").ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snapshot envelope has a crc32 but no store field",
-                )
-            })?;
-            let store_json = serde_json::to_string(store_field)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let actual_crc = u64::from(crc32fast::hash(store_json.as_bytes()));
-            if actual_crc != expected_crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "JSON snapshot checksum mismatch (expected {expected_crc:#010x}, got \
-                         {actual_crc:#010x}): the snapshot is damaged and must not be loaded. \
-                         Restore it from a backup — or, for the eventual store only, re-fill \
-                         from peers via anti-entropy (see docs/ops-guide.md)"
-                    ),
-                ));
-            }
+        let envelope: PersistedStore = serde_json::from_value(parsed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let store_json = serde_json::to_string(&envelope.store)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let actual_crc = crc32fast::hash(store_json.as_bytes());
+        if actual_crc != envelope.crc32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "JSON snapshot checksum mismatch (expected {:#010x}, got {actual_crc:#010x})",
+                    envelope.crc32
+                ),
+            ));
         }
-
-        // Extract the store data from the envelope.
-        let store_data = if parsed.get("format_version").is_some() {
-            if let Some(store_field) = parsed.get("store") {
-                // New versioned format: store data is in the "store" field.
-                store_field.clone()
-            } else {
-                // Legacy versioned format (flatten): strip format_version to get raw store data.
-                let mut obj = parsed;
-                if let Some(map) = obj.as_object_mut() {
-                    map.remove("format_version");
-                }
-                obj
-            }
-        } else {
-            // Legacy format (v1): the entire JSON is the store.
-            parsed
-        };
-
-        // Apply migrations if needed.
-        let registry = migration::default_registry();
-        let migrated = registry
-            .apply_migrations(store_data, data_version, CURRENT_FORMAT_VERSION)
+        let mut store: Self = serde_json::from_value(envelope.store)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let mut store: Self = serde_json::from_value(migrated)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Pre-v3 snapshots did not persist visible_origins; restore the
-        // `visible ⊇ applied` invariant conservatively.
         store.rebuild_visible_origins();
         Ok(store)
     }
@@ -967,6 +762,13 @@ impl Store {
         // that adopted nothing, but never the reverse.
         #[cfg(debug_assertions)]
         let pre = self.data.get(&key).cloned();
+
+        if let Some(existing) = self.data.get(&key)
+            && let Err(conflict) = existing.validate_dot_assignments(value)
+        {
+            self.digest_cache.note_dirty(&key);
+            return Err(conflict);
+        }
 
         let changed = if let Some(existing) = self.data.get_mut(&key) {
             match (existing, value) {
@@ -1199,13 +1001,25 @@ impl Store {
     /// frontier for keys matching the given prefix.
     ///
     /// This is the "log deletion" step of compaction: once a checkpoint has
-    /// been created and confirmed by a majority of authorities, the
+    /// been created and confirmed by a signed majority of authorities, the
     /// per-key timestamps used for delta sync are no longer needed for
     /// entries older than the checkpoint. Removing them bounds the memory
     /// used by the change-tracking metadata.
     ///
     /// Returns the number of timestamp entries pruned.
     pub fn prune_timestamps_before(&mut self, prefix: &str, frontier: &HlcTimestamp) -> usize {
+        self.prune_timestamps_before_matching(prefix, frontier, |_| true)
+    }
+
+    /// Prune only keys that belong to the caller's exact certification scope.
+    /// A parent prefix may contain a child with a different policy or Authority
+    /// roster; its certificate cannot authorize deleting the child's index.
+    pub(crate) fn prune_timestamps_before_matching(
+        &mut self,
+        prefix: &str,
+        frontier: &HlcTimestamp,
+        belongs_to_scope: impl Fn(&str) -> bool,
+    ) -> usize {
         // Use the BTreeMap's efficient prefix range scan to find candidate
         // keys instead of scanning the entire timestamps HashMap.
         let candidate_keys: Vec<String> = if prefix.is_empty() {
@@ -1225,6 +1039,9 @@ impl Store {
 
         let mut count = 0;
         for key in candidate_keys {
+            if !belongs_to_scope(&key) {
+                continue;
+            }
             if let Some(ts) = self.timestamps.get(&key)
                 && ts <= frontier
             {
@@ -1793,6 +1610,61 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_live_dot_merges_leave_store_unchanged() {
+        let writer = node("writer");
+        let mut set_a = OrSet::new();
+        set_a.add("a".to_string(), &writer);
+        let mut set_b = OrSet::new();
+        set_b.add("b".to_string(), &writer);
+
+        let make_map = |key: &str, value: &str| {
+            let mut map = OrMap::new();
+            map.set(
+                key.to_string(),
+                value.to_string(),
+                ts(1, 0, "writer"),
+                &writer,
+            );
+            map
+        };
+        let cases = [
+            (CrdtValue::Set(set_a), CrdtValue::Set(set_b)),
+            (
+                CrdtValue::Map(make_map("a", "one")),
+                CrdtValue::Map(make_map("b", "one")),
+            ),
+            (
+                CrdtValue::Map(make_map("a", "one")),
+                CrdtValue::Map(make_map("a", "two")),
+            ),
+        ];
+        for (current, incoming) in cases {
+            let mut full_store = Store::new();
+            full_store.put("k".into(), current.clone());
+            assert!(matches!(
+                full_store.merge_value("k".into(), &incoming),
+                Err(CrdtError::DotAssignmentConflict(_))
+            ));
+            assert_eq!(full_store.get("k"), Some(&current));
+
+            let mut delta_store = Store::new();
+            delta_store.put("k".into(), current.clone());
+            assert!(matches!(
+                delta_store.merge_delta_value("k".into(), &incoming),
+                Err(CrdtError::DotAssignmentConflict(_))
+            ));
+            assert_eq!(delta_store.get("k"), Some(&current));
+
+            let mut direct = current.clone();
+            assert!(matches!(
+                direct.merge_delta(&incoming),
+                Err(CrdtError::DotAssignmentConflict(_))
+            ));
+            assert_eq!(direct, current);
+        }
+    }
+
+    #[test]
     fn merge_register_into_existing() {
         let mut store = Store::new();
         let mut r1 = LwwRegister::new();
@@ -2294,25 +2166,41 @@ mod tests {
     }
 
     #[test]
-    fn load_legacy_v1_format_without_version_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.json");
+    fn older_snapshots_are_rejected_before_payload_decode() {
+        use crate::store::backend::MemoryBackend;
 
-        // Write a legacy format (no format_version) — just a raw Store.
-        let mut store = Store::new();
-        let mut counter = PnCounter::new();
-        counter.increment(&node("A"));
-        store.put("k".into(), CrdtValue::Counter(counter));
+        let store = Store::new();
+        let json_backend = MemoryBackend::new();
+        store.save_to_backend(&json_backend).unwrap();
+        let current_json: serde_json::Value =
+            serde_json::from_slice(&json_backend.load().unwrap()).unwrap();
 
-        let json = serde_json::to_string(&store).unwrap();
-        std::fs::write(&path, json).unwrap();
+        let binary_backend = MemoryBackend::new();
+        store.save_to_backend_bincode(&binary_backend).unwrap();
+        let current_binary = binary_backend.load().unwrap();
 
-        let loaded = Store::load_snapshot(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        match loaded.get("k") {
-            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
-            other => panic!("expected Counter, got {:?}", other),
+        for old_version in 1..CURRENT_FORMAT_VERSION {
+            let mut old_json = current_json.clone();
+            old_json["format_version"] = old_version.into();
+            let err = Store::deserialize_snapshot(&old_json.to_string()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("incompatible"));
+
+            let mut old_binary = current_binary.clone();
+            old_binary[..4].copy_from_slice(&old_version.to_le_bytes());
+            let backend = MemoryBackend::new();
+            backend.save(&old_binary).unwrap();
+            let err = Store::load_from_backend_bincode(&backend).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("incompatible"));
         }
+
+        let mut unversioned = current_json;
+        unversioned
+            .as_object_mut()
+            .unwrap()
+            .remove("format_version");
+        assert!(Store::deserialize_snapshot(&unversioned.to_string()).is_err());
     }
 
     #[test]
@@ -2467,35 +2355,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn migration_chain_v1_to_current_applied_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v1.json");
-
-        // Write a v1-format file (with explicit version 1).
-        let mut store = Store::new();
-        let mut counter = PnCounter::new();
-        counter.increment(&node("X"));
-        store.put("test".into(), CrdtValue::Counter(counter));
-
-        let mut value = serde_json::to_value(&store).unwrap();
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "format_version".to_string(),
-                serde_json::Value::Number(1.into()),
-            );
-        }
-        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-
-        // Loading should apply migration v1->v2 and succeed.
-        let loaded = Store::load_snapshot(&path).unwrap();
-        assert_eq!(loaded.len(), 1);
-        match loaded.get("test") {
-            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 1),
-            other => panic!("expected Counter, got {:?}", other),
-        }
-    }
-
     // ---------------------------------------------------------------
     // StorageBackend integration (#251)
     // ---------------------------------------------------------------
@@ -2583,6 +2442,16 @@ mod tests {
         );
         // Trailing 0x7E ('~') increments to 0x7F
         assert_eq!(super::prefix_upper_bound("~"), Some("\x7F".to_string()));
+        assert_eq!(super::prefix_upper_bound("ÿ"), Some("Ā".to_string()));
+        assert_eq!(
+            super::prefix_upper_bound("\u{D7FF}"),
+            Some("\u{E000}".to_string())
+        );
+        assert_eq!(
+            super::prefix_upper_bound("a\u{10FFFF}"),
+            Some("b".to_string())
+        );
+        assert_eq!(super::prefix_upper_bound("\u{10FFFF}"), None);
         // Empty prefix => None (no bytes to increment)
         assert_eq!(super::prefix_upper_bound(""), None);
     }
@@ -2598,6 +2467,19 @@ mod tests {
 
         let keys = store.keys_with_prefix("abc");
         assert_eq!(keys, vec!["abc", "abcdef"]);
+    }
+
+    #[test]
+    fn unicode_prefix_scan_excludes_adjacent_key_range() {
+        let mut store = Store::new();
+        store.put("user/ÿ/one".into(), CrdtValue::Counter(PnCounter::new()));
+        store.put("user/Ā/two".into(), CrdtValue::Counter(PnCounter::new()));
+        assert_eq!(store.keys_with_prefix("user/ÿ"), vec!["user/ÿ/one"]);
+        store.record_change("user/ÿ/one", ts(10, 0, "n"));
+        store.record_change("user/Ā/two", ts(10, 0, "n"));
+        assert_eq!(store.prune_timestamps_before("user/ÿ", &ts(10, 0, "n")), 1);
+        assert!(store.timestamp_for("user/ÿ/one").is_none());
+        assert!(store.timestamp_for("user/Ā/two").is_some());
     }
 
     // ---------------------------------------------------------------
@@ -2818,175 +2700,42 @@ mod tests {
         assert!(loaded.contains_key("reg"));
     }
 
-    /// Serialisable mirrors of the exact PRE-v5 layouts (no
-    /// `compaction_floor` inside `OrSet`/`OrMap`), used to craft genuine
-    /// old-format snapshots in tests. Variant order MUST match
-    /// `CrdtValue` (bincode encodes the variant index).
-    #[derive(serde::Serialize)]
-    struct OldDotV4 {
-        node_id: NodeId,
-        counter: u64,
-    }
-
-    #[derive(serde::Serialize)]
-    struct OldOrSetV4 {
-        elements: HashMap<String, Vec<OldDotV4>>,
-        counters: HashMap<NodeId, u64>,
-        deferred: Vec<OldDotV4>,
-    }
-
-    #[derive(serde::Serialize)]
-    #[allow(dead_code)] // Map/Register variants exist to pin the indexes
-    enum OldCrdtValueV4 {
-        Counter(PnCounter),
-        Set(OldOrSetV4),
-        Map(()),
-        Register(LwwRegister<String>),
-    }
-
-    /// Old {data, timestamps}-only store layout (formats 1 and 2).
-    #[derive(serde::Serialize)]
-    struct OldStoreLayoutV2 {
-        data: BTreeMap<String, OldCrdtValueV4>,
-        timestamps: HashMap<String, HlcTimestamp>,
-    }
-
-    fn old_layout_data() -> BTreeMap<String, OldCrdtValueV4> {
-        let mut counter = PnCounter::new();
-        counter.increment(&node("A"));
-        counter.increment(&node("A"));
-        let set = OldOrSetV4 {
-            elements: HashMap::from([(
-                "alice".to_string(),
-                vec![OldDotV4 {
-                    node_id: node("A"),
-                    counter: 1,
-                }],
-            )]),
-            counters: HashMap::from([(node("A"), 2)]),
-            deferred: vec![OldDotV4 {
-                node_id: node("A"),
-                counter: 2,
-            }],
-        };
-
-        let mut data = BTreeMap::new();
-        data.insert("hits".to_string(), OldCrdtValueV4::Counter(counter));
-        data.insert("users".to_string(), OldCrdtValueV4::Set(set));
-        data
-    }
-
-    fn old_layout_bincode_snapshot(version: u32) -> Vec<u8> {
-        let mut timestamps = HashMap::new();
-        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
-
-        let old = OldStoreLayoutV2 {
-            data: old_layout_data(),
-            timestamps,
-        };
-        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
-            .expect("bincode encode failed");
-
-        let mut bytes = Vec::with_capacity(4 + payload.len());
-        bytes.extend_from_slice(&version.to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        bytes
-    }
-
-    /// Old v4 store layout (checksummed envelope, pre-floor CRDTs).
-    #[derive(serde::Serialize)]
-    struct OldStoreLayoutV4 {
-        data: BTreeMap<String, OldCrdtValueV4>,
-        timestamps: HashMap<String, HlcTimestamp>,
-        applied_origins: HashMap<String, HlcTimestamp>,
-        merge_failed_keys: HashSet<String>,
-        pruned_floor: Option<HlcTimestamp>,
-        visible_origins: HashMap<String, HlcTimestamp>,
-        recovery_gaps: Vec<RecoveryGap>,
-    }
-
-    fn v4_bincode_snapshot() -> Vec<u8> {
-        let mut timestamps = HashMap::new();
-        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
-        let mut applied = HashMap::new();
-        applied.insert("A".to_string(), ts(42, 0, "A"));
-
-        let old = OldStoreLayoutV4 {
-            data: old_layout_data(),
-            timestamps,
-            applied_origins: applied,
-            merge_failed_keys: HashSet::from(["bad".to_string()]),
-            pruned_floor: None,
-            visible_origins: HashMap::new(),
-            recovery_gaps: vec![RecoveryGap {
-                node_id: "A".to_string(),
-                floor: ts(1, 0, "A"),
-                ceiling: ts(10, 0, "A"),
-            }],
-        };
-        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard())
-            .expect("bincode encode failed");
-
-        let mut bytes = Vec::with_capacity(8 + payload.len());
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-        bytes.extend_from_slice(&payload);
-        bytes
-    }
-
-    /// A genuine v4 bincode snapshot (checksummed, pre-floor CRDT
-    /// layouts) must load through the frozen `StoreV4Layout` with all
-    /// fields intact and empty compaction floors.
     #[test]
-    fn bincode_v4_snapshot_migrates_on_load() {
+    fn snapshot_preserves_nonwinning_live_map_dot() {
         use crate::store::backend::MemoryBackend;
 
-        let backend = MemoryBackend::new();
-        backend.save(&v4_bincode_snapshot()).unwrap();
+        let key = "field".to_string();
+        let mut high_only = OrMap::new();
+        high_only.set(key.clone(), "high".to_string(), ts(200, 0, "A"), &node("A"));
+        let mut combined = high_only.clone();
+        combined.set(key.clone(), "low".to_string(), ts(100, 0, "B"), &node("B"));
+        assert_eq!(combined.get(&key), Some(&"high".to_string()));
+        let mut high_delete = high_only;
+        high_delete.delete(&key);
 
-        let loaded = Store::load_from_backend_bincode(&backend)
-            .unwrap_or_else(|e| panic!("v4 bincode snapshot should load: {e}"));
-
-        assert_eq!(loaded.len(), 2);
-        match loaded.get("hits") {
-            Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
-            other => panic!("expected Counter, got {:?}", other),
-        }
-        match loaded.get("users") {
-            Some(CrdtValue::Set(s)) => {
-                assert!(s.contains(&"alice".to_string()));
-                assert_eq!(s.deferred_len(), 1, "old tombstone must survive");
-                assert!(
-                    s.compaction_floor().is_empty(),
-                    "pre-floor snapshot converts with an empty floor"
-                );
+        for json in [false, true] {
+            let mut store = Store::new();
+            store.put("map".to_string(), CrdtValue::Map(combined.clone()));
+            let backend = MemoryBackend::new();
+            if json {
+                store.save_to_backend(&backend).unwrap();
+            } else {
+                store.save_to_backend_bincode(&backend).unwrap();
             }
-            other => panic!("expected Set, got {:?}", other),
+            let loaded = if json {
+                Store::load_from_backend(&backend).unwrap()
+            } else {
+                Store::load_from_backend_bincode(&backend).unwrap()
+            };
+            let Some(CrdtValue::Map(mut restored)) = loaded.get("map").cloned() else {
+                panic!("map missing after snapshot round trip");
+            };
+            restored.merge(&high_delete);
+            assert_eq!(restored.get(&key), Some(&"low".to_string()));
         }
-        assert_eq!(loaded.timestamp_for("hits"), Some(&ts(42, 0, "A")));
-        assert_eq!(loaded.applied_origin("A"), Some(&ts(42, 0, "A")));
-        assert!(loaded.merge_failed_contains("bad"));
-        assert_eq!(loaded.recovery_gaps().len(), 1);
     }
 
-    /// A corrupted v4 snapshot still fails the checksum (the v4 decode
-    /// arm shares the fail-stop envelope verification).
-    #[test]
-    fn bincode_v4_snapshot_bit_flip_is_fail_stop() {
-        use crate::store::backend::MemoryBackend;
-
-        let mut bytes = v4_bincode_snapshot();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        let backend = MemoryBackend::new();
-        backend.save(&bytes).unwrap();
-
-        let err = Store::load_from_backend_bincode(&backend).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("checksum"));
-    }
-
-    /// v5 round trip preserves the compaction floor (bincode + JSON).
+    /// Current-format round trip preserves the compaction floor (bincode + JSON).
     #[test]
     fn snapshot_round_trip_preserves_compaction_floor() {
         use crate::store::backend::MemoryBackend;
@@ -2995,7 +2744,7 @@ mod tests {
         let mut set = OrSet::new();
         set.add("x".to_string(), &n);
         set.remove(&"x".to_string());
-        set.compact_deferred_certified(&set.deferred_dots(), None);
+        set.compact_deferred_certified(&set.deferred_dots());
         assert_eq!(set.compaction_floor().get(&n), Some(&1));
 
         let mut store = Store::new();
@@ -3024,75 +2773,6 @@ mod tests {
                 }
                 other => panic!("expected Set, got {:?}", other),
             }
-        }
-    }
-
-    /// v4 JSON snapshots (no `compaction_floor` field anywhere) load via
-    /// the migration registry with empty floors.
-    #[test]
-    fn json_v4_snapshot_loads_with_default_floor() {
-        let raw = r#"{
-            "format_version": 4,
-            "store": {
-                "data": {
-                    "users": {"Set": {"elements": {"alice": [{"node_id": "A", "counter": 1}]}, "counters": {"A": 2}, "deferred": [{"node_id": "A", "counter": 2}]}}
-                },
-                "timestamps": {},
-                "applied_origins": {},
-                "merge_failed_keys": [],
-                "pruned_floor": null,
-                "visible_origins": {},
-                "recovery_gaps": []
-            }
-        }"#;
-        let loaded = Store::deserialize_snapshot(raw).unwrap();
-        match loaded.get("users") {
-            Some(CrdtValue::Set(s)) => {
-                assert!(s.contains(&"alice".to_string()));
-                assert_eq!(s.deferred_len(), 1);
-                assert!(s.compaction_floor().is_empty());
-            }
-            other => panic!("expected Set, got {:?}", other),
-        }
-    }
-
-    /// v1/v2 bincode snapshots use the old {data, timestamps} layout;
-    /// loading them must decode via the versioned layout (bincode is
-    /// positional — serde defaults cannot rescue missing trailing fields)
-    /// and fill the v3 session fields with defaults.
-    #[test]
-    fn bincode_v1_and_v2_snapshots_migrate_on_load() {
-        use crate::store::backend::MemoryBackend;
-
-        for version in [1u32, 2] {
-            let backend = MemoryBackend::new();
-            backend.save(&old_layout_bincode_snapshot(version)).unwrap();
-
-            let loaded = Store::load_from_backend_bincode(&backend).unwrap_or_else(|e| {
-                panic!("v{version} bincode snapshot should migrate and load: {e}")
-            });
-
-            assert_eq!(loaded.len(), 2, "all keys must survive migration");
-            match loaded.get("hits") {
-                Some(CrdtValue::Counter(c)) => assert_eq!(c.value(), 2),
-                other => panic!("expected Counter, got {:?}", other),
-            }
-            match loaded.get("users") {
-                Some(CrdtValue::Set(s)) => assert!(s.contains(&"alice".to_string())),
-                other => panic!("expected Set, got {:?}", other),
-            }
-            assert_eq!(
-                loaded.timestamp_for("hits"),
-                Some(&ts(42, 0, "A")),
-                "timestamp must survive migration"
-            );
-
-            // Session fields default; visible_origins is rebuilt from the
-            // change timestamps so response tokens keep covering the data.
-            assert!(loaded.applied_origins().is_empty());
-            assert!(loaded.merge_failed_keys().is_empty());
-            assert!(loaded.pruned_floor().is_none());
-            assert_eq!(loaded.visible_origins().get("A"), Some(&ts(42, 0, "A")));
         }
     }
 
@@ -3198,61 +2878,9 @@ mod tests {
         );
     }
 
-    /// Serialisable mirror of the exact struct layout persisted by
-    /// format version 3 (no checksum, no `recovery_gaps`), used to craft
-    /// genuine v3 snapshots in tests.
-    #[derive(serde::Serialize)]
-    struct OldStoreLayoutV3 {
-        data: BTreeMap<String, CrdtValue>,
-        timestamps: HashMap<String, HlcTimestamp>,
-        applied_origins: HashMap<String, HlcTimestamp>,
-        merge_failed_keys: HashSet<String>,
-        pruned_floor: Option<HlcTimestamp>,
-        visible_origins: HashMap<String, HlcTimestamp>,
-    }
-
-    /// v3 bincode snapshots (no checksum, no recovery_gaps) must keep
-    /// loading: the version prefix dispatches to the frozen v3 layout.
-    #[test]
-    fn bincode_v3_snapshot_loads_without_checksum() {
-        use crate::store::backend::MemoryBackend;
-
-        let mut counter = PnCounter::new();
-        counter.increment(&node("A"));
-        let mut data = BTreeMap::new();
-        data.insert("hits".to_string(), CrdtValue::Counter(counter));
-        let mut timestamps = HashMap::new();
-        timestamps.insert("hits".to_string(), ts(42, 0, "A"));
-        let mut applied = HashMap::new();
-        applied.insert("A".to_string(), ts(42, 0, "A"));
-        let old = OldStoreLayoutV3 {
-            data,
-            timestamps,
-            applied_origins: applied,
-            merge_failed_keys: HashSet::from(["bad".to_string()]),
-            pruned_floor: Some(ts(10, 0, "A")),
-            visible_origins: HashMap::new(),
-        };
-        let payload = bincode::serde::encode_to_vec(&old, bincode::config::standard()).unwrap();
-        let mut bytes = 3u32.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&payload);
-
-        let backend = MemoryBackend::new();
-        backend.save(&bytes).unwrap();
-        let loaded = Store::load_from_backend_bincode(&backend)
-            .expect("v3 snapshot must load via the frozen layout");
-
-        assert_eq!(loaded.applied_origin("A"), Some(&ts(42, 0, "A")));
-        assert!(loaded.merge_failed_contains("bad"));
-        assert_eq!(loaded.pruned_floor(), Some(&ts(10, 0, "A")));
-        assert!(loaded.recovery_gaps().is_empty());
-        // visible_origins is rebuilt to keep the superset invariant.
-        assert_eq!(loaded.visible_origins().get("A"), Some(&ts(42, 0, "A")));
-    }
-
     /// The JSON snapshot envelope carries a CRC over the canonical store
     /// JSON: a mutation that still parses as valid JSON must be rejected
-    /// by the checksum, and pre-v4 envelopes without a CRC keep loading.
+    /// by the checksum. The checksum is mandatory.
     #[test]
     fn json_snapshot_checksum_detects_value_mutation() {
         use crate::store::backend::MemoryBackend;
@@ -3279,19 +2907,9 @@ mod tests {
             "expected a checksum error, got: {err}"
         );
 
-        // Pre-v4 envelope without a crc32 field: read compatibility.
-        let store_value = serde_json::to_value(&store).unwrap();
-        let legacy = serde_json::json!({
-            "format_version": 3,
-            "store": store_value,
-        });
-        let legacy_backend = MemoryBackend::new();
-        legacy_backend
-            .save(serde_json::to_string(&legacy).unwrap().as_bytes())
-            .unwrap();
-        let loaded = Store::load_from_backend(&legacy_backend)
-            .expect("pre-v4 JSON snapshot without crc must load");
-        assert!(loaded.contains_key("k"));
+        let mut no_checksum: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        no_checksum.as_object_mut().unwrap().remove("crc32");
+        assert!(Store::deserialize_snapshot(&no_checksum.to_string()).is_err());
     }
 
     // ---------------------------------------------------------------
@@ -3505,49 +3123,6 @@ mod tests {
         assert_eq!(loaded.applied_origin("a"), Some(&ts(100, 0, "a")));
         assert!(loaded.merge_failed_contains("bad"));
         assert_eq!(loaded.pruned_floor(), Some(&ts(200, 0, "a")));
-    }
-
-    #[test]
-    fn snapshot_without_session_fields_loads_with_defaults() {
-        // Snapshots written before the session-guarantee fields existed
-        // must load with empty defaults.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.json");
-
-        let json = serde_json::json!({
-            "format_version": 2,
-            "store": { "data": {}, "timestamps": {} }
-        });
-        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
-
-        let loaded = Store::load_snapshot(&path).unwrap();
-        assert!(loaded.applied_origins().is_empty());
-        assert!(loaded.merge_failed_keys().is_empty());
-        assert!(loaded.pruned_floor().is_none());
-        assert!(loaded.visible_origins().is_empty());
-    }
-
-    /// Pre-v3 snapshots have no visible_origins; loading must rebuild it
-    /// conservatively from applied_origins and the change timestamps so
-    /// response tokens keep covering persisted data after an upgrade.
-    #[test]
-    fn snapshot_load_rebuilds_visible_origins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v2-with-data.json");
-
-        let json = serde_json::json!({
-            "format_version": 2,
-            "store": {
-                "data": {},
-                "timestamps": { "k": { "physical": 70, "logical": 0, "node_id": "c" } },
-                "applied_origins": { "a": { "physical": 50, "logical": 0, "node_id": "a" } }
-            }
-        });
-        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
-
-        let loaded = Store::load_snapshot(&path).unwrap();
-        assert_eq!(loaded.visible_origins().get("a"), Some(&ts(50, 0, "a")));
-        assert_eq!(loaded.visible_origins().get("c"), Some(&ts(70, 0, "c")));
     }
 
     // ===============================================================
@@ -3780,7 +3355,7 @@ mod tests {
 
         // Sweep exactly like `crdt::gc::run_gc_cycle` does.
         if let Some(CrdtValue::Set(s)) = store.get_mut("myset") {
-            let outcome = s.compact_deferred_certified(&s.deferred_dots(), None);
+            let outcome = s.compact_deferred_certified(&s.deferred_dots());
             assert!(outcome.collected > 0, "sweep must drop the tombstone");
         } else {
             panic!("expected set");
@@ -3838,7 +3413,7 @@ mod tests {
                 5 => {
                     // GC sweep on whatever key comes up.
                     if let Some(CrdtValue::Set(s)) = store.get_mut(&key) {
-                        s.compact_deferred_certified(&s.deferred_dots(), None);
+                        s.compact_deferred_certified(&s.deferred_dots());
                     }
                 }
                 6 => {
@@ -3976,24 +3551,5 @@ mod tests {
             },
         );
         assert_digest_exact(&mut store);
-    }
-
-    #[test]
-    fn digest_cache_migrated_snapshots_are_invalid_then_exact() {
-        // v2 JSON layout (data + timestamps only) → StoreV2Layout.
-        let raw = serde_json::json!({
-            "format_version": 2,
-            "store": {
-                "data": {},
-                "timestamps": { "k": { "physical": 70, "logical": 0, "node_id": "c" } }
-            }
-        })
-        .to_string();
-        let mut migrated = Store::deserialize_snapshot(&raw).unwrap();
-        assert!(
-            migrated.digest_cache_is_invalid(),
-            "migrated stores must start with an invalid cache"
-        );
-        assert_digest_exact(&mut migrated);
     }
 }

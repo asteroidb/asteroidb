@@ -1,7 +1,18 @@
 pub mod frontier_sync;
 pub mod membership;
+pub mod operation_certificate_outbox;
+pub mod operation_certificate_transport;
+pub mod operation_link_auth;
+pub mod operation_neighbors;
+pub mod operation_outbox;
+pub mod operation_policy_outbox;
+pub mod operation_policy_transport;
+pub mod operation_routes;
+pub mod operation_support_transport;
+pub mod operation_transport;
 mod peer;
 pub mod raft_transport;
+mod retry_cursor;
 pub mod sync;
 
 pub use frontier_sync::FrontierSyncClient;

@@ -1,7 +1,6 @@
 pub mod backend;
 pub mod digest;
 pub mod kv;
-pub mod migration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wal;
 
@@ -11,7 +10,6 @@ pub use backend::FileBackend;
 pub use backend::RedbBackend;
 pub use backend::{InMemoryKvBackend, KvBackend, MemoryBackend, StorageBackend};
 pub use kv::{CrdtValue, Store};
-pub use migration::{Migration, MigrationRegistry};
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-runtime"))]
 pub use wal::WalSyncer;
 #[cfg(not(target_arch = "wasm32"))]

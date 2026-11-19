@@ -433,7 +433,7 @@ proptest! {
                 ScriptOp::Merge { .. } => {}
                 ScriptOp::Sweep { replica } => {
                     let candidates = swept[*replica].deferred_dots();
-                    swept[*replica].compact_deferred_certified(&candidates, None);
+                    swept[*replica].compact_deferred_certified(&candidates);
                 }
             }
             for i in 0..3 {
@@ -500,7 +500,7 @@ proptest! {
                     ScriptOp::Merge { .. } => {}
                     ScriptOp::Sweep { replica } => {
                         let candidates = replicas[*replica].deferred_dots();
-                        replicas[*replica].compact_deferred_certified(&candidates, None);
+                        replicas[*replica].compact_deferred_certified(&candidates);
                     }
                 }
             }
@@ -648,7 +648,7 @@ fn run_map_script(
             MapScriptOp::Sweep { replica } => {
                 if sweeps_enabled {
                     let candidates = replicas[*replica].deferred_dots();
-                    replicas[*replica].compact_deferred_certified(&candidates, None);
+                    replicas[*replica].compact_deferred_certified(&candidates);
                 }
             }
         }
@@ -695,7 +695,7 @@ proptest! {
                 MapScriptOp::Merge { .. } => {}
                 MapScriptOp::Sweep { replica } => {
                     let candidates = swept[*replica].deferred_dots();
-                    swept[*replica].compact_deferred_certified(&candidates, None);
+                    swept[*replica].compact_deferred_certified(&candidates);
                 }
             }
             for i in 0..3 {

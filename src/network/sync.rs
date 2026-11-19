@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::authority::equivocation::ObservedAttestation;
+pub use crate::hlc::CertifiedDeltaCursor;
 use crate::hlc::HlcTimestamp;
 use crate::http::codec::{self, CONTENT_TYPE_BINCODE, deserialize_internal, serialize_internal};
 use crate::network::peer::PeerRegistry;
 use crate::store::digest::{DIGEST_LEN, DIGEST_SCHEME_VERSION, StoreDigest};
 use crate::store::kv::CrdtValue;
-use crate::types::PolicyVersion;
 
 /// Bulk sync request payload sent to `POST /api/internal/sync`.
 ///
@@ -32,6 +32,10 @@ pub struct SyncResponse {
     pub merged: usize,
     /// Keys that failed to merge (e.g. type mismatch), with error messages.
     pub errors: Vec<SyncError>,
+    /// The receiver durably stored the state covered by this reply.
+    /// Only this form of acknowledgement may advance a push baseline or GC evidence.
+    #[serde(default)]
+    pub durable: bool,
 }
 
 /// A single key-level sync error.
@@ -109,9 +113,9 @@ pub const CERTIFIED_DELTA_MAX_ENTRIES: usize = 512;
 pub struct CertifiedDeltaRequest {
     /// Node ID of the requesting node.
     pub sender: String,
-    /// The requester's baseline for this peer's certified store. Entries
-    /// strictly after this timestamp are returned.
-    pub frontier: HlcTimestamp,
+    /// Entries strictly after this position are returned. `None` starts
+    /// before every entry, including a zero timestamp and an empty key.
+    pub frontier: Option<CertifiedDeltaCursor>,
 }
 
 /// One replicated certified entry.
@@ -123,34 +127,18 @@ pub struct CertifiedDeltaEntry {
     /// with the local clock would make the entry look new to the peer on
     /// every round and the lane would never quiesce.
     pub hlc: HlcTimestamp,
-    /// The policy version the write was issued under, on the node that
-    /// accepted it.
-    ///
-    /// This is the field that keeps replication from bypassing the FR-009
-    /// fence: without it a receiver would evaluate the entry against its
-    /// OWN current version's frontier (#342, cluster-wide). `None` means
-    /// the sender has no recorded origin for the key (data written before
-    /// origins were persisted); the receiver falls back to its current
-    /// version, matching today's recovery behaviour.
-    ///
-    /// NOTE for maintainers: bincode is positional. New fields may only be
-    /// appended at the end with `#[serde(default)]` and never
-    /// `skip_serializing_if` (same rule as `DeltaSyncResponse`).
-    pub policy_version: Option<PolicyVersion>,
+    /// Exact write-time scope. The receiver validates its roster and range
+    /// against its trusted namespace before applying the value.
+    pub scope: crate::store::wal::CertifiedScopePin,
 }
 
 /// Response for a certified delta pull.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertifiedDeltaResponse {
-    /// Entries after the requested frontier, in ascending HLC order.
+    /// Entries after the requested frontier, ordered by (HLC, key).
     pub entries: Vec<CertifiedDeltaEntry>,
-    /// The baseline the requester may adopt once it has applied every
-    /// entry above.
-    ///
-    /// When `truncated` is set this is the LAST INCLUDED entry's HLC, not
-    /// the responder's full frontier: adopting the full frontier after a
-    /// partial batch would skip every key in between, forever.
-    pub sender_frontier: Option<HlcTimestamp>,
+    /// Position of the last delivered entry, adopted after processing it.
+    pub sender_frontier: Option<CertifiedDeltaCursor>,
     /// Whether entries were withheld by the batch limit. Advisory: the
     /// requester converges either way, this only says another round has
     /// work waiting.
@@ -250,9 +238,9 @@ pub struct DeltaSyncResponse {
     /// echo of an already-tracked converged key is absorbed by the RR
     /// gate (M-6) without dirtying the receiver's change log.
     ///
-    /// NOTE for maintainers: bincode is positional — new fields may only
-    /// be appended at the end with `#[serde(default)]` and never
-    /// `skip_serializing_if` (same rule as `KeyDumpResponse`). Old
+    /// NOTE for maintainers: bincode is positional; `#[serde(default)]`
+    /// applies to the JSON retry path, not old-shape bincode bodies.
+    /// Do not use `skip_serializing_if` on positional fields. Old
     /// senders omit this field (JSON retry path defaults it to empty);
     /// their migrated untracked keys still converge only via full sync.
     ///
@@ -274,9 +262,9 @@ pub struct DeltaSyncResponse {
 /// A single non-empty bucket digest in a [`DigestSyncRequest`].
 ///
 /// The bucket list is sparse: absent indexes mean "empty bucket".
-/// NOTE for maintainers: bincode is positional — new fields may only be
-/// appended at the end with `#[serde(default)]` and never
-/// `skip_serializing_if` (same rule as `KeyDumpResponse`).
+/// NOTE for maintainers: bincode is positional; adding a field requires
+/// the versioned JSON fallback path for mixed-version peers. Do not use
+/// `skip_serializing_if` on positional fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketDigestEntry {
     /// Bucket index (`0..DIGEST_BUCKET_COUNT`).
@@ -368,6 +356,9 @@ pub struct DigestSyncResponse {
     /// requester must fall back to legacy full sync.
     #[serde(default)]
     pub scheme_ok: bool,
+    /// The snapshotted responder state was durable before this reply.
+    #[serde(default)]
+    pub durable: bool,
     /// `true` when the root digests matched: states are identical and no
     /// entries are transferred.
     #[serde(default)]
@@ -907,6 +898,7 @@ impl SyncClient {
             return Some(SyncResponse {
                 merged: 0,
                 errors: Vec::new(),
+                durable: false,
             });
         }
 
@@ -982,8 +974,22 @@ impl SyncClient {
         sender_id: &str,
         batch_size: usize,
     ) -> Result<usize, SyncPushError> {
+        self.push_changed_keys_with_durability(peer_addr, changed_entries, sender_id, batch_size)
+            .await
+            .map(|(pushed, _)| pushed)
+    }
+
+    /// Push changed keys and report whether every successful batch was
+    /// durable on the receiver before its acknowledgement.
+    pub(crate) async fn push_changed_keys_with_durability(
+        &self,
+        peer_addr: &str,
+        changed_entries: Vec<(String, CrdtValue)>,
+        sender_id: &str,
+        batch_size: usize,
+    ) -> Result<(usize, bool), SyncPushError> {
         if changed_entries.is_empty() {
-            return Ok(0);
+            return Ok((0, false));
         }
 
         let effective_batch_size = if batch_size == 0 {
@@ -993,6 +999,7 @@ impl SyncClient {
         };
 
         let mut total_pushed = 0usize;
+        let mut all_durable = true;
         // The exact keys that failed, so the caller can mark per-key success
         // rather than treating `total_pushed` as a positional prefix length.
         let mut failed_keys: Vec<String> = Vec::new();
@@ -1042,6 +1049,7 @@ impl SyncClient {
                                 });
                             }
                         };
+                        all_durable &= sync_resp.durable;
                         let error_keys: Vec<String> =
                             sync_resp.errors.iter().map(|e| e.key.clone()).collect();
                         let error_count = error_keys.len();
@@ -1112,7 +1120,7 @@ impl SyncClient {
             });
         }
 
-        Ok(total_pushed)
+        Ok((total_pushed, all_durable))
     }
 
     /// Pull all key-value pairs from a specific peer.
@@ -1406,7 +1414,7 @@ impl SyncClient {
         &self,
         peer_addr: &str,
         sender: &str,
-        frontier: &HlcTimestamp,
+        frontier: &Option<CertifiedDeltaCursor>,
     ) -> CertifiedDeltaResult {
         let url = format!("http://{peer_addr}/api/internal/certified/delta");
         let req = CertifiedDeltaRequest {
@@ -1523,6 +1531,7 @@ mod tests {
                 key: "bad-key".into(),
                 error: "type mismatch".into(),
             }],
+            durable: true,
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -2168,6 +2177,7 @@ mod tests {
 
         DigestSyncResponse {
             scheme_ok: true,
+            durable: true,
             root_matched: false,
             mismatched_buckets: vec![3, 200],
             entries,
@@ -2555,7 +2565,7 @@ mod tests {
 mod certified_lane_tests {
     use super::*;
     use crate::crdt::pn_counter::PnCounter;
-    use crate::types::NodeId;
+    use crate::types::{NodeId, PolicyVersion};
 
     fn hlc(physical: u64) -> HlcTimestamp {
         HlcTimestamp {
@@ -2565,14 +2575,21 @@ mod certified_lane_tests {
         }
     }
 
-    fn entry(key: &str, origin: Option<u64>) -> CertifiedDeltaEntry {
+    fn entry(key: &str, origin: u64) -> CertifiedDeltaEntry {
         let mut c = PnCounter::new();
         c.increment(&NodeId("n1".into()));
         CertifiedDeltaEntry {
             key: key.into(),
             value: CrdtValue::Counter(c),
             hlc: hlc(10),
-            policy_version: origin.map(PolicyVersion),
+            scope: crate::store::wal::CertifiedScopePin {
+                write_hlc: hlc(10),
+                key_range: crate::types::KeyRange {
+                    prefix: String::new(),
+                },
+                policy_version: PolicyVersion(origin),
+                authority_nodes: vec![NodeId("auth-1".into()), NodeId("auth-2".into())],
+            },
         }
     }
 
@@ -2584,37 +2601,40 @@ mod certified_lane_tests {
     fn certified_delta_payloads_round_trip_in_both_encodings() {
         let req = CertifiedDeltaRequest {
             sender: "n2".into(),
-            frontier: hlc(5),
+            frontier: Some(CertifiedDeltaCursor {
+                hlc: hlc(5),
+                key: "a".into(),
+            }),
         };
         let json: CertifiedDeltaRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(json.sender, "n2");
-        assert_eq!(json.frontier, hlc(5));
+        assert_eq!(json.frontier, req.frontier);
         let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
         let (bin, _): (CertifiedDeltaRequest, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
-        assert_eq!(bin.frontier, hlc(5));
+        assert_eq!(bin.frontier, req.frontier);
 
         let resp = CertifiedDeltaResponse {
-            entries: vec![entry("a", Some(2)), entry("b", None)],
-            sender_frontier: Some(hlc(10)),
+            entries: vec![entry("a", 2), entry("b", 1)],
+            sender_frontier: Some(CertifiedDeltaCursor {
+                hlc: hlc(10),
+                key: "b".into(),
+            }),
             truncated: true,
         };
         let json: CertifiedDeltaResponse =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
-        assert_eq!(json.entries[0].policy_version, Some(PolicyVersion(2)));
-        assert_eq!(
-            json.entries[1].policy_version, None,
-            "an absent origin must stay absent, never become a sentinel version"
-        );
+        assert_eq!(json.entries[0].scope.policy_version, PolicyVersion(2));
+        assert_eq!(json.entries[0].scope.authority_nodes.len(), 2);
         assert!(json.truncated);
 
         let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
         let (bin, _): (CertifiedDeltaResponse, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(bin.entries.len(), 2);
-        assert_eq!(bin.entries[0].policy_version, Some(PolicyVersion(2)));
-        assert_eq!(bin.entries[1].policy_version, None);
-        assert_eq!(bin.sender_frontier, Some(hlc(10)));
+        assert_eq!(bin.entries[0].scope.policy_version, PolicyVersion(2));
+        assert_eq!(bin.entries[0].scope.authority_nodes.len(), 2);
+        assert_eq!(bin.sender_frontier, resp.sender_frontier);
     }
 }

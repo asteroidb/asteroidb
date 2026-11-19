@@ -26,6 +26,7 @@ use asteroidb_poc::authority::certificate::{
     AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
     sign_message,
 };
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::error::CrdtError;
@@ -64,6 +65,27 @@ fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> 
         policy_version: PolicyVersion(1),
         digest_hash: format!("{authority}-{physical}-{logical}"),
     }
+}
+
+/// Deliver a real certificate signature with the frontier. Distinct
+/// authorities use distinct deterministic keys, so only a true signer
+/// majority can certify a write in these partition simulations.
+fn submit_signed_frontier(
+    api: &mut CertifiedApi,
+    authority: &str,
+    physical: u64,
+    prefix: &str,
+) -> bool {
+    let mut seed = [0u8; 32];
+    seed[0] = *authority.as_bytes().last().unwrap();
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node(authority), &seed, false);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node(authority), &seed);
+    let frontier = make_frontier(authority, physical, 0, prefix);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let attestation = signer.self_verified(&frontier, &signature);
+    api.update_frontier_verified(frontier, Some(attestation))
 }
 
 /// Return a physical timestamp ahead of the wall clock but WITHIN
@@ -156,7 +178,7 @@ fn minority_1_of_3_cannot_certify() {
     let mut cert_api = CertifiedApi::new(node("node-minority"), default_namespace());
 
     // Only auth-1's frontier is visible (simulating minority partition).
-    cert_api.update_frontier(make_frontier("auth-1", 5000, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", future_physical(), "");
 
     // Certified write should not succeed (1 of 3 is not majority).
     let counter = CrdtValue::Counter(PnCounter::new());
@@ -174,8 +196,8 @@ fn majority_2_of_3_can_certify() {
 
     // Both auth-2 and auth-3 report frontiers far in the future (2 of 3 = majority).
     let ft = future_physical();
-    cert_api.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-3", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Pending);
@@ -200,7 +222,8 @@ fn majority_2_of_3_can_certify() {
 fn minority_1_of_3_pending_stays_pending() {
     // With OnTimeout::Pending, the minority write stays Pending indefinitely.
     let mut cert_api = CertifiedApi::new(node("node-minority"), default_namespace());
-    cert_api.update_frontier(make_frontier("auth-1", 5000, 0, ""));
+    let ft = future_physical();
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Pending);
@@ -214,7 +237,7 @@ fn minority_1_of_3_pending_stays_pending() {
     );
 
     // Adding more frontiers from the same authority doesn't help.
-    cert_api.update_frontier(make_frontier("auth-1", 10000, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft + 1_000, "");
     cert_api.process_certifications();
     assert_eq!(
         cert_api.get_certification_status("key1"),
@@ -232,8 +255,9 @@ fn minority_2_of_5_cannot_certify() {
     // Minority (2 of 5) cannot reach majority threshold of 3.
     let mut cert_api = CertifiedApi::new(node("node-minority"), five_authority_namespace());
 
-    cert_api.update_frontier(make_frontier("auth-1", 5000, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-2", 5000, 0, ""));
+    let ft = future_physical();
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
@@ -249,9 +273,9 @@ fn majority_3_of_5_can_certify() {
     let mut cert_api = CertifiedApi::new(node("node-majority"), five_authority_namespace());
 
     let ft = future_physical();
-    cert_api.update_frontier(make_frontier("auth-3", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-4", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-5", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-3", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-4", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-5", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Pending);
@@ -273,8 +297,9 @@ fn exact_half_of_5_cannot_certify() {
     // Edge case: exactly 2 of 5 is below majority (threshold = 3).
     let mut cert_api = CertifiedApi::new(node("node-half"), five_authority_namespace());
 
-    cert_api.update_frontier(make_frontier("auth-1", 5000, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-2", 5000, 0, ""));
+    let ft = future_physical();
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Error);
@@ -295,12 +320,12 @@ fn both_partitions_cannot_simultaneously_certify_3_nodes() {
 
     // Minority side: only auth-1
     let mut minority = CertifiedApi::new(node("minority-node"), Arc::clone(&ns));
-    minority.update_frontier(make_frontier("auth-1", ft, 0, ""));
+    submit_signed_frontier(&mut minority, "auth-1", ft, "");
 
     // Majority side: auth-2 + auth-3
     let mut majority = CertifiedApi::new(node("majority-node"), Arc::clone(&ns));
-    majority.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    majority.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut majority, "auth-2", ft, "");
+    submit_signed_frontier(&mut majority, "auth-3", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
 
@@ -330,6 +355,7 @@ fn both_partitions_cannot_simultaneously_certify_3_nodes() {
         CertificationStatus::Certified,
         "minority (1/3) must not certify"
     );
+    assert_eq!(maj_status, CertificationStatus::Certified);
 }
 
 #[test]
@@ -340,13 +366,13 @@ fn both_partitions_cannot_simultaneously_certify_5_nodes() {
     let ft = future_physical();
 
     let mut minority = CertifiedApi::new(node("minority-node"), Arc::clone(&ns));
-    minority.update_frontier(make_frontier("auth-1", ft, 0, ""));
-    minority.update_frontier(make_frontier("auth-2", ft, 0, ""));
+    submit_signed_frontier(&mut minority, "auth-1", ft, "");
+    submit_signed_frontier(&mut minority, "auth-2", ft, "");
 
     let mut majority = CertifiedApi::new(node("majority-node"), Arc::clone(&ns));
-    majority.update_frontier(make_frontier("auth-3", ft, 0, ""));
-    majority.update_frontier(make_frontier("auth-4", ft, 0, ""));
-    majority.update_frontier(make_frontier("auth-5", ft, 0, ""));
+    submit_signed_frontier(&mut majority, "auth-3", ft, "");
+    submit_signed_frontier(&mut majority, "auth-4", ft, "");
+    submit_signed_frontier(&mut majority, "auth-5", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
 
@@ -368,6 +394,7 @@ fn both_partitions_cannot_simultaneously_certify_5_nodes() {
         "SAFETY VIOLATION: both partitions certified for 5-node cluster!"
     );
     assert_ne!(min_status, CertificationStatus::Certified);
+    assert_eq!(maj_status, CertificationStatus::Certified);
 }
 
 // ===========================================================================
@@ -581,12 +608,12 @@ fn stale_frontier_from_old_partition_does_not_regress_certification() {
     let mut cert_api = CertifiedApi::new(node("node-a"), Arc::clone(&ns));
 
     let ft = future_physical();
-    let ft2 = ft + 600_000; // even further in the future
+    let ft2 = ft + 1_000; // next checkpoint, still inside the skew window
 
     // Phase 1: All 3 authorities report frontier at ft.
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-3", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let _result = cert_api.certified_write("key1".into(), counter.clone(), OnTimeout::Pending);
@@ -598,8 +625,8 @@ fn stale_frontier_from_old_partition_does_not_regress_certification() {
 
     // Phase 2: Partition — auth-1 gets isolated and its frontier stalls.
     // Majority (auth-2, auth-3) advances to ft2.
-    cert_api.update_frontier(make_frontier("auth-2", ft2, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-3", ft2, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-2", ft2, "");
+    submit_signed_frontier(&mut cert_api, "auth-3", ft2, "");
 
     // Write at the new frontier.
     let _result2 = cert_api.certified_write("key2".into(), counter.clone(), OnTimeout::Pending);
@@ -614,11 +641,12 @@ fn stale_frontier_from_old_partition_does_not_regress_certification() {
     // This should not regress the majority frontier.
     // The AckFrontierSet already monotonically advances, so the old update
     // should be ignored.
-    let _advanced = cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
-    // The frontier was already set for auth-1 at 5000; no advancement.
+    let advanced = submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
+    assert!(!advanced, "stale report must not advance auth-1's frontier");
+    // The frontier was already set for auth-1 at ft; no advancement.
     // Key point: a stale frontier does not overwrite a newer one.
 
-    // Certification at time 10000 should still be valid.
+    // Certification of key2 should still be valid.
     assert_eq!(
         cert_api.get_certification_status("key2"),
         CertificationStatus::Certified
@@ -655,7 +683,7 @@ fn minority_pending_write_certifies_after_partition_heal() {
 
     // During partition: only auth-1's frontier is visible (but far in the future).
     let ft = future_physical();
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     cert_api
@@ -669,11 +697,11 @@ fn minority_pending_write_certifies_after_partition_heal() {
     );
 
     // Partition heals: auth-2 and auth-3 frontiers arrive.
-    cert_api.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-3", ft, "");
 
     // Re-process: the write's timestamp (from the Pending phase) should now
-    // be below the majority frontier (which is at 5000 or later).
+    // be below the majority signed checkpoint.
     cert_api.process_certifications();
     assert_eq!(
         cert_api.get_certification_status("key1"),
@@ -689,7 +717,7 @@ fn multiple_pending_writes_certify_in_order_after_heal() {
 
     // During partition: only auth-1 frontier visible.
     let ft = future_physical();
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     for i in 1..=5 {
@@ -706,8 +734,8 @@ fn multiple_pending_writes_certify_in_order_after_heal() {
     }
 
     // Partition heals: remaining authorities report frontiers.
-    cert_api.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-3", ft, "");
     cert_api.process_certifications();
 
     for i in 1..=5 {
@@ -740,7 +768,7 @@ fn single_authority_cluster_certifies_with_one() {
     let mut cert_api = CertifiedApi::new(node("node-solo"), ns);
 
     let ft = future_physical();
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter, OnTimeout::Pending);
@@ -765,8 +793,8 @@ fn even_cluster_requires_strict_majority() {
 
     // 2 of 4 should NOT be enough.
     let mut cert_api = CertifiedApi::new(node("node-half"), Arc::clone(&ns));
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, ""));
-    cert_api.update_frontier(make_frontier("auth-2", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "");
+    submit_signed_frontier(&mut cert_api, "auth-2", ft, "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     let result = cert_api.certified_write("key1".into(), counter.clone(), OnTimeout::Error);
@@ -777,9 +805,9 @@ fn even_cluster_requires_strict_majority() {
 
     // 3 of 4 should be enough.
     let mut cert_api2 = CertifiedApi::new(node("node-majority"), Arc::clone(&ns));
-    cert_api2.update_frontier(make_frontier("auth-1", ft, 0, ""));
-    cert_api2.update_frontier(make_frontier("auth-2", ft, 0, ""));
-    cert_api2.update_frontier(make_frontier("auth-3", ft, 0, ""));
+    submit_signed_frontier(&mut cert_api2, "auth-1", ft, "");
+    submit_signed_frontier(&mut cert_api2, "auth-2", ft, "");
+    submit_signed_frontier(&mut cert_api2, "auth-3", ft, "");
 
     let result2 = cert_api2.certified_write("key2".into(), counter, OnTimeout::Pending);
     match result2 {
@@ -836,11 +864,11 @@ fn partition_with_different_key_ranges_independent() {
     let ft = future_physical();
 
     // "users/" range: only auth-1 reachable (minority).
-    cert_api.update_frontier(make_frontier("auth-1", ft, 0, "users/"));
+    submit_signed_frontier(&mut cert_api, "auth-1", ft, "users/");
 
     // "orders/" range: auth-4 and auth-5 reachable (majority).
-    cert_api.update_frontier(make_frontier("auth-4", ft, 0, "orders/"));
-    cert_api.update_frontier(make_frontier("auth-5", ft, 0, "orders/"));
+    submit_signed_frontier(&mut cert_api, "auth-4", ft, "orders/");
+    submit_signed_frontier(&mut cert_api, "auth-5", ft, "orders/");
 
     let counter = CrdtValue::Counter(PnCounter::new());
 
@@ -936,12 +964,12 @@ fn two_majority_certificates_must_share_signer() {
 // ===========================================================================
 
 #[test]
-fn minority_write_times_out_with_process_certifications_with_timeout() {
+fn minority_write_remains_pending_after_response_wait() {
     let ns = default_namespace();
     let mut cert_api = CertifiedApi::new(node("node-minority"), ns);
 
     // Only 1 of 3 authorities reachable.
-    cert_api.update_frontier(make_frontier("auth-1", 5000, 0, ""));
+    submit_signed_frontier(&mut cert_api, "auth-1", future_physical(), "");
 
     let counter = CrdtValue::Counter(PnCounter::new());
     cert_api
@@ -958,9 +986,9 @@ fn minority_write_times_out_with_process_certifications_with_timeout() {
         + 120_000; // 120 seconds in the future
     let transitions = cert_api.process_certifications_with_timeout(now_ms);
 
-    assert!(transitions > 0, "should have timed out");
+    assert_eq!(transitions, 0);
     assert_eq!(
         cert_api.get_certification_status("key1"),
-        CertificationStatus::Timeout,
+        CertificationStatus::Pending,
     );
 }

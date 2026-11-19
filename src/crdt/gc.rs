@@ -69,11 +69,10 @@
 //! If any replica still holds the tombstone, a bucket transfer re-offers
 //! it (it is uncovered, so it IS adopted), the hole fills, and the next
 //! cycle collects it — self-healing. If the whole cluster swept it, the
-//! floor for that (key, node) stalls permanently under Stage 1; Stage 2
-//! (`allow_hole_jump`, `ASTEROIDB_GC_HOLE_JUMP=1`) lets the walk cross
-//! holes once the caller's additional INBOUND gate holds: this node has
-//! merged every registry peer's complete state since the mark, so a dot
-//! that is still a hole is live on no known replica — i.e. removed.
+//! floor for that (key, node) stalls permanently under Stage 1. The
+//! lower-level Stage 2 walk remains covered by unit tests, but public GC
+//! always stops at holes. A pull from the current registry cannot prove
+//! safety: peers can be evicted while retaining live dots.
 //!
 //! That argument only covers dots that were ALREADY holes at mark time:
 //! an inbound partial delta can mint a NEW hole after the mark (counters
@@ -82,7 +81,8 @@
 //! the writer counter without the live dot), and the "complete pull
 //! since the mark" evidence says nothing about such a dot, which may be
 //! live on the pushing peer. The mark therefore snapshots each value's
-//! per-node counters alongside the candidates, and the Stage 2 walk only
+//! per-node counters alongside the candidates. Every sweep keeps its floor
+//! at or below those saved counters, and the Stage 2 walk only
 //! jumps holes at or below that snapshot (a dot that was live or
 //! deferred at mark time can never become an above-floor hole, so a hole
 //! at or below the snapshot provably existed at mark time — see
@@ -245,13 +245,9 @@ impl TombstoneGc {
     ///   — a partition or a lagging replica stalls collection entirely
     ///   (fail-closed) and it resumes automatically once the gates pass.
     ///
-    /// `allow_hole_jump` (Stage 2) lets the floor walk cross legacy holes
-    /// — restricted to holes at or below the counters snapshotted at
-    /// mark time, so holes minted by inbound merges AFTER the mark stall
-    /// regardless (see the module docs) — and is only sound under the
-    /// caller's ADDITIONAL inbound gate (all registry peers' complete
-    /// states merged since the mark); pass `false` otherwise
-    /// (fail-closed).
+    /// This public method always stops at holes. Current peer-registry
+    /// evidence cannot account for evicted peers that may later rejoin
+    /// with an old live dot.
     ///
     /// The two-pass structure is what makes the irrevocable floor advance
     /// safe against resurrection: every folded dot existed at mark time,
@@ -270,13 +266,33 @@ impl TombstoneGc {
         store: &mut Store,
         now_ms: u64,
         gates_passed: bool,
+    ) -> SweepStats {
+        self.mark_and_sweep_impl(store, now_ms, gates_passed, false)
+    }
+
+    /// Exercises the bounded hole walk in unit tests without exposing an
+    /// unsafe permit switch to production callers.
+    #[cfg(test)]
+    fn mark_and_sweep_with_hole_jump(
+        &mut self,
+        store: &mut Store,
+        now_ms: u64,
+        gates_passed: bool,
+    ) -> SweepStats {
+        self.mark_and_sweep_impl(store, now_ms, gates_passed, true)
+    }
+
+    fn mark_and_sweep_impl(
+        &mut self,
+        store: &mut Store,
+        now_ms: u64,
+        gates_passed: bool,
         allow_hole_jump: bool,
     ) -> SweepStats {
         let mut stats = SweepStats::default();
-        let retention_ms = self.retention_period.as_millis() as u64;
-        let sweep_ready = self
-            .marked_at_ms
-            .is_some_and(|mark| now_ms.saturating_sub(mark) >= retention_ms);
+        let sweep_ready = self.marked_at_ms.is_some_and(|mark| {
+            u128::from(now_ms) >= u128::from(mark) + self.retention_period.as_millis()
+        });
 
         if sweep_ready && gates_passed {
             stats.swept = true;
@@ -284,17 +300,22 @@ impl TombstoneGc {
                 let Some(snapshot) = self.marked.get(&key) else {
                     continue;
                 };
-                // Stage 2 may only jump holes that existed at mark time:
-                // the mark-time counters bound the jumpable range.
+                // Every sweep is capped at the mark-time counter. Stage 2,
+                // when enabled only in tests, may also jump old holes within
+                // that same saved range.
                 let ceilings = allow_hole_jump.then_some(&snapshot.counters_at_mark);
                 if let Some(value) = store.get_mut(&key) {
                     let outcome = match value {
-                        CrdtValue::Set(set) => {
-                            set.compact_deferred_certified(&snapshot.candidates, ceilings)
-                        }
-                        CrdtValue::Map(map) => {
-                            map.compact_deferred_certified(&snapshot.candidates, ceilings)
-                        }
+                        CrdtValue::Set(set) => set.compact_deferred_with_bounds(
+                            &snapshot.candidates,
+                            Some(&snapshot.counters_at_mark),
+                            ceilings,
+                        ),
+                        CrdtValue::Map(map) => map.compact_deferred_with_bounds(
+                            &snapshot.candidates,
+                            Some(&snapshot.counters_at_mark),
+                            ceilings,
+                        ),
                         CrdtValue::Counter(_) | CrdtValue::Register(_) => {
                             // No tombstones for counters or registers.
                             SweepOutcome::default()
@@ -439,13 +460,13 @@ mod tests {
         let mut store = store_with_set_tombstone();
 
         // Pass 1: marks only — nothing is collected even with gates open.
-        let stats = gc.mark_and_sweep(&mut store, 1_000, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000, true);
         assert_eq!(stats.collected, 0, "first pass only marks");
         assert_eq!(gc.pending_mark_ms(), Some(1_000));
 
         // Pass 2 after retention with gates passed: sweep collects and
         // advances the floor over the tombstone and the live dot.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert_eq!(stats.collected, 1);
         assert_eq!(gc.total_collected(), 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
@@ -471,11 +492,8 @@ mod tests {
         assert!(map.deferred_len() > 0);
         store.put("mymap".into(), CrdtValue::Map(map));
 
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
-            0
-        );
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 0);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert!(stats.collected > 0);
         if let Some(CrdtValue::Map(m)) = store.get("mymap") {
             assert_eq!(m.deferred_len(), 0);
@@ -483,6 +501,88 @@ mod tests {
         } else {
             panic!("expected Map");
         }
+    }
+
+    #[test]
+    fn post_mark_live_or_set_dot_does_not_raise_swept_floor() {
+        let writer = node("A");
+        let mut set = OrSet::new();
+        set.add("old".to_string(), &writer);
+        set.remove(&"old".to_string());
+        let mut store = Store::new();
+        store.put("set".into(), CrdtValue::Set(set));
+        let mut gc = TombstoneGc::new(Duration::ZERO, Duration::from_millis(1));
+
+        gc.mark_and_sweep(&mut store, 1_000, true); // saved counter A:1
+        let Some(CrdtValue::Set(set)) = store.get_mut("set") else {
+            panic!("expected Set");
+        };
+        set.add("new".to_string(), &writer); // A:2 after the mark
+
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_001, true).collected, 1);
+        let Some(CrdtValue::Set(set)) = store.get("set") else {
+            panic!("expected Set");
+        };
+        assert_eq!(set.compaction_floor().get(&writer), Some(&1));
+        assert!(set.contains(&"new".to_string()));
+        assert_eq!(set.counters().get(&writer), Some(&2));
+    }
+
+    #[test]
+    fn post_mark_live_or_map_dot_does_not_raise_swept_floor() {
+        let writer = node("A");
+        let mut map = OrMap::new();
+        map.set("old".to_string(), "v1".to_string(), ts(1, 0, "A"), &writer);
+        map.delete(&"old".to_string());
+        let mut store = Store::new();
+        store.put("map".into(), CrdtValue::Map(map));
+        let mut gc = TombstoneGc::new(Duration::ZERO, Duration::from_millis(1));
+
+        gc.mark_and_sweep(&mut store, 1_000, true); // saved counter A:1
+        let Some(CrdtValue::Map(map)) = store.get_mut("map") else {
+            panic!("expected Map");
+        };
+        map.set("new".to_string(), "v2".to_string(), ts(2, 0, "A"), &writer);
+
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_001, true).collected, 1);
+        let Some(CrdtValue::Map(map)) = store.get("map") else {
+            panic!("expected Map");
+        };
+        assert_eq!(map.compaction_floor().get(&writer), Some(&1));
+        assert_eq!(map.get(&"new".to_string()), Some(&"v2".to_string()));
+        assert_eq!(map.counters().get(&writer), Some(&2));
+    }
+
+    #[test]
+    fn inherited_floor_above_mark_cap_does_not_regress_or_collect_again() {
+        let writer = node("A");
+        let mut set = OrSet::new();
+        set.add("old".to_string(), &writer);
+        set.remove(&"old".to_string());
+        let mut store = Store::new();
+        store.put("set".into(), CrdtValue::Set(set.clone()));
+        let mut gc = TombstoneGc::new(Duration::ZERO, Duration::from_millis(1));
+        gc.mark_and_sweep(&mut store, 1_000, true); // saved counter A:1
+
+        // Another replica can legitimately advance through the same old
+        // tombstone after creating a live dot A:2, then send a full state.
+        set.add("new".to_string(), &writer);
+        set.compact_deferred_certified(&HashSet::from([(writer.clone(), 1)]));
+        assert_eq!(set.compaction_floor().get(&writer), Some(&2));
+        let Some(CrdtValue::Set(local)) = store.get_mut("set") else {
+            panic!("expected Set");
+        };
+        local.merge(&set);
+        assert_eq!(local.deferred_len(), 0);
+
+        let stats = gc.mark_and_sweep(&mut store, 1_001, true);
+        assert!(stats.swept);
+        assert_eq!(stats.collected, 0);
+        let Some(CrdtValue::Set(local)) = store.get("set") else {
+            panic!("expected Set");
+        };
+        assert_eq!(local.compaction_floor().get(&writer), Some(&2));
+        assert!(local.contains(&"new".to_string()));
     }
 
     #[test]
@@ -498,12 +598,9 @@ mod tests {
         reg.set("hello".to_string(), ts(100, 0, "A"));
         store.put("reg".into(), CrdtValue::Register(reg));
 
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 0);
         assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
-            0
-        );
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false),
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true),
             SweepStats {
                 swept: true,
                 ..SweepStats::default()
@@ -518,23 +615,38 @@ mod tests {
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = store_with_set_tombstone();
 
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
-            0
-        ); // mark
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 0); // mark
         // Too young: even with gates open nothing is collected and the
         // mark is retained.
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 2_000, true, false).collected,
-            0
-        );
+        assert_eq!(gc.mark_and_sweep(&mut store, 2_000, true).collected, 0);
         assert_eq!(gc.pending_mark_ms(), Some(1_000), "young mark is kept");
         // Old enough: collect.
         assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false)
-                .collected,
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true).collected,
             1
         );
+    }
+
+    #[test]
+    fn zero_retention_still_requires_time_not_before_mark() {
+        let mut gc = TombstoneGc::new(Duration::ZERO, Duration::ZERO);
+        let mut store = store_with_set_tombstone();
+
+        gc.mark_and_sweep(&mut store, 1_000, true);
+        // A wall-clock rollback must not satisfy markedAt + 0 <= now.
+        assert_eq!(gc.mark_and_sweep(&mut store, 999, true).collected, 0);
+        assert_eq!(gc.pending_mark_ms(), Some(1_000));
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 1);
+    }
+
+    #[test]
+    fn retention_longer_than_u64_milliseconds_does_not_wrap() {
+        let mut gc = TombstoneGc::new(Duration::ZERO, Duration::from_secs(u64::MAX));
+        let mut store = store_with_set_tombstone();
+
+        gc.mark_and_sweep(&mut store, 1, true);
+        assert_eq!(gc.mark_and_sweep(&mut store, u64::MAX, true).collected, 0);
+        assert_eq!(gc.pending_mark_ms(), Some(1));
     }
 
     /// C-2 regression (resurrection prevention): while any known replica
@@ -562,17 +674,14 @@ mod tests {
         store.put("myset".into(), CrdtValue::Set(local));
 
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, false, false).collected,
-            0
-        ); // mark
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, false).collected, 0); // mark
 
         // The partition outlives the retention window: gates still fail,
         // so NOTHING is collected — no matter how much wall-clock time
         // has passed — and the floor does not advance (the advance is
         // irrevocable, so it must be gate-authorised).
         assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000 + 10 * RET, false, false)
+            gc.mark_and_sweep(&mut store, 1_000 + 10 * RET, false)
                 .collected,
             0,
             "gates must stall collection through arbitrarily long partitions"
@@ -602,7 +711,7 @@ mod tests {
 
         // The replica has now provably synchronised past the mark: gates
         // pass and the ORIGINAL mark is finally swept.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + 11 * RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 11 * RET, true);
         assert_eq!(stats.collected, 1, "healing the cluster resumes collection");
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
@@ -620,10 +729,7 @@ mod tests {
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
         let mut store = store_with_set_tombstone(); // tombstone (A,1)
 
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
-            0
-        ); // marks (A,1)
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 0); // marks (A,1)
 
         // A remove AFTER the mark: dot (A,2) enters deferred, followed by
         // a later add (A,3).
@@ -635,7 +741,7 @@ mod tests {
 
         // Sweep collects only the marked (A,1); the younger (A,2) stalls
         // the floor walk and stays.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert_eq!(stats.collected, 1);
         assert_eq!(stats.stalled_uncandidated, 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
@@ -644,7 +750,7 @@ mod tests {
         }
 
         // The re-mark taken at sweep time covers it for the next cycle.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true);
         assert_eq!(stats.collected, 1);
         if let Some(CrdtValue::Set(s)) = store.get("myset") {
             assert_eq!(s.deferred_len(), 0);
@@ -672,13 +778,9 @@ mod tests {
         store.put("s1".into(), CrdtValue::Set(set1));
         store.put("s2".into(), CrdtValue::Set(set2));
 
+        assert_eq!(gc.mark_and_sweep(&mut store, 1_000, true).collected, 0);
         assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000, true, false).collected,
-            0
-        );
-        assert_eq!(
-            gc.mark_and_sweep(&mut store, 1_000 + RET, true, false)
-                .collected,
+            gc.mark_and_sweep(&mut store, 1_000 + RET, true).collected,
             2
         );
         assert_eq!(gc.total_collected(), 2);
@@ -692,13 +794,13 @@ mod tests {
         let mut store = store_with_set_tombstone();
 
         assert_eq!(gc.last_gc_ms(), 0);
-        gc.mark_and_sweep(&mut store, 5_000, true, false); // mark
+        gc.mark_and_sweep(&mut store, 5_000, true); // mark
         assert_eq!(gc.last_gc_ms(), 0, "marking must not advance last_gc_ms");
 
-        gc.mark_and_sweep(&mut store, 5_000 + RET, false, false); // blocked sweep
+        gc.mark_and_sweep(&mut store, 5_000 + RET, false); // blocked sweep
         assert_eq!(gc.last_gc_ms(), 0, "blocked sweep must not advance");
 
-        let stats = gc.mark_and_sweep(&mut store, 5_000 + 2 * RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 5_000 + 2 * RET, true);
         assert_eq!(stats.collected, 1);
         assert_eq!(gc.last_gc_ms(), 5_000 + 2 * RET);
     }
@@ -718,11 +820,11 @@ mod tests {
         store.put("myset".into(), CrdtValue::Set(set));
 
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
-        gc.mark_and_sweep(&mut store, 1_000, true, false); // mark (A,2)
+        gc.mark_and_sweep(&mut store, 1_000, true); // mark (A,2)
 
         // Stage 1: the hole stalls the walk; nothing is collected
         // (fail-closed) and the stall is observable.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true);
         assert_eq!(stats.collected, 0);
         assert_eq!(stats.stalled_holes, 1);
         assert_eq!(set_floor_for(&store, "myset", &n), None);
@@ -730,7 +832,7 @@ mod tests {
         // Stage 2 (inbound gate passed): the hole is jumped, the floor
         // reaches the tombstone and collection proceeds — but never past
         // counters[n].
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, true);
+        let stats = gc.mark_and_sweep_with_hole_jump(&mut store, 1_000 + 2 * RET, true);
         assert_eq!(stats.collected, 1);
         assert_eq!(stats.stalled_holes, 0);
         assert_eq!(set_floor_for(&store, "myset", &n), Some(&2));
@@ -757,20 +859,20 @@ mod tests {
         store.put("myset".into(), CrdtValue::Set(set));
 
         // Mark-only pass: no sweep executed.
-        let stats = gc.mark_and_sweep(&mut store, 1_000, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000, true);
         assert!(!stats.swept, "mark-only pass must not report a sweep");
 
         // Retention not reached: no sweep executed.
-        let stats = gc.mark_and_sweep(&mut store, 2_000, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 2_000, true);
         assert!(!stats.swept, "pre-retention pass must not report a sweep");
 
         // Gates blocked: no sweep executed.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, false, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, false);
         assert!(!stats.swept, "blocked pass must not report a sweep");
 
         // Gates pass after retention: the sweep runs (and stalls on the
         // legacy hole — the stall is part of an EXECUTED sweep's stats).
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true, false);
+        let stats = gc.mark_and_sweep(&mut store, 1_000 + 2 * RET, true);
         assert!(stats.swept);
         assert_eq!(stats.stalled_holes, 1);
         assert_eq!(set_floor_for(&store, "myset", &n), None);
@@ -785,7 +887,7 @@ mod tests {
         let n = node("A");
         let mut store = store_with_set_tombstone(); // tombstone (A,1), live (A,2)
         let mut gc = TombstoneGc::new(Duration::from_secs(0), Duration::from_secs(300));
-        gc.mark_and_sweep(&mut store, 1_000, true, true); // mark: counters {A:2}
+        gc.mark_and_sweep_with_hole_jump(&mut store, 1_000, true); // mark: counters {A:2}
 
         // AFTER the mark, an inbound partial delta mints holes: counters
         // jump to A=5 with no live/deferred dots for (A,3)..(A,5) — any
@@ -798,13 +900,15 @@ mod tests {
             s.merge(&counters_only);
         }
 
-        // Stage 2 sweep: collects the marked tombstone, walks over the
-        // mark-time range, and stalls at the first post-mark hole (A,3)
-        // instead of jumping to A=5.
-        let stats = gc.mark_and_sweep(&mut store, 1_000 + RET, true, true);
+        // Stage 2 sweep: collects the marked tombstone and stops at the
+        // saved counter A:2. It never inspects post-mark holes (A,3)..(A,5).
+        let stats = gc.mark_and_sweep_with_hole_jump(&mut store, 1_000 + RET, true);
         assert!(stats.swept);
         assert_eq!(stats.collected, 1);
-        assert_eq!(stats.stalled_holes, 1, "post-mark hole must stall");
+        assert_eq!(
+            stats.stalled_holes, 0,
+            "post-mark holes are outside the sweep"
+        );
         assert_eq!(
             set_floor_for(&store, "myset", &n),
             Some(&2),
@@ -825,7 +929,7 @@ mod tests {
         set.add("y".to_string(), &n);
 
         let pre_sweep = set.clone(); // "snapshot" before the sweep
-        set.compact_deferred_certified(&set.deferred_dots(), None);
+        set.compact_deferred_certified(&set.deferred_dots());
         let post_sweep = set.clone(); // peer state after the sweep
 
         // Crash: revert to the pre-sweep snapshot (floor lost — the
@@ -840,7 +944,7 @@ mod tests {
         assert_eq!(recovered.deferred_len(), 0);
 
         // A second sweep over the recovered state is a no-op.
-        let outcome = recovered.compact_deferred_certified(&recovered.deferred_dots(), None);
+        let outcome = recovered.compact_deferred_certified(&recovered.deferred_dots());
         assert_eq!(outcome, crate::crdt::SweepOutcome::default());
         assert!(!recovered.contains(&"x".to_string()));
         assert!(recovered.contains(&"y".to_string()));

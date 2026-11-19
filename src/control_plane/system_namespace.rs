@@ -37,8 +37,20 @@ pub struct SystemNamespace {
     version: PolicyVersion,
     placement_policies: HashMap<String, PlacementPolicy>,
     authority_definitions: HashMap<String, AuthorityDefinition>,
+    /// Node-local operation assignments. These are supplied by the operation
+    /// deployment on every boot, not by the legacy prefix-only Raft protocol.
+    #[serde(skip)]
+    operation_assignments: HashMap<String, HashMap<String, OperationAssignment>>,
     /// History of policy versions for observability (NFR-004).
     version_history: Vec<PolicyVersion>,
+}
+
+/// Static assignment for a single operation namespace and key prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationAssignment {
+    pub namespace_id: String,
+    pub policy: PlacementPolicy,
+    pub authority: AuthorityDefinition,
 }
 
 impl SystemNamespace {
@@ -49,6 +61,7 @@ impl SystemNamespace {
             version: initial_version,
             placement_policies: HashMap::new(),
             authority_definitions: HashMap::new(),
+            operation_assignments: HashMap::new(),
             version_history: vec![initial_version],
         }
     }
@@ -78,6 +91,153 @@ impl SystemNamespace {
     /// Returns the placement policy for the given prefix, if any.
     pub fn get_placement_policy(&self, prefix: &str) -> Option<&PlacementPolicy> {
         self.placement_policies.get(prefix)
+    }
+
+    /// Find the policy that actually governs a key, including shadowing by
+    /// a more specific prefix. This must be used for operation admission;
+    /// looking up only an Authority's prefix can overlook a nested disabled
+    /// policy.
+    pub fn get_placement_policy_for_key(&self, key: &str) -> Option<&PlacementPolicy> {
+        self.placement_policies
+            .iter()
+            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, policy)| policy)
+    }
+
+    /// Install a static operation assignment supplied by the deployment.
+    /// This intentionally does not change the replicated legacy policy version.
+    pub fn set_operation_assignment(
+        &mut self,
+        assignment: OperationAssignment,
+    ) -> Result<(), crate::error::CrdtError> {
+        if assignment.namespace_id.is_empty()
+            || assignment.policy.replica_count == 0
+            || assignment.policy.key_range.prefix != assignment.authority.key_range.prefix
+            || assignment.authority.authority_nodes.is_empty()
+        {
+            return Err(crate::error::CrdtError::InvalidArgument(
+                "invalid operation namespace assignment".into(),
+            ));
+        }
+        let prefix = assignment.policy.key_range.prefix.clone();
+        self.operation_assignments
+            .entry(assignment.namespace_id.clone())
+            .or_default()
+            .insert(prefix, assignment);
+        Ok(())
+    }
+
+    pub fn operation_placement_policy(
+        &self,
+        namespace_id: &str,
+        prefix: &str,
+    ) -> Option<&PlacementPolicy> {
+        self.operation_assignments
+            .get(namespace_id)
+            .and_then(|assignments| assignments.get(prefix))
+            .map(|assignment| &assignment.policy)
+            .or_else(|| self.get_placement_policy(prefix))
+    }
+
+    pub fn has_operation_assignment(&self, namespace_id: &str, prefix: &str) -> bool {
+        self.operation_assignments
+            .get(namespace_id)
+            .is_some_and(|assignments| assignments.contains_key(prefix))
+    }
+
+    /// Static assignments for one namespace, including nested ranges that
+    /// can shadow an Authority scope on a later operation.
+    pub fn operation_assignments_for_namespace(
+        &self,
+        namespace_id: &str,
+    ) -> Vec<&OperationAssignment> {
+        self.operation_assignments
+            .get(namespace_id)
+            .map(|assignments| assignments.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// All local operation assignments, for a canonical routed Authority pin.
+    pub fn all_operation_assignments(&self) -> Vec<&OperationAssignment> {
+        self.operation_assignments
+            .values()
+            .flat_map(|assignments| assignments.values())
+            .collect()
+    }
+
+    pub fn operation_authority_definition(
+        &self,
+        namespace_id: &str,
+        prefix: &str,
+    ) -> Option<&AuthorityDefinition> {
+        self.operation_assignments
+            .get(namespace_id)
+            .and_then(|assignments| assignments.get(prefix))
+            .map(|assignment| &assignment.authority)
+            .or_else(|| self.get_authority_definition(prefix))
+    }
+
+    pub fn operation_placement_for_key(
+        &self,
+        namespace_id: &str,
+        key: &str,
+    ) -> Option<&PlacementPolicy> {
+        let scoped = self
+            .operation_assignments
+            .get(namespace_id)
+            .and_then(|assignments| {
+                assignments
+                    .iter()
+                    .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+                    .max_by_key(|(prefix, _)| prefix.len())
+            });
+        let legacy = self
+            .placement_policies
+            .iter()
+            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len());
+        match (scoped, legacy) {
+            (Some((scoped_prefix, _)), Some((legacy_prefix, policy)))
+                if legacy_prefix.len() > scoped_prefix.len() =>
+            {
+                Some(policy)
+            }
+            (Some((_, assignment)), _) => Some(&assignment.policy),
+            (None, Some((_, policy))) => Some(policy),
+            (None, None) => None,
+        }
+    }
+
+    pub fn operation_authorities_for_key(
+        &self,
+        namespace_id: &str,
+        key: &str,
+    ) -> Option<&AuthorityDefinition> {
+        let scoped = self
+            .operation_assignments
+            .get(namespace_id)
+            .and_then(|assignments| {
+                assignments
+                    .iter()
+                    .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+                    .max_by_key(|(prefix, _)| prefix.len())
+            });
+        let legacy = self
+            .authority_definitions
+            .iter()
+            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len());
+        match (scoped, legacy) {
+            (Some((scoped_prefix, _)), Some((legacy_prefix, def)))
+                if legacy_prefix.len() > scoped_prefix.len() =>
+            {
+                Some(def)
+            }
+            (Some((_, assignment)), _) => Some(&assignment.authority),
+            (None, Some((_, def))) => Some(def),
+            (None, None) => None,
+        }
     }
 
     /// Removes and returns the placement policy for the given prefix.
@@ -563,6 +723,100 @@ mod tests {
         assert!(
             matches!(err, crate::error::CrdtError::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn operation_assignment_selects_namespace_and_longest_prefix() {
+        let mut ns = SystemNamespace::new();
+        ns.set_placement_policy(make_policy("orders/")).unwrap();
+        ns.set_authority_definition(make_authority_def("orders/", &["legacy"]));
+        let assignment = |namespace_id: &str, prefix: &str, node: &str| OperationAssignment {
+            namespace_id: namespace_id.into(),
+            policy: make_policy(prefix),
+            authority: make_authority_def(prefix, &[node]),
+        };
+        ns.set_operation_assignment(assignment("east", "orders/", "east-node"))
+            .unwrap();
+        ns.set_operation_assignment(assignment("west", "orders/", "west-node"))
+            .unwrap();
+        ns.set_operation_assignment(assignment("east", "orders/vip/", "vip-node"))
+            .unwrap();
+        assert_eq!(
+            ns.operation_authorities_for_key("east", "orders/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "east-node"
+        );
+        assert_eq!(
+            ns.operation_authorities_for_key("west", "orders/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "west-node"
+        );
+        assert_eq!(
+            ns.operation_authorities_for_key("other", "orders/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "legacy"
+        );
+        assert_eq!(
+            ns.operation_authorities_for_key("east", "orders/vip/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "vip-node"
+        );
+        ns.set_placement_policy(make_policy("orders/vip/private/"))
+            .unwrap();
+        ns.set_authority_definition(make_authority_def("orders/vip/private/", &["private"]));
+        assert_eq!(
+            ns.operation_authorities_for_key("east", "orders/vip/private/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "private"
+        );
+        assert_eq!(
+            ns.operation_placement_for_key("east", "orders/vip/private/1")
+                .unwrap()
+                .key_range
+                .prefix,
+            "orders/vip/private/"
+        );
+        assert_eq!(
+            ns.get_authorities_for_key("orders/1")
+                .unwrap()
+                .authority_nodes[0]
+                .0,
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn operation_assignment_is_local_to_deployment() {
+        let mut ns = SystemNamespace::new();
+        let assignment = OperationAssignment {
+            namespace_id: "east".into(),
+            policy: make_policy("orders/"),
+            authority: make_authority_def("orders/", &["east-node"]),
+        };
+        ns.set_operation_assignment(assignment).unwrap();
+        let serialized = serde_json::to_string(&ns).unwrap();
+        assert!(!serialized.contains("east-node"));
+        let recovered: SystemNamespace = serde_json::from_str(&serialized).unwrap();
+        assert!(
+            recovered
+                .operation_authority_definition("east", "orders/")
+                .is_none()
+        );
+        ns.replace_control_plane_core(Vec::new(), Vec::new());
+        assert!(
+            ns.operation_authority_definition("east", "orders/")
+                .is_some()
         );
     }
 

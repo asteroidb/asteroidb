@@ -19,9 +19,10 @@ use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout, ProofBundle};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
 use asteroidb_poc::authority::certificate::{
-    AuthoritySignature, EpochConfig, EpochManager, KeysetVersion, MajorityCertificate,
-    create_certificate_message, sign_message,
+    AuthoritySignature, EpochConfig, EpochManager, KeysetRegistry, KeysetVersion,
+    MajorityCertificate, create_certificate_message, sign_message,
 };
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::authority::verifier::verify_proof_with_registry;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
@@ -49,6 +50,14 @@ use tower::ServiceExt;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn trusted_roster(proof: &ProofBundle) -> Vec<NodeId> {
+    let mut members = proof.contributing_authorities.clone();
+    while members.len() < proof.total_authorities {
+        members.push(NodeId(format!("trusted-extra-{}", members.len())));
+    }
+    members
+}
 
 fn node_id(s: &str) -> NodeId {
     NodeId(s.into())
@@ -138,6 +147,31 @@ fn make_key_pair() -> (SigningKey, ed25519_dalek::VerifyingKey) {
     let sk = SigningKey::generate(&mut OsRng);
     let vk = sk.verifying_key();
     (sk, vk)
+}
+
+fn submit_signed_frontier(
+    api: &mut CertifiedApi,
+    authority: &str,
+    signing_key: &SigningKey,
+    keyset_version: u64,
+    policy_version: u64,
+    report_physical: u64,
+) -> bool {
+    let seed = signing_key.to_bytes();
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed, false);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed);
+    let frontier = make_frontier_v(authority, report_physical, 0, "sensor/", policy_version);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(keyset_version));
+    api.update_frontier_verified(
+        frontier.clone(),
+        Some(signer.self_verified(&frontier, &signature)),
+    )
+}
+
+fn report_after_checkpoint(write_physical: u64) -> u64 {
+    (write_physical / 1000 + 1) * 1000 + 100
 }
 
 fn test_state_with_ns(nid: NodeId, ns: Arc<RwLock<SystemNamespace>>) -> Arc<AppState> {
@@ -265,7 +299,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
 
     let (sk_n1_v1, vk_n1_v1) = make_key_pair();
     let (sk_n2_v1, vk_n2_v1) = make_key_pair();
-    let (_sk_n3_v1, vk_n3_v1) = make_key_pair();
+    let (sk_n3_v1, vk_n3_v1) = make_key_pair();
 
     epoch_manager
         .rotate_keyset(
@@ -313,9 +347,10 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         // Get the write timestamp so we can advance frontiers past it.
         let write_ts = api.pending_writes()[0].timestamp.physical;
 
-        // Advance n1 and n2 authority frontiers past the write (majority = 2 of 3).
-        api.update_frontier(make_frontier_v("n1", write_ts + 100, 0, "sensor/", 1));
-        api.update_frontier(make_frontier_v("n2", write_ts + 200, 0, "sensor/", 1));
+        // A 2-of-3 majority signs the same checkpoint after the write.
+        let report_ts = report_after_checkpoint(write_ts);
+        submit_signed_frontier(&mut api, "n1", &sk_n1_v1, 1, 1, report_ts);
+        submit_signed_frontier(&mut api, "n2", &sk_n2_v1, 1, 1, report_ts);
         api.process_certifications();
 
         // Verify the write is now certified.
@@ -338,45 +373,9 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
             .expect("proof should exist when certified");
         assert_eq!(proof.policy_version, PolicyVersion(1));
 
-        // Build a real MajorityCertificate signed with v1 keys for verification.
-        let message = create_certificate_message(
-            &proof.key_range,
-            &proof.frontier_hlc,
-            &proof.policy_version,
-        );
-        let mut cert = MajorityCertificate::new(
-            proof.key_range.clone(),
-            proof.frontier_hlc.clone(),
-            proof.policy_version,
-            KeysetVersion(1),
-        );
-        let sig_n1 = sign_message(&sk_n1_v1, &message);
-        cert.add_signature(AuthoritySignature {
-            authority_id: node_id("n1"),
-            public_key: vk_n1_v1,
-            signature: sig_n1,
-            keyset_version: KeysetVersion(1),
-        });
-        let sig_n2 = sign_message(&sk_n2_v1, &message);
-        cert.add_signature(AuthoritySignature {
-            authority_id: node_id("n2"),
-            public_key: vk_n2_v1,
-            signature: sig_n2,
-            keyset_version: KeysetVersion(1),
-        });
-
-        let signed_bundle = ProofBundle {
-            key_range: proof.key_range.clone(),
-            frontier_hlc: proof.frontier_hlc.clone(),
-            policy_version: proof.policy_version,
-            contributing_authorities: vec![node_id("n1"), node_id("n2")],
-            total_authorities: 3,
-            certificate: Some(cert),
-            bls_certificate: None,
-        };
-
         let verify_result = verify_proof_with_registry(
-            &signed_bundle,
+            proof,
+            &trusted_roster(proof),
             epoch_manager.registry(),
             epoch_manager.current_epoch(base_secs),
             epoch_manager.config(),
@@ -492,7 +491,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     // ===================================================================
 
     let epoch3_secs = base_secs + 86400 * 3; // 3 days later -> epoch 3.
-    let (_sk_n1_v2, vk_n1_v2) = make_key_pair();
+    let (sk_n1_v2, vk_n1_v2) = make_key_pair();
     let (sk_n2_v2, vk_n2_v2) = make_key_pair();
     let (_sk_n4_v2, vk_n4_v2) = make_key_pair();
 
@@ -536,7 +535,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     // n2 signs with v2 (already upgraded). Authority set is now {n1, n2}
     // after recalculation with replica_count=2.
     let new_proof_kr = kr("sensor/");
-    let new_proof_hlc = hlc(1_700_000_100_000, 0, "n1");
+    let new_proof_hlc = hlc(1_700_000_100_000, 0, "");
     let new_proof_pv = PolicyVersion(2);
     let message = create_certificate_message(&new_proof_kr, &new_proof_hlc, &new_proof_pv);
 
@@ -578,6 +577,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     // During grace period (epoch 5), mixed v1+v2 signatures are valid.
     let result = verify_proof_with_registry(
         &mixed_bundle,
+        &trusted_roster(&mixed_bundle),
         epoch_manager.registry(),
         epoch_manager.current_epoch(epoch5_time),
         epoch_manager.config(),
@@ -594,6 +594,7 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
     // proof should fail because n1's v1 signature is no longer accepted.
     let result_expired = verify_proof_with_registry(
         &mixed_bundle,
+        &trusted_roster(&mixed_bundle),
         epoch_manager.registry(),
         epoch_manager.current_epoch(epoch8_time),
         epoch_manager.config(),
@@ -758,9 +759,10 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
             "Phase 6b: new write should be under policy version 2"
         );
 
-        // Advance new authority frontiers (n1 and n2) under v2.
-        api.update_frontier(make_frontier_v("n1", write_ts + 100, 0, "sensor/", 2));
-        api.update_frontier(make_frontier_v("n2", write_ts + 200, 0, "sensor/", 2));
+        // New authorities sign a v2 checkpoint under keyset v2.
+        let report_ts = report_after_checkpoint(write_ts);
+        submit_signed_frontier(&mut api, "n1", &sk_n1_v2, 2, 2, report_ts);
+        submit_signed_frontier(&mut api, "n2", &sk_n2_v2, 2, 2, report_ts);
         api.process_certifications();
 
         assert_eq!(
@@ -788,8 +790,9 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         let write_ts = api.pending_writes()[pw_idx].timestamp.physical;
 
         // Attempt to use v1 frontiers (should be blocked by fencing).
-        let blocked1 = api.update_frontier(make_frontier_v("n1", write_ts + 500, 0, "sensor/", 1));
-        let blocked2 = api.update_frontier(make_frontier_v("n3", write_ts + 500, 0, "sensor/", 1));
+        let report_ts = report_after_checkpoint(write_ts);
+        let blocked1 = submit_signed_frontier(&mut api, "n1", &sk_n1_v1, 1, 1, report_ts);
+        let blocked2 = submit_signed_frontier(&mut api, "n3", &sk_n3_v1, 1, 1, report_ts);
         assert!(
             !blocked1,
             "Phase 6c: v1 frontier update should be rejected after fencing"
@@ -807,8 +810,8 @@ async fn authority_reconfig_with_key_rotation_and_delta_sync() {
         );
 
         // Now use v2 frontiers from the correct authority set (n1, n2).
-        api.update_frontier(make_frontier_v("n1", write_ts + 100, 0, "sensor/", 2));
-        api.update_frontier(make_frontier_v("n2", write_ts + 200, 0, "sensor/", 2));
+        submit_signed_frontier(&mut api, "n1", &sk_n1_v2, 2, 2, report_ts);
+        submit_signed_frontier(&mut api, "n2", &sk_n2_v2, 2, 2, report_ts);
         api.process_certifications();
 
         assert_eq!(
@@ -894,11 +897,33 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
         &["active"],
     )]));
 
+    // The reporter needs a registered Ed25519 signer for its own frontier
+    // to count as the single-authority majority before reconfiguration.
+    let mut seed = [0u8; 32];
+    seed[0] = 77;
+    #[cfg(feature = "native-crypto")]
+    let signer = Arc::new(NodeSigner::from_seed(node_id("n1"), &seed, false));
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = Arc::new(NodeSigner::from_seed(node_id("n1"), &seed));
+    let mut registry = KeysetRegistry::new();
+    registry
+        .register_keyset(
+            KeysetVersion(1),
+            0,
+            vec![(node_id("n1"), signer.verifying_key())],
+        )
+        .unwrap();
+    let config = NodeRunnerConfig {
+        node_signer: Some(signer),
+        keyset_registry: Some(Arc::new(RwLock::new(registry))),
+        ..fast_config()
+    };
+
     let mut runner = NodeRunner::with_cluster_nodes(
         node_id("n1"),
         shared_api.clone(),
         CompactionEngine::with_defaults(),
-        fast_config(),
+        config,
         default_metrics(),
         cluster_nodes.clone(),
     )
@@ -912,7 +937,7 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
     let api_clone = shared_api.clone();
     let nodes_ref = cluster_nodes.clone();
 
-    tokio::spawn(async move {
+    let monitor = tokio::spawn(async move {
         // Poll until the v1 write is certified (instead of fixed sleep).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -975,7 +1000,12 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
         let _ = handle.send(true);
     });
 
-    runner.run().await;
+    tokio::time::timeout(Duration::from_secs(8), runner.run())
+        .await
+        .expect("runner must shut down even if the monitor fails");
+    monitor
+        .await
+        .expect("reconfiguration monitor must complete");
 
     // After the runner exits, verify the v1 write was certified
     // (frontier reporter would have auto-certified it).
@@ -996,7 +1026,7 @@ async fn node_runner_reconfig_and_version_fencing_with_rotation() {
 #[test]
 fn expired_keyset_proof_rejected_after_reconfig() {
     let kr_val = kr("sensor/");
-    let hlc_val = hlc(1_700_000_050_000, 0, "n1");
+    let hlc_val = hlc(1_700_000_050_000, 0, "");
     let pv = PolicyVersion(2);
     let message = create_certificate_message(&kr_val, &hlc_val, &pv);
 
@@ -1042,16 +1072,30 @@ fn expired_keyset_proof_rejected_after_reconfig() {
     };
 
     // At epoch 3 (boundary): v1 registered at epoch 0, grace=3 -> 3 <= 0+3 -> valid.
-    let result =
-        verify_proof_with_registry(&bundle, manager.registry(), 3, manager.config(), None, 0);
+    let result = verify_proof_with_registry(
+        &bundle,
+        &trusted_roster(&bundle),
+        manager.registry(),
+        3,
+        manager.config(),
+        None,
+        0,
+    );
     assert!(
         result.valid,
         "v1 should still be valid at grace boundary (epoch 3)"
     );
 
     // At epoch 4: v1 expired (4 > 0+3).
-    let result_expired =
-        verify_proof_with_registry(&bundle, manager.registry(), 4, manager.config(), None, 0);
+    let result_expired = verify_proof_with_registry(
+        &bundle,
+        &trusted_roster(&bundle),
+        manager.registry(),
+        4,
+        manager.config(),
+        None,
+        0,
+    );
     assert!(
         !result_expired.valid,
         "v1 should be rejected after grace period (epoch 4)"

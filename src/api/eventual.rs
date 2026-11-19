@@ -24,14 +24,19 @@ use crate::crdt::pn_counter::PnCounter;
 /// When constructed via [`recovered`](Self::recovered) with a
 /// [`WalWriter`], every mutation appends a state-based redo record (the
 /// post-mutation CRDT value + HLC) to the write-ahead log BEFORE the call
-/// returns. A failed append surfaces as [`CrdtError::Storage`]: the
-/// in-memory effect remains (un-acked; it converges via anti-entropy), but
-/// the caller must not acknowledge durability. `new` builds a WAL-less
-/// API with the historical purely-in-memory behaviour.
+/// returns. A failed local append surfaces as [`CrdtError::Storage`] before
+/// the prepared value enters the store. Remote merges use a separate poison
+/// and retry path. `new` builds a WAL-less
+/// API with purely in-memory behaviour. Its dot incarnation is fixed at zero;
+/// it cannot promise dot freshness if a peer retains an old write across a
+/// restart. Recovered APIs reserve a new durable incarnation on each open.
 pub struct EventualApi {
     store: Store,
     clock: Hlc,
     node_id: NodeId,
+    /// Per-WAL-open identity for local OR-Set/OR-Map dots. HLC and session
+    /// origins continue to use `node_id`.
+    dot_writer_id: NodeId,
     /// Write-ahead log appender; `None` = persistence disabled.
     #[cfg(not(target_arch = "wasm32"))]
     wal: Option<WalWriter>,
@@ -53,6 +58,14 @@ pub struct EventualApi {
     redundant_merge_skips: u64,
 }
 
+fn dot_writer_identity(node_id: &NodeId, incarnation: u64) -> NodeId {
+    NodeId(format!(
+        "asteroidb/dot/v1/{}/{incarnation:016x}:{}",
+        node_id.0.len(),
+        node_id.0
+    ))
+}
+
 impl EventualApi {
     /// Create a new EventualApi for the given node (no WAL: in-memory only).
     pub fn new(node_id: NodeId) -> Self {
@@ -60,6 +73,7 @@ impl EventualApi {
         Self {
             store: Store::new(),
             clock,
+            dot_writer_id: dot_writer_identity(&node_id, 0),
             node_id,
             #[cfg(not(target_arch = "wasm32"))]
             wal: None,
@@ -82,9 +96,12 @@ impl EventualApi {
         if let Some(max) = store.max_known_hlc() {
             clock.seed_recovered(&max);
         }
+        let dot_writer_id =
+            dot_writer_identity(&node_id, wal.as_ref().map_or(0, WalWriter::boot_sequence));
         Self {
             store,
             clock,
+            dot_writer_id,
             node_id,
             wal,
             last_wal_pos: None,
@@ -281,26 +298,25 @@ impl EventualApi {
     #[cfg(target_arch = "wasm32")]
     fn wal_log_merge_failed(&mut self, _key: &str) {}
 
-    /// Finish a local write: record the change position, advance the applied
-    /// frontier, and log the post-state as an `UpsertApplied` record.
-    ///
-    /// If the WAL append fails, the key is poisoned exactly as
-    /// [`merge_remote`](Self::merge_remote) does: `note_applied` has already
-    /// advanced `applied_origins`, but the data record is NOT in the WAL,
-    /// while a *later* successful append (e.g. an adopted `SessionClaims` or
-    /// the next mutation) can still persist a frontier that covers this write.
-    /// Without the poison, recovery replays that later frontier, `note_applied`
-    /// re-advances past the never-logged record, and a read-your-writes token
-    /// for this write passes `session_check` on a store that is missing the
-    /// data — a false success the fail-closed design promises never happens.
-    fn finish_local_write(&mut self, key: &str, ts: &HlcTimestamp) -> Result<(), CrdtError> {
+    /// Publish a prepared local value only after its redo record is appended.
+    /// A failed append must leave neither a readable value nor an advanced
+    /// session frontier in memory; otherwise a later GET or checkpoint could
+    /// expose or preserve an unacknowledged write.
+    fn finish_local_write(
+        &mut self,
+        key: &str,
+        candidate: CrdtValue,
+        ts: &HlcTimestamp,
+    ) -> Result<(), CrdtError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wal_append(WalRecord::UpsertApplied {
+            key: key.to_string(),
+            value: candidate.clone(),
+            hlc: ts.clone(),
+        })?;
+        self.store.merge_value(key.to_string(), &candidate)?;
         self.store.record_change(key, ts.clone());
         self.store.note_applied(ts);
-        if let Err(e) = self.wal_log_applied(key, ts) {
-            self.store.note_merge_failed(key);
-            self.wal_log_merge_failed(key);
-            return Err(e);
-        }
         Ok(())
     }
 
@@ -350,8 +366,16 @@ impl EventualApi {
         value: CrdtValue,
     ) -> Result<HlcTimestamp, CrdtError> {
         let ts = self.clock.now()?;
-        self.store.merge_value(key.clone(), &value)?;
-        self.finish_local_write(&key, &ts)?;
+        let mut prepared = Store::new();
+        if let Some(existing) = self.store.get(&key) {
+            prepared.put(key.clone(), existing.clone());
+        }
+        prepared.merge_value(key.clone(), &value)?;
+        let candidate = prepared
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| CrdtError::Internal(format!("no prepared state for local key {key}")))?;
+        self.finish_local_write(&key, candidate, &ts)?;
         Ok(ts)
     }
 
@@ -368,17 +392,17 @@ impl EventualApi {
                     actual: other.type_name().into(),
                 });
             }
-            None => {
-                self.store
-                    .put(key.to_string(), CrdtValue::Counter(PnCounter::new()));
-            }
-        }
-        // Safe: we just ensured a Counter exists at this key.
-        if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
-            c.increment(&self.node_id);
+            None => {}
         }
         let ts = self.clock.now()?;
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Counter(c)) => c.clone(),
+            _ => PnCounter::new(),
+        };
+        candidate
+            .try_increment(&self.node_id)
+            .map_err(|_| CrdtError::PnCounterExhausted)?;
+        self.finish_local_write(key, CrdtValue::Counter(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -395,16 +419,17 @@ impl EventualApi {
                     actual: other.type_name().into(),
                 });
             }
-            None => {
-                self.store
-                    .put(key.to_string(), CrdtValue::Counter(PnCounter::new()));
-            }
-        }
-        if let Some(CrdtValue::Counter(c)) = self.store.get_mut(key) {
-            c.decrement(&self.node_id);
+            None => {}
         }
         let ts = self.clock.now()?;
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Counter(c)) => c.clone(),
+            _ => PnCounter::new(),
+        };
+        candidate
+            .try_decrement(&self.node_id)
+            .map_err(|_| CrdtError::PnCounterExhausted)?;
+        self.finish_local_write(key, CrdtValue::Counter(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -425,16 +450,17 @@ impl EventualApi {
                     actual: other.type_name().into(),
                 });
             }
-            None => {
-                self.store
-                    .put(key.to_string(), CrdtValue::Set(OrSet::new()));
-            }
-        }
-        if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
-            s.add(element, &self.node_id);
+            None => {}
         }
         let ts = self.clock.now()?;
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Set(s)) => s.clone(),
+            _ => OrSet::new(),
+        };
+        candidate
+            .try_add(element, &self.dot_writer_id)
+            .map_err(|_| CrdtError::DotCounterExhausted)?;
+        self.finish_local_write(key, CrdtValue::Set(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -459,11 +485,13 @@ impl EventualApi {
                 return Err(CrdtError::KeyNotFound(key.to_string()));
             }
         }
-        if let Some(CrdtValue::Set(s)) = self.store.get_mut(key) {
-            s.remove(&element.to_string());
-        }
         let ts = self.clock.now()?;
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Set(s)) => s.clone(),
+            _ => unreachable!("set type checked above"),
+        };
+        candidate.remove(&element.to_string());
+        self.finish_local_write(key, CrdtValue::Set(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -485,16 +513,17 @@ impl EventualApi {
                     actual: other.type_name().into(),
                 });
             }
-            None => {
-                self.store
-                    .put(key.to_string(), CrdtValue::Map(OrMap::new()));
-            }
+            None => {}
         }
         let ts = self.clock.now()?;
-        if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
-            m.set(map_key, map_value, ts.clone(), &self.node_id);
-        }
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Map(m)) => m.clone(),
+            _ => OrMap::new(),
+        };
+        candidate
+            .try_set(map_key, map_value, ts.clone(), &self.dot_writer_id)
+            .map_err(|_| CrdtError::DotCounterExhausted)?;
+        self.finish_local_write(key, CrdtValue::Map(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -519,11 +548,13 @@ impl EventualApi {
                 return Err(CrdtError::KeyNotFound(key.to_string()));
             }
         }
-        if let Some(CrdtValue::Map(m)) = self.store.get_mut(key) {
-            m.delete(&map_key.to_string());
-        }
         let ts = self.clock.now()?;
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Map(m)) => m.clone(),
+            _ => unreachable!("map type checked above"),
+        };
+        candidate.delete(&map_key.to_string());
+        self.finish_local_write(key, CrdtValue::Map(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -544,16 +575,15 @@ impl EventualApi {
                     actual: other.type_name().into(),
                 });
             }
-            None => {
-                self.store
-                    .put(key.to_string(), CrdtValue::Register(LwwRegister::new()));
-            }
+            None => {}
         }
         let ts = self.clock.now()?;
-        if let Some(CrdtValue::Register(r)) = self.store.get_mut(key) {
-            r.set(value, ts.clone());
-        }
-        self.finish_local_write(key, &ts)?;
+        let mut candidate = match self.store.get(key) {
+            Some(CrdtValue::Register(r)) => r.clone(),
+            _ => LwwRegister::new(),
+        };
+        candidate.set(value, ts.clone());
+        self.finish_local_write(key, CrdtValue::Register(candidate), &ts)?;
         Ok(ts)
     }
 
@@ -608,7 +638,17 @@ impl EventualApi {
             tracing::trace!(key = %key, "redundant remote merge skipped (RR)");
             return Ok(());
         }
-        let ts = self.clock.now()?;
+        let ts = match self.clock.now() {
+            Ok(ts) => ts,
+            Err(error) => {
+                // The CRDT merge already changed memory. A retry may be a
+                // state no-op, so it must bypass the RR gate and WAL-log the
+                // post-state before the sender can receive a clean ACK.
+                self.store.note_merge_failed(&key);
+                self.wal_log_merge_failed(&key);
+                return Err(error.into());
+            }
+        };
         self.store.record_change(&key, ts.clone());
         // The push path carries no origin HLC; the merged state is
         // re-stamped with a local timestamp, so only the LOCAL origin
@@ -735,15 +775,15 @@ impl EventualApi {
         if applied.is_empty() && visible.is_empty() && failed.is_empty() {
             return Ok(());
         }
-        self.store.merge_applied_origins(applied);
-        self.store.merge_visible_origins(visible);
-        self.store.merge_failed_extend(failed.iter().cloned());
         #[cfg(not(target_arch = "wasm32"))]
         self.wal_append(WalRecord::SessionClaims {
             applied: applied.clone(),
             visible: visible.clone(),
-            failed,
+            failed: failed.clone(),
         })?;
+        self.store.merge_applied_origins(applied);
+        self.store.merge_visible_origins(visible);
+        self.store.merge_failed_extend(failed);
         Ok(())
     }
 
@@ -902,6 +942,41 @@ mod tests {
     }
 
     #[test]
+    fn counter_component_exhaustion_does_not_ack_or_change_the_value() {
+        let writer = node("node-a");
+        let mut api = EventualApi::new(writer.clone());
+        let positive: PnCounter = serde_json::from_value(serde_json::json!({
+            "p": {"node-a": u64::MAX}, "n": {}
+        }))
+        .unwrap();
+        let negative: PnCounter = serde_json::from_value(serde_json::json!({
+            "p": {}, "n": {"node-a": u64::MAX}
+        }))
+        .unwrap();
+        api.store_mut()
+            .put("positive".into(), CrdtValue::Counter(positive.clone()));
+        api.store_mut()
+            .put("negative".into(), CrdtValue::Counter(negative.clone()));
+
+        assert_eq!(
+            api.eventual_counter_inc("positive"),
+            Err(CrdtError::PnCounterExhausted)
+        );
+        assert_eq!(
+            api.eventual_counter_dec("negative"),
+            Err(CrdtError::PnCounterExhausted)
+        );
+        assert_eq!(
+            api.get_eventual("positive"),
+            Some(&CrdtValue::Counter(positive))
+        );
+        assert_eq!(
+            api.get_eventual("negative"),
+            Some(&CrdtValue::Counter(negative))
+        );
+    }
+
+    #[test]
     fn counter_inc_type_mismatch() {
         let mut api = EventualApi::new(node("node-a"));
         api.eventual_write("k".into(), CrdtValue::Set(OrSet::new()))
@@ -1009,6 +1084,65 @@ mod tests {
             }
             other => panic!("expected Map, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn map_set_reports_dot_exhaustion_without_acknowledging_a_write() {
+        let mut api = EventualApi::new(node("node-a"));
+        api.eventual_map_set("config", "old".into(), "value".into())
+            .unwrap();
+        let Some(CrdtValue::Map(map)) = api.get_eventual("config") else {
+            panic!("expected map");
+        };
+        let mut encoded = serde_json::to_value(map).unwrap();
+        encoded["counters"][api.dot_writer_id.0.as_str()] = serde_json::json!(u64::MAX);
+        let exhausted = serde_json::from_value(encoded).unwrap();
+        api.store_mut()
+            .put("config".into(), CrdtValue::Map(exhausted));
+
+        assert_eq!(
+            api.eventual_map_set("config", "new".into(), "other".into()),
+            Err(CrdtError::DotCounterExhausted)
+        );
+        let Some(CrdtValue::Map(map)) = api.get_eventual("config") else {
+            panic!("expected map");
+        };
+        assert_eq!(map.get(&"old".into()), Some(&"value".into()));
+        assert_eq!(map.get(&"new".into()), None);
+    }
+
+    #[test]
+    fn map_set_retains_a_lower_hlc_dot_without_changing_the_winner() {
+        let mut api = EventualApi::new(node("node-a"));
+        let mut map = OrMap::new();
+        map.set(
+            "name".to_string(),
+            "remote".to_string(),
+            HlcTimestamp {
+                physical: u64::MAX,
+                logical: 0,
+                node_id: "remote".into(),
+            },
+            &node("remote"),
+        );
+        let mut remote_delete = map.clone();
+        remote_delete.delete(&"name".to_string());
+        api.store_mut().put("config".into(), CrdtValue::Map(map));
+
+        assert!(
+            api.eventual_map_set("config", "name".into(), "local".into())
+                .is_ok()
+        );
+        let Some(CrdtValue::Map(map)) = api.get_eventual("config") else {
+            panic!("expected map");
+        };
+        assert_eq!(map.get(&"name".into()), Some(&"remote".into()));
+        let mut after_remote_delete = map.clone();
+        after_remote_delete.merge(&remote_delete);
+        assert_eq!(
+            after_remote_delete.get(&"name".into()),
+            Some(&"local".into())
+        );
     }
 
     #[test]
@@ -1414,6 +1548,73 @@ mod tests {
         assert!(!api.session_check("k", &SessionToken::from_hlc(&hlc_ts(101, 0, "node-a"))));
     }
 
+    #[test]
+    fn failed_session_claim_append_does_not_publish_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let mut api = EventualApi::recovered(node("node-b"), Store::new(), Some(wal));
+        let ts = hlc_ts(100, 0, "node-a");
+        let token = SessionToken::from_hlc(&ts);
+        let applied = HashMap::from([("node-a".to_string(), ts.clone())]);
+        let visible = HashMap::from([("node-a".to_string(), ts)]);
+
+        api.wal.as_mut().unwrap().inject_append_failures(1);
+        assert!(
+            api.adopt_session_claims(&applied, &visible, vec![])
+                .is_err()
+        );
+        assert!(!api.session_check("k", &token));
+        assert!(api.store().applied_origins().is_empty());
+        assert!(api.store().visible_origins().is_empty());
+
+        api.adopt_session_claims(&applied, &visible, vec![])
+            .unwrap();
+        assert!(api.session_check("k", &token));
+    }
+
+    #[test]
+    fn failed_local_append_does_not_publish_value_or_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let mut api = EventualApi::recovered(node("node-a"), Store::new(), Some(wal));
+
+        api.wal.as_mut().unwrap().inject_append_failures(1);
+        assert!(matches!(
+            api.eventual_register_set("new", "unlogged".into()),
+            Err(CrdtError::Storage(_))
+        ));
+        assert!(api.get_eventual("new").is_none());
+        assert!(api.store().timestamp_for("new").is_none());
+        assert!(api.store().applied_origin("node-a").is_none());
+
+        api.eventual_set_add("set", "member".into()).unwrap();
+        let before = api.get_eventual("set").cloned();
+        let frontier_before = api.store().applied_origin("node-a").cloned();
+        let timestamp_before = api.store().timestamp_for("set").cloned();
+        api.wal.as_mut().unwrap().inject_append_failures(1);
+        assert!(matches!(
+            api.eventual_set_remove("set", "member"),
+            Err(CrdtError::Storage(_))
+        ));
+        assert_eq!(api.get_eventual("set"), before.as_ref());
+        assert_eq!(
+            api.store().applied_origin("node-a"),
+            frontier_before.as_ref()
+        );
+        assert_eq!(api.store().timestamp_for("set"), timestamp_before.as_ref());
+
+        api.eventual_set_remove("set", "member").unwrap();
+        assert_ne!(api.get_eventual("set"), before.as_ref());
+    }
+
     /// A failed merge (type mismatch) must not advance the applied
     /// frontier and must poison the key.
     #[test]
@@ -1717,7 +1918,7 @@ mod tests {
         // the floor kill is a real change → re-stamped.
         let mut swept = base.clone();
         swept.remove(&"x".to_string());
-        swept.compact_deferred_certified(&swept.deferred_dots().clone(), None);
+        swept.compact_deferred_certified(&swept.deferred_dots().clone());
         api.merge_remote("k".into(), &CrdtValue::Set(swept.clone()))
             .unwrap();
         let ts1 = api.store().timestamp_for("k").cloned().unwrap();
@@ -1835,5 +2036,133 @@ mod tests {
             api.last_wal_pos().unwrap() > pos_after_poison,
             "the retry must append the missing UpsertVisible record"
         );
+    }
+
+    #[test]
+    fn clock_overflow_after_floor_merge_poisoned_until_wal_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalWriter::open(crate::store::wal::WalConfig::new(
+            dir.path(),
+            crate::store::wal::SyncPolicy::Always,
+        ))
+        .unwrap();
+        let writer = node("writer");
+        let mut stale = OrSet::new();
+        stale.add("x".to_string(), &writer);
+        let mut swept = stale.clone();
+        swept.remove(&"x".to_string());
+        swept.compact_deferred_certified(&swept.deferred_dots().clone());
+        assert_eq!(swept.compaction_floor().get(&writer), Some(&1));
+
+        let mut initial = Store::new();
+        initial.put_with_timestamp(
+            "k".into(),
+            CrdtValue::Set(stale),
+            hlc_ts(
+                crate::hlc::wall_clock_ms().saturating_add(30_000),
+                u32::MAX,
+                "node-b",
+            ),
+        );
+        let mut api = EventualApi::recovered(node("node-b"), initial.clone(), Some(wal));
+        let pushed = CrdtValue::Set(swept);
+        assert!(api.merge_remote("k".into(), &pushed).is_err());
+        assert!(api.store().merge_failed_contains("k"));
+        let pos_after_failure = api.last_wal_pos();
+
+        // A second full push is a state no-op. The poison must force a
+        // durable post-state record instead of granting an RR-gated ACK.
+        api.merge_remote("k".into(), &pushed).unwrap();
+        assert_eq!(api.redundant_merge_skips(), 0);
+        assert!(api.last_wal_pos() > pos_after_failure);
+        api.wal.as_mut().unwrap().rotate().unwrap();
+        let mut replayed = initial;
+        for record in crate::store::wal::read_all_segments(dir.path())
+            .unwrap()
+            .records
+        {
+            crate::store::wal::replay_record(&mut replayed, record);
+        }
+        let Some(CrdtValue::Set(recovered)) = replayed.get("k") else {
+            panic!("expected recovered set");
+        };
+        assert!(!recovered.contains(&"x".to_string()));
+        assert_eq!(recovered.compaction_floor().get(&writer), Some(&1));
+    }
+
+    #[test]
+    fn local_crdt_clock_overflow_leaves_store_unchanged_for_retry() {
+        type Action = fn(&mut EventualApi) -> Result<HlcTimestamp, CrdtError>;
+
+        fn check(mut api: EventualApi, action: Action) -> EventualApi {
+            let before = serde_json::to_value(api.store()).unwrap();
+            api.clock.seed_recovered(&HlcTimestamp {
+                physical: crate::hlc::wall_clock_ms().saturating_add(30_000),
+                logical: u32::MAX,
+                node_id: "node-a".into(),
+            });
+            assert!(action(&mut api).is_err());
+            assert_eq!(serde_json::to_value(api.store()).unwrap(), before);
+            action(&mut api).unwrap();
+            api
+        }
+
+        let mut counter = EventualApi::new(node("node-a"));
+        counter.eventual_counter_inc("k").unwrap();
+        let counter = check(counter, |api| api.eventual_counter_inc("k"));
+        assert_eq!(
+            counter.get_eventual("k"),
+            Some(&CrdtValue::Counter({
+                let mut expected = PnCounter::new();
+                expected.increment(&node("node-a"));
+                expected.increment(&node("node-a"));
+                expected
+            }))
+        );
+
+        let mut counter = EventualApi::new(node("node-a"));
+        counter.eventual_counter_inc("k").unwrap();
+        let counter = check(counter, |api| api.eventual_counter_dec("k"));
+        let Some(CrdtValue::Counter(value)) = counter.get_eventual("k") else {
+            panic!("expected counter");
+        };
+        assert_eq!(value.value(), 0);
+
+        let mut set = EventualApi::new(node("node-a"));
+        set.eventual_set_add("k", "old".into()).unwrap();
+        let set = check(set, |api| api.eventual_set_add("k", "new".into()));
+        let Some(CrdtValue::Set(value)) = set.get_eventual("k") else {
+            panic!("expected set");
+        };
+        assert!(value.contains(&"old".into()) && value.contains(&"new".into()));
+
+        let mut set = EventualApi::new(node("node-a"));
+        set.eventual_set_add("k", "old".into()).unwrap();
+        let set = check(set, |api| api.eventual_set_remove("k", "old"));
+        let Some(CrdtValue::Set(value)) = set.get_eventual("k") else {
+            panic!("expected set");
+        };
+        assert!(!value.contains(&"old".into()));
+
+        let mut map = EventualApi::new(node("node-a"));
+        map.eventual_map_set("k", "old".into(), "value".into())
+            .unwrap();
+        let map = check(map, |api| api.eventual_map_delete("k", "old"));
+        let Some(CrdtValue::Map(value)) = map.get_eventual("k") else {
+            panic!("expected map");
+        };
+        assert!(value.get(&"old".into()).is_none());
+
+        let absent: [Action; 5] = [
+            |api| api.eventual_counter_inc("k"),
+            |api| api.eventual_counter_dec("k"),
+            |api| api.eventual_set_add("k", "new".into()),
+            |api| api.eventual_map_set("k", "new".into(), "value".into()),
+            |api| api.eventual_register_set("k", "value".into()),
+        ];
+        for action in absent {
+            let api = check(EventualApi::new(node("node-a")), action);
+            assert!(api.get_eventual("k").is_some());
+        }
     }
 }

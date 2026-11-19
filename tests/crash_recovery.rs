@@ -616,7 +616,7 @@ fn pending_state_persists_and_recovers() {
 }
 
 #[test]
-fn timeout_state_persists_and_recovers() {
+fn elapsed_wait_remains_pending_after_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tracker.json");
 
@@ -641,7 +641,7 @@ fn timeout_state_persists_and_recovers() {
 
     assert_eq!(
         recovered.get_status(&wid_timeout),
-        Some(CertificationStatus::Timeout)
+        Some(CertificationStatus::Pending)
     );
     assert_eq!(
         recovered.get_status(&wid_pending),
@@ -693,7 +693,7 @@ fn all_certification_statuses_persist() {
     );
     assert_eq!(
         recovered.get_status(&wid_timeout),
-        Some(CertificationStatus::Timeout)
+        Some(CertificationStatus::Pending)
     );
 }
 
@@ -722,7 +722,7 @@ fn timeout_detection_works_on_recovered_pending() {
     recovered.check_timeouts(&ts(6000, 0, "node-a"));
     assert_eq!(
         recovered.get_status(&wid),
-        Some(CertificationStatus::Timeout)
+        Some(CertificationStatus::Pending)
     );
 }
 
@@ -812,7 +812,7 @@ fn compaction_floor_regression_recovers_from_snapshot_and_peer_merge() {
 
     // Sweep AFTER the snapshot: floor advances in memory only, and a
     // peer receives the post-sweep state.
-    set.compact_deferred_certified(&set.deferred_dots(), None);
+    set.compact_deferred_certified(&set.deferred_dots());
     let peer_state = set.clone();
     assert_eq!(peer_state.compaction_floor().get(&n), Some(&2));
     assert_eq!(peer_state.deferred_len(), 0);
@@ -845,7 +845,7 @@ fn compaction_floor_regression_recovers_from_snapshot_and_peer_merge() {
 
             // A duplicate sweep over the recovered state is harmless.
             let candidates = s.deferred_dots();
-            let outcome = s.compact_deferred_certified(&candidates, None);
+            let outcome = s.compact_deferred_certified(&candidates);
             assert_eq!(outcome.collected, 0);
             assert_eq!(s.compaction_floor().get(&n), Some(&2));
         }
@@ -865,12 +865,12 @@ fn compaction_floor_survives_snapshot_round_trip() {
     let mut set = OrSet::new();
     set.add("x".to_string(), &n);
     set.remove(&"x".to_string());
-    set.compact_deferred_certified(&set.deferred_dots(), None);
+    set.compact_deferred_certified(&set.deferred_dots());
 
     let mut map: OrMap<String, String> = OrMap::new();
     map.set("k".into(), "v".into(), ts(100, 0, "A"), &n);
     map.delete(&"k".to_string());
-    map.compact_deferred_certified(&map.deferred_dots(), None);
+    map.compact_deferred_certified(&map.deferred_dots());
 
     let mut store = Store::new();
     store.put("set".into(), CrdtValue::Set(set));

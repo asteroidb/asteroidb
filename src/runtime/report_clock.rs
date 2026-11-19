@@ -133,6 +133,12 @@ impl ReportClockFloor {
             return Ok(());
         }
         let new_lease = issued.physical.saturating_add(FLOOR_LEASE_MS);
+        if new_lease <= issued.physical {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "frontier report clock cannot cover the maximum physical timestamp",
+            ));
+        }
         let payload = serde_json::to_vec(&PersistedFloor {
             version: 1,
             leased_physical_ms: new_lease,
@@ -242,5 +248,28 @@ mod tests {
         bad.path = dir.path().join("blocker/floor.json");
         assert!(bad.cover(&ts(1)).is_err());
         assert_eq!(bad.leased(), 0);
+    }
+
+    #[test]
+    fn maximum_physical_cannot_be_covered_or_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frontier_report_clock.json");
+        let (mut floor, _) = ReportClockFloor::load(path.clone());
+
+        assert_eq!(
+            floor.cover(&ts(u64::MAX)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(floor.leased(), 0);
+        assert!(!path.exists());
+
+        // Saturation is safe just below the maximum: MAX remains strictly
+        // greater than the signed time, but cannot cover MAX itself.
+        floor.cover(&ts(u64::MAX - 1)).unwrap();
+        assert_eq!(floor.leased(), u64::MAX);
+        assert!(floor.cover(&ts(u64::MAX)).is_err());
+        let (reloaded, existed) = ReportClockFloor::load(path);
+        assert!(existed);
+        assert_eq!(reloaded.leased(), u64::MAX);
     }
 }

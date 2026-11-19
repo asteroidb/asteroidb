@@ -8,6 +8,7 @@
 ## 目次
 
 1. [概要](#概要)
+   - [操作モードと CRDT API](#操作モードと-crdt-api)
 2. [認証](#認証)
 3. [Content-Type ネゴシエーション](#content-type-ネゴシエーション)
 4. [エラーレスポンス](#エラーレスポンス)
@@ -44,11 +45,24 @@ API は大きく3つのカテゴリに分かれる:
 
 | カテゴリ | パスプレフィックス | 認証 | 用途 |
 |----------|-------------------|------|------|
-| Public API | `/api/eventual/*`, `/api/certified/*`, `/api/status/*` | 不要 | クライアントからのデータ読み書き |
+| Public API | `/api/eventual/*`, `/api/certified/*`, `/api/status/*`, `/api/operations/*`（操作モード有効時） | 不要。操作提出は writer 署名を検証 | クライアントからのデータ読み書き |
 | Internal API | `/api/internal/*` | Bearer Token (設定時) | ノード間通信 (sync, membership) |
 | Control Plane (書き込み) | `PUT /api/control-plane/*`, `DELETE /api/control-plane/*` | Bearer Token (設定時) | Authority 定義・配置ポリシーの変更（Raft リーダーのみ受理 — 下記参照） |
 
 Control Plane の読み取りエンドポイント (`GET`) は認証不要で誰でもアクセス可能。
+
+### 操作モードと CRDT API
+
+`/api/eventual/*` と `/api/certified/*` は従来の CRDT ストア、`/api/operations/*` は署名付きの不変操作ストアを扱う。操作 API は `ASTEROIDB_WRITER_KEYS` と作成時ポリシーを設定したノードだけで利用できる。この操作モードでは旧 `/api/eventual/*`、`/api/certified/*`、`/api/status/*`、`/api/authority/equivocations*` と旧データ用 `/api/internal/frontiers`、`/api/internal/sync*`、`/api/internal/certified/delta`、`/api/internal/keys` は `409 Conflict` を返す。旧ストアの WAL・snapshot は読み込まず、旧データ処理 worker と checkpoint も動かさない。操作 inbox と証拠ストアはそれぞれの永続化処理を使う。制御プレーン、membership、epoch 処理は稼働する。
+
+| CRDT API の機能 | 操作 API の経路 | 意味の違い |
+| --- | --- | --- |
+| `POST /api/eventual/write` | `POST /api/operations/submit` | CRDT の型付き更新を、namespace・writer・counter で識別される署名付き Create/Add/Delete に変換する。`Add` は算術加算ではなく値と HLC を持つ更新。counter・set・map に同等の自動変換はない。 |
+| `GET /api/eventual/{key}` | `GET /api/operations/view/{namespace_id}/{key}?kind=local` | 操作 API は手元の全操作から `Unknown`・`Deleted`・`Value` を返す。従来のセッショントークンや `wait_ms` と同じ読取保証は持たない。 |
+| `POST /api/certified/write` | `POST /api/operations/submit-certified` | 従来は CRDT 値と frontier の証明を扱う。新経路は署名済みの一操作を保存し、その操作 ID の Merkle 証明書を待つ。`202` は保存済み・確定待ちであり、取消しではない。 |
+| `GET /api/certified/{key}` | `GET /api/operations/view/{namespace_id}/{key}?kind=certified` | 新経路は手元の本体と検証済み操作証明書から値と完全な `basis` を返す。従来の frontier 証明やクラスタ全体の最新値を表さない。 |
+
+操作モードを使う場合は、対象 namespace と key prefix、作成時の確定対象モード、writer 鍵を設定する。操作 ID の `status` と `kind=local|certified` の読みで結果を確認する。旧 CRDT データを操作台帳へ暗黙に取り込むことはない。
 
 ---
 
@@ -62,20 +76,58 @@ Control Plane の読み取りエンドポイント (`GET`) は認証不要で誰
 Authorization: Bearer <token>
 ```
 
-- トークンが設定されていない場合（または空文字列の場合）、全エンドポイントが認証なしでアクセス可能（後方互換モード）
+- トークンが設定されていない場合（または空文字列の場合）、全エンドポイントが認証なしでアクセス可能
 - トークンの比較は constant-time 比較 (`subtle::ConstantTimeEq`) で行われ、タイミング攻撃を防止する
 - 認証失敗時は `401 Unauthorized` が返る（ボディなし）
 
 **認証が必要なエンドポイント:**
 
 - `/api/internal/*` 全て
+- `POST /api/internal/operations/receive`（操作受信を有効化したノードのみ）
+- `POST /api/internal/operations/transfer`（操作受信を有効化したノードのみ）
+- `POST /api/internal/operations/policy-witness`（policy-only 配送を有効化したノードのみ。Bearer と隣接リンク署名を要求）
+- `POST /api/internal/operations/completion`（宛先別 routed custody を有効化したノードのみ）
+- `POST /api/internal/operations/retirement`（宛先別 routed custody を有効化したノードのみ）
 - `PUT /api/control-plane/authorities`
 - `PUT /api/control-plane/policies`
 - `DELETE /api/control-plane/policies/{prefix}`
 
+### 操作本体の受信（試験的）
+
+`POST /api/operations/policy/submit` は、完全な署名済み Create packet の作成ポリシーだけを固定宛先へ配送する公開 API。`ASTEROIDB_OPERATION_POLICY_DESTINATIONS` と固定経路が必要。固定経路は操作本体の routed 設定か、独立した `ASTEROIDB_OPERATION_POLICY_ROUTE_EDGES` / `ASTEROIDB_OPERATION_POLICY_ROUTES` で指定する。writer 署名、namespace、作成時設定、担当キーを検査し、Create を操作台帳の外に保存して全初回配送義務を fsync した後に `OperationReceipt` を返す。内部 `POST /api/internal/operations/policy-witness` はリンク署名付きの `PolicyWitnessTransfer { version:1, sender, receiver, destination, packet }` を受け、固定 route を検査する。各 hop は witness を永続化してから ACK する。次 hop の outbox 登録だけが失敗した場合は保存済み witness から再照合で復元する。Certified 読みでは本体未着でも Disabled と分かれば `NotTargeted`、Enabled なら `Unknown` を返す。通常読みと操作 ID status は本体未着のまま `Unknown`。
+policy-only 配送が有効なノードでは、通常の操作経路で受けた完全な署名済み Create も ACK 前に policy witness を保存し、設定済み宛先への再送対象にする。`policy/submit` は通常の操作本体を先に送らず作成ポリシーを届ける経路として使える。配送は設定済みの経路と宛先に限る。
+
+操作受信の起動には作成時ポリシー manifest が必要。namespace・キー prefix の最長一致で既定モードを決め、異なるモードはその範囲で明示許可された作成者だけが選べる。manifest は inbox に固定され、途中変更や既存操作への暗黙適用を拒否する。`ASTEROIDB_OPERATION_LEGACY_CREATION_POLICY` は受け付けない。
+
+`POST /api/operations/submit` はこのノードの担当キーへ署名済み `OperationPacket` をローカル提出する。writer と作成操作の署名、namespace 権限、キーの担当を検証し、パケット本体・操作 ledger を永続保存した後に `OperationReceipt` を返す。経路がある固定宛先への配送義務は別の永続ステップで登録し、登録に失敗しても保存済み操作から再試行する。内部 Bearer Token は使わず、署名と writer 登録を認証根拠とする。応答はローカル保存を示し、Certified 到達や全保存先への配送完了を示さない。担当外キーと無効な署名は `403`、同一操作 ID の異なる内容、およびこのノードで削除を保持しているキーへの新しいローカル提出は `409`。HTTP 入力か必要な転送・完了通知の JSON が受信上限を超える場合は、保存前に `413` で拒否する。削除前に保存した操作の同一 ID・同一内容の再試行は受け付ける。ネットワークから届く遅延操作の取り込みにはこのローカル提出制限を適用しない。
+routed custody でも必須宛先やローカル経路が未設定なら、ローカル保存後に受領票を返し、送れる宛先だけ配送する。Enabled 操作は必要な証拠が届くまで `pending` のままになる。経路設定の修復は送信履歴がない場合だけ安全に pin を更新できる。送信済みの宛先がある場合や neighbor・Authority 設定の変更を要する場合は、現在の設定のまま残る root と配送義務を保持する。
+静的証明書モードでは `POST /api/operations/submit-certified?wait_ms=30000` も使える。同じ署名済みパケットをローカル保存してから、その操作 ID と本体に一致する証明書を最大 `wait_ms` ミリ秒待つ（既定 30000、最大 60000）。到達した場合は `200` と `CertifiedSubmitResponse { receipt, status: "certified", certificate }`、時間切れなら `202` と現在の状態（`"pending"` または `"policy_unknown"`）を返す。`policy_unknown` は compact な作成参照に一致する Create 本体・receipt・完全な署名済み policy witness が未到着で、作成時ポリシーをまだ確定できない状態を示す。ledger 本体が receipt に圧縮済みの操作を再提出した場合は、`certificate` の代わりに値を含まない `compact_certificate` と `operation_receipt` を返す。`202` 後も操作・配送・証明書収集は続き、取消しは行わない。確定対象外、設定 scope 外、待機上限超過は保存前に `422` で拒否する。結果は `GET /api/operations/status/{namespace_id}/{writer}/{counter}` で後から確認できる。
+
+`ASTEROIDB_WRITER_KEYS` を設定したノードは `POST /api/internal/operations/receive` と `POST /api/internal/operations/transfer` を公開する。前者は署名済み `OperationPacket` を直接受信して `OperationReceipt` を返す。隣接 outbox の再送には後者を使う。従来の隣接配送では `OperationTransfer` は `version:1`、送信元 `sender`、送信元ごとの `transfer_id`、受信先 `receiver`、完全な `packet` を含む。宛先別 routed custody を設定した場合は `version:2` とし、最終宛先 `destination`、親転送 `parent`、転送深さ `depth` も含む。最終宛先と経路は namespace ID と key prefix で選択できる。受信ノードは署名付きパケットと転送記録をそれぞれ fsync してから `OperationTransferReceipt` を返す。受領証には同じ version・送信元・転送 ID・受信先と、署名を含むパケット全体の SHA-256 `commitment` を載せる。送信側はすべての項目が outbox 項目と一致する場合にのみ再送を止める。ACK は受信ノードでの永続保存だけを示し、Authority による確定や他ノードへの複製は示さない。
+
+routed custody では `POST /api/internal/operations/completion` で最終取り込みの完了通知を上流へ伝える。最終宛先は転送の取り込みを永続記録してから通知し、中継ノードは子転送の保存 ACK と完了通知が揃った後で親転送の完了を通知する。送信側は通知と自身の転送記録を照合して永続保存し、通知の ACK を返す。完了通知は転送の保存 ACK を代替せず、操作の Certified 成立も示さない。通知は保存済み記録から再起動後に再送される。設定形式と運用上の制限は [運用ガイド](ops-guide.md) を参照。
+
+送信側は保存済みの連続終了境界を `POST /api/internal/operations/retirement` で元の隣接受信先へ通知する。本文は `version:1`、`sender`、`receiver`、排他的 `closed_before`。受信側は単調な境界を fsync してから応答し、その境界より小さい ID の受信転送記録・最終取り込み記録・完了通知応答を回収する。転送 ID と要求の対応は catalog に保持する。証明済みで冗長になった ledger 値本体と全受信転送が終了した操作では、catalog を ID・経路・操作 ID・commitment の記述へ縮め、署名済み packet 本体も回収する。回収済み ID の遅延転送には新しい保存 ACK を返さない。通知は共有内部 token と静的隣接設定の信頼に依存し、HTTP 接続先のノード ID を暗号学的に証明しない。
+
+最終宛先が静的設定上の Authority の場合は、担当キーかどうかに関係なく署名対象の転送を `operation_inbox/signing-inbox` に永続記録してから ACK を返す。担当キーでもあればアプリ取り込み記録も永続化する。Authority worker は routed モードでローカル提出とこの署名処理待ち記録を処理し、通過中のコピーだけでは署名しない。署名用の保持は、そのキーを公開読み取りに適用する担当設定とは独立している。
+
+`GET /api/operations/read/{namespace_id}/{key}` は、このノードの担当 prefix に属するキーについて受信済みの全操作を投影した公開の通常読みを返す。同じ結果を内部 Bearer Token 必須の `GET /api/internal/operations/read/{namespace_id}/{key}` でも取得できる。担当外のキーは配送用コピーを保持していても `Unknown` を返す。応答は `Unknown`、`Deleted`、または `{"Value":{"value_bytes":[...],"timestamp":{...}}}`。`Unknown` はこのノードのアプリ読み取りに情報がないことを示し、クラスタ全体での不存在は示さない。
+
+`GET /api/operations/view/{namespace_id}/{key}?kind=local|certified` は操作 API の統合読み取り口。`kind` は必須で、`local` は全受信済み操作を投影した `{"kind":"local","view":<OperationRead>}` を返す。`certified` は検証済み証明書だけを使い、`{"kind":"certified","view":{"result":<CertifiedReadResult>,"basis":[<OperationMerkleCertificate>],"local_body_seen":<bool>}}` を返す。証明書モードが設定されていないノードでは、確定対象キーの本体と作成根拠があれば `NoCertifiedInformation` と空の `basis` を返す。compact 作成証明を参照する更新・削除が Create 本体より先に届いた場合は `PolicyUnknown` を返す。`local` は担当外キーに `Unknown` を返す。`certified` は担当外でも認証済み Disabled の作成根拠があれば `NotTargeted`、それ以外は `Unknown` を返す。
+
+証明書 scope を設定しない操作ノードでも、公開の `GET /api/operations/status/{namespace_id}/{writer}/{counter}` は保存済みの操作 ID から `unknown`・`policy_unknown`・`not_target`・`pending` を返す。`GET /api/operations/certified-read/{namespace_id}/{key}` は確定対象外キーを `NotTargeted`、確定対象キーに本体があれば `NoCertifiedInformation` として返す。compact 作成証明の参照先 Create をまだ確認できない場合は `PolicyUnknown` と `policy_unknown` になり、Create 本体またはその receipt が届くと確定したモードで再判定する。これらの応答に証明書は含まれない。担当外キーの Certified 読みは認証済み Disabled だけ `NotTargeted`、他は `Unknown` とする。担当外 ID の status は `unknown` とする。
+
+署名、namespace、作成時設定を検証できない要求は `403`、同一操作 ID に異なる内容を送る要求は `409`。この経路は既存の `/api/certified/write` と独立している。固定隣接先の key prefix 設定に従い、受信内容を永続化してから ACK する。後続の送信登録が失敗した場合は保存済み入力から再照合で補い、未 ACK 項目は再起動後も再送する。
+
+静的な操作証明書を設定したノードは `POST /api/internal/operations/supports/receive`、`POST /api/internal/operations/certificates/receive`、`GET /api/internal/operations/certified-read/{namespace_id}/{key}` と `GET /api/internal/operations/status/{namespace_id}/{writer}/{counter}` を公開する。support 受信は `SupportPacket` の操作本体・Authority 署名・包含証明を検証して fsync し、quorum が揃えば証明書を保存して `SupportReceipt` を返す。証明書受信は完成済みの `OperationMerkleCertificate` を検証・永続化してから `CertificateReceipt` を返す。証明書だけが先に届いても保存できる。完成した証明書は宛先別の永続 outbox に登録し、隣接先への配送を再試行する。複数 scope を設定した場合は namespace と最長一致する prefix で検証器を選び、親 scope は子 scope のキーに対する証拠を受け付けない。異なる namespace の同じキー名と操作 dot は独立して扱う。読み取りは担当キーについて、手元の操作本体と一致する証明済み操作だけで値を計算し、`result`、各操作の証明書 `basis`、`local_body_seen` を返す。同じ証明済み読み取りを公開の `GET /api/operations/certified-read/{namespace_id}/{key}` でも取得できる。`result` は `Unknown`（本体なし）、`PolicyUnknown`（本体はあるが認証済み Create 未着）、`NotTargeted`（確定対象外）、`NoCertifiedInformation`（本体はあるが証明済み操作なし）、`Deleted`、または `Value`。操作 ID の状態は `unknown`、`policy_unknown`、`not_target`、`pending`、`certified` で返す。certified で ledger 本体がある場合は `certificate`、本体が receipt に圧縮済みなら `compact_certificate` と `operation_receipt` を付ける。後者の証拠は操作 ID・内容 commitment・署名付き root・包含証明を持ち、値本体を含まない。第三者が元の操作内容まで確認するには、別途保持した元の署名済みパケットと receipt の照合が必要。担当判定は namespace ID とキーの組で行い、担当外キーは本体を配送用に保持していても、認証済み Disabled の作成根拠があるときだけ Certified 読みで `NotTargeted` を返す。他の担当外読みは `Unknown`。読み取りは固定鍵・scope の信頼アンカーを検査し、内部ルートには Bearer Token を要求する。既存の公開 `/api/certified/*` とは独立している。Authority ノードはローカルで発行した support を永続 outbox から固定隣接先へ再送する。
+
+操作 ID の `not_target` は認証済み Create で確定した mode が Disabled のときだけ返す。compact 作成証明の参照先 Create が未着なら、宣言の mode が署名済みでも `policy_unknown` を返す。完全な Create を埋め込む従来の署名証明では追加の Create 配送を待たない。mode が Enabled で、このノードの静的証明書 scope 外にある操作は、作成根拠を確認できれば `pending` と返す。scope は作成時に選ばれた確定対象設定を変更しない。保存済み scope の配置・信頼条件が live 設定と食い違う場合、公開 read/status と内部 certificate/support 受信、`submit-certified` は `503` を返す。証明済み操作を `pending` に降格させない。
+
+証明書が Create より先に届いた場合、`PolicyUnknown` / `policy_unknown` のままでも検証済み `basis` / `certificate` を含み得る。証拠の到着だけでは、このノードの作成ポリシーを学習済みとはみなさない。
+
 **認証が不要なエンドポイント:**
 
-- `/api/eventual/*`, `/api/certified/*`, `/api/status/*`
+- `/api/eventual/*`, `/api/certified/*`, `/api/status/*`, `POST /api/operations/submit` と `POST /api/operations/submit-certified` と `POST /api/operations/policy/submit`（writer 署名を検証）、`GET /api/operations/read/{namespace_id}/{key}`、`GET /api/operations/view/{namespace_id}/{key}`、`GET /api/operations/certified-read/{namespace_id}/{key}`、`GET /api/operations/status/{namespace_id}/{writer}/{counter}`
 - `GET /api/control-plane/*`
 - `/api/metrics`, `/api/slo`, `/api/topology`
 - `/healthz`
@@ -107,7 +159,7 @@ Internal API は 2 つのワイヤフォーマットをサポートする:
 
 | MIME タイプ | フォーマット | 用途 |
 |-------------|------------|------|
-| `application/json` | JSON | 後方互換、デバッグ用 |
+| `application/json` | JSON | デバッグ用 |
 | `application/octet-stream` | bincode | デフォルト、コンパクトバイナリ |
 
 **リクエスト時:**
@@ -469,21 +521,6 @@ entry   := physical-hex "." logical-hex "." nodeid-hex
   なるだけで他クライアントやサーバに害を与えない（BFT 拡張時に Ed25519 署名を
   検討予定）
 
-#### 内部プロトコル互換性(運用注意)
-
-セッション保証の導入で `DeltaSyncResponse` / `KeyDumpResponse`(Internal API)に
-フィールドが追加された。JSON では後方互換だが、bincode
-(`application/octet-stream`)は位置依存のため旧ノードの bincode 応答は新ノード
-でデコードできない。新ノードの pull はデコード失敗時に **JSON で自動リトライ**
-するため、ローリングアップグレード中も pull ベースの anti-entropy は JSON
-経路で継続する(帯域効率は落ちる)。混在期間を短くするためアップグレードは
-ロックステップ推奨(`KeyDumpResponse.timestamps` 追加時と同じ前例)。
-
-スナップショット形式もバージョン 3 に更新された(セッション関連フィールドの
-追加)。v1/v2 スナップショット(JSON / bincode とも)はロード時に自動マイグレー
-ションされるが、v3 スナップショットを旧バージョンのコードで読むことはできない
-(ダウングレード時はスナップショットの取り直しが必要)。
-
 #### 利用例
 
 ```bash
@@ -517,7 +554,7 @@ Authority ノード群の過半数合意によって認証が必要な値を書�
 
 - **認証**: 不要
 - **Content-Type**: `application/json`
-- **レスポンス**: `200 OK` (pending の場合) または `504 Gateway Timeout` (on_timeout=error の場合)
+- **レスポンス**: `200 OK` (pending の場合)、`504 Gateway Timeout` (on_timeout=error の場合)、または容量超過時 `503 Service Unavailable`
 
 **リクエストボディ:**
 
@@ -540,8 +577,10 @@ Authority ノード群の過半数合意によって認証が必要な値を書�
 
 **`on_timeout` の動作:**
 
-- `"pending"` — 合意タイムアウト時、ステータスを `Pending` として返す（クライアント側で後からポーリング可能）
-- `"error"` — 合意タイムアウト時、`504 Gateway Timeout` + `TIMEOUT` エラーを返す
+- `"pending"` — その時点で証明が揃わなければ `Pending` を返す（後からポーリング可能）
+- `"error"` — その時点で証明が揃わなければ、ローカル WAL の永続化を待ってから `504 Gateway Timeout` + `CERTIFICATION_TIMEOUT` を返す。書き込み自体は保存され、後から認証されうる
+
+受理済み操作は待機時間の経過で取り消されない。同じキーへの新しい書き込みが永続化されると、古い同一キーの追跡項目は置き換わる。古い項目は現在のストア値を証明できないため、容量を占め続けない。追跡容量が満杯で置換可能な同一キー項目もなければ、新しい書き込みは保存前に `503` + `CERTIFICATION_CAPACITY` で拒否される。`Retry-After: 1` に従って再試行する。
 
 **成功レスポンス:**
 
@@ -552,7 +591,7 @@ Authority ノード群の過半数合意によって認証が必要な値を書�
 ```
 
 `status` は `"Pending"` または `"Certified"` のいずれか。
-`"Timeout"` は `on_timeout=error` の場合にのみ返され、その場合の HTTP ステータスは `504 Gateway Timeout`（このレスポンスフォーマットではなくエラーレスポンスになる）。
+`on_timeout=error` の `504` はこの成功レスポンスではなくエラーレスポンスになる。
 `"Rejected"` は `certified_write` の直接のレスポンスには含まれず、後から `GET /api/status/{key}` でポーリングした際にのみ観測される
 
 **curl 例:**
@@ -623,9 +662,9 @@ curl -X POST http://localhost:3000/api/certified/write \
 |-----------|-----|------|
 | `key` | string | 要求したキー |
 | `value` | CrdtValueJson \| null | CRDT 値（存在しない場合は null） |
-| `status` | string | 認証ステータス: `"Pending"`, `"Certified"`, `"Rejected"`, `"Timeout"` のいずれか。`Rejected` は後から certification 評価で拒否された場合にのみ出現する |
-| `frontier` | FrontierJson \| null | HLC frontier（証明時のタイムスタンプ） |
-| `proof` | ProofBundleJson \| null | 検証可能な証明バンドル |
+| `status` | string | 認証ステータス: `"Pending"`, `"Certified"`, `"Rejected"` のいずれか。`Rejected` は後から certification 評価で拒否された場合にのみ出現する。待機時間の経過は `Pending` を変えない |
+| `frontier` | FrontierJson \| null | 読み取り時に観測した過半数 frontier。未署名報告を含み得るため、確定や署名の証拠ではなく、`proof.frontier`（証明書の checkpoint）とも一致するとは限らない |
+| `proof` | ProofBundleJson \| null | `Certified` の根拠となる検証可能な証明バンドル。`Pending` では null |
 
 **複製と `status` の関係（重要）**
 
@@ -636,8 +675,7 @@ certified の値は `POST /api/internal/certified/delta` レーンで全ノー�
   certified キーは `value: null` だった。今は値が入り、`status` は（そのノードが
   独自に attestation を集めるまで）`"Pending"` になる。
 - **`status` はノードローカルな観測であり、値の耐久性とは独立**。複製が運ぶのは値と
-  その origin バージョンだけで、認証の「判定」は運ばない。retention eviction の
-  タイミング差により、同じキーが A では `Certified`、B では `Pending` に見えることが
+  その origin バージョンだけで、認証の「判定」は運ばない。証拠の到着タイミングにより、同じキーが A では `Certified`、B では `Pending` に見えることが
   正常にありうる（fail-closed 方向なので安全側）。
 - 未知キーが永遠に `Pending` に見える件（`get_certification_status` の導出化）は
   **この変更では解消していない**。
@@ -696,7 +734,7 @@ curl http://localhost:3000/api/certified/sensor-1
 | `policy_version` | u64 | はい | 有効なポリシーバージョン |
 | `contributing_authorities` | string[] | はい | 証明に参加した Authority ノード ID |
 | `total_authorities` | usize | はい | Authority セット内の総ノード数 |
-| `certificate` | CertificateJson | いいえ | 暗号署名付き証明書 |
+| `certificate` | CertificateJson | 検証成功には必須 | 暗号署名付き証明書。省略したリクエストは無効と判定される |
 | `format_version` | u32 | いいえ | 証明書フォーマットバージョン（指定時にバージョン互換チェック実施） |
 | `signature_algorithm` | string | いいえ | 署名アルゴリズム: `"Ed25519"` (デフォルト) または `"Bls12_381"` |
 | `keyset_version` | u64 | いいえ | BLS 検証で使用する keyset バージョン（省略時は `certificate.keyset_version`、それも無ければ 1） |
@@ -705,10 +743,14 @@ curl http://localhost:3000/api/certified/sensor-1
 | `bls_public_keys` | string[] | いいえ | hex エンコード BLS 公開鍵（registry 鍵との一致を要求） |
 
 > `GET /api/certified/{key}` の `proof` オブジェクトはこのリクエストボディとして
-> そのまま送信できる（round-trip 可能）。署名パイプラインが有効な場合、`proof` には
+> そのまま送信できる（round-trip 可能）。`Certified` の `proof` には署名付き
+> `certificate` が必ず含まれる。署名が揃う前は `Pending` となり、`proof` はない。
+> 署名パイプラインが有効な場合、`proof` には
 > `signature_algorithm` / `keyset_version` / BLS フィールドが自動的に含まれる。
 > 証明書の `frontier` は Authority が署名したチェックポイント HLC
 > （1 秒単位に床丸めされた値、`logical=0`, `node_id=""`）である点に注意。
+> 現行証明書の署名対象はキー範囲・チェックポイント・ポリシー版であり、
+> 個々の操作 ID や内容を証明するものではない。
 
 **レスポンスボディ:**
 
@@ -763,7 +805,7 @@ curl -X POST http://localhost:3000/api/certified/verify \
 }
 ```
 
-`status` は `"Pending"`, `"Certified"`, `"Rejected"`, `"Timeout"` のいずれか。
+`status` は `"Pending"`, `"Certified"`, `"Rejected"` のいずれか。待機時間の経過は `Pending` を変えない。
 
 **curl 例:**
 
@@ -1187,6 +1229,7 @@ Internal API はノード間通信に使用される。
 ```json
 {
   "merged": 3,
+  "durable": true,
   "errors": [
     {
       "key": "bad-key",
@@ -1200,6 +1243,7 @@ Internal API はノード間通信に使用される。
 |-----------|-----|------|
 | `merged` | usize | 正常にマージされたエントリ数 |
 | `errors` | array | マージ失敗したエントリのリスト |
+| `durable` | bool | 応答対象の eventual ストア状態が WAL 同期済み。`false` の応答は push baseline と GC peer ACK の証拠にならない |
 
 **curl 例:**
 
@@ -1325,6 +1369,7 @@ digest 段階 diff 同期（フルシンクの前段）。要求側の 2 層キ�
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `scheme_ok` | bool | `false` = バージョン/形式非対応（要求側は従来フルシンクへ） |
+| `durable` | bool | この digest が参照した状態が WAL 同期済み。root 一致や peer-only 差分を GC peer ACK に使うには `true` が必要 |
 | `root_matched` | bool | `true` = 状態完全一致、転送ゼロで完了 |
 | `mismatched_buckets` | array<u16> | digest が不一致だったバケット番号（双方向差） |
 | `entries` | map<string, CrdtValue> | 不一致バケット所属キーの全データ（`include_entries=true` 時のみ） |
@@ -1435,8 +1480,9 @@ internal token を持つ者は certified ストアへ値を注入しうる。緩
 
 1. ローカル write と同じ `resolve_scope` を通す（authority 定義の無いキーは拒否）
 2. `policy_version` が受信側の現行バージョンより **先** のものは拒否
-3. ingest は `Pending` の追跡しか作れない。`certified_cache` / `attestations` /
-   frontier のいずれにも触れないため、**単独で `Certified` や proof を捏造できない**
+3. ingest は `Pending` の追跡しか作れず、値が変わった場合は旧 `certified_cache` を
+   無効化する。`attestations` / frontier に証拠を追加しないため、**単独で
+   `Certified` や proof を捏造できない**
 
 ---
 
@@ -2021,8 +2067,11 @@ curl -X DELETE http://<leader-addr>/api/control-plane/policies/user%2F \
 | `TYPE_MISMATCH` | 409 Conflict | 既存キーの CRDT 型と操作の型が不一致 | キーに対して正しい型の操作を使用する（例: Counter キーには `counter_inc`/`counter_dec`） |
 | `KEY_NOT_FOUND` | 404 Not Found | 指定キーが存在しない | キー名を確認する。`set_remove`/`map_delete` は事前にキーが存在する必要がある |
 | `STALE_VERSION` | 409 Conflict | 古いバージョンでの書き込み | 最新値を再取得してリトライする |
+| `DOT_COUNTER_EXHAUSTED` | 409 Conflict | OR-Set / OR-Map のローカル dot 採番が `u64` 上限に達し、書き込みを適用していない | 同じノード ID で再試行しない。新しい発行元 ID への移行を計画する |
+| `PN_COUNTER_EXHAUSTED` | 409 Conflict | PN-Counter のローカル正または負の成分が `u64` 上限に達し、書き込みを適用していない | 同じ成分への増減を再試行せず、新しい発行元 ID への移行を計画する |
 | `POLICY_DENIED` | 403 Forbidden | 配置ポリシーによる拒否 | 対象キー範囲の配置ポリシーを確認する |
-| `TIMEOUT` | 504 Gateway Timeout | Authority 合意がタイムアウト | Authority ノードの稼働状況を確認する。`on_timeout=pending` で再試行可能 |
+| `CERTIFICATION_TIMEOUT` | 504 Gateway Timeout | 書き込みは保存されたが、その応答時点では認証されていない | 状態を再照会する。再書き込みは不要 |
+| `CERTIFICATION_CAPACITY` | 503 Service Unavailable | 未認証操作の追跡容量が満杯で、書き込みは保存されていない | `Retry-After` に従い再試行する |
 | `SESSION_NOT_SATISFIED` | 412 Precondition Failed | セッショントークンの示す書き込みまでローカルレプリカが追いついていない | `Retry-After` に従いリトライ、`wait_ms` を増やす、または別レプリカに問い合わせる |
 | `NOT_LEADER` | 503 Service Unavailable | Control plane 書き込みを Raft リーダー以外のノードが受信した | 応答ヘッダ `x-asteroidb-leader-id` / `x-asteroidb-leader-addr` のヒント先へ再送する（`Retry-After: 1` 付き）。リーダー不明なら `GET /api/control-plane/raft/status` で確認 |
 | `STORAGE_UNAVAILABLE` | 503 Service Unavailable | 書き込みの WAL 追記に失敗し耐久性を確立できない（例: ディスクフル） | ディスク容量・I/O 状態を確認してリトライする。読み取りは継続可能 |
@@ -2039,7 +2088,7 @@ API で扱う CRDT 値は tagged union 形式で表現される。
 
 ### Counter (PN-Counter)
 
-増減可能なカウンタ。
+増減可能なカウンタ。正負の成分は合計してから差を計算し、結果だけを `i64` の範囲に収める。
 
 ```json
 {
@@ -2106,8 +2155,21 @@ Last-Writer-Wins セマンティクスのレジスタ。
 | `asteroidb-cli status` | GET | `/api/metrics` | ノードステータスのサマリ表示 |
 | `asteroidb-cli get <key>` | GET | `/api/eventual/{key}` | eventual ストアからの値取得。`--session-token <tok>` / `--session` / `--wait-ms <n>` でセッション保証付き読み取り |
 | `asteroidb-cli put <key> <value>` | POST | `/api/eventual/write` | LWW-Register への値書き込み。`OK` の次行に `session_token: <tok>` を表示 |
+| `asteroidb-cli operation-sign-create <namespace_id> <writer> <counter> <key> --value-file <file> --key-file <secret.hex> --creation-policy-file <policy.json> --mode enabled\|disabled --output <packet.json>` | ローカル | — | 作成ポリシーを検証し、その digest を含む作成証拠と操作に署名してパケットを書き出す |
+| `asteroidb-cli operation-sign-add <create.json> <writer> <counter> --value-file <file> --key-file <secret.hex> --output <packet.json>` | ローカル | — | 作成宣言を引き継ぎ、値の追加操作に署名する |
+| `asteroidb-cli operation-sign-delete <create.json> <writer> <counter> --key-file <secret.hex> --output <packet.json>` | ローカル | — | 作成宣言を引き継ぎ、削除操作に署名する |
+| `asteroidb-cli operation-submit <packet.json>` | POST | `/api/operations/submit` | 署名済み `OperationPacket` のローカル保存と受領証取得 |
+| `asteroidb-cli operation-submit-certified <packet.json> [--wait-ms <n>]` | POST | `/api/operations/submit-certified` | 同じ署名済みパケットを提出し、操作証明書を待つ。`202` は保存済み・確定待ち |
+| `asteroidb-cli operation-read <namespace_id> <key>` | GET | `/api/operations/read/{namespace_id}/{key}` | 手元の全操作による通常読み |
+| `asteroidb-cli operation-certified-read <namespace_id> <key>` | GET | `/api/operations/certified-read/{namespace_id}/{key}` | 証明済み操作と証拠による読み取り |
+| `asteroidb-cli operation-view <namespace_id> <key> --kind local\|certified` | GET | `/api/operations/view/{namespace_id}/{key}?kind=...` | 通常読みまたは証明付き読みを明示して取得 |
+| `asteroidb-cli operation-status <namespace_id> <writer> <counter>` | GET | `/api/operations/status/{namespace_id}/{writer}/{counter}` | 操作 ID ごとの確定状態 |
 | `asteroidb-cli metrics` | GET | `/api/metrics` | 詳細ランタイムメトリクス |
 | `asteroidb-cli slo` | GET | `/api/slo` | SLO バジェット状況 |
+
+`operation-sign-*` は `OperationPacket` JSON をローカルで生成する。`--key-file` は 32 バイトの Ed25519 秘密鍵を 64 桁の hex で記したファイル、`--value-file` は値の生バイト列。Create の `--creation-policy-file` は提出先ノードに固定された `ASTEROIDB_OPERATION_CREATION_POLICY` と同じ JSON manifest を指定する。CLI は署名前に作成宣言を検証し、manifest の digest を署名済み作成証拠に含める。Create/Add は `--timestamp-ms` と `--logical` を省略でき、省略時の時刻は現在時刻、logical は 0 になる。Add/Delete の `<create.json>` には Create 時のパケットを指定し、同じ宣言と署名済み作成証拠を引き継ぐ。作成者と更新者は別の writer でもよいが、両方の公開鍵と namespace 許可をノードの `ASTEROIDB_WRITER_KEYS` に登録する必要がある。入力ファイルの作成者署名と公開鍵許可は提出先ノードで検証する。
+
+例: `asteroidb-cli operation-sign-create example writer-1 1 orders/1 --value-file value.bin --key-file writer.secret.hex --creation-policy-file creation-policy.json --mode enabled --output create.json` の後に `asteroidb-cli operation-submit-certified create.json --wait-ms 5000`。更新時は `operation-sign-add create.json writer-1 2 --value-file next.bin --key-file writer.secret.hex --output add.json` で新しい操作 ID を使う。`operation-submit` 系はこの JSON を入力として受け取る。操作コマンドは操作 API を有効にしたノードが対象で、既存の `get` / `put` とストア・確定の意味を共有しない。
 
 ### CLI の接続先設定
 

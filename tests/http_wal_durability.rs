@@ -51,7 +51,9 @@ use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, System
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::http::handlers::AppState;
 use asteroidb_poc::http::routes::router;
-use asteroidb_poc::network::sync::{SyncRequest, SyncResponse};
+use asteroidb_poc::network::sync::{
+    DigestSyncRequest, DigestSyncResponse, SyncRequest, SyncResponse,
+};
 use asteroidb_poc::ops::metrics::RuntimeMetrics;
 use asteroidb_poc::placement::PlacementPolicy;
 use asteroidb_poc::runtime::persistence::{
@@ -509,6 +511,46 @@ async fn http_ack_blocks_until_flush_boundary() {
     crash(node).await;
 }
 
+/// A concurrent read must not expose a value and session token from an
+/// appended, still-unsynced write under the Always policy.
+#[tokio::test]
+async fn eventual_read_waits_for_observed_wal_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Always,
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+
+    let mut write = spawn_counter_inc(node.addr, "k");
+    wait_appended_eventual(&node.state, 1).await;
+    assert_pending(&mut write, "eventual write before WAL durability").await;
+
+    let addr = node.addr;
+    let mut read = tokio::spawn(async move {
+        let resp = client()
+            .get(format!("http://{addr}/api/eventual/k?session_token="))
+            .send()
+            .await
+            .expect("eventual read request");
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.expect("JSON body");
+        (status, body)
+    });
+    assert_pending(&mut read, "eventual read of unsynced value").await;
+
+    node.state.eventual.lock().await.wal_rotate().unwrap();
+    let (write_status, _) = await_ack(write, "eventual write after durability").await;
+    let (read_status, body) = await_ack(read, "eventual read after durability").await;
+    assert_eq!(write_status, 200);
+    assert_eq!(read_status, 200);
+    assert_counter_value(&body, "k", 1);
+    assert!(!body["session_token"].as_str().unwrap_or("").is_empty());
+    crash(node).await;
+}
+
 // ---------------------------------------------------------------
 // T3. Certified ack gate + recovery (status regresses to Pending)
 // ---------------------------------------------------------------
@@ -593,6 +635,125 @@ async fn http_certified_write_ack_gated_and_recovered() {
         body["status"], "Pending",
         "certification state is volatile: recovery must regress to Pending, never fake Certified"
     );
+    crash(node).await;
+}
+
+#[tokio::test]
+async fn http_certified_timeout_error_waits_for_local_wal_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Always,
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+
+    let addr = node.addr;
+    let mut task = tokio::spawn(async move {
+        let resp = client()
+            .post(format!("http://{addr}/api/certified/write"))
+            .header("content-type", "application/json")
+            .body(r#"{"key":"sensor","value":{"type":"counter","value":5},"on_timeout":"error"}"#)
+            .send()
+            .await
+            .expect("certified write request");
+        resp.status().as_u16()
+    });
+    wait_appended_certified(&node.state, 1).await;
+    assert_pending(&mut task, "certification timeout with unsynced local write").await;
+
+    node.state
+        .certified
+        .lock()
+        .await
+        .wal_rotate()
+        .expect("wal_rotate");
+    let status = timeout(Duration::from_secs(10), task)
+        .await
+        .expect("timeout response")
+        .expect("request task");
+    assert_eq!(status, 504);
+    assert!(node.certified_syncer.durable_watermark() >= 1);
+    crash(node).await;
+}
+
+#[tokio::test]
+async fn http_certified_read_and_status_wait_for_inflight_write_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Always,
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+
+    let addr = node.addr;
+    let mut write = tokio::spawn(async move {
+        client()
+            .post(format!("http://{addr}/api/certified/write"))
+            .header("content-type", "application/json")
+            .body(r#"{"key":"sensor","value":{"type":"counter","value":5},"on_timeout":"pending"}"#)
+            .send()
+            .await
+            .expect("certified write request")
+            .status()
+            .as_u16()
+    });
+    wait_appended_certified(&node.state, 1).await;
+    // The write handler has released the API mutex to wait on the WAL.
+    assert!(
+        node.state
+            .certified
+            .lock()
+            .await
+            .get_certified("sensor")
+            .value
+            .is_some(),
+        "the unflushed value is already visible inside the API"
+    );
+
+    let mut read = tokio::spawn(async move {
+        let response = client()
+            .get(format!("http://{addr}/api/certified/sensor"))
+            .send()
+            .await
+            .expect("certified read request");
+        (
+            response.status().as_u16(),
+            response.json::<serde_json::Value>().await.unwrap(),
+        )
+    });
+    let mut status = tokio::spawn(async move {
+        let response = client()
+            .get(format!("http://{addr}/api/status/sensor"))
+            .send()
+            .await
+            .expect("certification status request");
+        (
+            response.status().as_u16(),
+            response.json::<serde_json::Value>().await.unwrap(),
+        )
+    });
+
+    assert_pending(&mut write, "certified write before WAL durability").await;
+    assert_pending(&mut read, "certified read before WAL durability").await;
+    assert_pending(&mut status, "certification status before WAL durability").await;
+    node.state.certified.lock().await.wal_rotate().unwrap();
+
+    assert_eq!(
+        await_ack(write, "certified write after WAL durability").await,
+        200
+    );
+    let (read_code, read_body) = await_ack(read, "certified read after WAL durability").await;
+    assert_eq!(read_code, 200);
+    assert_eq!(read_body["status"], "Pending");
+    assert_eq!(read_body["value"]["value"], 5);
+    let (status_code, status_body) =
+        await_ack(status, "certification status after WAL durability").await;
+    assert_eq!(status_code, 200);
+    assert_eq!(status_body["status"], "Pending");
     crash(node).await;
 }
 
@@ -696,8 +857,8 @@ async fn http_pre_ack_crash_loses_only_unacked_writes() {
 // ---------------------------------------------------------------
 
 /// A write whose WAL append fails must answer non-2xx WITHOUT a session
-/// token, must not reappear after recovery, and the node must self-heal
-/// for subsequent writes (poison record flushed before the next append).
+/// token, must not appear in the live store or after recovery, and the node
+/// must accept subsequent writes.
 ///
 /// Fault injection: `segment_max_bytes: 1` forces every append into a
 /// non-empty segment to rotate first; removing write permission on the WAL
@@ -711,8 +872,7 @@ async fn http_pre_ack_crash_loses_only_unacked_writes() {
 /// empty — and a first append into an empty segment never rotates
 /// (`seg_records > 0` guards the rotation), so the fault would not fire.
 /// ok-1 is therefore left pending across the failure phase; it is released
-/// by the segment seal that the poison-flush rotation performs during
-/// ok-2's append (which also exercises `rotate_locked`'s
+/// by the segment seal that ok-2's append performs (which also exercises `rotate_locked`'s
 /// `advance_durable`).
 #[tokio::test]
 async fn http_wal_append_failure_rejects_ack() {
@@ -742,7 +902,7 @@ async fn http_wal_append_failure_rejects_ack() {
     }
 
     // fail-key: the append's forced rotation cannot create segment 2 →
-    // append Err → `finish_local_write` poisons the key and propagates →
+    // append Err → `finish_local_write` leaves the prepared value unpublished →
     // the handler must answer non-2xx with NO session token. (The error
     // path returns before the durability wait, so no task spawn needed.)
     let resp = client()
@@ -766,15 +926,12 @@ async fn http_wal_append_failure_rejects_ack() {
 
     drop(guard); // restore 0o755: the disk "heals"
 
-    // ok-2: its append first flushes the queued MergeFailed poison record
-    // (`pending_poison` must precede any frontier-advancing record), then
-    // the data record; both rotations succeed now. The first of those
-    // rotations seals segment 1 and releases ok-1's waiter.
-    // Wait for pos 3: poison record = pos 2, ok-2's data record = pos 3.
+    // ok-2's append rotates and seals segment 1, releasing ok-1's waiter.
+    // No poison record is needed for a local write that never entered memory.
     let mut task_ok2 = spawn_counter_inc(node.addr, "ok-2");
-    wait_appended_eventual(&node.state, 3).await;
+    wait_appended_eventual(&node.state, 2).await;
     assert_pending(&mut task_ok2, "ok-2 pends until a durable boundary").await;
-    let (status_ok1, _) = await_ack(task_ok1, "ok-1 released by the poison-flush rotation").await;
+    let (status_ok1, _) = await_ack(task_ok1, "ok-1 released by ok-2 rotation").await;
     assert_eq!(status_ok1, 200);
 
     node.state
@@ -786,6 +943,12 @@ async fn http_wal_append_failure_rejects_ack() {
     let (status_ok2, _) = await_ack(task_ok2, "ok-2 after rotation").await;
     assert_eq!(status_ok2, 200);
 
+    let body = get_eventual(node.addr, "fail-key").await;
+    assert!(
+        body["value"].is_null(),
+        "failed local append leaked into GET"
+    );
+
     crash(node).await;
     let node = spawn_node(dir.path(), SyncPolicy::Always, 1, FlusherMode::Held).await;
 
@@ -796,8 +959,7 @@ async fn http_wal_append_failure_rejects_ack() {
     let body = get_eventual(node.addr, "fail-key").await;
     assert!(
         body["value"].is_null(),
-        "a value that reached memory but never the WAL must not be resurrected \
-         (the un-acked 503 write must stay lost)"
+        "the un-acked 503 write must stay absent after recovery"
     );
     crash(node).await;
 }
@@ -907,10 +1069,9 @@ async fn http_interval_policy_acks_without_wait() {
 /// its push frontier, so under Always it must wait for the merged batch's
 /// WAL records to be durable.
 ///
-/// NOT tested: the wait-FAILURE branch (warn + ack anyway) — it is only
+/// NOT tested: the wait-FAILURE branch (503, no ack) — it is only
 /// reachable when the flusher task is gone, which the fail-stop policy on
-/// fsync errors makes deterministically unreachable from tests; the
-/// branch is intentional (documented in the handler).
+/// fsync errors makes deterministically unreachable from this harness.
 #[tokio::test]
 async fn http_internal_sync_waits_for_durability() {
     let dir = tempfile::tempdir().unwrap();
@@ -961,5 +1122,108 @@ async fn http_internal_sync_waits_for_durability() {
     assert_eq!(status, 200);
     assert_eq!(body.merged, 1, "the pushed entry must have merged");
     assert!(body.errors.is_empty());
+    assert!(body.durable);
+    crash(node).await;
+}
+
+#[tokio::test]
+async fn interval_internal_sync_waits_for_gc_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Interval(Duration::from_secs(3600)),
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+    let addr = node.addr;
+    let mut task = tokio::spawn(async move {
+        let mut counter = PnCounter::new();
+        counter.increment(&NodeId("sender".into()));
+        let request = SyncRequest {
+            sender: "sender".into(),
+            entries: HashMap::from([("interval-key".into(), CrdtValue::Counter(counter))]),
+        };
+        client()
+            .post(format!("http://{addr}/api/internal/sync"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json::<SyncResponse>()
+            .await
+            .unwrap()
+    });
+    wait_appended_eventual(&node.state, 1).await;
+    assert_pending(&mut task, "interval sync before its WAL rotation").await;
+    node.state.eventual.lock().await.wal_rotate().unwrap();
+    let response = task.await.unwrap();
+    assert_eq!(response.merged, 1);
+    assert!(response.errors.is_empty() && response.durable);
+    crash(node).await;
+}
+
+#[tokio::test]
+async fn digest_match_waits_for_the_snapshotted_wal_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Always,
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+
+    let mut write = spawn_counter_inc(node.addr, "digest-key");
+    wait_appended_eventual(&node.state, 1).await;
+    assert_pending(&mut write, "write before its WAL rotation").await;
+    let digest = node.state.eventual.lock().await.store_mut().digest();
+    let request = DigestSyncRequest::from_digest("sender", &digest, false);
+    let addr = node.addr;
+    let mut probe = tokio::spawn(async move {
+        client()
+            .post(format!("http://{addr}/api/internal/sync/digest"))
+            .json(&request)
+            .send()
+            .await
+            .expect("digest probe")
+            .json::<DigestSyncResponse>()
+            .await
+            .expect("digest response")
+    });
+    assert_pending(&mut probe, "digest match before the peer state is durable").await;
+    node.state.eventual.lock().await.wal_rotate().unwrap();
+    let response = probe.await.unwrap();
+    assert!(response.scheme_ok && response.root_matched && response.durable);
+    let (status, _) = write.await.unwrap();
+    assert_eq!(status, 200);
+    crash(node).await;
+}
+
+#[tokio::test]
+async fn unsynced_peer_ack_cannot_prove_gc_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = spawn_node(
+        dir.path(),
+        SyncPolicy::Off,
+        WalConfig::DEFAULT_SEGMENT_MAX_BYTES,
+        FlusherMode::Held,
+    )
+    .await;
+    let (status, _) = await_ack(spawn_counter_inc(node.addr, "off-key"), "off write").await;
+    assert_eq!(status, 200);
+    let digest = node.state.eventual.lock().await.store_mut().digest();
+    let request = DigestSyncRequest::from_digest("sender", &digest, false);
+    let response = client()
+        .post(format!("http://{}/api/internal/sync/digest", node.addr))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json::<DigestSyncResponse>()
+        .await
+        .unwrap();
+    assert!(response.scheme_ok && response.root_matched);
+    assert!(!response.durable);
     crash(node).await;
 }

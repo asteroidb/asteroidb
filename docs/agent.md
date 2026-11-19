@@ -12,6 +12,14 @@ Rust で実装し、MVP は CRDT ベース KVS + Authority 合意による Certi
 **Repository**: `asteroidb/asteroidb` (GitHub, private)
 **Status**: Implementation phase. Tasks are tracked as GitHub Issues.
 
+## 開発中の互換性方針
+
+AsteroidDB は実験的プロジェクトで、後方互換性は要件ではない。旧 API や旧保存形式は
+まだリリースされていないため、意味の整合や設計の単純さに必要なら既存実装を変更する。
+旧データ、旧 WAL、旧 wire 形式、異なる版のノードとの混在を維持するためだけのコードは
+追加せず、既存のものも設計変更の妨げになるなら削除する。現在の保証範囲は README の
+「開発段階の互換性」を参照。
+
 ## Architecture Overview
 
 ```
@@ -83,8 +91,7 @@ src/
 │   ├── or_map.rs
 │   └── lww_register.rs
 ├── store/              # KVS ストレージレイヤ (versioned persistence)
-│   ├── kv.rs
-│   └── migration.rs
+│   └── kv.rs
 ├── authority/          # Authority 合意・証明
 │   ├── ack_frontier.rs
 │   ├── certificate.rs  # Ed25519 / BLS デュアルモード, EpochManager

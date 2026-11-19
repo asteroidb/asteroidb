@@ -106,7 +106,8 @@ impl CertificationTracker {
             acked_by: HashSet::new(),
             acks_required,
         };
-        self.entries.insert(write_id, entry);
+        // A retry cannot reset an existing receipt or its certification work.
+        self.entries.entry(write_id).or_insert(entry);
     }
 
     /// Returns the current certification status of a write.
@@ -162,21 +163,18 @@ impl CertificationTracker {
         }
     }
 
-    /// Scans all pending entries and marks those that have exceeded
-    /// the timeout as `Timeout`.
-    ///
-    /// A write is considered timed out when the difference between
-    /// `now` and its `created_at` physical time exceeds `default_timeout_ms`.
-    pub fn check_timeouts(&mut self, now: &HlcTimestamp) {
-        for entry in self.entries.values_mut() {
-            if entry.status == CertificationStatus::Pending
+    /// Whether the caller's wait deadline has elapsed. This observation does
+    /// not end certification work or change the durable write status.
+    pub fn wait_elapsed(&self, write_id: &WriteId, now: &HlcTimestamp) -> bool {
+        self.entries.get(write_id).is_some_and(|entry| {
+            entry.status == CertificationStatus::Pending
                 && now.physical.saturating_sub(entry.created_at.physical) >= self.default_timeout_ms
-            {
-                entry.status = CertificationStatus::Timeout;
-                entry.updated_at = now.clone();
-            }
-        }
+        })
     }
+
+    /// Kept for callers of the old polling API. Time alone cannot turn a
+    /// pending operation into a terminal result.
+    pub fn check_timeouts(&mut self, _now: &HlcTimestamp) {}
 
     /// Returns the number of writes currently in `Pending` status.
     pub fn pending_count(&self) -> usize {
@@ -194,28 +192,24 @@ impl CertificationTracker {
             .collect()
     }
 
-    /// Removes all completed entries (certified, rejected, or timed out).
+    /// Removes completed entries while retaining every pending write.
     pub fn remove_completed(&mut self) {
         self.entries
             .retain(|_, e| e.status == CertificationStatus::Pending);
     }
 
-    /// Removes entries older than `ttl_ms` regardless of status.
+    /// Removes completed entries older than `ttl_ms`.
     ///
-    /// An entry is removed when `now.physical - entry.created_at.physical >= ttl_ms`.
+    /// A completed entry is removed when its age reaches `ttl_ms`.
     pub fn remove_expired(&mut self, now: &HlcTimestamp, ttl_ms: u64) {
-        self.entries
-            .retain(|_, e| now.physical.saturating_sub(e.created_at.physical) < ttl_ms);
+        self.entries.retain(|_, e| {
+            e.status == CertificationStatus::Pending
+                || now.physical.saturating_sub(e.created_at.physical) < ttl_ms
+        });
     }
 
-    /// Full cleanup: check timeouts, then remove all completed and expired entries.
-    ///
-    /// This is the recommended periodic maintenance method. It:
-    /// 1. Marks stale `Pending` entries as `Timeout`.
-    /// 2. Removes all non-`Pending` entries.
-    /// 3. Removes any remaining entries older than `ttl_ms`.
+    /// Removes completed entries while retaining pending certification work.
     pub fn cleanup(&mut self, now: &HlcTimestamp, ttl_ms: u64) {
-        self.check_timeouts(now);
         self.remove_completed();
         self.remove_expired(now, ttl_ms);
     }
@@ -240,9 +234,16 @@ impl CertificationTracker {
     /// After deserialization, entry consistency is validated: each
     /// `WriteId` key must match the `StatusEntry`'s `write_id` field.
     pub fn from_json(json: &str) -> Result<Self, io::Error> {
-        let tracker: Self = serde_json::from_str(json)
+        let mut tracker: Self = serde_json::from_str(json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         tracker.validate_entry_consistency()?;
+        // Older versions persisted a wait deadline as a terminal Timeout.
+        // Restore those writes as pending so a late certificate can finish.
+        for entry in tracker.entries.values_mut() {
+            if entry.status == CertificationStatus::Timeout {
+                entry.status = CertificationStatus::Pending;
+            }
+        }
         Ok(tracker)
     }
 
@@ -398,18 +399,27 @@ mod tests {
     }
 
     #[test]
-    fn check_timeouts_marks_old_pending_as_timeout() {
+    fn elapsed_wait_keeps_pending_eligible_for_certification() {
         let mut tracker = CertificationTracker::with_timeout(5000);
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
 
         // Not yet timed out
         tracker.check_timeouts(&ts(5999, 0, "node-a"));
+        assert!(!tracker.wait_elapsed(&wid, &ts(5999, 0, "node-a")));
         assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
 
         // Now timed out (6000 - 1000 = 5000 >= 5000)
         tracker.check_timeouts(&ts(6000, 0, "node-a"));
-        assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Timeout));
+        assert!(tracker.wait_elapsed(&wid, &ts(6000, 0, "node-a")));
+        assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
+        tracker.record_ack(&wid, auth("auth-1"), ts(6001, 0, "auth-1"));
+        tracker.record_ack(&wid, auth("auth-2"), ts(6002, 0, "auth-2"));
+        tracker.record_ack(&wid, auth("auth-3"), ts(6003, 0, "auth-3"));
+        assert_eq!(
+            tracker.get_status(&wid),
+            Some(CertificationStatus::Certified)
+        );
     }
 
     #[test]
@@ -466,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             tracker.get_status(&wid_timeout),
-            Some(CertificationStatus::Timeout)
+            Some(CertificationStatus::Pending)
         );
 
         tracker.remove_completed();
@@ -478,7 +488,10 @@ mod tests {
         );
         assert_eq!(tracker.get_status(&wid_certified), None);
         assert_eq!(tracker.get_status(&wid_rejected), None);
-        assert_eq!(tracker.get_status(&wid_timeout), None);
+        assert_eq!(
+            tracker.get_status(&wid_timeout),
+            Some(CertificationStatus::Pending)
+        );
     }
 
     #[test]
@@ -629,7 +642,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn remove_expired_removes_old_entries() {
+    fn remove_expired_retains_old_pending_entries() {
         let mut tracker = CertificationTracker::new();
         let wid_old = write_id("old-key", 1000);
         let wid_new = write_id("new-key", 9000);
@@ -640,7 +653,10 @@ mod tests {
         // TTL of 5000ms: old-key (created at 1000) should be expired at 10000.
         tracker.remove_expired(&ts(10000, 0, "node-a"), 5000);
 
-        assert_eq!(tracker.get_status(&wid_old), None);
+        assert_eq!(
+            tracker.get_status(&wid_old),
+            Some(CertificationStatus::Pending)
+        );
         assert_eq!(
             tracker.get_status(&wid_new),
             Some(CertificationStatus::Pending)
@@ -689,7 +705,10 @@ mod tests {
             Some(CertificationStatus::Pending)
         );
         assert_eq!(tracker.get_status(&wid_certified), None);
-        assert_eq!(tracker.get_status(&wid_old_pending), None);
+        assert_eq!(
+            tracker.get_status(&wid_old_pending),
+            Some(CertificationStatus::Pending)
+        );
     }
 
     // ---------------------------------------------------------------
@@ -738,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_growth_with_ttl_cleanup() {
+    fn ttl_cleanup_retains_pending_work() {
         let mut tracker = CertificationTracker::with_timeout(100);
 
         // Register writes at different times.
@@ -752,7 +771,7 @@ mod tests {
         // Full cleanup at time 2000 with TTL 500ms.
         tracker.cleanup(&ts(2000, 0, "node-a"), 500);
 
-        assert_eq!(tracker.total_count(), 0);
+        assert_eq!(tracker.total_count(), 20);
     }
 
     // ---------------------------------------------------------------
@@ -872,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_tracker_timeout_still_works() {
+    fn restored_tracker_wait_elapsed_preserves_pending() {
         let mut tracker = CertificationTracker::with_timeout(5000);
         let wid = write_id("key-1", 1000);
         tracker.register_write(wid.clone(), 3, ts(1000, 0, "node-a"));
@@ -882,10 +901,45 @@ mod tests {
 
         // Timeout should work on restored tracker
         restored.check_timeouts(&ts(7000, 0, "node-a"));
+        assert!(restored.wait_elapsed(&wid, &ts(7000, 0, "node-a")));
         assert_eq!(
             restored.get_status(&wid),
-            Some(CertificationStatus::Timeout)
+            Some(CertificationStatus::Pending)
         );
+    }
+
+    #[test]
+    fn legacy_timeout_reopens_pending_after_load() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("legacy", 1000);
+        tracker.register_write(wid.clone(), 1, ts(1000, 0, "node-a"));
+        tracker.entries.get_mut(&wid).unwrap().status = CertificationStatus::Timeout;
+
+        let json = tracker.to_json().unwrap();
+        let mut restored = CertificationTracker::from_json(&json).unwrap();
+        assert_eq!(
+            restored.get_status(&wid),
+            Some(CertificationStatus::Pending)
+        );
+        restored.record_ack(&wid, auth("auth-1"), ts(9000, 0, "auth-1"));
+        assert_eq!(
+            restored.get_status(&wid),
+            Some(CertificationStatus::Certified)
+        );
+    }
+
+    #[test]
+    fn registering_same_write_again_keeps_existing_result() {
+        let mut tracker = CertificationTracker::new();
+        let wid = write_id("retry", 1000);
+        tracker.register_write(wid.clone(), 1, ts(1000, 0, "node-a"));
+        tracker.record_ack(&wid, auth("auth-1"), ts(1001, 0, "auth-1"));
+        tracker.register_write(wid.clone(), 3, ts(2000, 0, "node-a"));
+        assert_eq!(
+            tracker.get_status(&wid),
+            Some(CertificationStatus::Certified)
+        );
+        assert_eq!(tracker.get_entry(&wid).unwrap().acks_required, 1);
     }
 
     #[test]
@@ -935,7 +989,7 @@ mod tests {
         );
         assert_eq!(
             restored.get_status(&wid_timeout),
-            Some(CertificationStatus::Timeout)
+            Some(CertificationStatus::Pending)
         );
     }
 }

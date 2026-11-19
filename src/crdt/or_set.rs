@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::crdt::{MergeEffects, SweepOutcome, covered};
+use crate::crdt::{DotCounterExhausted, MergeEffects, SweepOutcome, covered};
 use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
 
@@ -30,7 +30,7 @@ pub struct Dot {
 /// A causal context (`deferred` set) tracks all dots that have been removed.
 /// During merge, dots present in the remote's deferred set are discarded,
 /// ensuring that a remove on one replica propagates correctly to others.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrSet<T: Eq + Hash> {
     /// Maps each element to the set of dots that justify its presence.
     elements: HashMap<T, HashSet<Dot>>,
@@ -66,27 +66,73 @@ pub struct OrSet<T: Eq + Hash> {
     compaction_floor: HashMap<NodeId, u64>,
 }
 
-/// Frozen structural layout of [`OrSet`] as persisted before the
-/// `compaction_floor` field existed (snapshot formats v1–v4, WAL format
-/// v1). bincode is positional and non-self-describing, so old payloads
-/// must be decoded with exactly this layout and converted (`From`) with
-/// an empty floor.
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrSetV4Layout<T: Eq + Hash> {
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Eq + Hash + Deserialize<'de>"))]
+struct OrSetWire<T: Eq + Hash> {
     elements: HashMap<T, HashSet<Dot>>,
     counters: HashMap<NodeId, u64>,
     #[serde(default)]
     deferred: HashSet<Dot>,
+    #[serde(default)]
+    compaction_floor: HashMap<NodeId, u64>,
 }
 
-impl<T: Eq + Hash> From<OrSetV4Layout<T>> for OrSet<T> {
-    fn from(old: OrSetV4Layout<T>) -> Self {
-        OrSet {
-            elements: old.elements,
-            counters: old.counters,
-            deferred: old.deferred,
-            compaction_floor: HashMap::new(),
+impl<'de, T> Deserialize<'de> for OrSet<T>
+where
+    T: Eq + Hash + Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = OrSetWire::<T>::deserialize(deserializer)?;
+        let mut live = HashSet::new();
+        for dots in wire.elements.values() {
+            for dot in dots {
+                if dot.counter == 0 {
+                    return Err(serde::de::Error::custom(
+                        "OR-Set dot counter must be positive",
+                    ));
+                }
+                if !live.insert(dot) {
+                    return Err(serde::de::Error::custom(
+                        "OR-Set dot is live under multiple elements",
+                    ));
+                }
+                if wire.deferred.contains(dot) {
+                    return Err(serde::de::Error::custom(
+                        "OR-Set dot is both live and removed",
+                    ));
+                }
+                if wire.counters.get(&dot.node_id).copied().unwrap_or(0) < dot.counter {
+                    return Err(serde::de::Error::custom(
+                        "OR-Set counter is below a live dot",
+                    ));
+                }
+            }
         }
+        for dot in &wire.deferred {
+            if dot.counter == 0 {
+                return Err(serde::de::Error::custom(
+                    "OR-Set dot counter must be positive",
+                ));
+            }
+            if wire.counters.get(&dot.node_id).copied().unwrap_or(0) < dot.counter {
+                return Err(serde::de::Error::custom(
+                    "OR-Set counter is below a removed dot",
+                ));
+            }
+        }
+        for (node, floor) in &wire.compaction_floor {
+            if wire.counters.get(node).copied().unwrap_or(0) < *floor {
+                return Err(serde::de::Error::custom(
+                    "OR-Set counter is below the compaction floor",
+                ));
+            }
+        }
+        Ok(Self {
+            elements: wire.elements,
+            counters: wire.counters,
+            deferred: wire.deferred,
+            compaction_floor: wire.compaction_floor,
+        })
     }
 }
 
@@ -106,13 +152,21 @@ where
 
     /// Adds an element with a fresh unique dot generated from `node_id`.
     pub fn add(&mut self, element: T, node_id: &NodeId) {
+        self.try_add(element, node_id)
+            .expect("OR-Set dot counter exhausted");
+    }
+
+    /// Return an error before mutating when this writer has used every dot.
+    /// The caller can reject a write without reusing a historical identity.
+    pub fn try_add(&mut self, element: T, node_id: &NodeId) -> Result<(), DotCounterExhausted> {
         let counter = self.counters.entry(node_id.clone()).or_insert(0);
-        *counter += 1;
+        *counter = counter.checked_add(1).ok_or(DotCounterExhausted)?;
         let dot = Dot {
             node_id: node_id.clone(),
             counter: *counter,
         };
         self.elements.entry(element).or_default().insert(dot);
+        Ok(())
     }
 
     /// Removes an element by moving all of its currently observed dots
@@ -157,6 +211,22 @@ where
     /// Returns `true` if the set contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Detect a live dot assigned to different elements across two states.
+    /// Both states can pass wire validation separately even though their
+    /// union violates the one-element-per-dot invariant. Check this before
+    /// mutating a received state.
+    pub(crate) fn has_conflicting_live_dot(&self, other: &Self) -> bool {
+        let owners: HashMap<&Dot, &T> = self
+            .elements
+            .iter()
+            .flat_map(|(element, dots)| dots.iter().map(move |dot| (dot, element)))
+            .collect();
+        other.elements.iter().any(|(element, dots)| {
+            dots.iter()
+                .any(|dot| owners.get(dot).is_some_and(|owner| *owner != element))
+        })
     }
 
     /// Merges another OR-Set into this one, returning floor diagnostics.
@@ -398,9 +468,9 @@ where
         Some(self.clone())
     }
 
-    /// Compute a true incremental delta against a known old state.
+    /// Compute a merge payload against a known old state.
     ///
-    /// Returns an OrSet containing only:
+    /// When the compaction floor is unchanged, returns an OrSet containing only:
     /// - Elements whose dots are NOT present in `old`
     /// - Deferred (tombstone) dots NOT present in `old`
     /// - Updated counters
@@ -408,10 +478,31 @@ where
     /// The `compaction_floor` is deliberately EMPTY (INV-W): this payload
     /// carries an incomplete live set, and a receiver applying the floor
     /// kill rule against it would destroy live dots that simply were not
-    /// part of the delta. The floor travels on complete states only.
+    /// part of the delta. If the floor changed, return a complete state
+    /// instead so a receiver can safely apply the floor.
     ///
     /// Returns `None` if there are no changes.
     pub fn delta_from(&self, old: &OrSet<T>) -> Option<Self> {
+        if self.compaction_floor != old.compaction_floor {
+            return Some(self.clone());
+        }
+        // A tombstone for a live dot below an existing floor can be swept
+        // without moving that floor. Its absence in the complete live set is
+        // then the only remaining remove evidence. A partial payload cannot
+        // express that absence, even though the floor itself is unchanged.
+        let current_live: HashSet<&Dot> = self
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .collect();
+        if old
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .any(|dot| !current_live.contains(dot) && !self.deferred.contains(dot))
+        {
+            return Some(self.clone());
+        }
         let mut delta = OrSet {
             elements: HashMap::new(),
             counters: HashMap::new(),
@@ -454,6 +545,23 @@ where
             }
         }
 
+        // A partial delta is decoded as a standalone OR-Set before it is
+        // merged. Every included live or removed dot therefore needs its
+        // writer counter, even when that counter did not advance since old.
+        for dot in delta
+            .elements
+            .values()
+            .flat_map(|dots| dots.iter())
+            .chain(delta.deferred.iter())
+        {
+            let counter = self
+                .counters
+                .get(&dot.node_id)
+                .copied()
+                .expect("valid OR-Set has a counter for every dot");
+            delta.counters.entry(dot.node_id.clone()).or_insert(counter);
+        }
+
         if has_changes { Some(delta) } else { None }
     }
 
@@ -479,8 +587,8 @@ where
     }
 
     /// The per-node add counters (highest dot counter ever allocated per
-    /// writer). The tombstone-GC mark phase snapshots these as the Stage 2
-    /// hole-jump ceilings (see [`Self::compact_deferred_certified`]).
+    /// writer). The tombstone-GC mark phase snapshots these for the
+    /// internal Stage 2 boundary tests.
     pub fn counters(&self) -> &HashMap<NodeId, u64> {
         &self.counters
     }
@@ -509,17 +617,9 @@ where
     /// — this is the compression), stopping at:
     /// - an UNMARKED tombstone (created after the mark; the next cycle's
     ///   gate covers it) → `stalled_uncandidated`;
-    /// - a hole (neither live nor deferred: a dot discarded by the legacy
-    ///   pre-floor sweep) → `stalled_holes`, unless the hole is covered
-    ///   by `hole_jump_ceilings` (Stage 2): the node's counters AS
-    ///   SNAPSHOTTED AT MARK TIME. Hole-jump additionally requires the
-    ///   caller's INBOUND gate: having merged every registry peer's
-    ///   complete state since the mark proves a MARK-TIME hole dot is
-    ///   live nowhere, i.e. removed. Holes above the mark-time counters
-    ///   were minted after the mark (e.g. by an inbound partial delta
-    ///   whose counters arrived without their entry) and stall the walk
-    ///   even under Stage 2 — the inbound evidence says nothing about
-    ///   them. Pass `None` for Stage 1 (fail-closed on every hole).
+    /// - a hole (neither live nor deferred) → `stalled_holes`.
+    ///   Current membership cannot prove that an evicted peer holds no
+    ///   old live dot at the hole, so this public method never jumps it.
     ///
     /// Hole spans are crossed as intervals between consecutive known
     /// dots (`O(state·log state)`, independent of the node's lifetime
@@ -534,6 +634,16 @@ where
     pub fn compact_deferred_certified(
         &mut self,
         candidates: &HashSet<(NodeId, u64)>,
+    ) -> SweepOutcome {
+        self.compact_deferred_with_bounds(candidates, None, None)
+    }
+
+    /// Internal walk used by saved-mark GC and Stage 2 boundary tests.
+    /// A mark cap never enables hole jumping on its own.
+    pub(in crate::crdt) fn compact_deferred_with_bounds(
+        &mut self,
+        candidates: &HashSet<(NodeId, u64)>,
+        mark_counter_caps: Option<&HashMap<NodeId, u64>>,
         hole_jump_ceilings: Option<&HashMap<NodeId, u64>>,
     ) -> SweepOutcome {
         let live_dots: HashSet<(&NodeId, u64)> = self
@@ -554,6 +664,7 @@ where
             &self.counters,
             &mut self.compaction_floor,
             candidates,
+            mark_counter_caps,
             hole_jump_ceilings,
         );
 
@@ -643,6 +754,149 @@ impl<T: Eq + Hash + Clone + Serialize + DeserializeOwned> Default for OrSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_decode_rejected(set: &OrSet<String>) {
+        let json = serde_json::to_vec(set).unwrap();
+        assert!(serde_json::from_slice::<OrSet<String>>(&json).is_err());
+
+        let binary = bincode::serde::encode_to_vec(set, bincode::config::standard()).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<OrSet<String>, _>(
+                &binary,
+                bincode::config::standard()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_live_and_removed_dot() {
+        let mut set = OrSet::new();
+        set.add("a".to_string(), &node("A"));
+        set.deferred
+            .insert(set.elements["a"].iter().next().unwrap().clone());
+        assert_decode_rejected(&set);
+    }
+
+    #[test]
+    fn deserialize_rejects_dot_live_under_multiple_elements() {
+        let mut set = OrSet::new();
+        set.add("a".to_string(), &node("A"));
+        set.elements
+            .insert("b".to_string(), set.elements["a"].clone());
+        assert_decode_rejected(&set);
+    }
+
+    #[test]
+    fn separately_valid_states_detect_conflicting_live_dot() {
+        let writer = node("writer");
+        let mut first = OrSet::new();
+        first.add("a".to_string(), &writer);
+        let mut second = OrSet::new();
+        second.add("b".to_string(), &writer);
+
+        for state in [&first, &second] {
+            let json = serde_json::to_vec(state).unwrap();
+            let _: OrSet<String> = serde_json::from_slice(&json).unwrap();
+            let binary = bincode::serde::encode_to_vec(state, bincode::config::standard()).unwrap();
+            let _: (OrSet<String>, usize) =
+                bincode::serde::decode_from_slice(&binary, bincode::config::standard()).unwrap();
+        }
+        assert!(first.has_conflicting_live_dot(&second));
+        assert!(second.has_conflicting_live_dot(&first));
+        assert!(!first.has_conflicting_live_dot(&first));
+    }
+
+    #[test]
+    fn deserialize_rejects_counters_below_retained_dots_or_floor() {
+        let mut live = OrSet::new();
+        live.add("a".to_string(), &node("A"));
+        live.counters.insert(node("A"), 0);
+        assert_decode_rejected(&live);
+
+        let mut removed = OrSet::new();
+        removed.add("a".to_string(), &node("A"));
+        removed.remove(&"a".to_string());
+        removed.counters.remove(&node("A"));
+        assert_decode_rejected(&removed);
+
+        let mut floored: OrSet<String> = OrSet::new();
+        floored.compaction_floor.insert(node("A"), 1);
+        assert_decode_rejected(&floored);
+    }
+
+    #[test]
+    fn deserialize_rejects_zero_counter_dots() {
+        let dot = Dot {
+            node_id: node("A"),
+            counter: 0,
+        };
+        let mut live: OrSet<String> = OrSet::new();
+        live.elements
+            .insert("a".into(), HashSet::from([dot.clone()]));
+        live.counters.insert(node("A"), 0);
+        assert_decode_rejected(&live);
+
+        let mut removed: OrSet<String> = OrSet::new();
+        removed.deferred.insert(dot);
+        removed.counters.insert(node("A"), 0);
+        assert_decode_rejected(&removed);
+    }
+
+    #[test]
+    fn deserialize_accepts_live_dot_below_floor() {
+        let mut set = OrSet::new();
+        set.add("live".to_string(), &node("A"));
+        set.compaction_floor.insert(node("A"), 1);
+
+        let json = serde_json::to_vec(&set).unwrap();
+        let restored: OrSet<String> = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored, set);
+
+        let binary = bincode::serde::encode_to_vec(&set, bincode::config::standard()).unwrap();
+        let (restored, _): (OrSet<String>, usize) =
+            bincode::serde::decode_from_slice(&binary, bincode::config::standard()).unwrap();
+        assert_eq!(restored, set);
+    }
+
+    #[test]
+    fn exhausted_counter_cannot_reuse_a_dot_for_another_element() {
+        let writer = NodeId("writer".into());
+        let mut set = OrSet::new();
+        set.add("old".to_string(), &writer);
+        set.counters.insert(writer.clone(), u64::MAX);
+        let before = set.clone();
+        assert_eq!(
+            set.try_add("new".to_string(), &writer),
+            Err(DotCounterExhausted)
+        );
+        assert_eq!(set, before);
+        assert!(set.contains(&"old".to_string()));
+        assert!(!set.contains(&"new".to_string()));
+    }
+
+    #[test]
+    fn sweep_at_max_counter_is_idempotent() {
+        let writer = node("writer");
+        let mut set = OrSet::<String>::new();
+        set.counters.insert(writer.clone(), u64::MAX);
+        set.compaction_floor.insert(writer.clone(), u64::MAX - 1);
+        set.deferred.insert(Dot {
+            node_id: writer.clone(),
+            counter: u64::MAX,
+        });
+        let encoded = serde_json::to_vec(&set).unwrap();
+        let mut set: OrSet<String> = serde_json::from_slice(&encoded).unwrap();
+        let candidates = HashSet::from([(writer.clone(), u64::MAX)]);
+
+        let first = set.compact_deferred_certified(&candidates);
+        assert_eq!(first.collected, 1);
+        assert_eq!(set.compaction_floor().get(&writer), Some(&u64::MAX));
+        let after_first = set.clone();
+        let second = set.compact_deferred_certified(&HashSet::new());
+        assert_eq!(second.collected, 0);
+        assert_eq!(set, after_first);
+    }
 
     fn node(name: &str) -> NodeId {
         NodeId(name.into())
@@ -1208,6 +1462,21 @@ mod tests {
     }
 
     #[test]
+    fn delta_from_removed_dot_is_valid_on_the_wire() {
+        let mut current = OrSet::new();
+        current.add("x".to_string(), &node("A"));
+        let old = current.clone();
+        current.remove(&"x".to_string());
+
+        let delta = current.delta_from(&old).unwrap();
+        let bytes = serde_json::to_vec(&delta).unwrap();
+        let received: OrSet<String> = serde_json::from_slice(&bytes).unwrap();
+        let mut merged = old;
+        merged.merge_delta(&received);
+        assert!(!merged.contains(&"x".to_string()));
+    }
+
+    #[test]
     fn delta_from_detects_counter_advance() {
         let mut set = OrSet::new();
         let old = set.clone();
@@ -1314,7 +1583,7 @@ mod tests {
 
         // A marks (candidates = current tombstones) and certified-sweeps.
         let candidates = set_a.deferred_dots();
-        let outcome = set_a.compact_deferred_certified(&candidates, None);
+        let outcome = set_a.compact_deferred_certified(&candidates);
         assert_eq!(outcome.collected, 1);
         assert_eq!(set_a.deferred_len(), 0);
         assert_eq!(set_a.compaction_floor().get(&n), Some(&1));
@@ -1338,8 +1607,8 @@ mod tests {
 
         // Fixed point: further sweep/merge rounds change nothing.
         for _ in 0..3 {
-            set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
-            set_b.compact_deferred_certified(&set_b.deferred_dots().clone(), None);
+            set_a.compact_deferred_certified(&set_a.deferred_dots().clone());
+            set_b.compact_deferred_certified(&set_b.deferred_dots().clone());
             let snap_a = set_a.clone();
             set_a.merge(&set_b);
             set_b.merge(&snap_a);
@@ -1357,7 +1626,7 @@ mod tests {
         let mut set_a = OrSet::new();
         set_a.add("x".to_string(), &na);
         set_a.remove(&"x".to_string());
-        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone());
         assert_eq!(set_a.compaction_floor().get(&na), Some(&1));
 
         let mut set_b = OrSet::new();
@@ -1365,7 +1634,7 @@ mod tests {
         set_b.add("z".to_string(), &nb);
         set_b.remove(&"y".to_string());
         set_b.remove(&"z".to_string());
-        set_b.compact_deferred_certified(&set_b.deferred_dots().clone(), None);
+        set_b.compact_deferred_certified(&set_b.deferred_dots().clone());
         assert_eq!(set_b.compaction_floor().get(&nb), Some(&2));
 
         set_a.merge(&set_b);
@@ -1390,7 +1659,7 @@ mod tests {
         let mut lagging = set_a.clone(); // holds (A,1) live
 
         set_a.remove(&"x".to_string());
-        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone());
         assert_eq!(set_a.deferred_len(), 0, "tombstone gone — floor only");
 
         // Lagging <- A: floor kills the stale live dot.
@@ -1418,7 +1687,7 @@ mod tests {
         let mut set = OrSet::new();
         set.add("x".to_string(), &n);
         set.remove(&"x".to_string());
-        set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+        set.compact_deferred_certified(&set.deferred_dots().clone());
 
         set.add("x".to_string(), &n); // dot (A,2) > floor 1
         assert!(set.contains(&"x".to_string()));
@@ -1437,14 +1706,14 @@ mod tests {
         let json = r#"{"elements":{"y":[{"node_id":"A","counter":2}]},"counters":{"A":2}}"#;
         let mut set: OrSet<String> = serde_json::from_str(json).unwrap();
 
-        let outcome = set.compact_deferred_certified(&HashSet::new(), None);
+        let outcome = set.compact_deferred_certified(&HashSet::new());
         assert_eq!(outcome.stalled_holes, 1, "hole must stall Stage 1");
         assert!(set.compaction_floor().is_empty(), "floor must not advance");
 
         // Stage 2: the hole is jumped (it is at or below the mark-time
         // counter ceiling), and the walk never exceeds the node's counter.
         let ceilings: HashMap<NodeId, u64> = set.counters().clone();
-        let outcome = set.compact_deferred_certified(&HashSet::new(), Some(&ceilings));
+        let outcome = set.compact_deferred_with_bounds(&HashSet::new(), None, Some(&ceilings));
         assert_eq!(outcome.stalled_holes, 0);
         assert_eq!(set.compaction_floor().get(&n), Some(&2));
 
@@ -1457,7 +1726,7 @@ mod tests {
             counter: 7,
         };
         set2.deferred.insert(unknown.clone());
-        let outcome = set2.compact_deferred_certified(&HashSet::new(), None);
+        let outcome = set2.compact_deferred_certified(&HashSet::new());
         assert_eq!(outcome.collected, 0);
         assert_eq!(outcome.stalled_uncandidated, 1);
         assert!(set2.deferred.contains(&unknown), "unknown node dot kept");
@@ -1496,7 +1765,7 @@ mod tests {
         // Stage 2 sweep with the MARK-TIME ceilings: the marked tombstone
         // is collected, but the walk stalls at the post-mark hole (A,2)
         // instead of jumping to A=3.
-        let outcome = set.compact_deferred_certified(&candidates, Some(&ceilings));
+        let outcome = set.compact_deferred_with_bounds(&candidates, None, Some(&ceilings));
         assert_eq!(outcome.collected, 1);
         assert_eq!(outcome.stalled_holes, 1, "post-mark hole must stall");
         assert_eq!(
@@ -1516,7 +1785,7 @@ mod tests {
         set.add("x".to_string(), &n); // dot (A,1) — the highest dot
         set.remove(&"x".to_string());
 
-        let outcome = set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+        let outcome = set.compact_deferred_certified(&set.deferred_dots().clone());
         assert_eq!(
             outcome.collected, 1,
             "the non-dominated top tombstone must be collected (behaviour change vs the legacy sweep)"
@@ -1561,7 +1830,7 @@ mod tests {
         set_a.add("pad".to_string(), &n); // (A,3)
         set_a.remove(&"pad".to_string());
         // First GC: floor walks over live (A,1), (A,2) and tombstone (A,3).
-        set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        set_a.compact_deferred_certified(&set_a.deferred_dots().clone());
         assert_eq!(set_a.compaction_floor().get(&n), Some(&3));
         let mut set_b = set_a.clone();
 
@@ -1596,7 +1865,7 @@ mod tests {
         assert_eq!(digest_of(&set_a), digest_of(&set_b));
 
         // (4) The origin's next gated sweep reclaims it.
-        let outcome = set_a.compact_deferred_certified(&set_a.deferred_dots().clone(), None);
+        let outcome = set_a.compact_deferred_certified(&set_a.deferred_dots().clone());
         assert_eq!(outcome.collected, 1);
         assert_eq!(set_a.deferred_len(), 0);
         assert_eq!(digest_of(&set_a), digest_of(&set_b));
@@ -1611,7 +1880,7 @@ mod tests {
         let mut set = OrSet::new();
         set.add("x".to_string(), &n);
         set.remove(&"x".to_string());
-        set.compact_deferred_certified(&set.deferred_dots().clone(), None);
+        set.compact_deferred_certified(&set.deferred_dots().clone());
         set.add("y".to_string(), &n);
 
         let since = set.delta_since(&frontier(0)).unwrap();
@@ -1633,48 +1902,63 @@ mod tests {
         assert_eq!(set.compaction_floor, snapshot.compaction_floor);
     }
 
-    /// Old serialized format without `compaction_floor` still loads
-    /// (mixed-version JSON compatibility).
     #[test]
-    fn serde_backward_compat_missing_floor() {
+    fn delta_from_sends_complete_state_after_floor_compacts_a_remove() {
+        let writer = node("A");
+        let mut source = OrSet::new();
+        source.add("x".to_string(), &writer);
+        let before_remove = source.clone();
+        source.remove(&"x".to_string());
+        let marked = source.deferred_dots();
+        source.compact_deferred_certified(&marked);
+
+        let delta = source
+            .delta_from(&before_remove)
+            .expect("floor advance is a change");
+        assert_eq!(delta.compaction_floor(), source.compaction_floor());
+        let mut receiver = before_remove;
+        receiver.merge_delta(&delta);
+        assert!(!receiver.contains(&"x".to_string()));
+        assert_eq!(receiver.compaction_floor(), source.compaction_floor());
+    }
+
+    #[test]
+    fn delta_from_sends_complete_state_when_covered_remove_keeps_floor() {
+        let writer = node("A");
+        let mut source = OrSet::new();
+        source.add("keep".to_string(), &writer);
+        source.add("remove".to_string(), &writer);
+        source.add("pad".to_string(), &writer);
+        source.remove(&"pad".to_string());
+        let first_mark = source.deferred_dots();
+        source.compact_deferred_certified(&first_mark);
+        assert_eq!(source.compaction_floor().get(&writer), Some(&3));
+
+        let before_remove = source.clone();
+        source.remove(&"remove".to_string());
+        let second_mark = source.deferred_dots();
+        source.compact_deferred_certified(&second_mark);
+        assert_eq!(source.compaction_floor(), before_remove.compaction_floor());
+        assert!(source.deferred.is_empty());
+
+        let delta = source
+            .delta_from(&before_remove)
+            .expect("covered removal still needs a complete delta");
+        assert_eq!(delta.compaction_floor(), source.compaction_floor());
+        let mut receiver = before_remove;
+        receiver.merge_delta(&delta);
+        assert!(!receiver.contains(&"remove".to_string()));
+        assert!(receiver.contains(&"keep".to_string()));
+    }
+
+    /// An omitted floor defaults to empty in the JSON representation.
+    #[test]
+    fn serde_missing_floor_defaults_empty() {
         let json =
             r#"{"elements":{"a":[{"node_id":"A","counter":1}]},"counters":{"A":1},"deferred":[]}"#;
         let set: OrSet<String> = serde_json::from_str(json).unwrap();
         assert!(set.contains(&"a".to_string()));
         assert!(set.compaction_floor().is_empty());
-    }
-
-    /// Mixed-version simulation: a v1 node (JSON round trip with the
-    /// floor stripped) merging with a floor-bearing v2 node must neither
-    /// resurrect removed elements nor roll the v2 node's GC back; the v1
-    /// node does not gain a floor from the stripped payload.
-    #[test]
-    fn mixed_version_merge_is_safe() {
-        let n = node("A");
-        let mut v2 = OrSet::new();
-        v2.add("x".to_string(), &n);
-        v2.add("keep".to_string(), &n);
-        v2.remove(&"x".to_string());
-        let pre_sweep = v2.clone(); // what the v1 node holds
-        v2.compact_deferred_certified(&v2.deferred_dots().clone(), None);
-
-        // Strip the floor via JSON surgery (a v1 node's view of v2 state).
-        let mut json = serde_json::to_value(&v2).unwrap();
-        json.as_object_mut().unwrap().remove("compaction_floor");
-        let stripped: OrSet<String> = serde_json::from_value(json).unwrap();
-        assert!(stripped.compaction_floor().is_empty());
-
-        // v1 node = pre-sweep state merged with the stripped v2 state.
-        let mut v1 = pre_sweep;
-        v1.merge(&stripped);
-        assert!(!v1.contains(&"x".to_string()), "no resurrection on v1");
-        assert!(v1.compaction_floor().is_empty(), "floor not fabricated");
-
-        // v2 <- v1 (stale tombstone): GC must not roll back.
-        v2.merge(&v1);
-        assert_eq!(v2.deferred_len(), 0, "v1 tombstone must not reinject");
-        assert!(!v2.contains(&"x".to_string()));
-        assert!(v2.contains(&"keep".to_string()));
     }
 
     /// Canonical digest rules: covered own tombstones are invisible;
@@ -1686,7 +1970,7 @@ mod tests {
         base.add("keep".to_string(), &n); // (A,1)
         base.add("x".to_string(), &n); // (A,2)
         base.remove(&"x".to_string());
-        base.compact_deferred_certified(&base.deferred_dots().clone(), None);
+        base.compact_deferred_certified(&base.deferred_dots().clone());
 
         // Covered own tombstone only difference -> digests match.
         let mut with_fresh = base.clone();
@@ -1715,7 +1999,7 @@ mod tests {
         let mut floored = OrSet::new();
         floored.add("x".to_string(), &n);
         floored.remove(&"x".to_string());
-        floored.compact_deferred_certified(&floored.deferred_dots().clone(), None);
+        floored.compact_deferred_certified(&floored.deferred_dots().clone());
         let holed: OrSet<String> =
             serde_json::from_str(r#"{"elements":{},"counters":{"A":1},"deferred":[]}"#).unwrap();
         assert_eq!(floored.elements(), holed.elements());
@@ -1821,7 +2105,7 @@ mod tests {
         let mut swept = OrSet::new();
         swept.add("x".to_string(), &n);
         swept.remove(&"x".to_string());
-        swept.compact_deferred_certified(&swept.deferred_dots().clone(), None);
+        swept.compact_deferred_certified(&swept.deferred_dots().clone());
         assert_eq!(swept.compaction_floor().get(&n), Some(&1));
 
         // Floor kill: the lagging replica still holds (A,1) live.
@@ -1845,7 +2129,7 @@ mod tests {
         a.add("x".to_string(), &n);
         a.remove(&"x".to_string());
         let pre_sweep = a.clone(); // holds tombstone (A,1)
-        a.compact_deferred_certified(&a.deferred_dots().clone(), None);
+        a.compact_deferred_certified(&a.deferred_dots().clone());
 
         // (viii) stale live re-offer: rejected, no state change.
         let mut stale_live = OrSet::new();

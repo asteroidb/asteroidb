@@ -280,6 +280,107 @@ async fn certified_value_survives_writer_loss() {
     );
 }
 
+/// A replacement at the same socket address may have entries older than the
+/// previous peer's delta cursor. The first pull after the roster change must
+/// fetch them; the periodic full rescan is not a substitute for this handoff.
+#[tokio::test]
+async fn certified_lane_restarts_cursor_for_new_node_at_same_address() {
+    let old = build_node("z-old", 1);
+    let replacement = build_node("a-new", 1);
+    let receiver = build_node("receiver", 1);
+    assert_eq!(
+        certified_write(&replacement.state, "user/replacement", 2).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        certified_write(&old.state, "user/old", 1).await,
+        StatusCode::OK
+    );
+    let replacement_ts = replacement
+        .state
+        .certified
+        .lock()
+        .await
+        .store()
+        .timestamp_for("user/replacement")
+        .unwrap()
+        .clone();
+    let old_ts = old
+        .state
+        .certified
+        .lock()
+        .await
+        .store()
+        .timestamp_for("user/old")
+        .unwrap()
+        .clone();
+    assert!(
+        replacement_ts < old_ts,
+        "test requires the new entry below the old cursor"
+    );
+
+    let serving = Arc::new(RwLock::new(Arc::clone(&old.state)));
+    let app = axum::Router::new().fallback({
+        let serving = Arc::clone(&serving);
+        move |request: axum::extract::Request| {
+            let serving = Arc::clone(&serving);
+            async move {
+                let state = Arc::clone(&serving.read().unwrap());
+                router(state).oneshot(request).await.unwrap()
+            }
+        }
+    });
+    let (addr, server) = serve(app).await;
+    let registry = Arc::new(Mutex::new(
+        PeerRegistry::new(
+            node_id("receiver"),
+            vec![PeerConfig {
+                node_id: node_id("z-old"),
+                addr: addr.to_string(),
+            }],
+        )
+        .unwrap(),
+    ));
+    let mut runner = NodeRunner::with_sync(
+        node_id("receiver"),
+        Arc::clone(&receiver.state.certified),
+        CompactionEngine::with_defaults(),
+        NodeRunnerConfig {
+            sync_interval: None,
+            ping_interval: None,
+            ..NodeRunnerConfig::default()
+        },
+        SyncClient::new(Arc::clone(&registry)),
+        Arc::clone(&receiver.state.eventual),
+        Arc::clone(&receiver.state.metrics),
+    )
+    .await;
+    runner.run_certified_sync().await;
+    assert_eq!(
+        certified_read(&receiver.state, "user/old").await.1["value"]["value"],
+        1
+    );
+
+    *serving.write().unwrap() = Arc::clone(&replacement.state);
+    {
+        let mut peers = registry.lock().await;
+        peers.remove_peer(&node_id("z-old")).unwrap();
+        peers
+            .add_peer(PeerConfig {
+                node_id: node_id("a-new"),
+                addr: addr.to_string(),
+            })
+            .unwrap();
+    }
+    runner.run_certified_sync().await;
+    assert_eq!(
+        certified_read(&receiver.state, "user/replacement").await.1["value"]["value"],
+        2,
+        "the new peer's older entry must arrive on the first pull"
+    );
+    server.abort();
+}
+
 // ---------------------------------------------------------------
 // RED-2: replication must not smuggle a value past the FR-009 fence.
 // ---------------------------------------------------------------
@@ -605,7 +706,11 @@ async fn origin_ahead_refusal_is_retried_after_the_namespace_converges() {
 
     // B pulls while it still believes the scope is v1: the v2 origin is
     // ahead of anything it can validate, so the entry is refused.
-    runner_b.run_certified_sync().await;
+    // Keep the policy behind for longer than the old 12-round retry budget.
+    // No number of failed rounds may turn refusal into delivery evidence.
+    for _ in 0..14 {
+        runner_b.run_certified_sync().await;
+    }
     let (_, body) = certified_read(&b.state, "user/k1").await;
     assert!(
         body["value"].is_null(),
@@ -616,14 +721,14 @@ async fn origin_ahead_refusal_is_retried_after_the_namespace_converges() {
             .metrics
             .snapshot()
             .certified_sync_origin_ahead_rejected_total,
-        1
+        14
     );
     assert_eq!(
         b.state
             .metrics
             .snapshot()
             .certified_sync_baseline_held_total,
-        1,
+        14,
         "the baseline must be HELD, not advanced past the refused entry"
     );
 
@@ -648,6 +753,109 @@ async fn origin_ahead_refusal_is_retried_after_the_namespace_converges() {
         1
     );
 
+    a_server.abort();
+}
+
+/// The runtime must resume at the accepted (HLC, key), not just the HLC.
+/// Two distinct keys can share a timestamp after recovery or import. If the
+/// second one is temporarily refused, a timestamp-only baseline loses it.
+#[tokio::test]
+async fn equal_hlc_refusal_retries_the_later_key_over_http() {
+    let a = build_node("node-a", 1);
+    let b = build_node("node-b", 1);
+    assert_eq!(certified_write(&a.state, "user/a", 1).await, StatusCode::OK);
+    bump_policy(&a.namespace, 2);
+    assert_eq!(certified_write(&a.state, "user/z", 2).await, StatusCode::OK);
+
+    // Reconstruct a valid imported state in which both keys have the same
+    // HLC but retain their distinct write-time policy pins.
+    {
+        let mut api = a.state.certified.lock().await;
+        let mut store = api.store().clone();
+        let mut scope_pins = api.scope_pins().clone();
+        let origins = api.origins().clone();
+        let shared_hlc = store.timestamp_for("user/a").unwrap().clone();
+        store.record_change("user/z", shared_hlc.clone());
+        scope_pins.get_mut("user/z").unwrap().write_hlc = shared_hlc;
+        *api = CertifiedApi::recovered_with_scope_pins(
+            node_id("node-a"),
+            Arc::clone(&a.namespace),
+            store,
+            None,
+            origins,
+            scope_pins,
+        );
+    }
+
+    let (a_addr, a_server) = serve(router(Arc::clone(&a.state))).await;
+    let mut runner_b = lane_runner("node-b", &b, "node-a", &a_addr.to_string()).await;
+    runner_b.run_certified_sync().await;
+    assert_eq!(
+        certified_read(&b.state, "user/a").await.1["value"]["value"],
+        1
+    );
+    assert!(certified_read(&b.state, "user/z").await.1["value"].is_null());
+    assert_eq!(
+        b.state
+            .metrics
+            .snapshot()
+            .certified_sync_origin_ahead_rejected_total,
+        1
+    );
+
+    bump_policy(&b.namespace, 2);
+    runner_b.run_certified_sync().await;
+    assert_eq!(
+        certified_read(&b.state, "user/z").await.1["value"]["value"],
+        2
+    );
+    a_server.abort();
+}
+
+#[tokio::test]
+async fn changed_authority_roster_holds_baseline_until_namespace_converges() {
+    let a = build_node("node-a", 1);
+    let b = build_node("node-b", 1);
+    let (a_addr, a_server) = serve(router(Arc::clone(&a.state))).await;
+    let mut runner_b = lane_runner("node-b", &b, "node-a", &a_addr.to_string()).await;
+
+    assert_eq!(
+        certified_write(&a.state, "user/k1", 7).await,
+        StatusCode::OK
+    );
+    b.namespace
+        .write()
+        .unwrap()
+        .set_authority_definition(AuthorityDefinition {
+            key_range: user_range(),
+            authority_nodes: vec![node_id("auth-2")],
+            auto_generated: false,
+        });
+
+    for _ in 0..3 {
+        runner_b.run_certified_sync().await;
+    }
+    let (_, body) = certified_read(&b.state, "user/k1").await;
+    assert!(body["value"].is_null());
+    assert_eq!(
+        b.state
+            .metrics
+            .snapshot()
+            .certified_sync_baseline_held_total,
+        3
+    );
+
+    b.namespace
+        .write()
+        .unwrap()
+        .set_authority_definition(AuthorityDefinition {
+            key_range: user_range(),
+            authority_nodes: vec![node_id("auth-1")],
+            auto_generated: false,
+        });
+    runner_b.run_certified_sync().await;
+    let (_, body) = certified_read(&b.state, "user/k1").await;
+    assert_eq!(body["value"]["value"], 7);
     a_server.abort();
 }
 

@@ -10,6 +10,7 @@ pub mod http;
 #[cfg(feature = "native-runtime")]
 pub mod network;
 pub mod node;
+pub mod operation;
 pub mod ops;
 pub mod placement;
 #[cfg(feature = "native-runtime")]

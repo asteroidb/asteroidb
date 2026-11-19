@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write;
@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::hlc::HlcTimestamp;
 use crate::types::{KeyRange, NodeId, PolicyVersion};
+
+/// Match the in-memory attestation pool's checkpoint window.
+const MAX_ACCEPTED_CHECKPOINTS_PER_SCOPE: usize = 128;
 
 /// A fenced (key_range, policy_version) pair.
 ///
@@ -111,6 +114,12 @@ pub struct AckFrontierSet {
     /// GC authority gate stays fail-closed until fresh reports arrive.
     #[serde(skip)]
     advanced_at_ms: HashMap<FrontierScope, u64>,
+    /// Checkpoint buckets reached by an accepted frontier during this
+    /// process. The attestation pool is also volatile and retains at most
+    /// 128 buckets per scope; old buckets are only needed while a late
+    /// signature may still join that pool.
+    #[serde(skip)]
+    accepted_checkpoints: HashMap<FrontierScope, BTreeMap<u64, AckFrontier>>,
     /// Count of frontier reports dropped by [`update_at`](Self::update_at)
     /// because their `frontier_hlc.physical` was more than
     /// [`crate::hlc::MAX_CLOCK_SKEW_MS`] ahead of this node's local wall clock.
@@ -201,6 +210,7 @@ impl AckFrontierSet {
             fenced_versions: HashSet::new(),
             fenced_at: HashMap::new(),
             advanced_at_ms: HashMap::new(),
+            accepted_checkpoints: HashMap::new(),
             skew_rejected_total: 0,
             local_authority: None,
         }
@@ -274,7 +284,14 @@ impl AckFrontierSet {
                 false
             }
             _ => {
-                self.frontiers.insert(scope.clone(), frontier);
+                let checkpoint =
+                    crate::authority::frontier_sig::checkpoint_hlc(&frontier.frontier_hlc).physical;
+                self.frontiers.insert(scope.clone(), frontier.clone());
+                let accepted = self.accepted_checkpoints.entry(scope.clone()).or_default();
+                accepted.insert(checkpoint, frontier);
+                while accepted.len() > MAX_ACCEPTED_CHECKPOINTS_PER_SCOPE {
+                    accepted.pop_first();
+                }
                 // Max-monotone so an out-of-order test clock can never
                 // regress a previously recorded receipt.
                 let stamp = self.advanced_at_ms.entry(scope).or_insert(now_ms);
@@ -284,10 +301,35 @@ impl AckFrontierSet {
         }
     }
 
+    /// Whether this process accepted a frontier in the exact signed
+    /// checkpoint bucket. A newer frontier alone does not prove this.
+    pub fn accepted_checkpoint(&self, scope: &FrontierScope, physical: u64) -> bool {
+        self.accepted_checkpoints
+            .get(scope)
+            .is_some_and(|checkpoints| checkpoints.contains_key(&physical))
+    }
+
+    /// Copyable receipt of a frontier accepted in this exact checkpoint.
+    /// The current frontier may have since advanced to another bucket.
+    pub fn accepted_frontier_at(
+        &self,
+        scope: &FrontierScope,
+        physical: u64,
+    ) -> Option<&AckFrontier> {
+        self.accepted_checkpoints.get(scope)?.get(&physical)
+    }
+
     /// LOCAL wall-clock time (ms) when this scope's frontier last
     /// advanced, if it advanced during this process's lifetime.
     pub fn advanced_at_for_scope(&self, scope: &FrontierScope) -> Option<u64> {
         self.advanced_at_ms.get(scope).copied()
+    }
+
+    /// Discard GC freshness receipts when a new tombstone mark is taken.
+    /// The stored frontier and accepted checkpoints remain valid; only a
+    /// later advancement can establish that it followed the new mark.
+    pub(crate) fn clear_gc_advance_receipts(&mut self) {
+        self.advanced_at_ms.clear();
     }
 
     /// The OLDEST advancement receipt across all authorities of a
@@ -388,6 +430,8 @@ impl AckFrontierSet {
         }
         self.fenced_at.remove(&fv);
         self.frontiers
+            .retain(|scope, _| !(scope.key_range == *range && scope.policy_version == version));
+        self.accepted_checkpoints
             .retain(|scope, _| !(scope.key_range == *range && scope.policy_version == version));
         true
     }
@@ -668,6 +712,7 @@ impl AckFrontierSet {
         for scope in &to_remove {
             self.frontiers.remove(scope);
             self.advanced_at_ms.remove(scope);
+            self.accepted_checkpoints.remove(scope);
         }
 
         // Also clean up fenced_versions and fenced_at entries for scopes
@@ -1013,6 +1058,19 @@ mod tests {
     }
 
     #[test]
+    fn accepted_checkpoints_do_not_infer_intermediate_buckets() {
+        let mut set = AckFrontierSet::new();
+        let scope = FrontierScope::new(kr("user/"), PolicyVersion(1), NodeId("auth-1".into()));
+        assert!(set.update(make_frontier("auth-1", 10_100, 0, "user/")));
+        assert!(set.update(make_frontier("auth-1", 12_100, 0, "user/")));
+        assert!(set.accepted_checkpoint(&scope, 10_000));
+        assert!(!set.accepted_checkpoint(&scope, 11_000));
+        assert!(set.accepted_checkpoint(&scope, 12_000));
+        assert!(!set.update(make_frontier("auth-1", 11_100, 0, "user/")));
+        assert!(!set.accepted_checkpoint(&scope, 11_000));
+    }
+
+    #[test]
     fn serde_roundtrip_ack_frontier() {
         let f = make_frontier("auth-1", 1_700_000_000_000, 42, "user/");
         let json = serde_json::to_string(&f).expect("serialize");
@@ -1193,6 +1251,21 @@ mod tests {
             set.get_scoped(&scope_order).unwrap().frontier_hlc.physical,
             50
         );
+    }
+
+    #[test]
+    fn new_gc_mark_invalidates_old_advance_receipts_without_erasing_frontiers() {
+        let mut set = AckFrontierSet::new();
+        let scope = FrontierScope::new(kr("user/"), pv(1), NodeId("auth-1".into()));
+        assert!(set.update_at(make_frontier("auth-1", 100, 0, "user/"), 9_000));
+        assert_eq!(set.advanced_at_for_scope(&scope), Some(9_000));
+
+        set.clear_gc_advance_receipts();
+        assert!(set.get_scoped(&scope).is_some());
+        assert_eq!(set.advanced_at_for_scope(&scope), None);
+
+        assert!(set.update_at(make_frontier("auth-1", 101, 0, "user/"), 8_100));
+        assert_eq!(set.advanced_at_for_scope(&scope), Some(8_100));
     }
 
     #[test]

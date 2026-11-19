@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::node::Node;
 use crate::types::NodeId;
@@ -15,6 +15,10 @@ pub enum PeerError {
     /// Two or more peers share the same [`NodeId`].
     #[error("duplicate node_id: {0}")]
     DuplicateNodeId(String),
+
+    /// Two distinct peers use the same transport destination.
+    #[error("duplicate peer address: {0}")]
+    DuplicatePeerAddress(String),
 
     /// The local node's own ID appears in the peer list.
     #[error("self_id {0} must not appear in the peer list")]
@@ -43,12 +47,12 @@ pub struct PeerConfig {
 
 /// Registry that holds validated peer configurations.
 ///
-/// `PeerRegistry` enforces the following invariants at construction time:
-/// - No duplicate `node_id` values.
+/// `PeerRegistry` enforces the following invariants on construction and mutation:
+/// - No duplicate `node_id` or address values.
 /// - The local node's own ID (`self_id`) must not be present.
 ///
-/// Once constructed, the registry is immutable and can be queried by node ID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Peers can be added, removed, and updated while preserving these invariants.
+#[derive(Debug, Clone, Serialize)]
 pub struct PeerRegistry {
     self_id: NodeId,
     peers: HashMap<NodeId, PeerConfig>,
@@ -59,15 +63,57 @@ pub struct PeerRegistry {
     generation: u64,
 }
 
+#[derive(Deserialize)]
+struct PeerRegistryWire {
+    self_id: NodeId,
+    peers: HashMap<NodeId, PeerConfig>,
+    #[serde(default)]
+    generation: u64,
+}
+
+impl<'de> Deserialize<'de> for PeerRegistry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PeerRegistryWire::deserialize(deserializer)?;
+        let mut addresses = HashMap::new();
+        for (id, peer) in &wire.peers {
+            if id != &peer.node_id {
+                return Err(serde::de::Error::custom(
+                    "peer map key differs from node_id",
+                ));
+            }
+            if id == &wire.self_id {
+                return Err(serde::de::Error::custom(PeerError::SelfInPeerList(
+                    id.0.clone(),
+                )));
+            }
+            if addresses.insert(&peer.addr, id).is_some() {
+                return Err(serde::de::Error::custom(PeerError::DuplicatePeerAddress(
+                    peer.addr.clone(),
+                )));
+            }
+        }
+        Ok(Self {
+            self_id: wire.self_id,
+            peers: wire.peers,
+            generation: wire.generation,
+        })
+    }
+}
+
 impl PeerRegistry {
     /// Create a new `PeerRegistry`, validating the given peer list.
     ///
     /// # Errors
     ///
     /// Returns [`PeerError::DuplicateNodeId`] if two peers share the same ID,
-    /// or [`PeerError::SelfInPeerList`] if `self_id` appears in `peers`.
+    /// [`PeerError::DuplicatePeerAddress`] if two IDs share an address, or
+    /// [`PeerError::SelfInPeerList`] if `self_id` appears in `peers`.
     pub fn new(self_id: NodeId, peers: Vec<PeerConfig>) -> Result<Self, PeerError> {
         let mut map = HashMap::with_capacity(peers.len());
+        let mut addresses = std::collections::HashSet::with_capacity(peers.len());
 
         for peer in peers {
             if peer.node_id == self_id {
@@ -75,6 +121,9 @@ impl PeerRegistry {
             }
             if map.contains_key(&peer.node_id) {
                 return Err(PeerError::DuplicateNodeId(peer.node_id.0.clone()));
+            }
+            if !addresses.insert(peer.addr.clone()) {
+                return Err(PeerError::DuplicatePeerAddress(peer.addr));
             }
             map.insert(peer.node_id.clone(), peer);
         }
@@ -111,7 +160,8 @@ impl PeerRegistry {
     /// # Errors
     ///
     /// Returns [`PeerError::DuplicateNodeId`] if a peer with the same ID
-    /// already exists, or [`PeerError::SelfInPeerList`] if the peer's ID
+    /// already exists, [`PeerError::DuplicatePeerAddress`] if another peer
+    /// uses the address, or [`PeerError::SelfInPeerList`] if the peer's ID
     /// matches the local node's own ID.
     pub fn add_peer(&mut self, peer: PeerConfig) -> Result<(), PeerError> {
         if peer.node_id == self.self_id {
@@ -119,6 +169,9 @@ impl PeerRegistry {
         }
         if self.peers.contains_key(&peer.node_id) {
             return Err(PeerError::DuplicateNodeId(peer.node_id.0.clone()));
+        }
+        if self.peers.values().any(|known| known.addr == peer.addr) {
+            return Err(PeerError::DuplicatePeerAddress(peer.addr));
         }
         self.peers.insert(peer.node_id.clone(), peer);
         self.generation += 1;
@@ -128,16 +181,26 @@ impl PeerRegistry {
     /// Update the address of an existing peer.
     ///
     /// Returns `true` if the address was changed, `false` if the peer was
-    /// not found or the address was already up-to-date.
-    pub fn update_address(&mut self, node_id: &NodeId, new_addr: &str) -> bool {
+    /// not found or the address was already up-to-date. A collision is an error.
+    pub fn update_address(&mut self, node_id: &NodeId, new_addr: &str) -> Result<bool, PeerError> {
+        if !self.peers.contains_key(node_id) {
+            return Ok(false);
+        }
+        if self
+            .peers
+            .values()
+            .any(|peer| &peer.node_id != node_id && peer.addr == new_addr)
+        {
+            return Err(PeerError::DuplicatePeerAddress(new_addr.to_string()));
+        }
         if let Some(peer) = self.peers.get_mut(node_id)
             && peer.addr != new_addr
         {
             peer.addr = new_addr.to_string();
             self.generation += 1;
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
     /// Remove a peer from the registry by its node ID.
@@ -622,6 +685,53 @@ mod tests {
             PeerError::DuplicateNodeId(id) => assert_eq!(id, "node-2"),
             other => panic!("expected DuplicateNodeId, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_address_cannot_enter_or_reenter_registry() {
+        let first = peer("node-2", "127.0.0.1:8001");
+        let second = peer("node-3", "127.0.0.1:8001");
+        assert_eq!(
+            PeerRegistry::new(nid("node-1"), vec![first.clone(), second.clone()]).unwrap_err(),
+            PeerError::DuplicatePeerAddress(first.addr.clone())
+        );
+
+        let mut reg = PeerRegistry::new(
+            nid("node-1"),
+            vec![first.clone(), peer("node-3", "127.0.0.1:8002")],
+        )
+        .unwrap();
+        let generation = reg.generation();
+        assert_eq!(reg.update_address(&nid("missing"), &first.addr), Ok(false));
+        assert_eq!(
+            reg.update_address(&nid("node-3"), &first.addr),
+            Err(PeerError::DuplicatePeerAddress(first.addr.clone()))
+        );
+        assert_eq!(reg.generation(), generation);
+        assert_eq!(reg.get_peer(&nid("node-3")).unwrap().addr, "127.0.0.1:8002");
+        assert_eq!(
+            reg.add_peer(peer("node-4", &first.addr)),
+            Err(PeerError::DuplicatePeerAddress(first.addr.clone()))
+        );
+
+        let mut json = serde_json::to_value(&reg).unwrap();
+        json["peers"]["node-3"]["addr"] = serde_json::json!(first.addr);
+        let path = tempfile::tempdir().unwrap();
+        let registry_path = path.path().join("peers.json");
+        std::fs::write(&registry_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            PeerRegistry::load(&registry_path),
+            Err(PeerError::Json(_))
+        ));
+
+        let mut config = serde_json::to_value(&generate_cluster_configs(3, 9000)[0]).unwrap();
+        config["peers"] = json;
+        let config_path = path.path().join("node.json");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(matches!(
+            NodeConfig::load(&config_path),
+            Err(PeerError::Json(_))
+        ));
     }
 
     #[test]

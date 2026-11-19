@@ -1,13 +1,23 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::{Deref, DerefMut};
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::crdt::lww_register::LwwRegister;
-use crate::crdt::{MergeEffects, SweepOutcome, covered};
+use crate::crdt::{DotCounterExhausted, MergeEffects, SweepOutcome, covered};
 use crate::hlc::HlcTimestamp;
 use crate::types::NodeId;
+
+/// A live event dot must keep one key and one immutable value/HLC across
+/// replicas. A merge of individually valid snapshots can violate this rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OrMapMergeConflict {
+    #[error("OR-Map dot is live under different keys across states")]
+    DifferentKey,
+    #[error("OR-Map dot has different values or timestamps across states")]
+    DifferentValue,
+}
 
 /// A unique event identifier (node, counter) for OR-Set semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -16,20 +26,84 @@ struct Dot {
     counter: u64,
 }
 
+/// The immutable payload assigned to one event dot. Only live dots are kept
+/// in `entries`, so a removed write can never influence the visible value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DotValue<V> {
+    value: V,
+    timestamp: HlcTimestamp,
+}
+
+/// Hash lookup internally, a dot/value sequence on disk and JSON wire.
+/// Struct-valued map keys cannot be encoded by `serde_json`.
+#[derive(Debug, Clone, PartialEq)]
+struct DotValues<V>(HashMap<Dot, DotValue<V>>);
+
+const DOT_VALUES_SCHEMA: u8 = 250;
+
+impl<V> Default for DotValues<V> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<V> Deref for DotValues<V> {
+    type Target = HashMap<Dot, DotValue<V>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V> DerefMut for DotValues<V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<V: Serialize> Serialize for DotValues<V> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut entries: Vec<_> = self.0.iter().collect();
+        entries.sort_unstable_by(|a, b| {
+            a.0.node_id
+                .0
+                .cmp(&b.0.node_id.0)
+                .then_with(|| a.0.counter.cmp(&b.0.counter))
+        });
+        (DOT_VALUES_SCHEMA, entries).serialize(serializer)
+    }
+}
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for DotValues<V> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (schema, entries) = <(u8, Vec<(Dot, DotValue<V>)>)>::deserialize(deserializer)?;
+        if schema != DOT_VALUES_SCHEMA {
+            return Err(serde::de::Error::custom("invalid OR-Map dot-value schema"));
+        }
+        let mut map = HashMap::with_capacity(entries.len());
+        for (dot, value) in entries {
+            if map.insert(dot, value).is_some() {
+                return Err(serde::de::Error::custom("duplicate OR-Map dot"));
+            }
+        }
+        Ok(Self(map))
+    }
+}
+
 /// Observed-Remove Map (FR-005).
 ///
 /// Combines OR-Set semantics for key presence (add-wins on concurrent
-/// add/remove) with LWW-Register for values. Each key tracks its causal
+/// add/remove) with immutable per-dot values. Each key tracks its causal
 /// dots so that concurrent `set` and `delete` operations resolve correctly:
 /// a `set` that is concurrent with a `delete` will re-add the key.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrMap<K, V>
 where
     K: Eq + Hash + Clone,
     V: Clone + Ord,
 {
-    /// Active entries: key -> (dots that justify presence, LWW value).
-    entries: HashMap<K, (HashSet<Dot>, LwwRegister<V>)>,
+    /// Active entries: key -> dot -> immutable value and write timestamp.
+    entries: HashMap<K, DotValues<V>>,
     /// Per-node monotonic counters for generating unique dots.
     counters: HashMap<NodeId, u64>,
     /// Tombstone: all dots that have ever been removed.
@@ -47,33 +121,73 @@ where
     compaction_floor: HashMap<NodeId, u64>,
 }
 
-/// Frozen structural layout of [`OrMap`] as persisted before the
-/// `compaction_floor` field existed (snapshot formats v1–v4, WAL format
-/// v1). bincode is positional, so old payloads must be decoded with
-/// exactly this layout and converted (`From`) with an empty floor.
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrMapV4Layout<K, V>
-where
-    K: Eq + Hash + Clone,
-    V: Clone + Ord,
-{
-    entries: HashMap<K, (HashSet<Dot>, LwwRegister<V>)>,
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "K: Eq + Hash + Deserialize<'de>, V: Deserialize<'de>"))]
+struct OrMapWire<K, V> {
+    entries: HashMap<K, DotValues<V>>,
     counters: HashMap<NodeId, u64>,
     deferred: HashSet<Dot>,
+    #[serde(default)]
+    compaction_floor: HashMap<NodeId, u64>,
 }
 
-impl<K, V> From<OrMapV4Layout<K, V>> for OrMap<K, V>
+impl<'de, K, V> Deserialize<'de> for OrMap<K, V>
 where
-    K: Eq + Hash + Clone,
-    V: Clone + Ord,
+    K: Eq + Hash + Clone + Deserialize<'de>,
+    V: Clone + Ord + Deserialize<'de>,
 {
-    fn from(old: OrMapV4Layout<K, V>) -> Self {
-        OrMap {
-            entries: old.entries,
-            counters: old.counters,
-            deferred: old.deferred,
-            compaction_floor: HashMap::new(),
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = OrMapWire::<K, V>::deserialize(deserializer)?;
+        let mut live = HashSet::new();
+        for dots in wire.entries.values() {
+            for dot in dots.keys() {
+                if dot.counter == 0 {
+                    return Err(serde::de::Error::custom(
+                        "OR-Map dot counter must be positive",
+                    ));
+                }
+                if !live.insert(dot) {
+                    return Err(serde::de::Error::custom(
+                        "OR-Map dot is live under multiple keys",
+                    ));
+                }
+                if wire.deferred.contains(dot) {
+                    return Err(serde::de::Error::custom(
+                        "OR-Map dot is both live and removed",
+                    ));
+                }
+                if wire.counters.get(&dot.node_id).copied().unwrap_or(0) < dot.counter {
+                    return Err(serde::de::Error::custom(
+                        "OR-Map counter is below a live dot",
+                    ));
+                }
+            }
         }
+        for dot in &wire.deferred {
+            if dot.counter == 0 {
+                return Err(serde::de::Error::custom(
+                    "OR-Map dot counter must be positive",
+                ));
+            }
+            if wire.counters.get(&dot.node_id).copied().unwrap_or(0) < dot.counter {
+                return Err(serde::de::Error::custom(
+                    "OR-Map counter is below a removed dot",
+                ));
+            }
+        }
+        for (node, floor) in &wire.compaction_floor {
+            if wire.counters.get(node).copied().unwrap_or(0) < *floor {
+                return Err(serde::de::Error::custom(
+                    "OR-Map counter is below the compaction floor",
+                ));
+            }
+        }
+        Ok(Self {
+            entries: wire.entries,
+            counters: wire.counters,
+            deferred: wire.deferred,
+            compaction_floor: wire.compaction_floor,
+        })
     }
 }
 
@@ -82,6 +196,31 @@ where
     K: Eq + Hash + Clone + Serialize + DeserializeOwned,
     V: Clone + Ord + Serialize + DeserializeOwned,
 {
+    /// Validate immutable live-dot assignments before merging an external
+    /// state. Deserialization checks each state in isolation; this catches
+    /// conflicts that exist only between the two states.
+    pub fn validate_merge_compatible(&self, other: &Self) -> Result<(), OrMapMergeConflict> {
+        let mut assignments = HashMap::new();
+        for (key, dots) in &self.entries {
+            for (dot, value) in dots.iter() {
+                assignments.insert(dot, (key, value));
+            }
+        }
+        for (key, dots) in &other.entries {
+            for (dot, value) in dots.iter() {
+                if let Some((held_key, held_value)) = assignments.get(dot) {
+                    if *held_key != key {
+                        return Err(OrMapMergeConflict::DifferentKey);
+                    }
+                    if *held_value != value {
+                        return Err(OrMapMergeConflict::DifferentValue);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create an empty OR-Map.
     pub fn new() -> Self {
         Self {
@@ -93,51 +232,37 @@ where
     }
 
     /// Generate a fresh dot for the given node.
-    fn next_dot(&mut self, node_id: &NodeId) -> Dot {
+    fn next_dot(&mut self, node_id: &NodeId) -> Result<Dot, DotCounterExhausted> {
         let counter = self.counters.entry(node_id.clone()).or_insert(0);
-        *counter += 1;
-        Dot {
+        *counter = counter.checked_add(1).ok_or(DotCounterExhausted)?;
+        Ok(Dot {
             node_id: node_id.clone(),
             counter: *counter,
-        }
+        })
     }
 
     /// Set a key to a value with add-wins semantics.
     ///
-    /// This removes existing dots for the key (superseding prior presence)
-    /// and adds a fresh dot. The value is updated via LWW-Register.
-    ///
-    /// Returns `true` if the value was updated, `false` if the timestamp
-    /// was stale compared to the current LWW-Register value. When `false`
-    /// is returned, no dots are modified to prevent inconsistency between
-    /// key presence and the register value.
+    /// This adds a fresh dot with its own immutable value and timestamp.
+    /// Previously observed dots remain live until an explicit delete.
     pub fn set(&mut self, key: K, value: V, timestamp: HlcTimestamp, node_id: &NodeId) -> bool {
-        // Pre-check: if the key already has a higher or equal timestamp,
-        // skip the entire operation to avoid adding a dot without updating
-        // the register value.
-        if let Some(entry) = self.entries.get(&key)
-            && timestamp <= *entry.1.timestamp()
-        {
-            return false;
-        }
+        self.try_set(key, value, timestamp, node_id)
+            .expect("OR-Map dot counter exhausted")
+    }
 
-        let dot = self.next_dot(node_id);
+    /// Distinguish dot exhaustion before changing the map.
+    pub fn try_set(
+        &mut self,
+        key: K,
+        value: V,
+        timestamp: HlcTimestamp,
+        node_id: &NodeId,
+    ) -> Result<bool, DotCounterExhausted> {
+        let dot = self.next_dot(node_id)?;
+        let entry = self.entries.entry(key).or_default();
 
-        let entry = self.entries.entry(key).or_insert_with(|| {
-            let reg = LwwRegister::new();
-            (HashSet::new(), reg)
-        });
-
-        // Remove old dots for this key (current set supersedes them).
-        let old_dots: Vec<Dot> = entry.0.drain().collect();
-        for d in old_dots {
-            self.deferred.insert(d);
-        }
-
-        // Add the new dot and update the register value.
-        entry.0.insert(dot);
-        entry.1.set(value, timestamp);
-        true
+        entry.insert(dot, DotValue { value, timestamp });
+        Ok(true)
     }
 
     /// Delete a key using OR-Set remove semantics.
@@ -147,8 +272,8 @@ where
     /// a dot not in the deferred set will cause the key to reappear after
     /// merge (add-wins).
     pub fn delete(&mut self, key: &K) {
-        if let Some((dots, _)) = self.entries.remove(key) {
-            for d in dots {
+        if let Some(dots) = self.entries.remove(key) {
+            for (d, _) in dots.0 {
                 self.deferred.insert(d);
             }
         }
@@ -156,23 +281,23 @@ where
 
     /// Get a reference to the value associated with a key.
     pub fn get(&self, key: &K) -> Option<&V> {
-        self.entries
-            .get(key)
-            .and_then(|(dots, reg)| if dots.is_empty() { None } else { reg.get() })
+        self.entries.get(key).and_then(|dots| {
+            dots.values()
+                .max_by(|a, b| (&a.timestamp, &a.value).cmp(&(&b.timestamp, &b.value)))
+                .map(|winner| &winner.value)
+        })
     }
 
     /// Check whether a key is present.
     pub fn contains_key(&self, key: &K) -> bool {
-        self.entries
-            .get(key)
-            .is_some_and(|(dots, _)| !dots.is_empty())
+        self.entries.get(key).is_some_and(|dots| !dots.is_empty())
     }
 
     /// Return all currently present keys.
     pub fn keys(&self) -> Vec<&K> {
         self.entries
             .iter()
-            .filter(|(_, (dots, _))| !dots.is_empty())
+            .filter(|(_, dots)| !dots.is_empty())
             .map(|(k, _)| k)
             .collect()
     }
@@ -187,7 +312,12 @@ where
     ///   removed, as are dots covered by the other's floor while absent
     ///   from the other's live set for the key (floor kill; sound only
     ///   under INV-W — a non-empty floor rides complete live sets only).
-    /// - LWW-Register values are merged by timestamp.
+    /// - Each surviving dot keeps its own immutable value. Call
+    ///   [`Self::validate_merge_compatible`] before merging externally
+    ///   supplied state: this infallible method assumes one key and one
+    ///   value/HLC assignment per live dot across both states. The
+    ///   `(timestamp, value)` tie break is only a deterministic fallback
+    ///   for direct callers that bypass the checked ingress.
     ///
     /// This ensures add-wins semantics: if node A deletes a key while node B
     /// concurrently sets it, the set wins because B's dot is not in A's
@@ -206,33 +336,42 @@ where
         // and nowhere else (see `OrSet::merge` for the full contract):
         // `changed == false` guarantees `pre == post` — the RR gate (M-6).
 
-        for (key, (other_dots, other_reg)) in &other.entries {
+        for (key, other_dots) in &other.entries {
             if let Some(entry) = self.entries.get_mut(key) {
-                // Key exists in both — merge dots and register in place.
+                // Key exists in both — merge dot/value assignments.
 
                 // Add dots from other that we haven't tombstoned and that
                 // are not stale under our pre-merge floor.
-                for dot in other_dots {
-                    if self.deferred.contains(dot) || entry.0.contains(dot) {
+                for (dot, other_value) in other_dots.iter() {
+                    if self.deferred.contains(dot) {
+                        continue;
+                    }
+                    if let Some(value) = entry.get_mut(dot) {
+                        if (&other_value.timestamp, &other_value.value)
+                            > (&value.timestamp, &value.value)
+                        {
+                            *value = other_value.clone();
+                            fx.changed = true;
+                        }
                         continue;
                     }
                     if covered(&floor_pre, &dot.node_id, dot.counter) {
                         fx.rejected_stale_live += 1;
                         continue;
                     }
-                    entry.0.insert(dot.clone());
+                    entry.insert(dot.clone(), other_value.clone());
                     fx.changed = true;
                 }
 
                 // Remove our dots that the other has tombstoned or
                 // floor-compacted away.
-                entry.0.retain(|dot| {
+                entry.retain(|dot, _| {
                     if other.deferred.contains(dot) {
                         fx.changed = true;
                         return false;
                     }
                     if covered(&other.compaction_floor, &dot.node_id, dot.counter)
-                        && !other_dots.contains(dot)
+                        && !other_dots.contains_key(dot)
                     {
                         fx.killed_by_floor += 1;
                         fx.changed = true;
@@ -240,21 +379,10 @@ where
                     }
                     true
                 });
-
-                // Merge LWW value.
-                if entry.1.merge(other_reg) {
-                    fx.changed = true;
-                }
             } else {
-                // Key only in other — filter the dots FIRST and adopt
-                // nothing (not even the register) when every dot is
-                // deferred/stale. The previous in-place formulation
-                // created an empty entry, merged the register into it and
-                // relied on the retain below to delete the entry again —
-                // a net no-op that a naive `changed` instrumentation
-                // would misreport as a change on every round.
-                let mut filtered: HashSet<Dot> = HashSet::new();
-                for dot in other_dots {
+                // Key only in other — adopt only dots that are not removed.
+                let mut filtered = DotValues::default();
+                for (dot, value) in other_dots.iter() {
                     if self.deferred.contains(dot) {
                         continue;
                     }
@@ -262,12 +390,10 @@ where
                         fx.rejected_stale_live += 1;
                         continue;
                     }
-                    filtered.insert(dot.clone());
+                    filtered.insert(dot.clone(), value.clone());
                 }
                 if !filtered.is_empty() {
-                    let mut reg = LwwRegister::new();
-                    reg.merge(other_reg);
-                    self.entries.insert(key.clone(), (filtered, reg));
+                    self.entries.insert(key.clone(), filtered);
                     fx.changed = true;
                 }
             }
@@ -275,9 +401,9 @@ where
 
         // Apply other's tombstones and floor to self-only entries (keys
         // not in other.entries — trivially absent from its live set).
-        for (key, (dots, _)) in &mut self.entries {
+        for (key, dots) in &mut self.entries {
             if !other.entries.contains_key(key) {
-                dots.retain(|dot| {
+                dots.retain(|dot, _| {
                     if other.deferred.contains(dot) {
                         fx.changed = true;
                         return false;
@@ -295,7 +421,7 @@ where
         // Remove entries with no remaining dots. (Not a `changed` site:
         // an entry can only become empty through a dot-dropping retain
         // above, which already flagged.)
-        self.entries.retain(|_, (dots, _)| !dots.is_empty());
+        self.entries.retain(|_, dots| !dots.is_empty());
 
         // Merge counters (take max). Only an actual raise mutates state;
         // no ghost zero entries (see OrSet::merge).
@@ -391,8 +517,8 @@ where
 
     /// Extract changes since the given frontier timestamp.
     ///
-    /// OrMap entries carry LWW-Register timestamps, so this method returns
-    /// only entries whose register timestamp is strictly greater than
+    /// OrMap entries carry per-dot timestamps, so this method returns
+    /// only keys with a live dot timestamp strictly greater than
     /// `frontier`, along with any tombstones. Returns `None` when there
     /// are no entries or tombstones newer than the frontier.
     ///
@@ -412,11 +538,9 @@ where
         };
         let mut has_entries = false;
 
-        for (key, (dots, reg)) in &self.entries {
-            if !dots.is_empty() && *reg.timestamp() > *frontier {
-                delta
-                    .entries
-                    .insert(key.clone(), (dots.clone(), reg.clone()));
+        for (key, dots) in &self.entries {
+            if dots.values().any(|value| value.timestamp > *frontier) {
+                delta.entries.insert(key.clone(), dots.clone());
                 has_entries = true;
             }
         }
@@ -427,22 +551,36 @@ where
         Some(delta)
     }
 
-    /// Compute a true incremental delta against a known old state.
+    /// Compute a delta against a known old state.
     ///
-    /// Returns an OrMap containing only:
-    /// - Entries whose dots are NOT present in `old`
-    /// - Entries whose LWW-Register has a newer timestamp than in `old`
+    /// Ordinarily returns an OrMap containing only:
+    /// - Entries with a new dot or a changed same-dot assignment
     /// - Deferred (tombstone) dots NOT present in `old`
     /// - Updated counters
     ///
     /// The `compaction_floor` is deliberately EMPTY (INV-W): partial
     /// payloads never carry the floor (see [`delta_since`](Self::delta_since)).
+    /// If the floor changed, or a formerly live dot disappeared without a
+    /// tombstone, return a full state instead: a receiver needs the complete
+    /// live set to distinguish removed dots from live dots below the floor.
     ///
     /// Returns `None` if there are no changes.
     pub fn delta_from(&self, old: &OrMap<K, V>) -> Option<Self>
     where
         V: PartialEq,
     {
+        let unrepresented_removal = old.entries.iter().any(|(key, dots)| {
+            dots.keys().any(|dot| {
+                !self
+                    .entries
+                    .get(key)
+                    .is_some_and(|live| live.contains_key(dot))
+                    && !self.deferred.contains(dot)
+            })
+        });
+        if self.compaction_floor != old.compaction_floor || unrepresented_removal {
+            return Some(self.clone());
+        }
         let mut delta = OrMap {
             entries: HashMap::new(),
             counters: HashMap::new(),
@@ -453,29 +591,17 @@ where
         let mut has_changes = false;
 
         // Collect all dots in old state for comparison.
-        let old_all_dots: HashSet<&Dot> = old
-            .entries
-            .values()
-            .flat_map(|(dots, _)| dots.iter())
-            .collect();
+        let old_all_dots: HashSet<&Dot> =
+            old.entries.values().flat_map(|dots| dots.keys()).collect();
 
-        for (key, (dots, reg)) in &self.entries {
-            // Check if this entry has new dots or a newer register value.
-            let new_dots: HashSet<Dot> = dots
-                .iter()
-                .filter(|d| !old_all_dots.contains(d))
-                .cloned()
-                .collect();
+        for (key, dots) in &self.entries {
+            let changed = dots.iter().any(|(dot, value)| {
+                !old_all_dots.contains(dot)
+                    || old.entries.get(key).and_then(|entries| entries.get(dot)) != Some(value)
+            });
 
-            let reg_changed = match old.entries.get(key) {
-                Some((_, old_reg)) => *reg.timestamp() > *old_reg.timestamp(),
-                None => true,
-            };
-
-            if !new_dots.is_empty() || reg_changed {
-                delta
-                    .entries
-                    .insert(key.clone(), (dots.clone(), reg.clone()));
+            if changed {
+                delta.entries.insert(key.clone(), dots.clone());
                 has_changes = true;
             }
         }
@@ -495,6 +621,23 @@ where
                 delta.counters.insert(node_id.clone(), counter);
                 has_changes = true;
             }
+        }
+
+        // Changed keys carry their complete live dot set. The delta is
+        // decoded on its own, so include counters for older dots in those
+        // keys and for newly transmitted tombstones as well.
+        for dot in delta
+            .entries
+            .values()
+            .flat_map(|dots| dots.keys())
+            .chain(delta.deferred.iter())
+        {
+            let counter = self
+                .counters
+                .get(&dot.node_id)
+                .copied()
+                .expect("valid OR-Map has a counter for every dot");
+            delta.counters.entry(dot.node_id.clone()).or_insert(counter);
         }
 
         if has_changes { Some(delta) } else { None }
@@ -522,8 +665,8 @@ where
     }
 
     /// The per-node add counters (highest dot counter ever allocated per
-    /// writer). The tombstone-GC mark phase snapshots these as the Stage 2
-    /// hole-jump ceilings (see [`Self::compact_deferred_certified`]).
+    /// writer). The tombstone-GC mark phase snapshots these for the
+    /// internal Stage 2 boundary tests.
     pub fn counters(&self) -> &HashMap<NodeId, u64> {
         &self.counters
     }
@@ -546,19 +689,28 @@ where
     /// tombstones the floor now covers (candidates only).
     ///
     /// See [`OrSet::compact_deferred_certified`] for the full walk
-    /// semantics, gating requirements, hole-jump precondition and
-    /// origin-retention argument.
+    /// semantics, gating requirements, and origin-retention argument.
     ///
     /// [`OrSet::compact_deferred_certified`]: crate::crdt::or_set::OrSet::compact_deferred_certified
     pub fn compact_deferred_certified(
         &mut self,
         candidates: &HashSet<(NodeId, u64)>,
+    ) -> SweepOutcome {
+        self.compact_deferred_with_bounds(candidates, None, None)
+    }
+
+    /// Internal walk used by saved-mark GC and Stage 2 boundary tests.
+    /// A mark cap never enables hole jumping on its own.
+    pub(in crate::crdt) fn compact_deferred_with_bounds(
+        &mut self,
+        candidates: &HashSet<(NodeId, u64)>,
+        mark_counter_caps: Option<&HashMap<NodeId, u64>>,
         hole_jump_ceilings: Option<&HashMap<NodeId, u64>>,
     ) -> SweepOutcome {
         let live_dots: HashSet<(&NodeId, u64)> = self
             .entries
             .values()
-            .flat_map(|(dots, _)| dots.iter())
+            .flat_map(|dots| dots.keys())
             .map(|d| (&d.node_id, d.counter))
             .collect();
         let deferred_dots: HashSet<(&NodeId, u64)> = self
@@ -573,6 +725,7 @@ where
             &self.counters,
             &mut self.compaction_floor,
             candidates,
+            mark_counter_caps,
             hole_jump_ceilings,
         );
 
@@ -591,7 +744,7 @@ where
     pub fn len(&self) -> usize {
         self.entries
             .iter()
-            .filter(|(_, (dots, _))| !dots.is_empty())
+            .filter(|(_, dots)| !dots.is_empty())
             .count()
     }
 
@@ -606,7 +759,7 @@ impl OrMap<String, String> {
     /// (digest-based anti-entropy, scheme v2).
     ///
     /// Stream: `0x04` ‖ live entries (key byte order), each as
-    /// `str(key)` ‖ dots (dot order) ‖ LWW-register canonical stream ‖
+    /// `str(key)` ‖ live `(dot, value, HLC)` records in dot order ‖
     /// counters (node-id order) ‖ compaction floor (node-id order) ‖
     /// UNCOVERED deferred dots (dot order). Entries whose dot set is
     /// empty are skipped (normalisation: semantically equal to absent
@@ -623,25 +776,36 @@ impl OrMap<String, String> {
     /// for new key/value types in `CrdtValue` requires defining their
     /// canonical byte encoding here, plus a scheme version bump.
     pub(crate) fn digest_into(&self, hasher: &mut sha2::Sha256) {
-        use crate::crdt::digest::{write_counters, write_dots, write_str, write_u32};
+        use crate::crdt::digest::{
+            write_counters, write_dots, write_hlc, write_str, write_u32, write_u64,
+        };
         use sha2::Digest as _;
 
         hasher.update([0x04]);
-        type MapEntryRef<'a> = (&'a String, &'a (HashSet<Dot>, LwwRegister<String>));
+        type MapEntryRef<'a> = (&'a String, &'a DotValues<String>);
         let mut items: Vec<MapEntryRef<'_>> = self
             .entries
             .iter()
-            .filter(|(_, (dots, _))| !dots.is_empty())
+            .filter(|(_, dots)| !dots.is_empty())
             .collect();
         items.sort_unstable_by(|a, b| a.0.cmp(b.0));
         write_u32(hasher, items.len() as u32);
-        for (key, (dots, reg)) in items {
+        for (key, dots) in items {
             write_str(hasher, key);
-            write_dots(
-                hasher,
-                dots.iter().map(|d| (d.node_id.0.as_str(), d.counter)),
-            );
-            reg.digest_into(hasher);
+            let mut ordered: Vec<_> = dots.iter().collect();
+            ordered.sort_unstable_by(|a, b| {
+                a.0.node_id
+                    .0
+                    .cmp(&b.0.node_id.0)
+                    .then_with(|| a.0.counter.cmp(&b.0.counter))
+            });
+            write_u32(hasher, ordered.len() as u32);
+            for (dot, assignment) in ordered {
+                write_str(hasher, &dot.node_id.0);
+                write_u64(hasher, dot.counter);
+                write_str(hasher, &assignment.value);
+                write_hlc(hasher, &assignment.timestamp);
+            }
         }
         write_counters(hasher, &self.counters);
         write_counters(hasher, &self.compaction_floor);
@@ -679,6 +843,162 @@ mod tests {
 
     fn node(id: &str) -> NodeId {
         NodeId(id.into())
+    }
+
+    #[test]
+    fn merge_preflight_rejects_cross_state_dot_assignment_conflicts() {
+        let mut original = OrMap::new();
+        original.set(
+            "first".to_string(),
+            "one".to_string(),
+            ts(10, 0, "A"),
+            &node("A"),
+        );
+
+        let mut different_key = OrMap::new();
+        different_key.set(
+            "second".to_string(),
+            "one".to_string(),
+            ts(10, 0, "A"),
+            &node("A"),
+        );
+        assert_eq!(
+            original.validate_merge_compatible(&different_key),
+            Err(OrMapMergeConflict::DifferentKey)
+        );
+
+        let mut different_value = OrMap::new();
+        different_value.set(
+            "first".to_string(),
+            "two".to_string(),
+            ts(10, 0, "A"),
+            &node("A"),
+        );
+        assert_eq!(
+            original.validate_merge_compatible(&different_value),
+            Err(OrMapMergeConflict::DifferentValue)
+        );
+
+        let mut different_timestamp = OrMap::new();
+        different_timestamp.set(
+            "first".to_string(),
+            "one".to_string(),
+            ts(11, 0, "A"),
+            &node("A"),
+        );
+        assert_eq!(
+            original.validate_merge_compatible(&different_timestamp),
+            Err(OrMapMergeConflict::DifferentValue)
+        );
+        assert_eq!(original.validate_merge_compatible(&original), Ok(()));
+    }
+
+    fn assert_decode_rejected(map: &OrMap<String, i32>) {
+        let json = serde_json::to_vec(map).unwrap();
+        assert!(serde_json::from_slice::<OrMap<String, i32>>(&json).is_err());
+
+        let binary = bincode::serde::encode_to_vec(map, bincode::config::standard()).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<OrMap<String, i32>, _>(
+                &binary,
+                bincode::config::standard(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_dot_live_and_removed() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(1, 0, "A"), &node("A"));
+        let dot = map.entries["a"].keys().next().unwrap().clone();
+        map.deferred.insert(dot);
+        assert_decode_rejected(&map);
+    }
+
+    #[test]
+    fn deserialize_rejects_dot_live_under_multiple_keys() {
+        let mut map = OrMap::new();
+        map.set("a".to_string(), 1, ts(1, 0, "A"), &node("A"));
+        map.entries
+            .insert("b".to_string(), map.entries["a"].clone());
+        assert_decode_rejected(&map);
+    }
+
+    #[test]
+    fn deserialize_rejects_counters_below_retained_dots_or_floor() {
+        let mut live = OrMap::new();
+        live.set("a".to_string(), 1, ts(1, 0, "A"), &node("A"));
+        live.counters.insert(node("A"), 0);
+        assert_decode_rejected(&live);
+
+        let mut removed = OrMap::new();
+        removed.set("a".to_string(), 1, ts(1, 0, "A"), &node("A"));
+        removed.delete(&"a".to_string());
+        removed.counters.remove(&node("A"));
+        assert_decode_rejected(&removed);
+
+        let mut floored: OrMap<String, i32> = OrMap::new();
+        floored.compaction_floor.insert(node("A"), 1);
+        assert_decode_rejected(&floored);
+    }
+
+    #[test]
+    fn deserialize_rejects_zero_counter_dots() {
+        let dot = Dot {
+            node_id: node("A"),
+            counter: 0,
+        };
+        let mut live: OrMap<String, i32> = OrMap::new();
+        live.entries.insert(
+            "a".into(),
+            DotValues(HashMap::from([(
+                dot.clone(),
+                DotValue {
+                    value: 1,
+                    timestamp: ts(1, 0, "A"),
+                },
+            )])),
+        );
+        live.counters.insert(node("A"), 0);
+        assert_decode_rejected(&live);
+
+        let mut removed: OrMap<String, i32> = OrMap::new();
+        removed.deferred.insert(dot);
+        removed.counters.insert(node("A"), 0);
+        assert_decode_rejected(&removed);
+    }
+
+    #[test]
+    fn deserialize_accepts_live_dot_below_floor() {
+        let mut map = OrMap::new();
+        map.set("live".to_string(), 1, ts(1, 0, "A"), &node("A"));
+        map.compaction_floor.insert(node("A"), 1);
+
+        let json = serde_json::to_vec(&map).unwrap();
+        let restored: OrMap<String, i32> = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored, map);
+
+        let binary = bincode::serde::encode_to_vec(&map, bincode::config::standard()).unwrap();
+        let (restored, _): (OrMap<String, i32>, usize) =
+            bincode::serde::decode_from_slice(&binary, bincode::config::standard()).unwrap();
+        assert_eq!(restored, map);
+    }
+
+    #[test]
+    fn exhausted_counter_cannot_reuse_a_dot_on_another_key() {
+        let writer = node("writer");
+        let mut map = OrMap::new();
+        assert!(map.set("old".to_string(), 1, ts(1, 0, "writer"), &writer));
+        map.counters.insert(writer.clone(), u64::MAX);
+        let before = map.clone();
+        assert_eq!(
+            map.try_set("new".to_string(), 2, ts(2, 0, "writer"), &writer),
+            Err(DotCounterExhausted)
+        );
+        assert_eq!(map, before);
+        assert_eq!(map.get(&"old".to_string()), Some(&1));
+        assert_eq!(map.get(&"new".to_string()), None);
     }
 
     #[test]
@@ -969,9 +1289,9 @@ mod tests {
     }
 
     #[test]
-    fn set_after_merge_with_higher_timestamp_is_noop() {
-        // Regression test for #126: after merging a higher-timestamp value,
-        // a local set with a lower timestamp should be a no-op.
+    fn set_after_merge_with_higher_timestamp_records_new_dot() {
+        // A local set creates a new dot even if its HLC is lower; the
+        // already live higher-HLC dot remains the visible winner.
         let mut map_a = OrMap::new();
         map_a.set(
             "k".to_string(),
@@ -988,19 +1308,20 @@ mod tests {
             &node("node-b"),
         );
 
-        // A merges B: register now holds value_b (ts=200).
+        // A merges B: the higher-HLC live dot wins.
         map_a.merge(&map_b);
         assert_eq!(map_a.get(&"k".to_string()), Some(&"value_b".to_string()));
 
-        // A tries to set with ts=150 (stale). Should be rejected.
+        // A writes at ts=150, retaining the earlier live dots.
         let updated = map_a.set(
             "k".to_string(),
             "value_c".to_string(),
             ts(150, 0, "node-a"),
             &node("node-a"),
         );
-        assert!(!updated, "set with stale timestamp should return false");
+        assert!(updated);
         assert_eq!(map_a.get(&"k".to_string()), Some(&"value_b".to_string()));
+        assert_eq!(map_a.entries["k"].len(), 3);
     }
 
     #[test]
@@ -1012,13 +1333,50 @@ mod tests {
     }
 
     #[test]
-    fn set_with_equal_timestamp_is_noop() {
+    fn set_with_equal_timestamp_uses_value_tiebreak() {
         let mut map = OrMap::new();
         map.set("k".to_string(), 1, ts(100, 0, "node-a"), &node("node-a"));
 
         let updated = map.set("k".to_string(), 2, ts(100, 0, "node-a"), &node("node-a"));
-        assert!(!updated);
-        assert_eq!(map.get(&"k".to_string()), Some(&1));
+        assert!(updated);
+        assert_eq!(map.get(&"k".to_string()), Some(&2));
+        assert_eq!(map.entries["k"].len(), 2);
+    }
+
+    #[test]
+    fn removed_higher_value_never_wins_over_concurrent_live_dot() {
+        let key = "k".to_string();
+        let mut first = OrMap::new();
+        first.set(key.clone(), 100, ts(100, 0, "A"), &node("A"));
+        let mut concurrent = OrMap::new();
+        concurrent.set(key.clone(), 50, ts(50, 0, "B"), &node("B"));
+
+        // B learned the higher value before it learned A's deletion.
+        concurrent.merge(&first);
+        assert_eq!(concurrent.get(&key), Some(&100));
+        let mut deleted = first;
+        deleted.delete(&key);
+        concurrent.merge(&deleted);
+        assert_eq!(concurrent.get(&key), Some(&50));
+
+        let mut opposite = deleted;
+        opposite.merge(&concurrent);
+        assert_eq!(opposite.get(&key), Some(&50));
+    }
+
+    #[test]
+    fn delete_removes_every_observed_write_dot() {
+        let key = "k".to_string();
+        let mut map = OrMap::new();
+        map.set(key.clone(), 1, ts(100, 0, "A"), &node("A"));
+        map.set(key.clone(), 2, ts(200, 0, "A"), &node("A"));
+        let before_delete = map.clone();
+        assert_eq!(map.entries["k"].len(), 2);
+
+        map.delete(&key);
+        assert_eq!(map.deferred_len(), 2);
+        map.merge(&before_delete);
+        assert_eq!(map.get(&key), None);
     }
 
     #[test]
@@ -1123,6 +1481,29 @@ mod tests {
     }
 
     #[test]
+    fn delta_from_keeps_wire_counter_context_for_live_and_removed_dots() {
+        let mut current = OrMap::new();
+        current.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
+        let old = current.clone();
+
+        current.set("a".to_string(), 2, ts(200, 0, "B"), &node("B"));
+        let delta = current.delta_from(&old).unwrap();
+        let bytes = serde_json::to_vec(&delta).unwrap();
+        let received: OrMap<String, i32> = serde_json::from_slice(&bytes).unwrap();
+        let mut merged = old.clone();
+        merged.merge(&received);
+        assert_eq!(merged.get(&"a".to_string()), current.get(&"a".to_string()));
+
+        current.delete(&"a".to_string());
+        let delta = current.delta_from(&old).unwrap();
+        let bytes = serde_json::to_vec(&delta).unwrap();
+        let received: OrMap<String, i32> = serde_json::from_slice(&bytes).unwrap();
+        let mut merged = old;
+        merged.merge(&received);
+        assert!(!merged.contains_key(&"a".to_string()));
+    }
+
+    #[test]
     fn delta_round_trip_add_produces_same_result() {
         let mut map = OrMap::new();
         map.set("a".to_string(), 1, ts(100, 0, "A"), &node("A"));
@@ -1221,7 +1602,7 @@ mod tests {
         map_a.delete(&"k".to_string()); // tombstone (A,1)
         let map_b = map_a.clone();
 
-        let swept = map_a.compact_deferred_certified(&map_a.deferred_dots(), None);
+        let swept = map_a.compact_deferred_certified(&map_a.deferred_dots());
         assert_eq!(swept.collected, 1);
         assert_eq!(map_a.deferred_len(), 0);
         assert_eq!(map_a.compaction_floor().get(&n), Some(&1));
@@ -1246,7 +1627,7 @@ mod tests {
         let mut map_b = map_a.clone(); // B holds (A,1) live
 
         map_a.delete(&"k".to_string());
-        map_a.compact_deferred_certified(&map_a.deferred_dots(), None);
+        map_a.compact_deferred_certified(&map_a.deferred_dots());
         assert_eq!(map_a.deferred_len(), 0, "tombstone gone — only the floor");
 
         // B <- A (complete state with floor): B's live dot is killed.
@@ -1268,7 +1649,7 @@ mod tests {
         let mut map = OrMap::new();
         map.set("k".to_string(), 1, ts(100, 0, "A"), &n);
         map.delete(&"k".to_string());
-        map.compact_deferred_certified(&map.deferred_dots(), None);
+        map.compact_deferred_certified(&map.deferred_dots());
         assert_eq!(map.compaction_floor().get(&n), Some(&1));
 
         assert!(map.set("k".to_string(), 2, ts(200, 0, "A"), &n));
@@ -1293,7 +1674,7 @@ mod tests {
         // Sender advances its floor past (A,1) — "old" stays live.
         sender.set("gone".to_string(), 2, ts(150, 0, "A"), &n); // dot (A,2)
         sender.delete(&"gone".to_string());
-        sender.compact_deferred_certified(&sender.deferred_dots(), None);
+        sender.compact_deferred_certified(&sender.deferred_dots());
         assert_eq!(sender.compaction_floor().get(&n), Some(&2));
 
         // New entry only — the delta excludes "old" (ts 100 <= frontier 200).
@@ -1321,7 +1702,7 @@ mod tests {
         let mut map = OrMap::new();
         map.set("a".to_string(), 1, ts(100, 0, "A"), &n);
         map.delete(&"a".to_string());
-        map.compact_deferred_certified(&map.deferred_dots(), None);
+        map.compact_deferred_certified(&map.deferred_dots());
         let old = map.clone();
 
         map.set("b".to_string(), 2, ts(200, 0, "A"), &n);
@@ -1329,14 +1710,67 @@ mod tests {
         assert!(delta.compaction_floor.is_empty(), "INV-W");
     }
 
-    /// Old serialized format without `compaction_floor` still loads
-    /// (mixed-version JSON compatibility).
     #[test]
-    fn serde_backward_compat_missing_floor() {
-        let json = r#"{"entries":{"k":[[{"node_id":"A","counter":1}],{"value":"v","timestamp":{"physical":100,"logical":0,"node_id":"A"}}]},"counters":{"A":1},"deferred":[]}"#;
-        let map: OrMap<String, String> = serde_json::from_str(json).unwrap();
-        assert!(map.contains_key(&"k".to_string()));
-        assert!(map.compaction_floor().is_empty());
+    fn delta_from_floor_advance_sends_complete_live_set() {
+        let n = node("A");
+        let mut sender = OrMap::new();
+        sender.set("kept".to_string(), 1, ts(100, 0, "A"), &n);
+        sender.set("removed".to_string(), 2, ts(101, 0, "A"), &n);
+        let old = sender.clone();
+
+        sender.delete(&"removed".to_string());
+        sender.compact_deferred_certified(&sender.deferred_dots());
+        assert_eq!(sender.compaction_floor().get(&n), Some(&2));
+        assert_eq!(sender.deferred_len(), 0);
+
+        let delta = sender.delta_from(&old).expect("floor advance must be sent");
+        assert_eq!(delta.compaction_floor(), sender.compaction_floor());
+        let mut receiver = old;
+        receiver.merge_delta(&delta);
+        assert_eq!(receiver.get(&"kept".to_string()), Some(&1));
+        assert!(!receiver.contains_key(&"removed".to_string()));
+    }
+
+    #[test]
+    fn delta_from_detects_removal_of_live_dot_under_unchanged_floor() {
+        let n = node("A");
+        let mut sender = OrMap::new();
+        sender.set("kept".to_string(), 1, ts(100, 0, "A"), &n);
+        sender.set("already_removed".to_string(), 2, ts(101, 0, "A"), &n);
+        sender.delete(&"already_removed".to_string());
+        sender.compact_deferred_certified(&sender.deferred_dots());
+        assert_eq!(sender.compaction_floor().get(&n), Some(&2));
+        let old = sender.clone();
+
+        sender.delete(&"kept".to_string());
+        sender.compact_deferred_certified(&sender.deferred_dots());
+        assert_eq!(sender.compaction_floor(), old.compaction_floor());
+        assert_eq!(sender.deferred_len(), 0);
+
+        let delta = sender
+            .delta_from(&old)
+            .expect("covered live removal must be sent");
+        assert_eq!(delta.compaction_floor(), sender.compaction_floor());
+        let mut receiver = old;
+        receiver.merge_delta(&delta);
+        assert!(!receiver.contains_key(&"kept".to_string()));
+    }
+
+    /// The optional floor defaults to empty when omitted from JSON.
+    #[test]
+    fn serde_missing_floor_defaults_empty() {
+        let mut map = OrMap::new();
+        map.set(
+            "k".to_string(),
+            "v".to_string(),
+            ts(100, 0, "A"),
+            &node("A"),
+        );
+        let mut json = serde_json::to_value(&map).unwrap();
+        json.as_object_mut().unwrap().remove("compaction_floor");
+        let restored: OrMap<String, String> = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.get(&"k".to_string()), Some(&"v".to_string()));
+        assert!(restored.compaction_floor().is_empty());
     }
 
     /// The sweep stalls on tombstones outside the candidate set and on
@@ -1351,7 +1785,7 @@ mod tests {
         map.set("k2".to_string(), 2, ts(200, 0, "A"), &n); // dot (A,2)
         map.delete(&"k2".to_string()); // post-mark tombstone
 
-        let outcome = map.compact_deferred_certified(&marked, None);
+        let outcome = map.compact_deferred_certified(&marked);
         assert_eq!(outcome.collected, 1, "only the marked dot is collected");
         assert_eq!(outcome.stalled_uncandidated, 1);
         assert_eq!(map.deferred_len(), 1, "post-mark tombstone survives");
@@ -1399,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_changed_register_timestamp_directions() {
+    fn merge_changed_dot_value_timestamp_directions() {
         let n = node("A");
         let mut a = OrMap::new();
         a.set("k".to_string(), "old".to_string(), ts(100, 0, "A"), &n);
@@ -1411,12 +1845,12 @@ mod tests {
             &node("B"),
         );
 
-        // Newer register on b: changed (dot + register both advance).
+        // B's newer live dot wins after merge.
         let fx = merge_ground_truth(&mut a, &newer);
         assert!(fx.changed);
         assert_eq!(a.get(&"k".to_string()), Some(&"new".to_string()));
 
-        // Older register re-offered: the stale dot is still adopted (it
+        // Older value re-offered: the dot is still adopted (it
         // is a distinct live dot) — but repeating the SAME merge again
         // must be a no-op.
         let mut older = OrMap::new();
@@ -1451,7 +1885,7 @@ mod tests {
         swept.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         let mut lagging = swept.clone();
         swept.delete(&"k".to_string());
-        swept.compact_deferred_certified(&swept.deferred_dots(), None);
+        swept.compact_deferred_certified(&swept.deferred_dots());
         let fx = merge_ground_truth(&mut lagging, &swept);
         assert!(fx.changed, "a floor kill must report changed");
         assert_eq!(fx.killed_by_floor, 1);
@@ -1464,7 +1898,7 @@ mod tests {
         a.set("k".to_string(), "v".to_string(), ts(100, 0, "A"), &n);
         a.delete(&"k".to_string());
         let pre_sweep = a.clone(); // holds tombstone (A,1)
-        a.compact_deferred_certified(&a.deferred_dots(), None);
+        a.compact_deferred_certified(&a.deferred_dots());
 
         // Covered deferred re-offer: rejected, no state change.
         let fx = merge_ground_truth(&mut a, &pre_sweep);
@@ -1478,11 +1912,9 @@ mod tests {
     /// Regression pin for the other-only-key refactor: a key that exists
     /// only on the other side but whose dots are ALL stale (deferred or
     /// floor-covered) must be a full no-op — no entry created, no
-    /// register adopted, `changed == false`. The previous formulation
-    /// created an empty entry (or_insert_with), merged the register into
-    /// it and deleted the entry again in the retain — a net no-op that a
-    /// naive instrumentation would misreport as a change on EVERY round
-    /// (permanent ping-pong for lagging-peer re-offers).
+    /// value adopted, `changed == false`. A rejected re-offer must not
+    /// create a transient empty entry, since that would make the RR gate
+    /// report a change on every round.
     #[test]
     fn or_map_other_only_key_all_dots_stale_is_noop() {
         let n = node("A");
@@ -1502,7 +1934,7 @@ mod tests {
         // Case 2: all dots floor-covered (certified-removed re-offer).
         let mut b = sender.clone();
         b.delete(&"k".to_string());
-        b.compact_deferred_certified(&b.deferred_dots(), None);
+        b.compact_deferred_certified(&b.deferred_dots());
         assert_eq!(b.deferred_len(), 0, "tombstone folded into the floor");
         let fx = merge_ground_truth(&mut b, &sender);
         assert_eq!(fx.rejected_stale_live, 1);

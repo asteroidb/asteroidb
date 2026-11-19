@@ -176,6 +176,20 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_AUTHORITY_NODES` | いいえ | `auth-1,auth-2,auth-3` | Authority ノード ID（カンマ区切り） |
 | `ASTEROIDB_DATA_DIR` | いいえ | `./data` | データ永続化ディレクトリ |
 | `ASTEROIDB_INTERNAL_TOKEN` | いいえ | なし | 内部 API 認証用 Bearer トークン |
+| `ASTEROIDB_WRITER_KEYS` | いいえ | なし | 操作受信を有効化する writer 公開鍵と namespace 許可の JSON 配列。設定時は内部 token、操作 namespace、固定隣接先 manifest が必須。操作モードでは旧 eventual/certified の公開書き込みは `409` で拒否する |
+| `ASTEROIDB_OPERATION_NAMESPACE_ID` | 条件付き | なし | 操作受信を許す単一 namespace。`ASTEROIDB_WRITER_KEYS` を設定した場合に必須 |
+| `ASTEROIDB_OPERATION_CREATION_POLICY` | 条件付き | なし | 操作の作成時モードを検証する不変 JSON manifest。`ASTEROIDB_WRITER_KEYS` 設定時に必須。Create の CLI 署名にも同じ manifest を渡す |
+| `ASTEROIDB_OPERATION_NEIGHBORS` | 条件付き | なし | 操作配送の固定隣接先 JSON 配列。`key_prefixes` は全 namespace に適用し、任意の `scoped_key_prefixes:[{"namespace_id":"orders","key_prefix":"item/"}]` は指定 namespace だけに適用する。`ASTEROIDB_WRITER_KEYS` を設定した場合に必須。末端ノードは `[]` |
+| `ASTEROIDB_OPERATION_ROUTE_EDGES` | 任意・3変数同時 | なし | 許可隣接辺 JSON 配列。各辺の任意の `namespace_id` で適用先を絞れる。routed custody を有効にする場合に必須 |
+| `ASTEROIDB_OPERATION_ROUTES` | 任意・3変数同時 | なし | 宛先・namespace・key prefix ごとの経路と減少 rank。行の `namespace_id` 省略時は全 namespace に適用 |
+| `ASTEROIDB_OPERATION_REQUIRED_DESTINATIONS` | 任意・3変数同時 | なし | namespace・key prefix ごとに初回提出が必要とする最終 NodeId の配列。行の `namespace_id` 省略時は全 namespace に適用 |
+| `ASTEROIDB_OPERATION_LINK_SEED` | routed 時に必須 | なし | 操作隣接リンク専用 Ed25519 秘密 seed（32 バイト hex）。Authority 鍵とは別にする |
+| `ASTEROIDB_OPERATION_LINK_KEYS` | routed 時に必須 | なし | 隣接 NodeId と固定 Ed25519 公開鍵（32 バイト hex）の JSON 配列。`NEIGHBORS` と完全一致させる |
+| `ASTEROIDB_OPERATION_OWNED_PREFIXES` | 条件付き | なし | このノードのアプリ読み取りに適用する担当範囲の JSON 配列。文字列は全 namespace に適用し、`{"namespace_id":"orders","key_prefix":"item/"}` はその namespace だけに適用する。`ASTEROIDB_WRITER_KEYS` 設定時に必須。中継専用は `[]`、全キー担当は `[""]` |
+| `ASTEROIDB_OPERATION_CERT_SCOPE_PREFIX` | いいえ | なし | 静的な操作証明書受信を有効化するキー prefix。設定時は同 prefix の certified 配置ポリシー、Authority 定義、その Authority ID に対応する公開鍵、`ASTEROIDB_OPERATION_CERT_FAULTS` が必要 |
+| `ASTEROIDB_OPERATION_CERT_FAULTS` | 条件付き | なし | 操作証明書で許容する Authority 故障数。静的な証明書受信を有効化した場合に必須 |
+| `ASTEROIDB_OPERATION_CERT_SCOPES` | いいえ | なし | 証明書 scope を指定する JSON 配列。例: `[{"key_prefix":"orders/","faults":1},{"namespace_id":"other-ns","key_prefix":"orders/","faults":0}]`。`namespace_id` 省略時は `ASTEROIDB_OPERATION_NAMESPACE_ID` を使う。同じ namespace と prefix の重複は不可。キーには最長一致する prefix の Authority 定義と配置ポリシーを適用する。上の単一 scope 用 2 変数とは併用不可 |
+| `ASTEROIDB_OPERATION_ASSIGNMENTS` | いいえ | なし | 操作用の namespace 別 Authority・配置設定を指定する JSON 配列。各項目は `namespace_id`、`policy`（`PlacementPolicy`）、`authority`（`AuthorityDefinition`）を持ち、両者の key prefix を一致させる。同じ namespace と prefix の重複は不可。未指定 scope は従来の prefix 設定を使う |
 | `ASTEROIDB_BLS_SEED` | いいえ | なし | 署名鍵生成用 hex シード（32 バイト）。Ed25519 署名鍵と（`native-crypto` ビルドでは）BLS 鍵ペアの両方をこのシードから導出し、frontier 報告への署名（FR-008）を有効化する。`native-crypto` 無効ビルドでは Ed25519 のみで署名する |
 | `ASTEROIDB_AUTHORITY_KEYS` | いいえ | なし | ピア Authority の公開鍵（`<node-id>=<ed25519 hex 64 文字>[/<bls hex 96 文字>/<pop hex 192 文字>]` をカンマ区切り）。ピアの署名付き frontier を検証するために必須。第 3 セグメントは BLS 鍵の **Proof-of-Possession（PoP）**——公開鍵そのものへの署名で秘密鍵の所有を証明し、BLS 集約検証に対する rogue-key 攻撃を防ぐ（draft-irtf-cfrg-bls-signature §3.3）。各ノードは起動ログに自身の配布用エントリ（`Authority key entry for ASTEROIDB_AUTHORITY_KEYS distribution: <node-id>=<ed>/<bls>/<pop>`）を出力するので、そこから PoP 付きのエントリをコピーする。BLS 部を省略したピア、または PoP を欠く 2 セグメント旧形式（`<ed>/<bls>`）は BLS レーンが破棄され Ed25519 のみで検証される（degrade、下記のローリングアップグレード手順を参照）。PoP の検証に失敗したエントリは（lenient モードでは）警告付きでスキップされる。`ASTEROIDB_BLS_SEED` 未設定でも本変数のみで検証専用のキーセットレジストリが構築される |
 | `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS` | いいえ | `false` | `1`/`true` で無署名 frontier 報告の受理を拒否（strict モード）。**全ノードへの鍵配布（`ASTEROIDB_AUTHORITY_KEYS`）完了後に有効化する運用切替**。署名付きで検証に失敗した報告はこの設定に関わらず常に拒否される。strict モードでは加えて `ASTEROIDB_AUTHORITY_KEYS` に PoP 無し／不正な PoP を持つ BLS 鍵エントリがあると起動時にエラー終了する（`native-crypto` 無効ビルドは PoP を暗号検証できないため hex 長などの構文検査のみを行う）。キーセットレジストリを構築できない構成（`ASTEROIDB_BLS_SEED` と `ASTEROIDB_AUTHORITY_KEYS` の両方が未設定）で有効化した場合も、ノードは起動時にエラー終了する |
@@ -183,8 +197,71 @@ RUST_LOG=asteroidb_poc=info \
 | `ASTEROIDB_DIGEST_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で digest 段階 diff 同期（フルシンク前のキー範囲 digest 比較）を無効化し、従来のフルシンクのみのフォールバック動作へ切り戻す（ops キルスイッチ。3.6 を参照） |
 | `ASTEROIDB_CERTIFIED_SYNC_DISABLED` | いいえ | `false` | `1`/`true` で certified replication レーン（P0-1、同期 tick ごとの certified pull）を無効化し、レーン導入前の挙動へ切り戻す。pull は**一切発行されない**（結果を捨てるのではなくリクエスト自体を出さない）。有効化中は certified write がそれを受理したノードの喪失で失われうる（ops キルスイッチ、要再起動。4.5 を参照） |
 | `ASTEROIDB_FRONTIER_STORE_DIGEST` | いいえ | `true` | `0`/`false` で frontier 報告の `digest_hash` を M-12 以前のプレースホルダ形式（`{node}-{physical}-{logical}`）へ切り戻す（ops キルスイッチ、要再起動）。既定の有効時は eventual store の M-7 root digest（`sd2:<hex64>`）を束縛し、データ内容の split-view 検知が働く。有効化には data dir（ReportClockFloor の永続化先 `frontier_report_clock.json`）が必要で、floor が構成できない場合は自動的にプレースホルダ形式へ fail-safe する。floor ファイルが無い起動（初回起動・floor 喪失）は 180 秒の activation grace の間 **frontier 報告そのものを停止**し（前世代がどの形式で署名していたか不明なため、無署名だけが両形式方向に衝突フリー）、grace 明けに `sd2:` 形式で報告を再開する（「Equivocation / split-view 検知」節を参照） |
-| `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` でトゥームストーン GC の Stage 2 hole-jump を有効化。旧方式 sweep が痕跡なく物理削除した dot（legacy hole）を、追加の inbound ゲート（mark 以降に全 registry peer の全量状態をエラーなしで取り込んだ証跡）が成立したときに限り compaction floor が跨げるようになる。**Stage 1 を soak し `gc_floor_stalled_hole_dots` が恒常的に非ゼロのときのみ有効化する**（3.7 を参照） |
+| `ASTEROIDB_GC_HOLE_JUMP` | いいえ | `false` | `1`/`true` は起動時に拒否する。現在の peer registry だけでは、除外後に再参加する peer が保持する live dot の不在を証明できない（3.7 を参照） |
 | `RUST_LOG` | いいえ | `info` | ログレベル（tracing-subscriber 形式）。**未設定・空文字列の場合は `info` 相当**（6.1 を参照）。値を明示した場合はその指定がそのまま尊重される（`RUST_LOG=error` で ERROR のみに絞ることもできる） |
+
+操作受信の設定例（公開鍵は Ed25519 の 32 バイトを hex で指定）:
+
+```sh
+export ASTEROIDB_WRITER_KEYS='[{"writer_id":"writer-1","public_key_hex":"<64桁のhex>","namespaces":["example"]}]'
+export ASTEROIDB_OPERATION_NAMESPACE_ID=example
+export ASTEROIDB_OPERATION_CREATION_POLICY='{"version":1,"ranges":[{"namespace_id":"example","key_prefix":"","default_mode":"Disabled","override_writers":[]},{"namespace_id":"example","key_prefix":"orders/","default_mode":"Enabled","override_writers":["writer-1"]}]}'
+export ASTEROIDB_OPERATION_NEIGHBORS='[{"node_id":"neighbor-1","addr":"127.0.0.1:3001","key_prefixes":["orders/"]}]'
+export ASTEROIDB_OPERATION_OWNED_PREFIXES='["orders/"]'
+export ASTEROIDB_INTERNAL_TOKEN='<既存クラスタと共有するトークン>'
+```
+
+操作モードでは、全操作ノードに同じ `ASTEROIDB_OPERATION_CREATION_POLICY` を配布する。例: `{"version":1,"ranges":[{"namespace_id":"example","key_prefix":"","default_mode":"Disabled","override_writers":[]},{"namespace_id":"example","key_prefix":"orders/","default_mode":"Enabled","override_writers":["writer-1"]}]}`。namespace 内の最長一致 prefix が既定モードを決める。署名済み作成宣言が既定値と異なる場合は、その作成者が該当範囲の `override_writers` に明示されているときだけ受け付ける。更新・削除も元の署名済み作成を照合する。該当範囲がなければ拒否する。manifest の digest は `operation_inbox/.creation-policy-manifest` と Authority worker の `operation_authority/creation-policy-anchor.bin` に固定される。`operation-sign-create --creation-policy-file` にも同じ manifest を渡し、CLI で宣言を検証して digest を署名する。操作状態がある inbox への後付け、設定変更、設定削除は起動時に拒否する。動的な版切替は未実装。Enabled の作成宣言が証明書を得るには、別途 certified 配置ポリシーと Authority scope が必要。
+
+CLI の Create packet は、作成者が宣言と Create 本体の commitment に署名する値なし作成証拠を持つ。Add/Delete packet は Create の初期値を埋め込まない。Authority は後続操作を署名する前に、一致する Create 本体・receipt、または同じ inbox にある完全な署名済み policy witness を要求する。先に届いた Add/Delete は作成根拠の到着後に再照合する。
+
+この設定で署名済み操作の受信ルートを起動し、受信パケットを `ASTEROIDB_DATA_DIR/operation_inbox` に永続化する。受信側は完全な署名付きパケットを先に fsync し、担当キーなら操作 ledger も fsync してから ACK する。後続の outbox 登録だけが失敗した場合も ACK を返し、保存済み入力から稼働中または再起動後の再照合で登録を補う。パケット保存後・ledger 保存前に停止した場合は、再起動時に検証済みパケットから ledger を復元する。署名付きパケットのない ledger 本体は起動時に拒否する。`key_prefixes` が操作キーに一致する固定隣接先へ配送し、全キーを許可する隣接先には `key_prefixes:[""]` を明示する。保存済み送信項目は再起動後も再試行し、inbox の全パケットと固定隣接先を照合して不足した項目を補う。設定不足、不正な manifest、復旧できない inbox/outbox は起動時にエラーとする。全ノードで隣接先 ID と接続先を管理し、変更時は古い outbox 送信先も残ることに注意する。操作モードでは旧 `/api/eventual/*`、`/api/certified/*`、`/api/status/*` と旧内部データ同期 API を `409 Conflict` で拒否する。旧ストアの WAL・snapshot は読み込まず、旧データ処理 worker・checkpoint も動かさない。制御プレーン、membership、epoch 処理は稼働し、操作の証明書経路は次段の静的設定で有効にする。
+
+隣接 ACK は署名付きパケットと送信元・転送 ID・受信先の転送記録が受信側に保存されたことだけを示す。隣接 outbox は `operation_outbox` に version 2 の送信記録を保存し、`operation_inbox/transfers` に受信転送記録を保存する。異なる隣接先や転送 ID の ACK は再送停止に使えない。完了通知は同じパケットが最終宛先へ永続取り込みされたことを示し、Certified の成立や現在値の有効性は示さない。固定 prefix は配送先選択であり、担当外ノードのアプリへの適用可否や Authority の署名許可を代替しない。
+
+`operation_inbox`、`operation_outbox`、support/certificate outbox、Authority と操作台帳の各保存先は一つのプロセスだけが開ける。二重起動は復旧や採番の前に排他エラーで停止する。不確定な書き込みの後は、受信処理や再送ワーカーが保存済み記録を再読込・検証してから処理を再開する。再検証に失敗している間は古いメモリ状態から ACK・署名・配送完了を返さず、公開 read/status は HTTP 503 を返す。
+
+inbox や evidence への保存後に outbox 登録だけが失敗した場合、定期ワーカーは保存済みの操作・support・certificate から配送義務を再発見する。稼働中の復旧に再起動を要求しない。公開の操作提出は inbox 保存が完了すれば受領票を返し、outbox 登録の失敗は警告として記録する。受領票はローカル保存を示すもので、配送完了や Certified 到達を示さない。
+
+Authority worker は初回起動時に配置と入れ子の規則、writer 権限、Authority 鍵集合の指紋を保存し、再起動時に照合する。署名済み状態があるのにこの信頼アンカーがない旧 Authority ディレクトリは起動を拒否する。既存ディレクトリの自動移行は未実装。
+
+routed モードのローカル提出は、完全な署名付き本体を `operation_inbox/roots` に先に fsync し、packet・ledger・outbox の順に保存する。途中で停止しても起動時に root の本体から packet と ledger を復元し、配送義務を再登録する。
+
+古いローカル root の署名付き本体は、その操作の Certified 証拠に基づく ledger receipt が保存され、必要な全最終宛先への root 配送に ACK と完了通知が永続記録され、ローカル Authority の署名待ち義務がない場合に回収する。先に `operation_inbox/root-tombstones` へ操作 ID・キー・作成モード・パケットと操作の commitment を fsync し、その後 `roots` と共有 packet を削除する。再起動時は tombstone を ledger receipt と outbox の完了済み配送記録に照合する。照合できなければ起動を拒否する。同じ署名付き操作の再提出には保存済み receipt を返し、本体は復元しない。
+
+宛先別 routed custody を使う場合、上記3変数と `OPERATION_LINK_SEED`、`OPERATION_LINK_KEYS` を設定する。`ROUTE_EDGES` は `[{"source":"a","receiver":"b","key_prefixes":[""]}]`、`ROUTES` は `[{"source":"a","destination":"c","key_prefix":"","next_hop":"b","rank":2}, {"source":"b","destination":"c","key_prefix":"","next_hop":"c","rank":1}]`、`REQUIRED_DESTINATIONS` は `[{"key_prefix":"","destinations":["c"]}]` の形。各ノードの `NEIGHBORS` には、そのノードから出る route の next hop とアドレスを登録する。完了通知を返すため、受信側には上流の送信元 ID とアドレスも登録する。routed モードは最終宛先、親の送信元・転送 ID、depth を version 2 転送に保存する。受信側は全体経路と最終宛先を検証してから ACK し、親を持つ子配送だけを登録する。最終宛先は受信済み転送と署名付き本体を `operation_inbox/terminal` に結び付けて保存し、元の送信者に完了通知を再送する。中継元は完全な転送記述を照合して `operation_outbox/*.done` に保存し、子配送の保存 ACK も揃った後で親へ通知する。完了通知だけでは子配送の ACK 待ちは解除されない。通知元は上流の保存応答を `operation_inbox/report-acks` に記録するまで再送する。再起動時は `operation_inbox/roots` のローカル提出と `operation_inbox/transfers` の受信記録から義務を再構築する。全 inbox パケットを隣接先へ配る legacy モードは3変数を設定しない場合に継続する。`operation_outbox/.mode` はモードの混在を、`.routing` は経路・必要宛先・ローカル隣接設定の暗黙の変更を拒否する。既存の配送ディレクトリを routed モードへそのまま切り替えることはできない。
+
+`LINK_KEYS` は `[{"node_id":"b","public_key":"<64桁hex>"}]` の形で、各ノードの隣接先を過不足なく列挙する。NodeId は ASCII 英数字、`.`、`_`、`-` のみを使う。各ノードの seed は固有にし、公開鍵を相手側 manifest に固定する。転送、完了通知、回収境界に加え、Authority support と証明書の要求と保存 ACK も専用 Ed25519 鍵で署名し、送信元・受信先・HTTP メソッドとパス・本文 SHA-256・元要求の digest に結び付ける。同一の署名済み要求の再送は保存済み転送の照合と境界の単調性で扱う。鍵やアドレスの暗黙変更は `operation_inbox/.link-manifest` と `operation_outbox/.link-manifest` で拒否する。署名無しで処理した既存 routed 配送記録の移行も拒否し、空の配送ディレクトリからのみリンク認証を有効化できる。support と証明書の既存 outbox も署名無し ACK を再利用しないよう起動時に確認する。
+
+`REQUIRED_DESTINATIONS` にはアプリ担当ノードに加え、操作の署名を求める Authority ノードも指定する。routed モードの非担当 Authority は、静的 Authority 定義・scope・有効な作成宣言に一致する操作だけを `operation_inbox/signing-inbox` に保存してから最終受け渡し ACK を返す。署名 worker はローカル提出とこの処理待ち記録だけを対象にし、中継中のコピーからは署名しない。Authority の `OWNED_PREFIXES` は `[]` にでき、配送用・署名用の本体保持だけで公開読み取りを有効にしない。
+Enabled 操作も、担当 Authority への経路や必要宛先が欠けていてもローカル root を保存し、送れる宛先だけ配送登録する。署名・作成根拠・所有キーの検査は維持する。証明書を集めるには担当 Authority へ届く経路を設定する必要があり、欠けたままなら操作は Pending に残る。起動時には certificate scope の信頼済み名簿と `n > 3f` を検査し、経路の欠落だけで起動を拒否しない。後から routing pin を変更できるのは転送 ID を一度も発行せず、inbox に受信転送・退役記録・回収済み root がない場合だけ。neighbor・link・Authority の pin 変更と、既存転送を持つノードでの経路修復は未対応。
+操作本体の `ROUTES` は support・証明書の配送経路を設定しない。証拠は各ノードの `NEIGHBORS` に沿って転送するため、Authority から担当ノードまでの証拠経路に入る中継ノードにも、その namespace/key を覆う `ASTEROIDB_OPERATION_CERT_SCOPES`、Authority 鍵と配置・Authority 定義を設定する。中継専用ノードの `OWNED_PREFIXES` は `[]` のままでよい。たとえば A→B→C しか通信できず A が Authority、C が担当なら、B に証明書 scope がないと操作本体は C に届いても A の support は B の受信経路で 404 となり、C は証拠を得られない。現在の起動時検査はデータ経路だけを確認し、証拠経路の成立までは検査しない。
+最終受け取り Authority の scope、配置・Authority 定義、ローカル NodeId は `operation_inbox/.authority-terminal-manifest` に固定する。再起動時の暗黙の担当変更を拒否し、未固定の既存 inbox 状態に後から担当を付けることも拒否する。担当変更には保存済み配送・署名義務を引き継ぐ明示的な移行が必要。
+policy 付き routed relay では、提出用の配置・Authority 定義と namespace 別 assignment も同じ pin に含める。再起動時に異なる設定を渡すと root の配送再登録より前に起動を拒否する。稼働中の control-plane 変更後は新しい Enabled 提出を拒否し、変更前に保存した root は mount 時の設定で配送を再登録する。
+この提出用 policy を含まない旧形式の Authority pin がある既存 inbox は自動移行しない。保存済み配送・署名義務を調べた上で明示的な移行が必要。
+
+送信側は ACK と完了通知の両方を fsync した配送 ID だけを終了とする。`operation_outbox/.index` は連続して終了した ID の排他的境界と、穴より後の終了 ID を保持する。更新中は `*.closed` を回復用記録として残し、境界が永続化された後に個別の `*.ack` と `*.done` を消す。routed モードでは終了済み `*.send` の署名付き本体を回収し、転送 ID・送信元・宛先・親配送・操作 ID・packet commitment の記述を残す。未終了の `*.send` は再送用の完全な本体を保持する。残した記述は再起動時の配送照合と子配送の完了判定に使う。`operation_outbox/.next-id` は次の採番位置を永続化し、再起動時にも終了済み ID を再利用しない。保存済みの連続境界だけを元の隣接受信先に繰り返し通知し、受信側は送信元別の単調な境界を `operation_inbox/retirement-fences` に fsync してから詳細を削除する。受信転送と完了通知応答は境界未満だけ回収し、`operation_inbox/transfer-catalog` は配送 ID と要求の対応を保持する。ledger の値本体が証明済みの冗長データとして receipt に置き換わり、同じ操作の全受信転送が終了境界未満になった場合は、catalog の完全な転送を操作 ID・署名付き packet commitment・ledger 本体 commitment・宛先・親配送の記述へ置き換え、`operation_inbox/packets` の署名付き本体を回収する。ローカル提出、Authority 署名待ち、未終了の受信転送に必要な本体は保持する。compact 記述から元の packet を復元できるとは扱わず、再送・競合判定は SHA-256 commitment の一致に依存する。別の送信元から同じ操作が新しい配送 ID で届けば、その署名付き本体を再び保存して未終了配送に使う。終了境界未満の最終取り込み記録も回収する。Authority の署名処理待ち記録は、ローカル root 発行、検証済み証拠による ledger receipt 化、送信側の退役境界が揃うまで保持し、その後は完全な転送を削除する。root log は発行済み操作の同一性を、転送 catalog は配送 ID と packet commitment を保持する。記録削除と packet 回収の間で停止しても、再起動時に回収を再試行する。遅延した古い転送には新しい ACK を返さない。境界より後の配送は通常どおり進む。routed モードの配送・完了・境界通知は隣接先の固定公開鍵で署名を確認する。legacy モードは共有内部 token に依存する。
+
+証明済みの冗長な ledger 本体を receipt に置き換えた後、`operation_evidence.log` も値を含まない証拠レコードへ原子的に書き換える。必要な隣接先への完全な証明書が certificate outbox に保存済みでない操作は、この書き換えの対象にしない。未完了の配送コピーは値を保持し得るため、古い値のバイト列をノード全体から完全に消す GC は未実装。保持先と残る接続は [操作値の物理回収](design/operation-value-retention.md) を参照。
+
+旧 version 1 の `operation_outbox/*.send` がある状態では起動を拒否する。アップグレード時はノードを停止し、`operation_outbox` ディレクトリを別名に退避してから起動する。起動時に署名済み `operation_inbox` の全パケットから現在の固定隣接先への送信義務を再登録するため、旧 ACK 済み送信も再配送される。退避したディレクトリは復旧確認まで保管する。元の署名済み inbox が欠けている場合はこの再登録に頼れないため、先に保存状態を修復する。
+`ASTEROIDB_OPERATION_OWNED_PREFIXES` はそれとは独立した、このノードの読み取り対象である。中継専用ノードも署名付き本体と証拠を配送用に保持するが、公開の通常読みと対応する内部読みは担当外キーに `Unknown` を返す。Certified 読みは担当外でも認証済み Disabled の作成根拠があれば `NotTargeted`、それ以外は `Unknown` を返す。操作 ID 状態も担当外では `unknown` とし、配送用コピーだけでアプリに適用されたとは報告しない。担当 prefix は operation inbox の信頼アンカーに固定し、再起動時の変更を拒否する。既存状態があるのにアンカーがない inbox は起動を拒否する。現行の担当 prefix は静的な運用入力で、配置変更時の自動移管は未実装。
+担当ノードは `POST /api/operations/submit` で署名済み操作を受け付ける。writer と作成操作の署名・namespace 権限を検証し、ローカル保存と隣接配送義務を永続登録した後で応答する。認証には writer 署名を使い、内部 token は要求しない。中継専用ノードでのローカル提出は拒否する。受信済み操作の公開通常読みは `GET /api/operations/read/{namespace_id}/{key}` で行い、証明書モードでは `GET /api/operations/certified-read/{namespace_id}/{key}` が検証済み証明書を各操作の根拠として返す。これらの公開読みは内部 token を要求しない。
+静的証明書モードでは `POST /api/operations/submit-certified?wait_ms=30000` で Certified 到達を待てる。待機が時間切れになった場合も操作は保持・配送され続ける。`202 pending` の後は、提出したパケットの操作 ID を `GET /api/operations/status/{namespace_id}/{writer}/{counter}` で再確認する。`wait_ms` の既定値は 30000、上限は 60000。
+
+操作証明書の静的受信を有効にする場合、`ASTEROIDB_OPERATION_CERT_SCOPE_PREFIX` と `ASTEROIDB_OPERATION_CERT_FAULTS` を設定する。起動時に同 prefix の certified 配置ポリシーと Authority 定義を照合し、より狭い prefix による上書きがないこと、定義の Authority ID と現在配布されている Ed25519 鍵集合が一致することを確認する。鍵集合、scope、ポリシー版、epoch 設定、故障許容数を `operation_evidence` の信頼アンカーへ固定し、変化した場合は support・証明書の受信と読み取りを拒否する。Authority ノードには登録済みの署名鍵を設定する。受信した操作を専用 ledger に保存し、発行済み root を `operation_authority` に fsync してから、自分の support を `operation_supports` と隣接先別の `operation_support_outbox` に登録する。中継ノードも受信した support を検証・永続化してから固定隣接先へ転送し、ACK がない項目は再送する。起動時には support log から証明書と outbox の不足項目を補う。このモードでは操作証明書を固定 epoch 0 で扱い、鍵・scope の運用中ローテーションは対象外。ローテーションには信頼できる履歴を別途実装する必要がある。
+
+同じノードに複数の証明書 scope がある場合は `ASTEROIDB_OPERATION_CERT_SCOPES` を使用する。各項目で独立に配置ポリシー、Authority 定義、故障許容数を検証し、support・証明書・Authority の状態と再送キューを `operation_certificate_scopes/<scope hash>/` 以下に保存する。単一 scope の旧変数で起動する場合は従来の `operation_evidence` などの保存先を維持する。scope hash は固定のドメイン文字列、namespace ID と key prefix の長さ・バイト列から SHA-256 で決定する。旧変数から複数 scope 変数への切替だけでは従来の保存済み証拠は新しい保存先へ移らない。保存済み scope を設定から外す場合や証明書設定を解除する場合も起動を拒否するため、既存ノードの切替には保存先の明示的な移行が必要となる。
+
+異なる namespace の同じ key prefix に異なる Authority 集合や配置ポリシーを割り当てる場合は、各ノードに同じ `ASTEROIDB_OPERATION_ASSIGNMENTS` を設定する。この設定は操作用のローカル静的設定であり、既存 Raft の prefix 単位の設定には追加されず、SystemNamespace の保存 JSON にも書かれない。再起動時にも必ず指定する。操作では namespace と key prefix の最長一致を使い、同じ prefix 長では namespace 指定行を優先する。設定を変更すると保存済み証明書の信頼アンカーが一致せず、起動を拒否する。既存の prefix 単位の設定を使う scope の digest は変更しない。
+
+各 scope はその Authority 定義に含まれる ID とグローバルな信頼済み公開鍵から検証用 keyset を作るため、scope ごとに異なる Authority 集合を設定できる。包含関係のある prefix では、子 scope のキーを親 scope の Authority が署名・検証しない。追加した namespace の署名済み操作も同じ inbox で受け付ける。その namespace は writer の許可一覧と作成ポリシーにも登録する必要がある。既存 inbox の作成ポリシー manifest は固定されるため、運用中に namespace 範囲を追加するには状態移行が必要となる。担当範囲、隣接先、最終宛先、経路は namespace ごとに設定できる。namespace 指定のない行は全 namespace に適用し、key prefix の最長一致を優先して、同じ長さなら namespace 指定行を選ぶ。操作用の namespace 別 Authority・配置設定は静的入力であり、Raft による配布は未実装。Authority が個別 packet を拒否した場合は警告を記録して次の packet を処理する。admission ledger の I/O 異常や署名 root の永続化異常では worker を停止する。
+
+routed custody と上記の操作証明書受信が両方有効な場合、30 秒ごとに操作 ledger の値本体を回収する。証明書を現在の固定信頼設定で再検証し、削除済みまたは認証済みの勝者に吸収された値だけを対象にする。対象操作の署名付き packet と、全必須宛先に対する永続送信登録を照合する。Enabled のローカル root は、必須宛先が担当 Authority 全員を含むことも確認し、欠ける間は root と値本体を回収しない。送信 ACK は不要で、未完了の送信は packet と outbox の記録から引き続き再試行する。ledger は ID receipt と checkpoint を永続化して旧 WAL の本体を削除する。署名付き packet、転送カタログ、outbox の送信本体は残るため、この処理だけでは操作データ全体のディスク容量は回収されない。
+
+同じ周期処理で、receipt 化済み操作の証明書を値なしの署名・包含証拠へ圧縮し、ACK 済みの support・証明書送信を値なしの識別記録へ置換する。support ストアの本体は、証明書の compact 証拠を再検証でき、各 support の必要な隣接先から ACK が永続化された場合に限って圧縮する。Authority の発行 root と admission ledger も、対応する検証済み証拠と全必要先の support ACK が揃った後に値なしの root 識別記録と admission receipt へ圧縮する。root 書き換えを先に永続化し、途中停止後は admission ledger の checkpoint を再実行する。最初の support または root 圧縮時に `ASTEROIDB_OPERATION_NEIGHBORS` の配送先と適用範囲を永続的に固定する。圧縮後にその設定を変更したノードは再起動を拒否するため、変更には未完了の過去の配送を維持する状態移行が必要となる。
+
+quorum が揃って完成した証明書も、受信済み証明書も、検証して `operation_evidence` に fsync した後、キーを許可する固定隣接先ごとに `operation_certificate_outbox` へ登録して再送する。受信側は証明書を検証・永続化してから証明書内容の commitment を ACK する。次ホップの送信登録だけが失敗した場合は、保存済み証明書から再照合で不足義務を補う。本体より証明書が先に到着しても証明書は保持され、担当ノードの Certified 読みには本体が届いてから反映される。証明書配送には support と同じ固定隣接設定を使う。隣接先の網羅性、通信回復、接続先 ID の認証はこの設定と運用に依存する。
 
 ### Control plane Raft コンセンサス
 
@@ -214,7 +291,7 @@ RUST_LOG=asteroidb_poc=info \
 |--------|------|-----------|------|
 | `ASTEROIDB_PERSISTENCE` | いいえ | `on` | `off` で永続化を完全に無効化（従来の純メモリ動作。スナップショットのロードも WAL も行わない）。開発・ベンチ用エスケープハッチ |
 | `ASTEROIDB_WAL_SYNC` | いいえ | `always` | WAL の fsync ポリシー: `always` / `interval` / `off`（下記の耐久性保証表を参照） |
-| `ASTEROIDB_WAL_SYNC_INTERVAL_MS` | いいえ | `100` | `interval` モードの fdatasync 周期（ミリ秒） |
+| `ASTEROIDB_WAL_SYNC_INTERVAL_MS` | いいえ | `100` | `interval` モードの fdatasync 周期（ミリ秒）。`0` は 1 ms に補正する |
 | `ASTEROIDB_SNAPSHOT_INTERVAL_SECS` | いいえ | `300` | チェックポイント（スナップショット保存 + 封印済み WAL セグメント削除）の周期。`0` で周期チェックポイント無効（graceful shutdown 時の最終チェックポイントは行う） |
 | `ASTEROIDB_WAL_SEGMENT_BYTES` | いいえ | `67108864` (64 MiB) | WAL セグメントのローテーション閾値 |
 | `ASTEROIDB_WAL_RECOVER_TRUNCATE` | いいえ | `0` | `1` で、mid-log corruption 検出時に最初の無効レコード以降を**明示的に切り捨てて**起動する（既定は fail-stop。13.6 の runbook を参照） |
@@ -235,6 +312,12 @@ wal/certified/wal-<seq>.log  certified ストアの WAL セグメント
 | `always`（既定） | WAL append 後、group-commit fdatasync の完了を待って ack | ack 済み書き込みはプロセス/OS クラッシュ・電源断で失われない。fdatasync 失敗は fail-stop（プロセス abort） |
 | `interval` | append 直後に ack。背景タスクが N ms ごとに fdatasync | プロセスクラッシュ単体では損失ゼロ（ページキャッシュ生存）。OS クラッシュ / 電源断では最大 N ms ぶんの ack 済み書き込みを**ローカルでは**喪失し得る（ピアへ複製済みの分は anti-entropy で回復） |
 | `off` | append 直後に ack。明示 fsync なし | プロセスクラッシュでは損失ゼロ。OS クラッシュ時の耐久性は OS のライトバック（数十秒）依存。開発・ベンチ用 |
+
+内部の full-state push と digest の応答は、応答が参照した eventual ストア状態の
+WAL 同期完了を `durable` で示す。`interval` では内部応答が同期完了を待つ。
+`off` または永続化無効の受信ノードは通常の同期に応答するが `durable=false` を返し、
+送信ノードはその応答で push の確定済み進捗や tombstone GC の peer ACK を更新しない。
+したがってその構成では、該当 peer を含む GC gate は通らない。
 
 **ディスクフル時の挙動**: WAL append の失敗は書き込み API に HTTP 503
 （`STORAGE_UNAVAILABLE`）を返す degrade 動作で、読み取りは継続する。
@@ -388,7 +471,7 @@ curl -s http://localhost:3000/api/slo | jq .
 | `digest_push_probe_total` | u64 | push 側 digest probe 試行累計 |
 | `digest_push_match_total` | u64 | probe 一致によるフル push スキップ累計 |
 | `digest_push_keys_pushed_total` | u64 | digest subset push で送ったキー数累計 |
-| `gc_floor_stalled_hole_dots` | u64 (gauge) | 直近に**実行された** GC sweep で legacy hole に停止した floor 走査数。mark のみ・ゲート不合格の tick では上書きされず、次の sweep 実行まで値を保持する。恒常的に非ゼロなら Stage 2 hole-jump の有効化を検討（3.7） |
+| `gc_floor_stalled_hole_dots` | u64 (gauge) | 直近に**実行された** GC sweep で hole に停止した floor 走査数。mark のみ・ゲート不合格の tick では上書きされず、次の sweep 実行まで値を保持する。恒常的に非ゼロなら peer の全状態同期と tombstone の再配送を調べる（3.7） |
 | `gc_floor_stalled_uncandidated_dots` | u64 (gauge) | 直近に実行された GC sweep で mark 後 tombstone に停止した floor 走査数（一時的。次サイクルで解消。非 sweep tick では保持） |
 | `gc_floor_rejected_dots_total` | u64 | compaction floor に覆われた受信 tombstone の不採用累計。ローリングアップグレード混在期の v1 再注入圧の観測 = 全ノード更新完了の判定材料 |
 | `gc_floor_killed_by_floor_total` | u64 | floor により抑止された stale live dot 累計（未知レプリカ・遅延 push 由来の削除済み dot の棄却/殺） |
@@ -611,6 +694,8 @@ push 証拠（`push_acked_wall_ms`、tombstone GC のピアゲート）が意図
 静まった後の root 一致 probe で自動的に前進する。tombstone GC の停滞を
 調査する際は、まず対象ピアへの書き込みレートを確認すること。
 
+HLC index の `pruned_floor` より古い push baseline から delta scan した場合は、prune 済みのキーを送れていない可能性を peer ごとに記憶する。その delta が成功して baseline が進んでも、次の空 scan だけでは tombstone GC の push 証拠を更新しない。次周期に digest 省略の完全状態 push を試み、全キーにエラーのない応答があった時だけ記憶を消して証拠を更新する。失敗や一部キーのエラーでは次周期も再送する。再起動時には push 証拠と baseline も初期化される。
+
 **切り戻し手順**（digest 同期に起因する問題を疑う場合）:
 
 1. 対象ノードに `ASTEROIDB_DIGEST_SYNC_DISABLED=1` を設定して再起動。
@@ -621,28 +706,11 @@ push 証拠（`push_acked_wall_ms`、tombstone GC のピアゲート）が意図
    なったことを確認。
 3. 問題が解消しない場合、digest 同期は原因ではない。
 
-**ローリングアップグレード時の挙動**: 旧ノードは
-`POST /api/internal/sync/digest` に 404 を返し（またはスキームバージョン
-不一致で `scheme_ok=false` を返し）、新ノードはそれを検知して従来フル
-シンクへフォールバックする（`digest_sync_unsupported_total` に計上）。
-混在期間中は帯域削減効果がないだけで、収束の正しさ・セッション保証は不変。
-全ノードのアップグレード完了後、10 分以内（再 probe TTL）に digest 同期が
-自動的に有効化される。
-
-scheme v2（compaction floor）への更新に固有の注意:
-
-- **GC 収束（floor 伝播）は全ノード更新後に発効する**。混在期の旧ノードは
-  floor を発行も解釈もしないため、旧ノード同士では v1 のライブロックが
-  残存する（fail-safe: tombstone が溜まる方向）。旧ノードへの remove
-  伝播は origin-retention 則により tombstone が担い続けるので、C-2 の
-  ゲート保証はそのまま旧ノードを守る。
-- **スナップショット v5 / WAL v2 は片方向アップグレード**。v5/v2 を書いた
-  ノードを旧バイナリに戻すと読めない（v3→v4 と同じ制約）。ロールバック時、
-  旧バイナリが floor を落とす方向は fail-safe（tombstone 蓄積側）。
-- 混在期の残余 corner（設計で文書化済み）: 他ノードの sweep が live として
-  跨いだ dot を並行 remove し、その tombstone がゲート通過前に floor 継承で
-  剥がれたケースでは、旧ノードへの当該 remove の伝播が full-state 経路
-  依存になる。全ノード v2 なら floor kill で完全に安全。
+**版の切り替え**: AsteroidDB は実験段階で、異なる版のノードの混在運用や
+旧 snapshot / WAL の読み込みを保証しない。永続形式を変える版への切り替えでは、
+対象版の形式で新しいデータ領域を用意して同じ版のノードを起動する。
+保存済みデータを引き継ぐ必要がある場合は、その版に対応した明示的な移行手順を
+先に用意する。現行コードは旧形式を暗黙に復元しない。
 
 ### 3.7 tombstone GC（compaction floor）と Stage 2 hole-jump
 
@@ -658,15 +726,17 @@ tombstone / stale live dot をマージ時に棄却するため、GC はクラ�
   sweep が痕跡なく削除した dot（legacy hole）で floor が停止している。
   クラスタのどこかに tombstone が残っていれば anti-entropy が hole を埋めて
   自己治癒するため、まず数 GC サイクル分待つこと。
-- **Stage 2 有効化手順**: (1) 全ノードが v2 で soak 済みであることを確認
-  （`gc_floor_rejected_dots_total` が横ばい）。(2) `gc_floor_stalled_hole_dots`
-  が恒常非ゼロのノードに `ASTEROIDB_GC_HOLE_JUMP=1` を設定して再起動。
-  (3) hole-jump は既存の二重ゲートに加え、mark 以降に全 registry peer の
-  全量状態をエラーなしで取り込んだ **inbound ゲート**の成立時のみ発火する
-  （fail-closed）。さらに跨げるのは **mark 時点で既に hole だった dot のみ**
-  （mark が per-node カウンタをスナップショットし、それ以下の hole だけを
-  跳ぶ）。mark 後の inbound merge が新たに作った hole は対象外で次の mark を
-  待つ。ゲージが 0 に落ちたら Stage 2 は外してもよい（残すのも安全）。
+- Stage 2 hole-jump は停止中。mark 後に peer が ping 失敗で registry から
+  除外されると、現在の registry に対する inbound ゲートが空集合として通る。
+  除外された peer が hole に対応する live dot を保持して再参加すれば、進んだ
+  floor がその値を誤って消す。`ASTEROIDB_GC_HOLE_JUMP=1` は起動時に拒否し、
+  直接構築した `NodeRunner` でも hole-jump を実行しない。再開には、mark 時点と
+  それ以前に存在した replica の保管責任を永続的に追跡し、除外・再参加を含む
+  inbound 証拠の健全性を確認する仕組みが必要。
+- Authority の frontier が全員分揃っていても、現行名簿の過半数が同じ
+  checkpoint に署名し、受理済み full frontier と一致するまで sweep は進まない。
+  `ASTEROIDB_REQUIRE_SIGNED_FRONTIERS=false` は未署名報告の受信を許すだけで、
+  未署名報告を GC の認証済み floor として扱わない。
 - `gc_interval` の短縮は hole 停滞・ゲート不合格には**効かない**（12.3 も
   参照）。停滞の原因はゲート（dead peer / 分断 / hole）であり周期ではない。
 
@@ -692,6 +762,8 @@ tombstone / stale live dot をマージ時に棄却するため、GC はクラ�
    - `frontier_behind_mark`: 報告は揃ったがデータ時刻が mark 未満。
    - `report_not_advanced`: mark 以降にローカルで前進した報告が無い
      （永続化から復元しただけの frontier を含む。fail-closed）。
+   - `signed_quorum_missing`: 現行 Authority 名簿の署名付き checkpoint が
+     mark を覆わない、または署名対象の full frontier が受理済み報告と一致しない。
    - `peer_evidence_missing_or_stale`: レジストリに残った dead peer が
      典型。9.2 のノード削除手順でレジストリから外す。
 
@@ -1576,7 +1648,7 @@ curl -s http://localhost:3000/api/internal/keys | jq '.entries | length'
 
 | 原因 | 対処 |
 |------|------|
-| トゥームストーン蓄積 | まず `gc_last_sweep_wall_ms` を見て「一度でも sweep したか」を切り分ける（0 のまま＝GC 実質停止。3.7.1 の手順で `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` と `tombstone GC gate blocked` WARN へ）。その上で原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 の Stage 2 を検討）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
+| トゥームストーン蓄積 | まず `gc_last_sweep_wall_ms` を見て「一度でも sweep したか」を切り分ける（0 のまま＝GC 実質停止。3.7.1 の手順で `gc_gate_blocked_authority_total` / `gc_gate_blocked_peer_total` と `tombstone GC gate blocked` WARN へ）。その上で原因を分類する: GC ゲート不合格（dead peer が registry に残存・分断・lagging authority）と hole 停滞（`gc_floor_stalled_hole_dots`、3.7 を参照）には `gc_interval` 短縮は**効かない**。ゲートが通っていて単に回収周期が長いだけの場合のみ `gc_interval` を短縮（デフォルト 60 秒） |
 | ack-frontier エントリの蓄積 | `frontier_gc_interval` を短縮、`frontier_gc_max_retained_versions` を縮小 |
 | Compaction が進まない | Authority 可用性を確認（過半数必要） |
 | pending_count が高い | Certified Write のタイムアウト設定を見直す |
@@ -2063,47 +2135,11 @@ certify し続ける（詳細は api-reference の該当節）。
 
 `/api/internal/raft/*`（vote / append / snapshot）は他の内部エンドポイント
 と同じく `ASTEROIDB_INTERNAL_TOKEN` の Bearer 認証で保護される。
-**トークン未設定時は無認証で開放される**（既存の後方互換ポリシー踏襲）——
-その状態では偽の AppendEntries / InstallSnapshot を投げるだけで制御プレーン
+**トークン未設定時は無認証で開放される**。その状態では偽の
+AppendEntries / InstallSnapshot を投げるだけで制御プレーン
 状態全体を汚染できるため、**本番環境ではトークン設定を必須とする**。
 
-### 14.7 ローリングアップグレード（pre-Raft バイナリとの混在）
-
-旧バイナリは `/api/internal/raft/*` に 404 を返す。新ノードはこれを
-「到達不能」として扱い次の tick で再試行するため、**投票者の過半数が
-新バイナリになるまで制御プレーンの書き込みは失敗し続ける**（安全側）。
-データプレーンの同期・読み書きは混在中も動作する。
-
-また、Raft の RPC / ログエントリ型は bincode（field-order 依存）で
-やり取りされるため、**これらの型へのフィールド追加はワイヤ互換を壊す**。
-追加が必要な場合は新エンドポイントの追加か JSON 移行を伴うリリース手順が
-必要（`src/control_plane/raft/types.rs` の先頭コメントを参照）。
-
-#### 空 `PutAuthority` エントリと混在バージョン
-
-現行バイナリは空 `authority_nodes` の `PutAuthority` を**決定的 no-op**
-として apply する（旧バイナリは定義をそのまま書き込んでいた）。同じ
-committed エントリの適用結果がバイナリ世代で変わるため、混在期間中は
-状態機械が分岐しうる。到達経路は 2 つ:
-
-1. **アップグレード中の新規 PUT**: 旧バイナリのリーダーだけが空配列を
-   受理する（新バイナリは propose 前に 400）。→ **全ノードの更新が
-   完了するまで空の `authority_nodes` を PUT しないこと。**
-2. **アップグレード前に commit 済みのエントリの再適用**: そのエントリが
-   まだログ末尾に残っているノードは新バイナリで no-op になり、先に
-   スナップショットへ畳み込んでいたノードは定義を保持したまま起動する。
-   スナップショット境界はノードごとに異なる（`InstallSnapshot` で復旧した
-   ノード、後から join したノード）ため、**完全に更新済みのクラスタでも
-   分岐が残りうる**。
-
-いずれの分岐も「certify する / しない」ではなく「certify を拒否する形が
-2 通りある」だけなので安全側だが、収束させるには当該プレフィックスへ
-非空の `PUT /api/control-plane/authorities` を 1 回行えばよい
-（全ノードが同じ定義に上書きされる）。
-アップグレード後に `GET /api/control-plane/authorities` を全ノードで
-突き合わせ、差異があればこの手順で揃えること。
-
-### 14.8 observer（非 voter）ノードの運用と namespace pull（M-17）
+### 14.7 observer（非 voter）ノードの運用と namespace pull（M-17）
 
 `ASTEROIDB_CONTROL_PLANE_NODES` に含まれないノードは **observer** として
 動作する: 選挙に参加せず、ポリシー / Authority 定義の変更を受け付けない。
@@ -2183,3 +2219,9 @@ asteroidb-cli --host <addr> slo
 asteroidb-cli --host <addr> get <key>
 asteroidb-cli --host <addr> put <key> <value>
 ```
+
+## 作成ポリシーだけを先に配送する
+
+`ASTEROIDB_OPERATION_POLICY_DESTINATIONS` を設定する。形式は `ASTEROIDB_OPERATION_REQUIRED_DESTINATIONS` と同じ行配列で、例は `[{"namespace_id":"example","key_prefix":"orders/","destinations":["owner-2"]}]`。操作本体を routed にしている場合は、その経路を policy-only にも使える。policy-only だけ独立させる場合は `ASTEROIDB_OPERATION_POLICY_ROUTE_EDGES` と `ASTEROIDB_OPERATION_POLICY_ROUTES` を一緒に設定する。操作本体が non-routed でも、この policy-only 固定経路を使用できる。どちらも `ASTEROIDB_OPERATION_LINK_SEED` と `ASTEROIDB_OPERATION_LINK_KEYS`、隣接先の許可 prefix を設定する。
+
+公開 `POST /api/operations/policy/submit` に完全な署名済み Create packet を渡すと、作成ポリシーを操作台帳の外に保存し、専用の永続 outbox から固定宛先へ再送する。宛先は Enabled/Disabled を本体より先に学べる。policy-only witness の Disabled は、受信ノードが対象キーを担当していなくても公開 Certified 読みに `NotTargeted` として反映される。Disabled の本体未着キーは Certified 読みで `NotTargeted` になる。保存済み `operation_policy_outbox/` がある場合、宛先設定を外すか変更すると起動を拒否する。

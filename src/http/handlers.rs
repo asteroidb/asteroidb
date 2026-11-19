@@ -6,7 +6,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tokio::sync::Mutex;
 
 use super::codec::{deserialize_internal, internal_response};
@@ -148,6 +148,25 @@ async fn wait_wal_durable(
     Ok(())
 }
 
+/// Durability evidence for a store snapshot taken under the API lock. This
+/// deliberately waits under Interval as well: GC evidence must survive a
+/// receiver crash regardless of the ordinary client acknowledgement policy.
+async fn sync_snapshot_durable(
+    syncer: &Option<Arc<WalSyncer>>,
+    pos: Option<WalPos>,
+) -> std::io::Result<bool> {
+    let Some(syncer) = syncer else {
+        return Ok(false);
+    };
+    if syncer.policy() == SyncPolicy::Off {
+        return Ok(false);
+    }
+    if let Some(pos) = pos {
+        syncer.wait_durable(pos).await?;
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------
 // Eventual handlers
 // ---------------------------------------------------------------
@@ -282,7 +301,13 @@ pub async fn get_eventual(
                 response_token.merge_frontiers(api.store().visible_origins());
                 response_token.encode()
             });
+            let wal_pos = api.last_wal_pos();
             drop(api);
+
+            // A read can race a still-pending write or session-claim
+            // adoption. Do not publish its value or session token until
+            // the WAL state backing this snapshot is durable.
+            wait_wal_durable(&state.eventual_wal, wal_pos).await?;
 
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             state
@@ -329,12 +354,20 @@ pub async fn certified_write(
     let written_key = req.key.clone();
 
     let mut api = state.certified.lock().await;
-    let status = api.certified_write(req.key, crdt_value, on_timeout)?;
-    let wal_pos = api.last_wal_pos();
+    let result = api.certified_write(req.key, crdt_value, on_timeout);
+    // A certification timeout still leaves an accepted local write. Wait for
+    // its WAL record before telling the client that it can be polled later.
+    // Other errors may precede the append, so their last position can belong
+    // to an unrelated earlier write.
+    let accepted = matches!(&result, Ok(_) | Err(CrdtError::CertificationTimeout));
+    let wal_pos = accepted.then(|| api.last_wal_pos()).flatten();
     drop(api);
 
-    // Durability before ack (SyncPolicy::Always), outside the lock.
-    wait_wal_durable(&state.certified_wal, wal_pos).await?;
+    // Durability before either a success or a post-acceptance timeout.
+    if accepted {
+        wait_wal_durable(&state.certified_wal, wal_pos).await?;
+    }
+    let status = result?;
 
     state.metrics.record_write_op(&written_key);
 
@@ -347,7 +380,7 @@ pub async fn certified_write(
 pub async fn get_certified(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-) -> Json<CertifiedReadResponse> {
+) -> Result<Json<CertifiedReadResponse>, ApiError> {
     let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let start = Instant::now();
     let api = state.certified.lock().await;
@@ -453,18 +486,24 @@ pub async fn get_certified(
         }
     });
 
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    state
-        .slo_tracker
-        .record_observation(SLO_CERTIFIED_READ_P99, elapsed_ms);
-
-    Json(CertifiedReadResponse {
+    let response = Json(CertifiedReadResponse {
         key,
         value,
         status: read.status,
         frontier,
         proof,
-    })
+    });
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+    // A concurrent write may have updated the in-memory value and proof
+    // before its HTTP handler finished waiting for the WAL. The read must
+    // not publish that state until the captured record is durable too.
+    wait_wal_durable(&state.certified_wal, wal_pos).await?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    state
+        .slo_tracker
+        .record_observation(SLO_CERTIFIED_READ_P99, elapsed_ms);
+    Ok(response)
 }
 
 /// `GET /api/status/:key`
@@ -473,12 +512,14 @@ pub async fn get_certified(
 pub async fn get_certification_status(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-) -> Json<StatusResponse> {
+) -> Result<Json<StatusResponse>, ApiError> {
     let key = key.strip_prefix('/').unwrap_or(&key).to_string();
     let api = state.certified.lock().await;
     let status = api.get_certification_status(&key);
-
-    Json(StatusResponse { key, status })
+    let wal_pos = api.last_wal_pos();
+    drop(api);
+    wait_wal_durable(&state.certified_wal, wal_pos).await?;
+    Ok(Json(StatusResponse { key, status }))
 }
 
 // ---------------------------------------------------------------
@@ -1508,6 +1549,7 @@ pub async fn verify_proof(
                 .collect::<std::collections::HashSet<NodeId>>(),
         )
     };
+    let authority_roster: Vec<NodeId> = authority_members.iter().cloned().collect();
 
     // Determine the signature algorithm from the request.
     let sig_algorithm = match req.signature_algorithm.as_deref() {
@@ -1590,7 +1632,7 @@ pub async fn verify_proof(
             .load(std::sync::atomic::Ordering::Relaxed);
         let result = verifier::verify_dual_proof_with_registry(
             &cert,
-            total_authorities,
+            &authority_roster,
             &registry,
             current_epoch,
             &state.epoch_config,
@@ -1668,6 +1710,7 @@ pub async fn verify_proof(
         .load(std::sync::atomic::Ordering::Relaxed);
     let result = verifier::verify_proof_with_registry(
         &bundle,
+        &authority_roster,
         &registry,
         current_epoch,
         &state.epoch_config,
@@ -1718,15 +1761,20 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
 ///
 /// Receives CRDT values from a remote peer and merges them into the
 /// local eventual store using `merge_remote`.
+// Axum handlers use Response for both the encoded success body and the
+// negotiated error body. Boxing only one branch would complicate the handler
+// type without reducing the response allocated for the actual HTTP reply.
+#[allow(clippy::result_large_err)]
 pub async fn internal_sync(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, super::codec::SerializationError> {
+) -> Result<Response, Response> {
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
     let accept = headers.get("accept").and_then(|v| v.to_str().ok());
 
-    let req: SyncRequest = deserialize_internal(&body, content_type)?;
+    let req: SyncRequest =
+        deserialize_internal(&body, content_type).map_err(IntoResponse::into_response)?;
 
     let mut api = state.eventual.lock().await;
     let mut merged = 0;
@@ -1746,17 +1794,20 @@ pub async fn internal_sync(
     let wal_pos = api.last_wal_pos();
     drop(api);
 
-    // One durability wait for the whole batch (SyncPolicy::Always): the
-    // pushing peer advances its push frontier on our ack, so acking
-    // un-synced merges could strand them on a crash. A wait error is only
-    // possible when the flusher is gone (which fail-stops the process on
-    // fsync errors), so it is logged rather than surfaced.
-    if let Err(e) = wait_wal_durable(&state.eventual_wal, wal_pos).await {
-        tracing::warn!(error = ?e.0, "internal sync WAL durability wait failed");
-    }
+    // Only a response with `durable = true` is push evidence for the
+    // sender's GC gate. A plain 2xx under disabled persistence or WAL sync
+    // still reports the merge for ordinary replication.
+    let durable = sync_snapshot_durable(&state.eventual_wal, wal_pos)
+        .await
+        .map_err(|e| ApiError(CrdtError::Storage(format!("WAL sync wait failed: {e}"))))
+        .map_err(IntoResponse::into_response)?;
 
-    let resp = SyncResponse { merged, errors };
-    internal_response(&resp, accept)
+    let resp = SyncResponse {
+        merged,
+        errors,
+        durable,
+    };
+    internal_response(&resp, accept).map_err(IntoResponse::into_response)
 }
 
 /// `GET /api/internal/keys`
@@ -1939,11 +1990,11 @@ pub async fn internal_certified_delta(
     let truncated = raw.len() >= CERTIFIED_DELTA_MAX_ENTRIES;
     let entries: Vec<CertifiedDeltaEntry> = raw
         .into_iter()
-        .map(|(key, value, hlc, policy_version)| CertifiedDeltaEntry {
+        .map(|(key, value, hlc, scope)| CertifiedDeltaEntry {
             key,
             value,
             hlc,
-            policy_version,
+            scope,
         })
         .collect();
 
@@ -1972,7 +2023,8 @@ pub async fn internal_certified_delta(
 /// in full — completeness equivalent to a full dump. The O(state size)
 /// hashing runs OFF the lock in `spawn_blocking`.
 ///
-/// Read-only: no `wait_wal_durable` is needed (nothing is acknowledged).
+/// The digest may be used as GC push evidence on a root match or peer-only
+/// difference, so its snapshotted WAL position must also be durable.
 pub async fn internal_digest_sync(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2040,12 +2092,17 @@ pub async fn internal_digest_sync(
             let merge_failed_keys: Vec<String> =
                 store.merge_failed_keys().iter().cloned().collect();
             let visible_origins = store.visible_origins().clone();
+            let wal_pos = api.last_wal_pos();
 
             if req.root.as_slice() == local.root {
                 drop(api);
+                let durable = sync_snapshot_durable(&state.eventual_wal, wal_pos)
+                    .await
+                    .unwrap_or(false);
                 return internal_response(
                     &DigestSyncResponse {
                         scheme_ok: true,
+                        durable,
                         root_matched: true,
                         frontier,
                         applied_origins,
@@ -2083,10 +2140,14 @@ pub async fn internal_digest_sync(
                 )
             };
             drop(api);
+            let durable = sync_snapshot_durable(&state.eventual_wal, wal_pos)
+                .await
+                .unwrap_or(false);
 
             return internal_response(
                 &DigestSyncResponse {
                     scheme_ok: true,
+                    durable,
                     root_matched: false,
                     mismatched_buckets: mismatched,
                     entries,
@@ -2121,7 +2182,12 @@ pub async fn internal_digest_sync(
     let applied_origins = store.applied_origins().clone();
     let merge_failed_keys: Vec<String> = store.merge_failed_keys().iter().cloned().collect();
     let visible_origins = store.visible_origins().clone();
+    let wal_pos = api.last_wal_pos();
     drop(api);
+
+    let durable = sync_snapshot_durable(&state.eventual_wal, wal_pos)
+        .await
+        .unwrap_or(false);
 
     let resp = tokio::task::spawn_blocking(move || {
         let local = compute_store_digest(&data);
@@ -2130,6 +2196,7 @@ pub async fn internal_digest_sync(
         if req.root.as_slice() == local.root {
             return DigestSyncResponse {
                 scheme_ok: true,
+                durable,
                 root_matched: true,
                 frontier,
                 applied_origins,
@@ -2168,6 +2235,7 @@ pub async fn internal_digest_sync(
 
         DigestSyncResponse {
             scheme_ok: true,
+            durable,
             root_matched: false,
             mismatched_buckets: mismatched,
             entries,
@@ -2227,7 +2295,9 @@ pub async fn internal_join(
         // If the peer already exists, update its address in case it restarted
         // with a new IP.
         if registry.get_peer(&joining_node_id).is_some() {
-            registry.update_address(&joining_node_id, &req.address);
+            registry
+                .update_address(&joining_node_id, &req.address)
+                .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
         } else {
             registry
                 .add_peer(PeerConfig {
@@ -2385,7 +2455,9 @@ pub async fn internal_announce(
         // If the peer is already known, update its address in case it
         // restarted with a new IP, then return success.
         if registry.get_peer(&announcing_node_id).is_some() {
-            registry.update_address(&announcing_node_id, &req.address);
+            registry
+                .update_address(&announcing_node_id, &req.address)
+                .map_err(|e| ApiError(CrdtError::InvalidArgument(e.to_string())))?;
             let snapshot = state
                 .peer_persist_path
                 .as_ref()
@@ -2495,10 +2567,13 @@ pub async fn internal_ping(
         // registry via a bare ping.
         // Apply the SSRF guard before writing sender_addr into the registry.
         if registry.get_peer(&sender_nid).is_some() {
-            if is_safe_peer_address(&req.sender_addr)
-                && registry.update_address(&sender_nid, &req.sender_addr)
-            {
-                changed = true;
+            if is_safe_peer_address(&req.sender_addr) {
+                match registry.update_address(&sender_nid, &req.sender_addr) {
+                    Ok(updated) => changed |= updated,
+                    Err(error) => {
+                        tracing::warn!(sender = %req.sender_id, %error, "ping peer address rejected")
+                    }
+                }
             }
         } else if state.internal_token.as_ref().is_some_and(|t| !t.is_empty()) {
             if is_safe_peer_address(&req.sender_addr)
@@ -2544,8 +2619,11 @@ pub async fn internal_ping(
                     if is_ip_addr && !is_safe_peer_address(&peer_info.address) {
                         continue;
                     }
-                    if registry.update_address(&peer_nid, &peer_info.address) {
-                        changed = true;
+                    match registry.update_address(&peer_nid, &peer_info.address) {
+                        Ok(updated) => changed |= updated,
+                        Err(error) => {
+                            tracing::warn!(peer = %peer_info.node_id, %error, "gossip peer address rejected")
+                        }
                     }
                 } else if new_peers_added < MAX_NEW_PEERS_PER_PING {
                     // New peer: full SSRF check to prevent injecting unknown endpoints.

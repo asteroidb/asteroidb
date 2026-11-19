@@ -29,6 +29,13 @@ pub struct HlcTimestamp {
     pub node_id: String,
 }
 
+/// Position in the certified delta stream, ordered by timestamp then key.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CertifiedDeltaCursor {
+    pub hlc: HlcTimestamp,
+    pub key: String,
+}
+
 impl Ord for HlcTimestamp {
     fn cmp(&self, other: &Self) -> Ordering {
         self.physical
@@ -73,9 +80,9 @@ impl Hlc {
     /// clamping (the former `saturating_add` behaviour) that would produce
     /// duplicate timestamps and violate strict monotonicity.
     ///
-    /// On `Overflow`, the physical clock is advanced by 1 ms and the logical
-    /// counter is reset to 0, allowing the next `now()` call to succeed.
-    /// This mirrors the recovery guarantee in `update()`.
+    /// On `Overflow`, the physical clock advances by 1 ms and resets the
+    /// logical counter when possible. At `u64::MAX`, the clock stays saturated
+    /// and rejects future issuance rather than reusing an older timestamp.
     pub fn now(&mut self) -> Result<HlcTimestamp, HlcError> {
         let wall = physical_ms();
 
@@ -87,10 +94,14 @@ impl Hlc {
                 Some(l) => self.logical = l,
                 None => {
                     // Logical saturated: advance physical by 1 ms and reset
-                    // logical so subsequent calls can succeed. The caller
-                    // receives Overflow to signal the exceptional tick.
-                    self.physical = self.physical.saturating_add(1);
-                    self.logical = 0;
+                    // logical so subsequent calls can succeed. At the maximum
+                    // physical time there is no later timestamp to issue.
+                    // Keep the saturated state so a later call cannot reissue
+                    // an older HLC after this error.
+                    if let Some(next_physical) = self.physical.checked_add(1) {
+                        self.physical = next_physical;
+                        self.logical = 0;
+                    }
                     return Err(HlcError::Overflow);
                 }
             }
@@ -156,15 +167,15 @@ impl Hlc {
                 Ok(())
             }
             Err(e) => {
-                // On overflow the logical counter cannot be expressed at the current
-                // physical time.  Advance physical by 1 ms and reset logical to 0 so
-                // that the next now() or update() call produces a timestamp strictly
-                // greater than any peer timestamp at max_physical (including one with
-                // logical == u32::MAX).  Without this reset, self.logical would retain
-                // its pre-call value and a subsequent now() could return a timestamp
-                // less than the overflowed peer timestamp, violating HLC causality.
-                self.physical = self.physical.saturating_add(1);
-                self.logical = 0;
+                // A successor physical time permits recovery. At u64::MAX,
+                // retain the saturated logical bound: resetting it would let
+                // the next now() reissue an older timestamp.
+                if let Some(next_physical) = self.physical.checked_add(1) {
+                    self.physical = next_physical;
+                    self.logical = 0;
+                } else {
+                    self.logical = u32::MAX;
+                }
                 Err(e)
             }
         }
@@ -526,6 +537,32 @@ mod tests {
             t2 > t1,
             "seeding with an old timestamp must not regress the clock"
         );
+    }
+
+    #[test]
+    fn maximum_physical_overflow_never_reissues_an_older_timestamp() {
+        let saturated = HlcTimestamp {
+            physical: u64::MAX,
+            logical: u32::MAX,
+            node_id: "node-a".into(),
+        };
+        let mut clock = Hlc::new("node-a".into());
+        clock.seed_recovered(&saturated);
+
+        assert_eq!(clock.now(), Err(HlcError::Overflow));
+        assert_eq!(clock.now(), Err(HlcError::Overflow));
+        assert_eq!(clock.physical, u64::MAX);
+        assert_eq!(clock.logical, u32::MAX);
+
+        let ordinary_peer = HlcTimestamp {
+            physical: wall_clock_ms(),
+            logical: 0,
+            node_id: "node-b".into(),
+        };
+        assert_eq!(clock.update(&ordinary_peer), Err(HlcError::Overflow));
+        assert_eq!(clock.now(), Err(HlcError::Overflow));
+        assert_eq!(clock.physical, u64::MAX);
+        assert_eq!(clock.logical, u32::MAX);
     }
 
     #[test]

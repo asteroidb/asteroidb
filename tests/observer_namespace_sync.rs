@@ -34,6 +34,8 @@ use std::time::Duration;
 use asteroidb_poc::api::certified::CertifiedApi;
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
+use asteroidb_poc::authority::certificate::{KeysetRegistry, KeysetVersion};
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::consensus::ControlPlaneConsensus;
 use asteroidb_poc::control_plane::raft::node::{AdoptOutcome, RaftConfig, RaftNode};
@@ -65,6 +67,24 @@ fn node_id(s: &str) -> NodeId {
 fn kr(prefix: &str) -> KeyRange {
     KeyRange {
         prefix: prefix.into(),
+    }
+}
+
+fn test_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = match authority {
+        "cp-1" => 1,
+        "cp-2" => 2,
+        "obs-1" => 3,
+        _ => panic!("unexpected test authority {authority}"),
+    };
+    #[cfg(feature = "native-crypto")]
+    {
+        NodeSigner::from_seed(node_id(authority), &seed, false)
+    }
+    #[cfg(not(feature = "native-crypto"))]
+    {
+        NodeSigner::from_seed(node_id(authority), &seed)
     }
 }
 
@@ -103,6 +123,17 @@ fn app_state(
     namespace: Arc<RwLock<SystemNamespace>>,
     consensus: ControlPlaneConsensus,
 ) -> (Arc<AppState>, Arc<Mutex<CertifiedApi>>) {
+    let mut registry = KeysetRegistry::new();
+    registry
+        .register_keyset(
+            KeysetVersion(1),
+            0,
+            ["cp-1", "cp-2", "obs-1"]
+                .into_iter()
+                .map(|authority| (node_id(authority), test_signer(authority).verifying_key()))
+                .collect(),
+        )
+        .unwrap();
     let certified = Arc::new(Mutex::new(CertifiedApi::new(
         id.clone(),
         Arc::clone(&namespace),
@@ -122,7 +153,7 @@ fn app_state(
         latency_model: None,
         cluster_nodes: None,
         slo_tracker: Arc::new(asteroidb_poc::ops::slo::SloTracker::new()),
-        keyset_registry: None,
+        keyset_registry: Some(Arc::new(RwLock::new(registry))),
         epoch_config: asteroidb_poc::authority::certificate::EpochConfig::default(),
         current_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         require_signed_frontiers: false,
@@ -194,7 +225,7 @@ async fn propose_authority(nodes: &[Arc<RaftNode>], spec: AuthoritySpec) {
     }
 }
 
-/// Push one unsigned frontier report for `authority` at `policy_version`
+/// Push one signed frontier report for `authority` at `policy_version`
 /// to the node at `addr` (exercises the real voter receive path:
 /// admission, stale/fenced instrumentation, metrics export).
 async fn push_frontier(
@@ -205,19 +236,21 @@ async fn push_frontier(
     policy_version: u64,
     physical: u64,
 ) {
+    let frontier = AckFrontier {
+        authority_id: node_id(authority),
+        frontier_hlc: HlcTimestamp {
+            physical,
+            logical: 0,
+            node_id: authority.into(),
+        },
+        key_range: kr(prefix),
+        policy_version: PolicyVersion(policy_version),
+        digest_hash: format!("digest-{authority}-{physical}"),
+    };
+    let signature = test_signer(authority).sign_frontier(&frontier, KeysetVersion(1));
     let req = FrontierPushRequest {
-        frontiers: vec![AckFrontier {
-            authority_id: node_id(authority),
-            frontier_hlc: HlcTimestamp {
-                physical,
-                logical: 0,
-                node_id: authority.into(),
-            },
-            key_range: kr(prefix),
-            policy_version: PolicyVersion(policy_version),
-            digest_hash: format!("digest-{authority}-{physical}"),
-        }],
-        signatures: Vec::new(),
+        frontiers: vec![frontier],
+        signatures: vec![Some(signature)],
         observed: Vec::new(),
     };
     let resp = client
@@ -503,7 +536,7 @@ async fn t0_silent_fence_reproduction_without_pull() {
 
     // Real harm, phase 1: cp-2 is down too. Only cp-1 reports v2; the
     // observer's stale report contributes nothing. Majority (2 of 3) is
-    // unreachable -> the certified write TIMES OUT.
+    // unreachable -> the certified write remains pending.
     let resp = client
         .post(format!("http://{cp1}/api/certified/write"))
         .json(&serde_json::json!({
@@ -523,7 +556,7 @@ async fn t0_silent_fence_reproduction_without_pull() {
         let read = api.get_certified("user/z");
         assert_eq!(
             read.status,
-            asteroidb_poc::types::CertificationStatus::Timeout,
+            asteroidb_poc::types::CertificationStatus::Pending,
             "with the observer silently fenced and one voter down, the \
              certification quorum is quietly gone (the M-17 harm)"
         );

@@ -13,6 +13,8 @@ use std::sync::{Arc, RwLock};
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::api::eventual::EventualApi;
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+use asteroidb_poc::authority::certificate::KeysetVersion;
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::{CompactionConfig, CompactionEngine};
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -52,6 +54,20 @@ fn make_frontier(authority: &str, physical: u64, logical: u32, prefix: &str) -> 
         policy_version: PolicyVersion(1),
         digest_hash: format!("{authority}-{physical}-{logical}"),
     }
+}
+
+fn signed_frontier(api: &mut CertifiedApi, authority: &str, after_physical: u64) {
+    let mut seed = [0u8; 32];
+    seed[0] = *authority.as_bytes().last().unwrap();
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node(authority), &seed, true);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node(authority), &seed);
+    let report_physical = (after_physical / 1000 + 1) * 1000 + 100;
+    let frontier = make_frontier(authority, report_physical, 0, "");
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let verified = signer.self_verified(&frontier, &signature);
+    api.update_frontier_verified(frontier, Some(verified));
 }
 
 fn wrap_ns(ns: SystemNamespace) -> Arc<RwLock<SystemNamespace>> {
@@ -468,7 +484,7 @@ fn authority_majority_loss_and_recovery() {
     let write_ts = cert.pending_writes()[0].timestamp.physical;
 
     // Only 1 authority reports (no majority).
-    cert.update_frontier(make_frontier("auth-3", write_ts + 100, 0, ""));
+    signed_frontier(&mut cert, "auth-3", write_ts);
     cert.process_certifications();
     assert_eq!(
         cert.get_certification_status("key1"),
@@ -476,7 +492,7 @@ fn authority_majority_loss_and_recovery() {
     );
 
     // Authority recovery: 2nd authority reports (now have majority 2/3).
-    cert.update_frontier(make_frontier("auth-1", write_ts + 200, 0, ""));
+    signed_frontier(&mut cert, "auth-1", write_ts);
     cert.process_certifications();
     assert_eq!(
         cert.get_certification_status("key1"),
@@ -546,8 +562,8 @@ fn authority_partition_different_certified_values() {
     let write_ts_c = cert_c.pending_writes()[0].timestamp.physical;
 
     // Auth-1 and Auth-2 advance past A's write (majority in partition 1).
-    cert_ab.update_frontier(make_frontier("auth-1", write_ts_ab + 100, 0, ""));
-    cert_ab.update_frontier(make_frontier("auth-2", write_ts_ab + 100, 0, ""));
+    signed_frontier(&mut cert_ab, "auth-1", write_ts_ab);
+    signed_frontier(&mut cert_ab, "auth-2", write_ts_ab);
     cert_ab.process_certifications();
 
     // A's write is certified in partition 1.
@@ -557,7 +573,7 @@ fn authority_partition_different_certified_values() {
     );
 
     // Auth-3 alone is not enough for C's write (1 of 3, no majority).
-    cert_c.update_frontier(make_frontier("auth-3", write_ts_c + 100, 0, ""));
+    signed_frontier(&mut cert_c, "auth-3", write_ts_c);
     cert_c.process_certifications();
 
     // C's write remains Pending.
@@ -567,8 +583,8 @@ fn authority_partition_different_certified_values() {
     );
 
     // --- Partition heals: C receives auth-1 and auth-2 frontiers ---
-    cert_c.update_frontier(make_frontier("auth-1", write_ts_c + 200, 0, ""));
-    cert_c.update_frontier(make_frontier("auth-2", write_ts_c + 200, 0, ""));
+    signed_frontier(&mut cert_c, "auth-1", write_ts_c);
+    signed_frontier(&mut cert_c, "auth-2", write_ts_c);
     cert_c.process_certifications();
 
     // Now C's write should be certified too.
@@ -729,7 +745,15 @@ fn partition_compaction_eligibility_requires_majority_post_heal() {
     frontiers.update(make_frontier("auth-3", 2000, 0, "data/"));
 
     // Not compactable (1/3 authorities).
-    assert!(!engine.is_compactable("data/", &frontiers, 3));
+    assert!(!engine.is_compactable(
+        "data/",
+        &frontiers,
+        &[
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into())
+        ]
+    ));
 
     // Partition heals: auth-1 and auth-2 catch up.
     frontiers.update(make_frontier("auth-1", 1500, 0, "data/"));
@@ -737,7 +761,15 @@ fn partition_compaction_eligibility_requires_majority_post_heal() {
 
     // Now majority (3/3) have consumed past t=1000.
     // Majority frontier: sorted [1200, 1500, 2000], idx=1 → 1500 >= 1000 ✓
-    assert!(engine.is_compactable("data/", &frontiers, 3));
+    assert!(engine.is_compactable(
+        "data/",
+        &frontiers,
+        &[
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into())
+        ]
+    ));
 }
 
 #[test]
@@ -811,9 +843,9 @@ fn certified_write_succeeds_with_full_authority_set() {
     let write_ts = cert.pending_writes()[0].timestamp.physical;
 
     // Advance all 3 authorities past the write timestamp.
-    cert.update_frontier(make_frontier("auth-1", write_ts + 1000, 0, ""));
-    cert.update_frontier(make_frontier("auth-2", write_ts + 1000, 0, ""));
-    cert.update_frontier(make_frontier("auth-3", write_ts + 1000, 0, ""));
+    signed_frontier(&mut cert, "auth-1", write_ts);
+    signed_frontier(&mut cert, "auth-2", write_ts);
+    signed_frontier(&mut cert, "auth-3", write_ts);
 
     cert.process_certifications();
 
@@ -893,8 +925,8 @@ fn partition_certified_api_multiple_pending_writes_resolve_after_heal() {
         .unwrap();
 
     // Authorities recover and report frontiers past all write timestamps.
-    cert.update_frontier(make_frontier("auth-1", max_ts + 1000, 0, ""));
-    cert.update_frontier(make_frontier("auth-2", max_ts + 1000, 0, ""));
+    signed_frontier(&mut cert, "auth-1", max_ts);
+    signed_frontier(&mut cert, "auth-2", max_ts);
     cert.process_certifications();
 
     // All writes should now be certified.

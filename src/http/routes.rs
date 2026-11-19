@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 
 use super::handlers::{
@@ -19,26 +20,43 @@ use super::handlers::{
 /// When `AppState::internal_token` is `Some`, the `/api/internal/*`
 /// routes and control-plane mutation routes (`PUT`, `DELETE`) are
 /// protected by Bearer token authentication. When `None`, all routes
-/// are open (backwards-compatible).
+/// are open.
 pub fn router(state: Arc<AppState>) -> Router {
+    router_with_operation_mode(state, false)
+}
+
+/// In operation mode the old data API uses a different ledger, so every old
+/// data route is fenced. Control-plane and membership routes remain available.
+pub fn router_with_operation_mode(state: Arc<AppState>, operation_mode: bool) -> Router {
+    let legacy_internal_data = if operation_mode {
+        Router::new()
+            .route(
+                "/api/internal/frontiers",
+                post(legacy_api_disabled).get(legacy_api_disabled),
+            )
+            .route("/api/internal/sync", post(legacy_api_disabled))
+            .route("/api/internal/sync/delta", post(legacy_api_disabled))
+            .route("/api/internal/sync/digest", post(legacy_api_disabled))
+            .route("/api/internal/certified/delta", post(legacy_api_disabled))
+            .route("/api/internal/keys", get(legacy_api_disabled))
+    } else {
+        Router::new()
+            .route(
+                "/api/internal/frontiers",
+                post(post_internal_frontiers).get(get_internal_frontiers),
+            )
+            .route("/api/internal/sync", post(internal_sync))
+            .route("/api/internal/sync/delta", post(internal_delta_sync))
+            .route("/api/internal/sync/digest", post(internal_digest_sync))
+            .route(
+                "/api/internal/certified/delta",
+                post(internal_certified_delta),
+            )
+            .route("/api/internal/keys", get(internal_keys))
+    };
     // Internal routes sub-router. Conditionally wrapped with auth middleware.
     let internal_routes = Router::new()
-        .route(
-            "/api/internal/frontiers",
-            post(post_internal_frontiers).get(get_internal_frontiers),
-        )
-        .route("/api/internal/sync", post(internal_sync))
-        .route("/api/internal/sync/delta", post(internal_delta_sync))
-        .route("/api/internal/sync/digest", post(internal_digest_sync))
-        // Certified replication lane (P0-1). Registered HERE, inside the
-        // internal sub-router, so it inherits the Bearer-token middleware
-        // with every other internal route — the ingest path it feeds
-        // bypasses client-facing policy checks.
-        .route(
-            "/api/internal/certified/delta",
-            post(internal_certified_delta),
-        )
-        .route("/api/internal/keys", get(internal_keys))
+        .merge(legacy_internal_data)
         .route("/api/internal/join", post(internal_join))
         .route("/api/internal/leave", post(internal_leave))
         .route("/api/internal/announce", post(internal_announce))
@@ -57,7 +75,19 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     // Control-plane mutation routes sub-router (PUT / DELETE).
     // These require internal token auth like the internal routes.
+    let legacy_equivocation_delete = if operation_mode {
+        Router::new().route(
+            "/api/authority/equivocations/{authority_id}",
+            delete(legacy_api_disabled),
+        )
+    } else {
+        Router::new().route(
+            "/api/authority/equivocations/{authority_id}",
+            delete(delete_equivocations),
+        )
+    };
     let cp_mutation_routes = Router::new()
+        .merge(legacy_equivocation_delete)
         .route(
             "/api/control-plane/authorities",
             put(set_authority_definition),
@@ -66,13 +96,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/control-plane/policies/{prefix}",
             delete(remove_policy),
-        )
-        // Equivocation false-positive recovery (M-12): a mutation, so it
-        // rides the token-protected sub-router — unlike the public
-        // read-only GET /api/authority/equivocations.
-        .route(
-            "/api/authority/equivocations/{authority_id}",
-            delete(delete_equivocations),
         );
 
     let (internal_routes, cp_mutation_routes) = if let Some(ref token) = state.internal_token
@@ -94,13 +117,32 @@ pub fn router(state: Arc<AppState>) -> Router {
         (internal_routes, cp_mutation_routes)
     };
 
+    let legacy_data = if operation_mode {
+        Router::new()
+            .route("/api/eventual/write", post(legacy_api_disabled))
+            .route("/api/eventual/{*key}", get(legacy_api_disabled))
+            .route("/api/certified/write", post(legacy_api_disabled))
+            .route("/api/certified/verify", post(legacy_api_disabled))
+            .route("/api/certified/{*key}", get(legacy_api_disabled))
+            .route("/api/status/{*key}", get(legacy_api_disabled))
+    } else {
+        Router::new()
+            .route("/api/eventual/write", post(eventual_write))
+            .route("/api/eventual/{*key}", get(get_eventual))
+            .route("/api/certified/write", post(certified_write))
+            .route("/api/certified/verify", post(verify_proof))
+            .route("/api/certified/{*key}", get(get_certified))
+            .route("/api/status/{*key}", get(get_certification_status))
+    };
+    let legacy_equivocation_read = if operation_mode {
+        Router::new().route("/api/authority/equivocations", get(legacy_api_disabled))
+    } else {
+        Router::new().route("/api/authority/equivocations", get(get_equivocations))
+    };
+
     Router::new()
-        .route("/api/eventual/write", post(eventual_write))
-        .route("/api/eventual/{*key}", get(get_eventual))
-        .route("/api/certified/write", post(certified_write))
-        .route("/api/certified/verify", post(verify_proof))
-        .route("/api/certified/{*key}", get(get_certified))
-        .route("/api/status/{*key}", get(get_certification_status))
+        .merge(legacy_data)
+        .merge(legacy_equivocation_read)
         .merge(internal_routes)
         .merge(cp_mutation_routes)
         // Control-plane read-only endpoints (public)
@@ -116,14 +158,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/topology", get(get_topology))
         .route("/api/metrics", get(get_metrics))
         .route("/api/slo", get(get_slo))
-        // Equivocation evidence is public read-only by design: the raw
-        // signed pairs already circulate via gossip, so there is nothing
-        // secret to protect, and operators need unauthenticated access
-        // during incident response (same posture as /api/metrics).
-        .route("/api/authority/equivocations", get(get_equivocations))
         // Health check endpoint — outside auth middleware for load balancer probes.
         .route("/healthz", get(healthz))
         .with_state(state)
+}
+
+async fn legacy_api_disabled() -> (StatusCode, &'static str) {
+    (
+        StatusCode::CONFLICT,
+        "legacy data API is disabled in operation mode; use /api/operations/*",
+    )
 }
 
 #[cfg(test)]
@@ -221,6 +265,77 @@ mod tests {
     async fn body_string(body: Body) -> String {
         let bytes = body.collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn operation_mode_fences_legacy_public_data_paths() {
+        let app = router_with_operation_mode(test_state(), true);
+        for (method, path) in [
+            ("POST", "/api/eventual/write"),
+            ("GET", "/api/eventual/key"),
+            ("POST", "/api/certified/write"),
+            ("POST", "/api/certified/verify"),
+            ("GET", "/api/certified/key"),
+            ("GET", "/api/status/key"),
+            ("GET", "/api/authority/equivocations"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(
+                body_string(response.into_body())
+                    .await
+                    .contains("/api/operations/*")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_mode_fences_legacy_internal_data_but_keeps_control_plane() {
+        let app = router_with_operation_mode(test_state_with_token(Some("secret".into())), true);
+        for (method, path) in [
+            ("POST", "/api/internal/frontiers"),
+            ("GET", "/api/internal/frontiers"),
+            ("POST", "/api/internal/sync"),
+            ("POST", "/api/internal/sync/delta"),
+            ("POST", "/api/internal/sync/digest"),
+            ("POST", "/api/internal/certified/delta"),
+            ("GET", "/api/internal/keys"),
+            ("DELETE", "/api/authority/equivocations/auth-1"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {path}");
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/control-plane/raft/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Test state with a populated keyset registry and configurable
@@ -1556,6 +1671,8 @@ mod tests {
     #[tokio::test]
     async fn certified_read_certified_has_proof() {
         use crate::authority::ack_frontier::AckFrontier;
+        use crate::authority::certificate::KeysetVersion;
+        use crate::authority::frontier_sig::NodeSigner;
         use crate::hlc::HlcTimestamp;
 
         let state = test_state();
@@ -1583,33 +1700,32 @@ mod tests {
 
             let write_ts = api.pending_writes()[0].timestamp.physical;
 
-            // Advance 2 of 3 authorities.
-            api.update_frontier(AckFrontier {
-                authority_id: NodeId("auth-1".into()),
-                frontier_hlc: HlcTimestamp {
-                    physical: write_ts + 100,
-                    logical: 0,
-                    node_id: "auth-1".into(),
-                },
-                key_range: KeyRange {
-                    prefix: String::new(),
-                },
-                policy_version: current_pv,
-                digest_hash: "h1".into(),
-            });
-            api.update_frontier(AckFrontier {
-                authority_id: NodeId("auth-2".into()),
-                frontier_hlc: HlcTimestamp {
-                    physical: write_ts + 200,
-                    logical: 0,
-                    node_id: "auth-2".into(),
-                },
-                key_range: KeyRange {
-                    prefix: String::new(),
-                },
-                policy_version: current_pv,
-                digest_hash: "h2".into(),
-            });
+            // A majority signs the same checkpoint after the write.
+            let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+            for (authority, seed) in [("auth-1", 1u8), ("auth-2", 2u8)] {
+                let mut key = [0u8; 32];
+                key[0] = seed;
+                #[cfg(feature = "native-crypto")]
+                let signer = NodeSigner::from_seed(NodeId(authority.into()), &key, true);
+                #[cfg(not(feature = "native-crypto"))]
+                let signer = NodeSigner::from_seed(NodeId(authority.into()), &key);
+                let frontier = AckFrontier {
+                    authority_id: NodeId(authority.into()),
+                    frontier_hlc: HlcTimestamp {
+                        physical: report_ts,
+                        logical: 0,
+                        node_id: authority.into(),
+                    },
+                    key_range: KeyRange {
+                        prefix: String::new(),
+                    },
+                    policy_version: current_pv,
+                    digest_hash: format!("h{seed}"),
+                };
+                let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+                let verified = signer.self_verified(&frontier, &signature);
+                api.update_frontier_verified(frontier, Some(verified));
+            }
             api.process_certifications();
         }
 
@@ -1632,6 +1748,7 @@ mod tests {
         );
 
         let proof = read_resp.proof.unwrap();
+        assert!(proof.certificate.is_some());
         assert_eq!(proof.total_authorities, 3);
         assert_eq!(proof.contributing_authorities.len(), 2);
         assert!(
@@ -1667,7 +1784,7 @@ mod tests {
         let hlc = crate::hlc::HlcTimestamp {
             physical: 1000,
             logical: 0,
-            node_id: "auth-1".into(),
+            node_id: String::new(),
         };
         let pv = PolicyVersion(1);
         let message = create_certificate_message(&kr, &hlc, &pv);
@@ -1692,7 +1809,7 @@ mod tests {
 
         let body_json = serde_json::json!({
             "key_range_prefix": "user/",
-            "frontier": {"physical": 1000, "logical": 0, "node_id": "auth-1"},
+            "frontier": {"physical": 1000, "logical": 0, "node_id": ""},
             "policy_version": 1,
             "contributing_authorities": auth_ids,
             "total_authorities": 5,
@@ -1711,7 +1828,7 @@ mod tests {
                 .register_keyset(KeysetVersion(1), 0, registry_keys)
                 .unwrap();
         }
-        let app = router(state);
+        let app = router(Arc::clone(&state));
 
         let req = Request::builder()
             .method("POST")
@@ -1731,6 +1848,25 @@ mod tests {
         // The denominator comes from the server's authority definition
         // (3 authorities), not the request's total_authorities=5: 3/2+1 = 2.
         assert_eq!(result.required_count, 2);
+
+        // A BLS label with only Ed25519 signatures must not be accepted as
+        // an aggregate proof when the aggregate fields are absent.
+        let mut mislabeled = body_json;
+        mislabeled["signature_algorithm"] = serde_json::json!("Bls12_381");
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/certified/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mislabeled.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result: VerifyProofResponse =
+            serde_json::from_str(&body_string(resp.into_body()).await).unwrap();
+        assert!(!result.valid);
     }
 
     /// verify_proof errors must be the same structured JSON
@@ -2234,7 +2370,7 @@ mod tests {
     async fn certified_delta_route_is_token_protected() {
         let state = test_state_with_token(Some("test-secret".into()));
         let app = router(state);
-        let body = r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#;
+        let body = r#"{"sender":"n2","frontier":null}"#;
 
         let req = Request::builder()
             .method("POST")
@@ -2294,9 +2430,7 @@ mod tests {
             .method("POST")
             .uri("/api/internal/certified/delta")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender":"n2","frontier":{"physical":0,"logical":0,"node_id":""}}"#,
-            ))
+            .body(Body::from(r#"{"sender":"n2","frontier":null}"#))
             .unwrap();
         let resp = router(state).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2307,8 +2441,7 @@ mod tests {
         assert_eq!(delta.entries.len(), 1, "exactly the certified key");
         assert_eq!(delta.entries[0].key, "certified-only");
         assert_eq!(
-            delta.entries[0].policy_version,
-            Some(current_version),
+            delta.entries[0].scope.policy_version, current_version,
             "every entry must carry its write-time origin version"
         );
         assert!(!delta.truncated);

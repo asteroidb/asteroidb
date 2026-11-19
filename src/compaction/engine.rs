@@ -1,10 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::authority::ack_frontier::AckFrontierSet;
+use crate::api::certified::VerifiedPruneFloor;
+use crate::authority::ack_frontier::{AckFrontierSet, FrontierScope};
 use crate::hlc::HlcTimestamp;
-use crate::types::{KeyRange, PolicyVersion};
+use crate::types::{KeyRange, NodeId, PolicyVersion};
 
 use super::tuner::AdaptiveCompactionConfig;
 
@@ -67,7 +68,7 @@ pub enum RevalidationTrigger {
 /// Compaction engine managing checkpoints and compaction eligibility (FR-010).
 ///
 /// Tracks per-key-range operation counts, creates periodic checkpoints,
-/// determines compaction eligibility based on Authority ack_frontiers,
+/// checks preliminary compaction eligibility based on Authority ack_frontiers,
 /// and manages revalidation triggers.
 pub struct CompactionEngine {
     config: CompactionConfig,
@@ -270,29 +271,39 @@ impl CompactionEngine {
         self.checkpoints.get(prefix)
     }
 
-    /// Check whether data for a key range can be compacted.
+    /// Check whether the current roster has a frontier majority.
     ///
-    /// Compaction is safe only when the majority of authorities **within the
-    /// same key_range and policy_version scope** have consumed updates past
-    /// the checkpoint's timestamp (FR-010).  Frontiers from other key ranges
-    /// or policy versions are excluded to prevent cross-scope contamination.
+    /// Check reports from the current Authority roster in the checkpoint's
+    /// exact range and policy version. A residual frontier from a replaced
+    /// member must not contribute to the majority. This is only a preliminary
+    /// gate: a signed quorum is additionally required by `run_compaction`.
     pub fn is_compactable(
         &self,
         prefix: &str,
         frontiers: &AckFrontierSet,
-        total_authorities: usize,
+        members: &[NodeId],
     ) -> bool {
-        let checkpoint = match self.checkpoints.get(prefix) {
-            Some(cp) => cp,
-            None => return false,
+        let Some(checkpoint) = self.checkpoints.get(prefix) else {
+            return false;
         };
-
-        frontiers.is_certified_at_for_scope(
-            &checkpoint.timestamp,
-            &checkpoint.key_range,
-            &checkpoint.policy_version,
-            total_authorities,
-        )
+        let mut unique = HashSet::new();
+        if members.is_empty() || !members.iter().all(|member| unique.insert(member)) {
+            return false;
+        }
+        let accepted = members
+            .iter()
+            .filter(|member| {
+                let scope = FrontierScope::new(
+                    checkpoint.key_range.clone(),
+                    checkpoint.policy_version,
+                    (*member).clone(),
+                );
+                frontiers
+                    .get_scoped(&scope)
+                    .is_some_and(|frontier| frontier.frontier_hlc >= checkpoint.timestamp)
+            })
+            .count();
+        accepted > members.len() / 2
     }
 
     /// Verify the digest hash for a key range against the stored checkpoint.
@@ -343,42 +354,78 @@ impl CompactionEngine {
 
     /// Run a full compaction cycle for a key range:
     /// 1. Create a checkpoint (if the threshold is met).
-    /// 2. Check compaction eligibility (majority of authorities past the checkpoint).
+    /// 2. Require a matched signed quorum on a normalized floor at least as
+    ///    high as the checkpoint. The token can only be issued by the
+    ///    certified API's verification path in production.
     /// 3. Prune old operation-log timestamps from the store.
     ///
     /// Returns the number of timestamp entries pruned, or 0 if compaction
     /// was not eligible or no checkpoint existed.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_compaction(
+    pub(crate) fn run_compaction(
         &mut self,
         key_range: &KeyRange,
         now: HlcTimestamp,
         digest_hash: String,
         policy_version: PolicyVersion,
         frontiers: &AckFrontierSet,
-        total_authorities: usize,
+        authority_nodes: &[NodeId],
+        signed_floor: Option<&VerifiedPruneFloor>,
         store: &mut crate::store::kv::Store,
+        belongs_to_scope: impl Fn(&str) -> bool,
     ) -> usize {
         let prefix = &key_range.prefix;
+        let checkpoint_due = self.should_checkpoint(key_range, &now);
+        let had_checkpoint = self.checkpoints.contains_key(prefix);
+        // Keep a pending checkpoint until its evidence arrives. Replacing it
+        // on every busy tick would make a signed floor that trails the latest
+        // write miss the checkpoint forever.
+        if !had_checkpoint && checkpoint_due {
+            self.create_checkpoint(
+                key_range.clone(),
+                now.clone(),
+                digest_hash.clone(),
+                policy_version,
+            );
+        }
 
-        // Step 1: create checkpoint if threshold is reached.
-        if self.should_checkpoint(key_range, &now) {
-            self.create_checkpoint(key_range.clone(), now.clone(), digest_hash, policy_version);
+        // A checkpoint from a previous policy version cannot be authorized
+        // by that version's residual frontier after the current policy moves.
+        if self.checkpoints.get(prefix).is_none_or(|checkpoint| {
+            checkpoint.key_range != *key_range || checkpoint.policy_version != policy_version
+        }) {
+            if checkpoint_due {
+                self.create_checkpoint(key_range.clone(), now, digest_hash, policy_version);
+            }
+            return 0;
         }
 
         // Step 2: check if compaction is safe (majority of authorities are past
         // the checkpoint frontier).
-        if !self.is_compactable(prefix, frontiers, total_authorities) {
+        if !self.is_compactable(prefix, frontiers, authority_nodes) {
             return 0;
         }
 
-        // Step 3: prune old timestamps from the store up to the checkpoint frontier.
+        // A frontier can be accepted without a signature. The caller obtains
+        // this floor from verified signatures matched to the exact accepted
+        // full reports of a quorum in the current roster. A later checkpoint
+        // is needed when this checkpoint's HLC falls after a rounded floor.
         let checkpoint = match self.checkpoints.get(prefix) {
             Some(cp) => cp.clone(),
             None => return 0,
         };
+        if signed_floor.is_none_or(|floor| floor.timestamp() < &checkpoint.timestamp) {
+            return 0;
+        }
 
-        store.prune_timestamps_before(prefix, &checkpoint.timestamp)
+        // Step 3: prune the proven checkpoint before replacing it with a
+        // newer one. The new checkpoint can wait for its own signed floor.
+        let pruned =
+            store.prune_timestamps_before_matching(prefix, &checkpoint.timestamp, belongs_to_scope);
+        if had_checkpoint && checkpoint_due {
+            self.create_checkpoint(key_range.clone(), now, digest_hash, policy_version);
+        }
+        pruned
     }
 }
 
@@ -388,6 +435,10 @@ mod tests {
     use crate::authority::ack_frontier::{AckFrontier, AckFrontierSet};
     use crate::compaction::tuner::AdaptiveCompactionConfig;
     use crate::types::NodeId;
+
+    fn roster(names: &[&str]) -> Vec<NodeId> {
+        names.iter().map(|name| NodeId((*name).into())).collect()
+    }
 
     fn make_ts(physical: u64, logical: u32, node: &str) -> HlcTimestamp {
         HlcTimestamp {
@@ -541,7 +592,102 @@ mod tests {
         frontiers.update(make_frontier("auth-2", 300, "user/"));
         frontiers.update(make_frontier("auth-3", 150, "user/"));
 
-        assert!(engine.is_compactable("user/", &frontiers, 3));
+        assert!(engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
+    }
+
+    #[test]
+    fn timestamp_prune_ignores_replaced_authority_frontier() {
+        let mut engine = CompactionEngine::with_defaults();
+        let range = make_key_range("user/");
+        engine.create_checkpoint(
+            range.clone(),
+            make_ts(100, 0, "node-a"),
+            "hash".into(),
+            PolicyVersion(1),
+        );
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-old", 200, "user/"));
+        frontiers.update(make_frontier("auth-current", 200, "user/"));
+        let current = [NodeId("auth-current".into()), NodeId("auth-new".into())];
+        assert!(!engine.is_compactable("user/", &frontiers, &current));
+
+        let mut store = crate::store::kv::Store::new();
+        store.put(
+            "user/a".into(),
+            crate::store::kv::CrdtValue::Counter(crate::crdt::pn_counter::PnCounter::new()),
+        );
+        store.record_change("user/a", make_ts(50, 0, "node-a"));
+        assert_eq!(
+            engine.run_compaction(
+                &range,
+                make_ts(100, 0, "node-a"),
+                "hash".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &current,
+                Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
+                &mut store,
+                |_| true,
+            ),
+            0,
+        );
+        assert!(store.timestamp_for("user/a").is_some());
+
+        frontiers.update(make_frontier("auth-new", 200, "user/"));
+        assert_eq!(
+            engine.run_compaction(
+                &range,
+                make_ts(100, 0, "node-a"),
+                "hash".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &current,
+                Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
+                &mut store,
+                |_| true,
+            ),
+            1,
+        );
+    }
+
+    #[test]
+    fn timestamp_prune_rejects_checkpoint_from_old_policy_version() {
+        let mut engine = CompactionEngine::with_defaults();
+        let range = make_key_range("user/");
+        engine.create_checkpoint(
+            range.clone(),
+            make_ts(100, 0, "node-a"),
+            "old".into(),
+            PolicyVersion(1),
+        );
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 200, "user/"));
+        let mut store = crate::store::kv::Store::new();
+        store.put(
+            "user/a".into(),
+            crate::store::kv::CrdtValue::Counter(crate::crdt::pn_counter::PnCounter::new()),
+        );
+        store.record_change("user/a", make_ts(50, 0, "node-a"));
+
+        assert_eq!(
+            engine.run_compaction(
+                &range,
+                make_ts(101, 0, "node-a"),
+                "new".into(),
+                PolicyVersion(2),
+                &frontiers,
+                &roster(&["auth-1"]),
+                Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
+                &mut store,
+                |_| true,
+            ),
+            0,
+        );
+        assert!(store.timestamp_for("user/a").is_some());
     }
 
     /// Compaction resolves the authority count itself and never passes
@@ -567,11 +713,11 @@ mod tests {
         frontiers.update(make_frontier("auth-1", 10_000, "user/"));
 
         assert!(
-            !engine.is_compactable("user/", &frontiers, 0),
+            !engine.is_compactable("user/", &frontiers, &[]),
             "an emptied authority set must never authorise compaction"
         );
         // Sanity: the same frontier does authorise it for a real set of 1.
-        assert!(engine.is_compactable("user/", &frontiers, 1));
+        assert!(engine.is_compactable("user/", &frontiers, &roster(&["auth-1"])));
     }
 
     #[test]
@@ -595,7 +741,11 @@ mod tests {
 
         // majority frontier with 3 authorities: sorted [100, 200, 600], majority=2, index=1 → 200
         // 200 < 500, so not compactable
-        assert!(!engine.is_compactable("user/", &frontiers, 3));
+        assert!(!engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -603,7 +753,11 @@ mod tests {
         let engine = CompactionEngine::with_defaults();
         let frontiers = AckFrontierSet::new();
 
-        assert!(!engine.is_compactable("user/", &frontiers, 3));
+        assert!(!engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -716,7 +870,11 @@ mod tests {
         frontiers.update(make_frontier("auth-3", 400, "order/"));
 
         // Should NOT be compactable: no user/ frontiers exist
-        assert!(!engine.is_compactable("user/", &frontiers, 3));
+        assert!(!engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -757,7 +915,11 @@ mod tests {
         });
 
         // Should NOT be compactable: no policy_version=1 frontiers
-        assert!(!engine.is_compactable("user/", &frontiers, 3));
+        assert!(!engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -781,7 +943,11 @@ mod tests {
         frontiers.update(make_frontier("auth-3", 400, "order/"));
 
         // Should NOT be compactable: only 1 of 3 in user/ scope
-        assert!(!engine.is_compactable("user/", &frontiers, 3));
+        assert!(!engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -805,7 +971,11 @@ mod tests {
         frontiers.update(make_frontier("auth-3", 400, "order/"));
 
         // Should be compactable: 2 of 3 in user/ scope past t=100
-        assert!(engine.is_compactable("user/", &frontiers, 3));
+        assert!(engine.is_compactable(
+            "user/",
+            &frontiers,
+            &roster(&["auth-1", "auth-2", "auth-3"])
+        ));
     }
 
     #[test]
@@ -1079,19 +1249,161 @@ mod tests {
         frontiers.update(make_frontier("auth-2", 300, "user/"));
         frontiers.update(make_frontier("auth-3", 150, "user/"));
 
+        let members = [
+            NodeId("auth-1".into()),
+            NodeId("auth-2".into()),
+            NodeId("auth-3".into()),
+        ];
+        assert_eq!(
+            engine.run_compaction(
+                &kr,
+                make_ts(100, 0, "node-a"),
+                "digest-100".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &members,
+                None,
+                &mut store,
+                |_| true,
+            ),
+            0,
+            "unsigned frontiers alone cannot prune timestamps"
+        );
+        assert!(store.timestamp_for("user/a").is_some());
+        assert_eq!(
+            engine.run_compaction(
+                &kr,
+                make_ts(100, 0, "node-a"),
+                "digest-100".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &members,
+                Some(&VerifiedPruneFloor::for_test(make_ts(99, 0, ""))),
+                &mut store,
+                |_| true,
+            ),
+            0,
+            "a signed floor below the checkpoint cannot authorize its prune"
+        );
+
         let pruned = engine.run_compaction(
             &kr,
             make_ts(100, 0, "node-a"),
             "digest-100".into(),
             PolicyVersion(1),
             &frontiers,
-            3,
+            &members,
+            Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
             &mut store,
+            |_| true,
         );
 
         // Checkpoint at t=100; user/a (ts=50) should be pruned, user/b (ts=200) kept.
         assert_eq!(pruned, 1);
         assert!(engine.get_checkpoint("user/").is_some());
+    }
+
+    #[test]
+    fn busy_writes_keep_an_unpruned_checkpoint_until_its_signed_floor_arrives() {
+        let mut engine = CompactionEngine::new(CompactionConfig {
+            time_threshold_ms: u64::MAX,
+            ops_threshold: 1,
+        });
+        let range = make_key_range("user/");
+        engine.create_checkpoint(
+            range.clone(),
+            make_ts(100, 0, "node"),
+            "first".into(),
+            PolicyVersion(1),
+        );
+        engine.record_op(&range);
+        let mut store = crate::store::kv::Store::new();
+        store.put(
+            "user/a".into(),
+            crate::store::kv::CrdtValue::Counter(crate::crdt::pn_counter::PnCounter::new()),
+        );
+        store.record_change("user/a", make_ts(50, 0, "node"));
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-1", 150, "user/"));
+        let members = roster(&["auth-1"]);
+
+        assert_eq!(
+            engine.run_compaction(
+                &range,
+                make_ts(200, 0, "node"),
+                "second".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &members,
+                None,
+                &mut store,
+                |_| true,
+            ),
+            0,
+        );
+        assert_eq!(
+            engine.get_checkpoint("user/").unwrap().timestamp.physical,
+            100
+        );
+
+        assert_eq!(
+            engine.run_compaction(
+                &range,
+                make_ts(210, 0, "node"),
+                "second".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &members,
+                Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
+                &mut store,
+                |_| true,
+            ),
+            1,
+        );
+        assert_eq!(
+            engine.get_checkpoint("user/").unwrap().timestamp.physical,
+            210
+        );
+        assert!(store.timestamp_for("user/a").is_none());
+    }
+
+    #[test]
+    fn parent_checkpoint_prunes_only_keys_in_its_assignment() {
+        let mut engine = CompactionEngine::with_defaults();
+        let parent = make_key_range("user/");
+        engine.create_checkpoint(
+            parent.clone(),
+            make_ts(100, 0, "node"),
+            "parent".into(),
+            PolicyVersion(1),
+        );
+        let mut store = crate::store::kv::Store::new();
+        for key in ["user/a", "user/private/b"] {
+            store.put(
+                key.into(),
+                crate::store::kv::CrdtValue::Counter(crate::crdt::pn_counter::PnCounter::new()),
+            );
+            store.record_change(key, make_ts(50, 0, "node"));
+        }
+        let mut frontiers = AckFrontierSet::new();
+        frontiers.update(make_frontier("auth-parent", 200, "user/"));
+
+        assert_eq!(
+            engine.run_compaction(
+                &parent,
+                make_ts(200, 0, "node"),
+                "later".into(),
+                PolicyVersion(1),
+                &frontiers,
+                &roster(&["auth-parent"]),
+                Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
+                &mut store,
+                |key| key == "user/a",
+            ),
+            1,
+        );
+        assert!(store.timestamp_for("user/a").is_none());
+        assert!(store.timestamp_for("user/private/b").is_some());
     }
 
     #[test]
@@ -1126,8 +1438,14 @@ mod tests {
             "digest-100".into(),
             PolicyVersion(1),
             &frontiers,
-            3,
+            &[
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+            Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
             &mut store,
+            |_| true,
         );
 
         assert_eq!(pruned, 0);
@@ -1150,8 +1468,14 @@ mod tests {
             "digest-100".into(),
             PolicyVersion(1),
             &frontiers,
-            3,
+            &[
+                NodeId("auth-1".into()),
+                NodeId("auth-2".into()),
+                NodeId("auth-3".into()),
+            ],
+            Some(&VerifiedPruneFloor::for_test(make_ts(1000, 0, ""))),
             &mut store,
+            |_| true,
         );
 
         assert_eq!(pruned, 0);

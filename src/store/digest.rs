@@ -43,6 +43,8 @@
 //! never converged cluster-wide under sustained digest fallback (the M-8
 //! livelock). In v2 the same transfer propagates the floor instead and
 //! the asymmetry heals in one round trip.
+//! The current v2 OR-Map stream includes every live dot's immutable value
+//! and HLC, including dots whose value does not win the local read.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -52,12 +54,13 @@ use crate::crdt::digest::write_str;
 use crate::store::kv::CrdtValue;
 
 /// Version of the digest wire scheme (bucket layout + canonical CRDT
-/// streams). Bump on ANY change to the canonical encoding — peers with a
-/// different version answer `scheme_ok = false` and the requester falls
+/// streams). Once released, bump on ANY change to the canonical encoding.
+/// Peers with a different version answer `scheme_ok = false` and the requester falls
 /// back to the legacy full sync (rolling-upgrade safe).
 ///
 /// v2: `OrSet`/`OrMap` streams include the `compaction_floor` and
-/// exclude floor-covered deferred dots (M-8 canonical form).
+/// exclude floor-covered deferred dots (M-8 canonical form). OR-Map also
+/// binds the immutable value and HLC of every live dot.
 pub const DIGEST_SCHEME_VERSION: u32 = 2;
 
 /// Number of key-range buckets (fixed; part of the wire scheme).
@@ -772,6 +775,29 @@ mod tests {
     }
 
     #[test]
+    fn map_digest_binds_nonwinning_dot_value() {
+        let key = "k".to_string();
+        let mut first = OrMap::new();
+        let mut second = OrMap::new();
+        // The same dot with conflicting payloads is invalid globally, but
+        // the digest must expose it even when a newer dot wins both reads.
+        first.set(key.clone(), "old-a".to_string(), ts(1, 0, "a"), &node("a"));
+        second.set(key.clone(), "old-b".to_string(), ts(1, 0, "a"), &node("a"));
+        let mut winner = OrMap::new();
+        winner.set(key.clone(), "winner".to_string(), ts(2, 0, "b"), &node("b"));
+        first.merge(&winner);
+        second.merge(&winner);
+        assert_eq!(first.get(&key), Some(&"winner".to_string()));
+        assert_eq!(second.get(&key), first.get(&key));
+        let first = to_btree(vec![(key.clone(), CrdtValue::Map(first))]);
+        let second = to_btree(vec![(key, CrdtValue::Map(second))]);
+        assert_ne!(
+            compute_store_digest(&first).root,
+            compute_store_digest(&second).root
+        );
+    }
+
+    #[test]
     fn insertion_order_does_not_affect_digest() {
         let forward = to_btree(fixture_entries());
         let mut reversed_entries = fixture_entries();
@@ -881,7 +907,7 @@ mod tests {
         base.add("x".to_string(), &n); // (a,2)
         base.remove(&"x".to_string());
         // Certified sweep: floor reaches 2, tombstone (a,2) dropped.
-        base.compact_deferred_certified(&base.deferred_dots(), None);
+        base.compact_deferred_certified(&base.deferred_dots());
 
         // Replica A: fresh remove below the floor (covered own tombstone).
         let mut set_a = base.clone();
@@ -923,7 +949,7 @@ mod tests {
         unswept.add("x".to_string(), &n);
         unswept.remove(&"x".to_string());
         let mut swept = unswept.clone();
-        swept.compact_deferred_certified(&swept.deferred_dots(), None);
+        swept.compact_deferred_certified(&swept.deferred_dots());
 
         let a = to_btree(vec![("k".into(), CrdtValue::Set(unswept))]);
         let b = to_btree(vec![("k".into(), CrdtValue::Set(swept))]);
@@ -1053,14 +1079,15 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// If this test fails you have changed the canonical digest encoding.
-    /// That is a WIRE CONTRACT change: bump `DIGEST_SCHEME_VERSION`, update
-    /// this expected value, and note the change in docs/architecture.md.
+    /// After release, that is a WIRE CONTRACT change: bump
+    /// `DIGEST_SCHEME_VERSION`, update this expected value, and note the
+    /// change in docs/architecture.md.
     #[test]
     fn golden_root_digest_scheme_v2() {
         let digest = compute_store_digest(&to_btree(fixture_entries()));
         assert_eq!(
             hex::encode(digest.root),
-            "c307197eecba4be1fe66034db3437ad98ee60e8123f76d50e76bc65e9dfb8372",
+            "135f661a6cc1d2d494caa0efc48fcf900d053c37f8a11962749b589d68b9ab74",
             "canonical digest encoding changed — see test doc comment"
         );
     }
@@ -1075,7 +1102,7 @@ mod tests {
         set.add("alice".to_string(), &n);
         set.add("bob".to_string(), &n);
         set.remove(&"bob".to_string());
-        set.compact_deferred_certified(&set.deferred_dots(), None);
+        set.compact_deferred_certified(&set.deferred_dots());
         // Fresh covered tombstone (canonical-invisible).
         set.remove(&"alice".to_string());
 
@@ -1134,7 +1161,7 @@ mod tests {
         }
         assert_eq!(
             hex::encode(store.digest().root),
-            "c307197eecba4be1fe66034db3437ad98ee60e8123f76d50e76bc65e9dfb8372",
+            "135f661a6cc1d2d494caa0efc48fcf900d053c37f8a11962749b589d68b9ab74",
             "the digest cache changed the wire digest — see the golden test doc"
         );
 

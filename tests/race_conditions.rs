@@ -667,7 +667,15 @@ async fn concurrent_store_merge_and_compaction_check() {
             let locked_fs = fs.lock().await;
             let locked_ce = ce.lock().await;
             // Check compactability (will be false since no checkpoint exists).
-            let _compactable = locked_ce.is_compactable("data/", &locked_fs, 3);
+            let _compactable = locked_ce.is_compactable(
+                "data/",
+                &locked_fs,
+                &[
+                    NodeId("auth-1".into()),
+                    NodeId("auth-2".into()),
+                    NodeId("auth-3".into()),
+                ],
+            );
 
             // Also check if we should create a checkpoint.
             let _should_cp = locked_ce.should_checkpoint(&kr("data/"), &ts(2000, 0, "check"));

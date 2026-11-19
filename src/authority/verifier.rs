@@ -1,10 +1,49 @@
 use serde::Serialize;
+use std::collections::HashSet;
+
+use ed25519_dalek::VerifyingKey;
 
 use crate::api::certified::ProofBundle;
 use crate::authority::certificate::{
     CertError, DualModeCertificate, EpochConfig, FormatVersionConfig, KeysetRegistry,
-    create_certificate_message, majority_threshold,
+    MajorityCertificate, create_certificate_message, majority_threshold,
 };
+use crate::authority::frontier_sig::checkpoint_hlc;
+use crate::types::NodeId;
+
+fn roster_contains_all<'a>(
+    roster: &'a [NodeId],
+    signers: impl IntoIterator<Item = &'a NodeId>,
+) -> bool {
+    let members: HashSet<_> = roster.iter().collect();
+    members.len() == roster.len() && signers.into_iter().all(|id| members.contains(id))
+}
+
+fn trusted_keys_match(cert: &MajorityCertificate, trusted_keys: &[(NodeId, VerifyingKey)]) -> bool {
+    let members: HashSet<_> = trusted_keys.iter().map(|(id, _)| id).collect();
+    let distinct_keys: HashSet<_> = trusted_keys.iter().map(|(_, key)| key.to_bytes()).collect();
+    members.len() == trusted_keys.len()
+        && distinct_keys.len() == trusted_keys.len()
+        && cert.signatures.iter().all(|sig| {
+            trusted_keys
+                .iter()
+                .any(|(id, key)| id == &sig.authority_id && key == &sig.public_key)
+        })
+}
+
+fn normalized_checkpoint(frontier: &crate::hlc::HlcTimestamp) -> bool {
+    *frontier == checkpoint_hlc(frontier)
+}
+
+fn certificate_matches_bundle(bundle: &ProofBundle, cert: &MajorityCertificate) -> bool {
+    let claimed: std::collections::HashSet<_> = bundle.contributing_authorities.iter().collect();
+    let signed: std::collections::HashSet<_> = cert.signers().into_iter().collect();
+    cert.key_range == bundle.key_range
+        && cert.frontier_hlc == bundle.frontier_hlc
+        && cert.policy_version == bundle.policy_version
+        && claimed == signed
+        && normalized_checkpoint(&cert.frontier_hlc)
+}
 
 /// Result of verifying a proof bundle.
 ///
@@ -21,7 +60,7 @@ pub struct VerificationResult {
     pub contributing_count: usize,
     /// Number of authorities required for majority.
     ///
-    /// `usize::MAX` when the proof claims zero total authorities: no signer
+    /// `usize::MAX` when the trusted roster is empty: no signer
     /// count can meet it, so `has_majority` is always false. See
     /// [`majority_threshold`].
     pub required_count: usize,
@@ -39,30 +78,40 @@ pub struct VerificationResult {
 ///    and policy version.
 /// 3. If `format_config` is provided, the certificate's format version is
 ///    checked against the grace-period policy.
+/// 4. The certificate metadata and signer set match the bundle, and the
+///    checkpoint uses the canonical 1000 ms bucket representation.
 ///
-/// External clients can use this to verify certification without trusting
-/// the node that returned the proof.
-///
-/// The denominator comes from the bundle and `contributing_count` is the
-/// number of signatures that verified — there is no membership check against
-/// an authority set, because an independent verifier has none. That makes the
-/// `total_authorities == 0` case load-bearing here rather than merely
-/// theoretical: `total / 2 + 1` yields 1, so a bundle claiming zero
-/// authorities and carrying one valid signature would verify as a majority of
-/// nobody. [`majority_threshold`] makes zero unsatisfiable instead.
-/// (A bundle that claims `total_authorities: 1` still verifies, of course; a
-/// caller that knows the real authority set must compare the denominator
-/// against it, as `http::handlers::verify_proof` does.)
+/// The caller supplies the exact trusted Authority ID→public-key roster for
+/// this range. Embedded keys are accepted only when they match that roster;
+/// both membership and the quorum denominator come from this trust anchor.
 pub fn verify_proof(
     bundle: &ProofBundle,
+    trusted_keys: &[(NodeId, VerifyingKey)],
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = majority_threshold(bundle.total_authorities);
+    let required = majority_threshold(trusted_keys.len());
+    if bundle.total_authorities != trusted_keys.len() {
+        return VerificationResult {
+            valid: false,
+            has_majority: false,
+            contributing_count: 0,
+            required_count: required,
+            signatures_valid: Some(false),
+        };
+    }
 
     // A proof without a certificate is always invalid — a caller could
     // fabricate a "valid" proof by simply listing enough authority IDs.
     let (contributing_count, signatures_valid) = match bundle.certificate.as_ref() {
+        Some(cert)
+            if !certificate_matches_bundle(bundle, cert)
+                || !trusted_keys_match(cert, trusted_keys) =>
+        {
+            let unique: std::collections::HashSet<_> =
+                bundle.contributing_authorities.iter().collect();
+            (unique.len(), Some(false))
+        }
         Some(cert) => {
             let message = create_certificate_message(
                 &bundle.key_range,
@@ -92,7 +141,9 @@ pub fn verify_proof(
         }
     };
 
-    let has_majority = contributing_count >= required;
+    let trusted_roster: Vec<NodeId> = trusted_keys.iter().map(|(id, _)| id.clone()).collect();
+    let has_majority = roster_contains_all(&trusted_roster, &bundle.contributing_authorities)
+        && contributing_count >= required;
     let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
@@ -106,28 +157,49 @@ pub fn verify_proof(
 
 /// Verify a proof bundle with keyset registry and epoch awareness.
 ///
-/// Extends `verify_proof` by additionally checking:
+/// Verifies with trusted scope membership and registry key lookup:
 /// 1. Each signature's keyset version is known in the registry.
 /// 2. Each signature's keyset version is within the epoch grace period.
 /// 3. Signatures are verified against the registry's public keys
 ///    (not just the embedded keys in the certificate).
 /// 4. If `format_config` is provided, the certificate's format version is
 ///    checked against the grace-period policy.
+/// 5. The certificate metadata and signer set match the bundle, and its
+///    checkpoint is canonical.
+/// 6. Every signer belongs to the caller's exact trusted scope roster and
+///    the bundle's claimed count matches that roster. The registry can hold
+///    keys for other ranges, so it alone cannot establish scope membership.
 ///
 /// Returns a `VerificationResult` with an optional `keyset_error` if
 /// any keyset/epoch validation fails.
 pub fn verify_proof_with_registry(
     bundle: &ProofBundle,
+    trusted_authorities: &[NodeId],
     registry: &KeysetRegistry,
     current_epoch: u64,
     epoch_config: &EpochConfig,
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = majority_threshold(bundle.total_authorities);
+    let required = majority_threshold(trusted_authorities.len());
+
+    if bundle.total_authorities != trusted_authorities.len() {
+        return VerificationResult {
+            valid: false,
+            has_majority: false,
+            contributing_count: 0,
+            required_count: required,
+            signatures_valid: Some(false),
+        };
+    }
 
     // A proof without a certificate is always invalid.
     let (contributing_count, signatures_valid) = match bundle.certificate.as_ref() {
+        Some(cert) if !certificate_matches_bundle(bundle, cert) => {
+            let unique: std::collections::HashSet<_> =
+                bundle.contributing_authorities.iter().collect();
+            (unique.len(), Some(false))
+        }
         Some(cert) => {
             let message = create_certificate_message(
                 &bundle.key_range,
@@ -167,7 +239,8 @@ pub fn verify_proof_with_registry(
         }
     };
 
-    let has_majority = contributing_count >= required;
+    let has_majority = roster_contains_all(trusted_authorities, &bundle.contributing_authorities)
+        && contributing_count >= required;
     let valid = has_majority && signatures_valid == Some(true);
 
     VerificationResult {
@@ -187,20 +260,20 @@ pub fn verify_proof_with_registry(
 /// rejection, and the registry/embedded key match requirement are delegated
 /// to `DualModeCertificate::verify_with_registry`.
 ///
-/// `has_majority` is judged independently from `signer_count()`, mirroring
-/// the Ed25519 verifier: `valid` requires both majority and valid signatures.
+/// The caller supplies the exact trusted scope roster. `valid` requires
+/// every verified signer to belong to it, as well as majority and valid signatures.
 /// When `format_config` is provided, the certificate's format version is
 /// checked first; an unacceptable version yields `signatures_valid = Some(false)`.
 pub fn verify_dual_proof_with_registry(
     cert: &DualModeCertificate,
-    total_authorities: usize,
+    trusted_authorities: &[NodeId],
     registry: &KeysetRegistry,
     current_epoch: u64,
     epoch_config: &EpochConfig,
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> VerificationResult {
-    let required = majority_threshold(total_authorities);
+    let required = majority_threshold(trusted_authorities.len());
 
     let format_ok = format_config
         .map(|fc| fc.is_version_acceptable(cert.format_version, elapsed_since_upgrade_secs))
@@ -209,17 +282,29 @@ pub fn verify_dual_proof_with_registry(
     let message =
         create_certificate_message(&cert.key_range, &cert.frontier_hlc, &cert.policy_version);
 
-    let (contributing_count, signatures_valid) = if !format_ok {
-        (cert.signer_count(), Some(false))
-    } else {
-        match cert.verify_with_registry(&message, registry, current_epoch, epoch_config) {
-            Ok(verified_signers) => (verified_signers.len(), Some(true)),
-            Err(_) => (cert.signer_count(), Some(false)),
-        }
-    };
+    let (contributing_count, signatures_valid, verified_signers) =
+        if !format_ok || !normalized_checkpoint(&cert.frontier_hlc) {
+            (cert.signer_count(), Some(false), Vec::new())
+        } else {
+            match cert.verify_with_registry(&message, registry, current_epoch, epoch_config) {
+                Ok(verified_signers) => (verified_signers.len(), Some(true), verified_signers),
+                Err(_) => (cert.signer_count(), Some(false), Vec::new()),
+            }
+        };
 
-    let has_majority = contributing_count >= required;
-    let valid = has_majority && signatures_valid == Some(true);
+    let signer_ids: Vec<&NodeId> = match &cert.mode {
+        crate::authority::certificate::CertificateMode::Ed25519 => cert
+            .ed25519_signatures
+            .iter()
+            .map(|sig| &sig.authority_id)
+            .collect(),
+        crate::authority::certificate::CertificateMode::Bls => cert.bls_signer_ids.iter().collect(),
+    };
+    let has_majority =
+        roster_contains_all(trusted_authorities, signer_ids) && contributing_count >= required;
+    let valid = has_majority
+        && signatures_valid == Some(true)
+        && roster_contains_all(trusted_authorities, &verified_signers);
 
     VerificationResult {
         valid,
@@ -237,15 +322,28 @@ pub fn verify_dual_proof_with_registry(
 /// invalid signatures, or expired format versions.
 pub fn verify_proof_with_registry_detailed(
     bundle: &ProofBundle,
+    trusted_authorities: &[NodeId],
     registry: &KeysetRegistry,
     current_epoch: u64,
     epoch_config: &EpochConfig,
     format_config: Option<&FormatVersionConfig>,
     elapsed_since_upgrade_secs: u64,
 ) -> Result<VerificationResult, CertError> {
-    let required = majority_threshold(bundle.total_authorities);
+    if bundle.total_authorities != trusted_authorities.len()
+        || !roster_contains_all(trusted_authorities, &bundle.contributing_authorities)
+    {
+        return Err(CertError::InvalidCertificateMetadata(
+            "proof count or signers do not match trusted roster",
+        ));
+    }
+    let required = majority_threshold(trusted_authorities.len());
 
     let (contributing_count, signatures_valid) = if let Some(cert) = &bundle.certificate {
+        if !certificate_matches_bundle(bundle, cert) {
+            return Err(CertError::InvalidCertificateMetadata(
+                "certificate fields or signer set do not match the proof bundle",
+            ));
+        }
         let message = create_certificate_message(
             &bundle.key_range,
             &bundle.frontier_hlc,
@@ -311,8 +409,8 @@ mod tests {
     fn sample_hlc() -> HlcTimestamp {
         HlcTimestamp {
             physical: 1_700_000_000_000,
-            logical: 42,
-            node_id: "node-1".into(),
+            logical: 0,
+            node_id: String::new(),
         }
     }
 
@@ -360,10 +458,126 @@ mod tests {
         }
     }
 
+    fn test_roster(ids: impl IntoIterator<Item = NodeId>, total: usize) -> Vec<NodeId> {
+        let mut roster: Vec<NodeId> = ids.into_iter().collect();
+        roster.truncate(total);
+        while roster.len() < total {
+            roster.push(NodeId(format!("trusted-extra-{}", roster.len())));
+        }
+        roster
+    }
+
+    fn test_keys(proof: &ProofBundle, total: usize) -> Vec<(NodeId, VerifyingKey)> {
+        let mut keys: Vec<(NodeId, VerifyingKey)> = proof
+            .certificate
+            .as_ref()
+            .map(|cert| {
+                cert.signatures
+                    .iter()
+                    .map(|sig| (sig.authority_id.clone(), sig.public_key))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in &proof.contributing_authorities {
+            if !keys.iter().any(|(member, _)| member == id) {
+                let (_, key) = make_key_pair();
+                keys.push((id.clone(), key));
+            }
+        }
+        keys.truncate(total);
+        while keys.len() < total {
+            let (_, key) = make_key_pair();
+            keys.push((NodeId(format!("trusted-extra-{}", keys.len())), key));
+        }
+        keys
+    }
+
+    // Test fixtures construct independent trust arguments explicitly at the
+    // call boundary. Production callers must supply their own trusted keys.
+    fn verify_proof(
+        proof: &ProofBundle,
+        total: usize,
+        format_config: Option<&FormatVersionConfig>,
+        elapsed: u64,
+    ) -> VerificationResult {
+        super::verify_proof(proof, &test_keys(proof, total), format_config, elapsed)
+    }
+
+    fn verify_proof_with_registry(
+        proof: &ProofBundle,
+        total: usize,
+        registry: &KeysetRegistry,
+        current_epoch: u64,
+        epoch_config: &EpochConfig,
+        format_config: Option<&FormatVersionConfig>,
+        elapsed: u64,
+    ) -> VerificationResult {
+        let roster = test_roster(proof.contributing_authorities.clone(), total);
+        super::verify_proof_with_registry(
+            proof,
+            &roster,
+            registry,
+            current_epoch,
+            epoch_config,
+            format_config,
+            elapsed,
+        )
+    }
+
+    fn verify_proof_with_registry_detailed(
+        proof: &ProofBundle,
+        total: usize,
+        registry: &KeysetRegistry,
+        current_epoch: u64,
+        epoch_config: &EpochConfig,
+        format_config: Option<&FormatVersionConfig>,
+        elapsed: u64,
+    ) -> Result<VerificationResult, CertError> {
+        let roster = test_roster(proof.contributing_authorities.clone(), total);
+        super::verify_proof_with_registry_detailed(
+            proof,
+            &roster,
+            registry,
+            current_epoch,
+            epoch_config,
+            format_config,
+            elapsed,
+        )
+    }
+
+    fn verify_dual_proof_with_registry(
+        cert: &DualModeCertificate,
+        total: usize,
+        registry: &KeysetRegistry,
+        current_epoch: u64,
+        epoch_config: &EpochConfig,
+        format_config: Option<&FormatVersionConfig>,
+        elapsed: u64,
+    ) -> VerificationResult {
+        let ids = match &cert.mode {
+            crate::authority::certificate::CertificateMode::Ed25519 => cert
+                .ed25519_signatures
+                .iter()
+                .map(|sig| sig.authority_id.clone())
+                .collect(),
+            crate::authority::certificate::CertificateMode::Bls => cert.bls_signer_ids.clone(),
+        };
+        let roster = test_roster(ids, total);
+        super::verify_dual_proof_with_registry(
+            cert,
+            &roster,
+            registry,
+            current_epoch,
+            epoch_config,
+            format_config,
+            elapsed,
+        )
+    }
+
     #[test]
     fn proof_without_certificate_is_rejected() {
         let proof = make_proof(3, 5, false);
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
 
         assert!(!result.valid);
         assert!(result.has_majority);
@@ -375,7 +589,7 @@ mod tests {
     #[test]
     fn proof_with_insufficient_authorities_fails() {
         let proof = make_proof(2, 5, true);
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
 
         assert!(!result.valid);
         assert!(!result.has_majority);
@@ -390,7 +604,7 @@ mod tests {
         let dup = proof.contributing_authorities[0].clone();
         proof.contributing_authorities.push(dup);
 
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
         assert!(!result.valid);
         assert!(!result.has_majority);
         assert_eq!(result.contributing_count, 2);
@@ -400,11 +614,119 @@ mod tests {
     #[test]
     fn valid_proof_with_certificate() {
         let proof = make_proof(3, 5, true);
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
 
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(true));
+    }
+
+    #[test]
+    fn certificate_metadata_and_signers_must_match_bundle() {
+        let mut proof = make_proof(3, 5, true);
+        proof.certificate.as_mut().unwrap().key_range.prefix = "other/".into();
+        assert!(!verify_proof(&proof, proof.total_authorities, None, 0).valid);
+
+        let mut proof = make_proof(3, 5, true);
+        proof.certificate.as_mut().unwrap().frontier_hlc.physical += 1_000;
+        assert!(!verify_proof(&proof, proof.total_authorities, None, 0).valid);
+
+        let mut proof = make_proof(3, 5, true);
+        proof.certificate.as_mut().unwrap().policy_version = PolicyVersion(2);
+        assert!(!verify_proof(&proof, proof.total_authorities, None, 0).valid);
+
+        let mut proof = make_proof(3, 5, true);
+        proof.contributing_authorities[0] = NodeId("someone-else".into());
+        assert!(!verify_proof(&proof, proof.total_authorities, None, 0).valid);
+    }
+
+    #[test]
+    fn genuinely_signed_noncanonical_checkpoint_is_rejected() {
+        let kr = sample_kr();
+        let mut hlc = sample_hlc();
+        hlc.logical = 1;
+        let pv = sample_pv();
+        let message = create_certificate_message(&kr, &hlc, &pv);
+        let (sk, vk) = make_key_pair();
+        let signer = NodeId("auth-0".into());
+        let mut cert = MajorityCertificate::new(kr.clone(), hlc.clone(), pv, KeysetVersion(1));
+        cert.add_signature(AuthoritySignature {
+            authority_id: signer.clone(),
+            public_key: vk,
+            signature: sign_message(&sk, &message),
+            keyset_version: KeysetVersion(1),
+        });
+        let proof = ProofBundle {
+            key_range: kr,
+            frontier_hlc: hlc,
+            policy_version: pv,
+            contributing_authorities: vec![signer],
+            total_authorities: 1,
+            certificate: Some(cert),
+            bls_certificate: None,
+        };
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
+        assert!(!result.valid);
+        assert_eq!(result.signatures_valid, Some(false));
+    }
+
+    #[test]
+    fn raw_report_signature_collision_cannot_certify_noncanonical_checkpoint() {
+        use crate::authority::ack_frontier::AckFrontier;
+        use crate::authority::frontier_sig::create_frontier_report_message;
+
+        let report = AckFrontier {
+            authority_id: NodeId(String::new()),
+            key_range: KeyRange {
+                prefix: String::new(),
+            },
+            frontier_hlc: HlcTimestamp {
+                physical: 76,
+                logical: 0,
+                node_id: String::new(),
+            },
+            policy_version: PolicyVersion(0),
+            digest_hash: "0".repeat(64),
+        };
+        let range = KeyRange {
+            prefix: "asteroidb/frontier-report/v1".into(),
+        };
+        let checkpoint = HlcTimestamp {
+            physical: 0,
+            logical: 0,
+            node_id: format!("{}@{}", "\0".repeat(19), "0".repeat(56)),
+        };
+        let version = PolicyVersion(0x3030_3030_3030_3030);
+        let report_message = create_frontier_report_message(&report);
+        assert_eq!(
+            report_message,
+            create_certificate_message(&range, &checkpoint, &version),
+            "raw encoders have the Lean counterexample's byte collision"
+        );
+
+        let (sk, vk) = make_key_pair();
+        let signer = NodeId("auth-0".into());
+        let mut cert =
+            MajorityCertificate::new(range.clone(), checkpoint.clone(), version, KeysetVersion(1));
+        cert.add_signature(AuthoritySignature {
+            authority_id: signer.clone(),
+            public_key: vk,
+            signature: sign_message(&sk, &report_message),
+            keyset_version: KeysetVersion(1),
+        });
+        assert!(cert.verify_signatures(&report_message).is_ok());
+        let proof = ProofBundle {
+            key_range: range,
+            frontier_hlc: checkpoint,
+            policy_version: version,
+            contributing_authorities: vec![signer],
+            total_authorities: 1,
+            certificate: Some(cert),
+            bls_certificate: None,
+        };
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
+        assert!(!result.valid);
+        assert_eq!(result.signatures_valid, Some(false));
     }
 
     #[test]
@@ -417,7 +739,7 @@ mod tests {
             cert.signatures[0].signature = bad_sig;
         }
 
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
         assert!(!result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(false));
@@ -430,7 +752,7 @@ mod tests {
     #[test]
     fn zero_total_authorities_never_verifies() {
         let proof = make_proof(1, 0, true);
-        let result = verify_proof(&proof, None, 0);
+        let result = verify_proof(&proof, proof.total_authorities, None, 0);
 
         assert!(!result.valid, "a majority of nobody is not a majority");
         assert!(!result.has_majority);
@@ -440,15 +762,22 @@ mod tests {
             usize::MAX,
             "zero authorities must be reported as unsatisfiable, not as 1"
         );
-        // The signature itself is genuine; only the denominator is not.
-        assert_eq!(result.signatures_valid, Some(true));
+        // An empty trust roster cannot bind the signed key to an Authority.
+        assert_eq!(result.signatures_valid, Some(false));
     }
 
     #[test]
     fn zero_total_authorities_never_verifies_with_registry() {
         let (proof, registry) = make_proof_with_registry(1, 0, 1);
-        let result =
-            verify_proof_with_registry(&proof, &registry, 0, &EpochConfig::default(), None, 0);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
         assert!(!result.valid);
         assert!(!result.has_majority);
         assert_eq!(result.required_count, usize::MAX);
@@ -457,13 +786,25 @@ mod tests {
     #[test]
     fn exact_majority_threshold() {
         let proof = make_proof(1, 1, true);
-        assert!(verify_proof(&proof, None, 0).valid);
+        assert!(verify_proof(&proof, proof.total_authorities, None, 0).valid);
 
         let proof = make_proof(2, 3, true);
-        assert!(verify_proof(&proof, None, 0).valid);
+        assert!(verify_proof(&proof, proof.total_authorities, None, 0).valid);
 
         let proof = make_proof(1, 3, true);
-        assert!(!verify_proof(&proof, None, 0).valid);
+        assert!(!verify_proof(&proof, proof.total_authorities, None, 0).valid);
+    }
+
+    #[test]
+    fn independent_verifier_rejects_forged_quorum_denominator() {
+        let mut proof = make_proof(1, 3, true);
+        proof.total_authorities = 1;
+
+        let result = verify_proof(&proof, 3, None, 0);
+        assert!(!result.valid);
+        assert!(!result.has_majority);
+        assert_eq!(result.required_count, 2);
+        assert_eq!(result.signatures_valid, Some(false));
     }
 
     // ---------------------------------------------------------------
@@ -522,14 +863,158 @@ mod tests {
     }
 
     #[test]
+    fn registered_signers_from_another_range_do_not_form_this_ranges_quorum() {
+        let (proof, registry) = make_proof_with_registry(2, 3, 1);
+        let result = super::verify_proof_with_registry(
+            &proof,
+            &[
+                NodeId("other-range-a".into()),
+                NodeId("other-range-b".into()),
+                NodeId("other-range-c".into()),
+            ],
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
+        assert_eq!(result.signatures_valid, Some(true));
+        assert!(!result.has_majority);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn embedded_key_cannot_substitute_for_the_trusted_authority_key() {
+        let proof = make_proof(2, 3, true);
+        let mut trusted = test_keys(&proof, 3);
+        trusted[0].1 = make_key_pair().1;
+        let result = super::verify_proof(&proof, &trusted, None, 0);
+        assert!(!result.valid);
+        assert_eq!(result.signatures_valid, Some(false));
+    }
+
+    #[test]
+    fn two_authority_ids_sharing_one_trusted_key_do_not_form_a_majority() {
+        let mut proof = make_proof(2, 3, true);
+        let cert = proof.certificate.as_mut().unwrap();
+        let first = cert.signatures[0].clone();
+        cert.signatures[1].public_key = first.public_key;
+        cert.signatures[1].signature = first.signature;
+        let trusted = test_keys(&proof, 3);
+
+        assert!(!super::verify_proof(&proof, &trusted, None, 0).valid);
+    }
+
+    #[test]
+    fn duplicate_trusted_roster_cannot_lower_quorum() {
+        let (proof, registry) = make_proof_with_registry(2, 3, 1);
+        let result = super::verify_proof_with_registry(
+            &proof,
+            &[
+                NodeId("auth-0".into()),
+                NodeId("auth-0".into()),
+                NodeId("auth-1".into()),
+            ],
+            &registry,
+            0,
+            &EpochConfig::default(),
+            None,
+            0,
+        );
+        assert!(!result.valid);
+    }
+
+    #[test]
     fn verify_with_registry_valid_proof() {
         let (proof, registry) = make_proof_with_registry(3, 5, 1);
         let config = EpochConfig::default();
-        let result = verify_proof_with_registry(&proof, &registry, 0, &config, None, 0);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            0,
+            &config,
+            None,
+            0,
+        );
 
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(true));
+    }
+
+    #[test]
+    fn registry_verifier_rejects_forged_quorum_denominator() {
+        let (mut proof, registry) = make_proof_with_registry(1, 3, 1);
+        proof.total_authorities = 1;
+        let config = EpochConfig::default();
+
+        let result = verify_proof_with_registry(&proof, 3, &registry, 0, &config, None, 0);
+        assert!(!result.valid);
+        assert!(!result.has_majority);
+        assert_eq!(result.required_count, 2);
+        assert!(matches!(
+            verify_proof_with_registry_detailed(&proof, 3, &registry, 0, &config, None, 0),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn registry_verifiers_reject_mismatched_certificate_fields_and_signers() {
+        let (mut proof, registry) = make_proof_with_registry(3, 5, 1);
+        proof.certificate.as_mut().unwrap().policy_version = PolicyVersion(2);
+        let config = EpochConfig::default();
+        assert!(
+            !verify_proof_with_registry(
+                &proof,
+                proof.total_authorities,
+                &registry,
+                0,
+                &config,
+                None,
+                0
+            )
+            .valid
+        );
+        assert!(matches!(
+            verify_proof_with_registry_detailed(
+                &proof,
+                proof.total_authorities,
+                &registry,
+                0,
+                &config,
+                None,
+                0
+            ),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
+
+        let (mut proof, registry) = make_proof_with_registry(3, 5, 1);
+        proof.contributing_authorities[0] = NodeId("outside".into());
+        assert!(
+            !verify_proof_with_registry(
+                &proof,
+                proof.total_authorities,
+                &registry,
+                0,
+                &config,
+                None,
+                0
+            )
+            .valid
+        );
+        assert!(matches!(
+            verify_proof_with_registry_detailed(
+                &proof,
+                proof.total_authorities,
+                &registry,
+                0,
+                &config,
+                None,
+                0
+            ),
+            Err(CertError::InvalidCertificateMetadata(_))
+        ));
     }
 
     #[test]
@@ -550,7 +1035,15 @@ mod tests {
             grace_epochs: 3,
         };
 
-        let result = verify_proof_with_registry(&proof, &registry, 4, &config, None, 0);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            4,
+            &config,
+            None,
+            0,
+        );
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -573,7 +1066,15 @@ mod tests {
             grace_epochs: 3,
         };
 
-        let result = verify_proof_with_registry_detailed(&proof, &registry, 4, &config, None, 0);
+        let result = verify_proof_with_registry_detailed(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            4,
+            &config,
+            None,
+            0,
+        );
         assert!(matches!(
             result,
             Err(CertError::ExpiredKeyset { version: 1, .. })
@@ -591,7 +1092,15 @@ mod tests {
         }
 
         let config = EpochConfig::default();
-        let result = verify_proof_with_registry(&proof, &registry, 0, &config, None, 0);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            0,
+            &config,
+            None,
+            0,
+        );
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -661,7 +1170,15 @@ mod tests {
             grace_epochs: 7,
         };
 
-        let result = verify_proof_with_registry(&bundle, &registry, 6, &config, None, 0);
+        let result = verify_proof_with_registry(
+            &bundle,
+            bundle.total_authorities,
+            &registry,
+            6,
+            &config,
+            None,
+            0,
+        );
         assert!(result.valid);
         assert!(result.has_majority);
         assert_eq!(result.signatures_valid, Some(true));
@@ -683,12 +1200,12 @@ mod tests {
         };
 
         // Within grace period: accepted.
-        let result = verify_proof(&proof, Some(&fc), 50);
+        let result = verify_proof(&proof, proof.total_authorities, Some(&fc), 50);
         assert!(result.valid);
         assert_eq!(result.signatures_valid, Some(true));
 
         // Beyond grace period: rejected.
-        let result = verify_proof(&proof, Some(&fc), 101);
+        let result = verify_proof(&proof, proof.total_authorities, Some(&fc), 101);
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -701,7 +1218,7 @@ mod tests {
             grace_period_secs: 0,
         };
 
-        let result = verify_proof(&proof, Some(&fc), 999_999);
+        let result = verify_proof(&proof, proof.total_authorities, Some(&fc), 999_999);
         assert!(result.valid);
         assert_eq!(result.signatures_valid, Some(true));
     }
@@ -718,11 +1235,26 @@ mod tests {
             grace_period_secs: 100,
         };
 
-        let result = verify_proof_with_registry(&proof, &registry, 0, &epoch_config, Some(&fc), 50);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            0,
+            &epoch_config,
+            Some(&fc),
+            50,
+        );
         assert!(result.valid);
 
-        let result =
-            verify_proof_with_registry(&proof, &registry, 0, &epoch_config, Some(&fc), 101);
+        let result = verify_proof_with_registry(
+            &proof,
+            proof.total_authorities,
+            &registry,
+            0,
+            &epoch_config,
+            Some(&fc),
+            101,
+        );
         assert!(!result.valid);
         assert_eq!(result.signatures_valid, Some(false));
     }
@@ -741,6 +1273,7 @@ mod tests {
 
         let result = verify_proof_with_registry_detailed(
             &proof,
+            proof.total_authorities,
             &registry,
             0,
             &epoch_config,
@@ -760,7 +1293,7 @@ mod tests {
             cert.format_version = 1;
         }
 
-        let result = verify_proof(&proof, None, 999_999);
+        let result = verify_proof(&proof, proof.total_authorities, None, 999_999);
         assert!(
             result.valid,
             "without format config, old version should still pass"
@@ -853,6 +1386,34 @@ mod tests {
             assert_eq!(result.signatures_valid, Some(true));
             assert_eq!(result.contributing_count, 2);
             assert_eq!(result.required_count, 2);
+        }
+
+        #[test]
+        fn dual_proof_rejects_genuinely_signed_noncanonical_checkpoint() {
+            let (mut cert, registry, keypairs) = make_bls_cert(2, 3);
+            cert.frontier_hlc.logical = 1;
+            let message = create_certificate_message(
+                &cert.key_range,
+                &cert.frontier_hlc,
+                &cert.policy_version,
+            );
+            let signatures: Vec<_> = keypairs
+                .iter()
+                .take(2)
+                .map(|kp| bls::sign_message(kp.secret_key(), &message))
+                .collect();
+            cert.bls_aggregated_signature = Some(bls::aggregate_signatures(&signatures).unwrap());
+            let result = verify_dual_proof_with_registry(
+                &cert,
+                3,
+                &registry,
+                0,
+                &EpochConfig::default(),
+                None,
+                0,
+            );
+            assert!(!result.valid);
+            assert_eq!(result.signatures_valid, Some(false));
         }
 
         #[test]

@@ -169,6 +169,8 @@ pub struct CertifiedReadResponse {
     pub key: String,
     pub value: Option<CrdtValueJson>,
     pub status: CertificationStatus,
+    /// Observed majority frontier; may include unsigned reports. This is not
+    /// the signed checkpoint in `proof.frontier`.
     pub frontier: Option<FrontierJson>,
     pub proof: Option<ProofBundleJson>,
 }
@@ -622,6 +624,11 @@ impl IntoResponse for ApiError {
                 "TYPE_MISMATCH",
                 format!("expected {expected}, got {actual}"),
             ),
+            CrdtError::DotAssignmentConflict(message) => (
+                StatusCode::CONFLICT,
+                "DOT_ASSIGNMENT_CONFLICT",
+                message.clone(),
+            ),
             CrdtError::KeyNotFound(key) => (
                 StatusCode::NOT_FOUND,
                 "KEY_NOT_FOUND",
@@ -631,6 +638,16 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT,
                 "STALE_VERSION",
                 "stale version".to_string(),
+            ),
+            CrdtError::DotCounterExhausted => (
+                StatusCode::CONFLICT,
+                "DOT_COUNTER_EXHAUSTED",
+                "CRDT dot counter exhausted".to_string(),
+            ),
+            CrdtError::PnCounterExhausted => (
+                StatusCode::CONFLICT,
+                "PN_COUNTER_EXHAUSTED",
+                "PN-Counter component exhausted".to_string(),
             ),
             CrdtError::PolicyDenied(msg) => (StatusCode::FORBIDDEN, "POLICY_DENIED", msg.clone()),
             CrdtError::Timeout => (
@@ -662,6 +679,11 @@ impl IntoResponse for ApiError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "CERTIFICATION_TIMEOUT",
                 CrdtError::CertificationTimeout.to_string(),
+            ),
+            CrdtError::CertificationCapacity { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "CERTIFICATION_CAPACITY",
+                self.0.to_string(),
             ),
             CrdtError::SessionNotSatisfied { key } => (
                 StatusCode::PRECONDITION_FAILED,
@@ -698,7 +720,9 @@ impl IntoResponse for ApiError {
         };
         let retry_after = matches!(
             &self.0,
-            CrdtError::SessionNotSatisfied { .. } | CrdtError::NotLeader { .. }
+            CrdtError::SessionNotSatisfied { .. }
+                | CrdtError::NotLeader { .. }
+                | CrdtError::CertificationCapacity { .. }
         );
 
         let body = ErrorResponse {
@@ -929,6 +953,23 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error_code"], "SESSION_NOT_SATISFIED");
         assert!(body["message"].as_str().unwrap().contains("k1"));
+    }
+
+    #[tokio::test]
+    async fn certification_capacity_maps_to_retryable_503() {
+        use http_body_util::BodyExt;
+
+        let resp = ApiError(CrdtError::CertificationCapacity { max_entries: 2 }).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error_code"], "CERTIFICATION_CAPACITY");
     }
 
     /// Other errors must not grow a Retry-After header.

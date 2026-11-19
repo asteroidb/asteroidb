@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout};
 use asteroidb_poc::authority::ack_frontier::{AckFrontier, AckFrontierSet};
+use asteroidb_poc::authority::certificate::KeysetVersion;
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -60,6 +62,24 @@ fn make_frontier_v(
         },
         policy_version: PolicyVersion(version),
         digest_hash: format!("{authority}-{physical}-{logical}"),
+    }
+}
+
+fn signed_checkpoint(api: &mut CertifiedApi, write_physical: u64, version: u64) {
+    let report_physical = (write_physical / 1000 + 1) * 1000 + 100;
+    for (authority, seed) in [("auth-1", 1u8), ("auth-2", 2u8)] {
+        let mut key = [0u8; 32];
+        key[0] = seed;
+        #[cfg(feature = "native-crypto")]
+        let signer = NodeSigner::from_seed(node(authority), &key, false);
+        #[cfg(not(feature = "native-crypto"))]
+        let signer = NodeSigner::from_seed(node(authority), &key);
+        let frontier = make_frontier_v(authority, report_physical, 0, "data/", version);
+        let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+        api.update_frontier_verified(
+            frontier.clone(),
+            Some(signer.self_verified(&frontier, &signature)),
+        );
     }
 }
 
@@ -138,8 +158,7 @@ fn full_version_switch_with_certified_api() {
     assert_eq!(api.pending_writes()[0].policy_version, PolicyVersion(1));
 
     // Advance v1 frontiers past the write.
-    api.update_frontier(make_frontier_v("auth-1", ts1 + 100, 0, "data/", 1));
-    api.update_frontier(make_frontier_v("auth-2", ts1 + 200, 0, "data/", 1));
+    signed_checkpoint(&mut api, ts1, 1);
     api.process_certifications();
 
     assert_eq!(
@@ -174,8 +193,7 @@ fn full_version_switch_with_certified_api() {
     assert!(!blocked, "fenced v1 should reject frontier updates");
 
     // v2 frontiers should work.
-    api.update_frontier(make_frontier_v("auth-1", ts2 + 100, 0, "data/", 2));
-    api.update_frontier(make_frontier_v("auth-2", ts2 + 200, 0, "data/", 2));
+    signed_checkpoint(&mut api, ts2, 2);
     api.process_certifications();
 
     assert_eq!(
@@ -276,8 +294,7 @@ fn cross_version_frontier_pollution_prevented() {
     );
 
     // Now advance v2 frontiers.
-    api.update_frontier(make_frontier_v("auth-1", ts + 100, 0, "data/", 2));
-    api.update_frontier(make_frontier_v("auth-2", ts + 200, 0, "data/", 2));
+    signed_checkpoint(&mut api, ts, 2);
     api.process_certifications();
 
     assert_eq!(
@@ -382,8 +399,7 @@ fn multiple_version_transitions() {
         .unwrap();
     let ts1 = api.pending_writes()[0].timestamp.physical;
 
-    api.update_frontier(make_frontier_v("auth-1", ts1 + 100, 0, "data/", 1));
-    api.update_frontier(make_frontier_v("auth-2", ts1 + 200, 0, "data/", 1));
+    signed_checkpoint(&mut api, ts1, 1);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("data/v1key"),
@@ -410,8 +426,7 @@ fn multiple_version_transitions() {
         PolicyVersion(2)
     );
 
-    api.update_frontier(make_frontier_v("auth-1", ts2 + 100, 0, "data/", 2));
-    api.update_frontier(make_frontier_v("auth-2", ts2 + 200, 0, "data/", 2));
+    signed_checkpoint(&mut api, ts2, 2);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("data/v2key"),
@@ -443,8 +458,7 @@ fn multiple_version_transitions() {
     assert!(!api.update_frontier(make_frontier_v("auth-1", ts3 + 500, 0, "data/", 2)));
 
     // v3 frontiers should work.
-    api.update_frontier(make_frontier_v("auth-1", ts3 + 100, 0, "data/", 3));
-    api.update_frontier(make_frontier_v("auth-2", ts3 + 200, 0, "data/", 3));
+    signed_checkpoint(&mut api, ts3, 3);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("data/v3key"),

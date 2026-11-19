@@ -18,7 +18,9 @@ use asteroidb_poc::authority::certificate::{EpochConfig, KeysetRegistry, KeysetV
 use asteroidb_poc::authority::equivocation::{
     EquivocationDetector, GOSSIP_SAMPLE_MAX, MAX_OBSERVED_PER_REQUEST, ObservedAttestation,
 };
-use asteroidb_poc::authority::frontier_reporter::format_store_digest_hash;
+use asteroidb_poc::authority::frontier_reporter::{
+    format_store_digest_hash, is_binding_store_digest,
+};
 use asteroidb_poc::authority::frontier_sig::{
     FrontierSignature, NodeSigner, verify_frontier_signature,
 };
@@ -791,6 +793,12 @@ async fn run_exclusion_scenario(exclude: bool) -> (CertificationStatus, bool) {
         let mut api = state.certified.lock().await;
         api.process_certifications();
         let read = api.get_certified("user/carol");
+        assert!(
+            read.frontier
+                .as_ref()
+                .is_some_and(|f| f.physical >= report_ts),
+            "the accused authority's frontier still advances the 2-of-3 majority"
+        );
         let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
         (read.status, has_cert)
     };
@@ -812,11 +820,10 @@ async fn exclusion_flag_drops_accused_attestations_from_certificates() {
     );
 
     // Opt-in exclusion: auth-1's attestation is dropped, leaving 1 of 3
-    // attestations — below the unchanged majority threshold, so no
-    // certificate. The write still certifies via frontier majority
-    // (frontier advancement is not blocked).
+    // attestations — below the unchanged majority threshold, so the
+    // write remains Pending. The frontier itself still advances.
     let (status, has_certificate) = run_exclusion_scenario(true).await;
-    assert_eq!(status, CertificationStatus::Certified);
+    assert_eq!(status, CertificationStatus::Pending);
     assert!(
         !has_certificate,
         "excluded attestation must not contribute to certificate assembly"
@@ -891,6 +898,12 @@ async fn run_pre_pooled_exclusion_scenario(exclude: bool) -> (CertificationStatu
         let mut api = state.certified.lock().await;
         api.process_certifications();
         let read = api.get_certified("user/dave");
+        assert!(
+            read.frontier
+                .as_ref()
+                .is_some_and(|f| f.physical >= report_ts),
+            "purging attestations must not roll back the frontier majority"
+        );
         let has_cert = read.proof.as_ref().is_some_and(|p| p.certificate.is_some());
         (read.status, has_cert)
     };
@@ -902,9 +915,10 @@ async fn run_pre_pooled_exclusion_scenario(exclude: bool) -> (CertificationStatu
 async fn accusation_purges_pre_pooled_attestations_from_certificates() {
     // exclude=1: the attestation auth-1 pooled BEFORE its accusation must
     // be purged at accusation time, leaving 1 of 3 attestations — no
-    // certificate. The write still certifies via frontier majority.
+    // certificate. The write remains Pending, though the frontier majority
+    // still advances (checked in the scenario helper).
     let (status, has_certificate) = run_pre_pooled_exclusion_scenario(true).await;
-    assert_eq!(status, CertificationStatus::Certified);
+    assert_eq!(status, CertificationStatus::Pending);
     assert!(
         !has_certificate,
         "attestations pooled before the accusation must not feed certificates"
@@ -1379,37 +1393,56 @@ async fn restart_with_recovery_reissues_reports_without_evidence() {
         }
     };
 
-    // Phase 1: run until the peer has indexed at least one signed sd2
-    // head from auth-1.
+    // Phase 1: wait for an actual store-bound digest, not a cold-cache
+    // sentinel. Give the background runner time under a busy test harness.
     let (shutdown1, handle1) = run_phase(0).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let heads = state2
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let pre_restart = loop {
+        let head = state2
             .equivocation
             .gossip_summaries(GOSSIP_SAMPLE_MAX)
             .into_iter()
-            .filter(|o| {
+            .find(|o| {
                 o.frontier.authority_id == node_id("auth-1")
-                    && o.frontier.digest_hash.starts_with("sd2:")
-            })
-            .count();
-        if heads > 0 {
-            break;
+                    && is_binding_store_digest(&o.frontier.digest_hash)
+            });
+        if let Some(head) = head {
+            break head.frontier;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "peer never observed a pre-restart sd2 head"
+            "peer never observed a pre-restart store-bound head"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
     let _ = shutdown1.send(true);
     let _ = handle1.await;
 
     // Phase 2: "restart" — fresh clock, fresh detector, same floor file,
-    // different store content. Run several report ticks against the peer
-    // that still holds every phase-1 head.
+    // different store content. Require the peer to receive a new report;
+    // otherwise a silent restarted runner would make this test pass vacuously.
     let (shutdown2, handle2) = run_phase(1).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let post_restart_seen = state2
+            .equivocation
+            .gossip_summaries(GOSSIP_SAMPLE_MAX)
+            .into_iter()
+            .any(|o| {
+                o.frontier.authority_id == node_id("auth-1")
+                    && is_binding_store_digest(&o.frontier.digest_hash)
+                    && o.frontier.digest_hash != pre_restart.digest_hash
+                    && o.frontier.frontier_hlc > pre_restart.frontier_hlc
+            });
+        if post_restart_seen {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer never observed a newer post-restart store-bound head"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let _ = shutdown2.send(true);
     let _ = handle2.await;
 

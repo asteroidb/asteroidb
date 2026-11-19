@@ -17,6 +17,7 @@ use asteroidb_poc::authority::certificate::{
     CertificateMode, DualModeCertificate, EpochConfig, EpochManager, KeysetVersion,
     create_certificate_message,
 };
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -484,9 +485,20 @@ async fn certification_works_with_ed25519_default() {
         .unwrap();
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
-    // Advance 2 of 3 authorities past the write timestamp (majority).
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, ""));
-    api.update_frontier(make_frontier("auth-2", write_ts + 200, ""));
+    // Two authorities sign the same checkpoint beyond the write. Keep BLS
+    // disabled on both signers to exercise the Ed25519 default path.
+    let report_ts = (write_ts / 1000 + 1) * 1000 + 100;
+    for (authority, seed) in [("auth-1", 1u8), ("auth-2", 2u8)] {
+        let mut key = [0u8; 32];
+        key[0] = seed;
+        let signer = NodeSigner::from_seed(node_id(authority), &key, false);
+        let frontier = make_frontier(authority, report_ts, "");
+        let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+        api.update_frontier_verified(
+            frontier.clone(),
+            Some(signer.self_verified(&frontier, &signature)),
+        );
+    }
 
     let shared_api = Arc::new(Mutex::new(api));
     let metrics = Arc::new(RuntimeMetrics::default());
@@ -504,9 +516,17 @@ async fn certification_works_with_ed25519_default() {
     .await;
 
     let handle = runner.shutdown_handle();
-
+    let observed = Arc::clone(&shared_api);
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if observed.lock().await.get_certification_status("key1")
+                == CertificationStatus::Certified
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let _ = handle.send(true);
     });
 
@@ -518,6 +538,27 @@ async fn certification_works_with_ed25519_default() {
         api.get_certification_status("key1"),
         CertificationStatus::Certified,
         "write should be certified with Ed25519 default"
+    );
+    let proof = api
+        .get_certified("key1")
+        .proof
+        .expect("signed majority proof");
+    assert!(proof.certificate.is_some());
+    assert!(proof.bls_certificate.is_none());
+    let trusted_keys: Vec<_> = [("auth-1", 1u8), ("auth-2", 2u8), ("auth-3", 3u8)]
+        .into_iter()
+        .map(|(id, seed)| {
+            let mut key = [0u8; 32];
+            key[0] = seed;
+            let signer = NodeSigner::from_seed(node_id(id), &key, false);
+            (node_id(id), signer.verifying_key())
+        })
+        .collect();
+    let verification =
+        asteroidb_poc::authority::verifier::verify_proof(&proof, &trusted_keys, None, 0);
+    assert!(
+        verification.valid,
+        "Ed25519 proof must verify: {verification:?}"
     );
 }
 

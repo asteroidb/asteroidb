@@ -5,7 +5,7 @@
 //!
 //! 1. **3-Authority auto-certification**: a `certified_write` on an authority
 //!    node is automatically certified by the frontier auto-report pipeline.
-//! 2. **Timeout detection**: stale pending writes are promoted to `Timeout`
+//! 2. **Wait expiry**: old pending writes remain eligible for certification
 //!    during the certification tick.
 //! 3. **Rejected transition**: writes can be explicitly rejected and the
 //!    status is observable.
@@ -18,7 +18,9 @@ use std::time::Duration;
 use asteroidb_poc::api::certified::{CertifiedApi, OnTimeout, RetentionPolicy};
 use asteroidb_poc::api::status::{CertificationTracker, WriteId};
 use asteroidb_poc::authority::ack_frontier::AckFrontier;
+use asteroidb_poc::authority::certificate::{KeysetRegistry, KeysetVersion};
 use asteroidb_poc::authority::frontier_reporter::FrontierReporter;
+use asteroidb_poc::authority::frontier_sig::{CHECKPOINT_INTERVAL_MS, NodeSigner};
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
@@ -66,6 +68,48 @@ fn make_frontier(authority: &str, physical: u64, prefix: &str) -> AckFrontier {
         policy_version: PolicyVersion(1),
         digest_hash: format!("{authority}-{physical}"),
     }
+}
+
+#[cfg(feature = "native-crypto")]
+fn signer(name: &str, seed_byte: u8) -> Arc<NodeSigner> {
+    let mut seed = [0; 32];
+    seed[0] = seed_byte;
+    Arc::new(NodeSigner::from_seed(node_id(name), &seed, false))
+}
+
+#[cfg(not(feature = "native-crypto"))]
+fn signer(name: &str, seed_byte: u8) -> Arc<NodeSigner> {
+    let mut seed = [0; 32];
+    seed[0] = seed_byte;
+    Arc::new(NodeSigner::from_seed(node_id(name), &seed))
+}
+
+fn registry(signers: &[&NodeSigner]) -> Arc<RwLock<KeysetRegistry>> {
+    let mut registry = KeysetRegistry::new();
+    registry
+        .register_keyset(
+            KeysetVersion(1),
+            0,
+            signers
+                .iter()
+                .map(|signer| (signer.node_id().clone(), signer.verifying_key()))
+                .collect(),
+        )
+        .unwrap();
+    Arc::new(RwLock::new(registry))
+}
+
+/// The certificate signs a floor-normalized checkpoint, so it must be
+/// strictly later than the write and shared by every quorum signer.
+fn covering_report_time(write_physical: u64) -> u64 {
+    (write_physical / CHECKPOINT_INTERVAL_MS + 1) * CHECKPOINT_INTERVAL_MS + 100
+}
+
+fn add_signed_frontier(api: &mut CertifiedApi, signer: &NodeSigner, physical: u64, prefix: &str) {
+    let frontier = make_frontier(&signer.node_id().0, physical, prefix);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let verified = signer.self_verified(&frontier, &signature);
+    assert!(api.update_frontier_verified(frontier, Some(verified)));
 }
 
 /// Build a 3-authority namespace with a catch-all key range.
@@ -132,11 +176,9 @@ async fn three_authority_auto_certification() {
 
     let write_ts = &client_api.pending_writes()[0].timestamp;
 
-    // Each authority generates a frontier report at a timestamp guaranteed
-    // to be after the write. We use the write timestamp + 100ms to ensure
-    // the frontier strictly covers the write.
+    // All authorities must sign the same checkpoint strictly after the write.
     let frontier_ts = HlcTimestamp {
-        physical: write_ts.physical + 100,
+        physical: covering_report_time(write_ts.physical),
         logical: 0,
         node_id: "frontier-gen".into(),
     };
@@ -145,15 +187,18 @@ async fn three_authority_auto_certification() {
     let frontiers2 = reporter2.report_frontiers_at(&frontier_ts, "digest-2");
     let frontiers3 = reporter3.report_frontiers_at(&frontier_ts, "digest-3");
 
-    // Apply frontiers from all 3 authorities to the client.
-    for f in frontiers1 {
-        client_api.update_frontier(f);
-    }
-    for f in frontiers2 {
-        client_api.update_frontier(f);
-    }
-    for f in frontiers3 {
-        client_api.update_frontier(f);
+    // The reporting path yields frontiers; the signers attach verifiable
+    // attestations before the client can assemble a certificate.
+    for (frontiers, signing_key) in [
+        (frontiers1, signer("auth-1", 1)),
+        (frontiers2, signer("auth-2", 2)),
+        (frontiers3, signer("auth-3", 3)),
+    ] {
+        for frontier in frontiers {
+            let signature = signing_key.sign_frontier(&frontier, KeysetVersion(1));
+            let verified = signing_key.self_verified(&frontier, &signature);
+            client_api.update_frontier_verified(frontier, Some(verified));
+        }
     }
 
     // Process certifications on the client side.
@@ -171,11 +216,14 @@ async fn three_authority_auto_certification() {
 /// Full NodeRunner-based E2E: an authority node running a NodeRunner
 /// with its own frontier reporter auto-certifies a pending write.
 /// Uses 3-authority namespace but only one authority node runs locally.
-/// The other 2 authorities' frontiers are injected manually to simulate
-/// the network sync that would deliver them.
+/// One other authority's signed frontier is injected to simulate network
+/// sync; auth-1's own auto-report is required to reach the 2-of-3 majority.
 #[tokio::test]
 async fn three_authority_node_runner_certification() {
     let ns = three_authority_namespace_shared();
+    let s1 = signer("auth-1", 1);
+    let s2 = signer("auth-2", 2);
+    let keys = registry(&[&s1, &s2]);
 
     // auth-1 is an authority node that also has the pending write.
     let mut api = CertifiedApi::new(node_id("auth-1"), ns);
@@ -183,10 +231,11 @@ async fn three_authority_node_runner_certification() {
         .unwrap();
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
-    // Inject frontiers for auth-2 and auth-3 (simulating network sync).
-    // These are past the write timestamp.
-    api.update_frontier(make_frontier("auth-2", write_ts + 500, ""));
-    api.update_frontier(make_frontier("auth-3", write_ts + 600, ""));
+    // Inject auth-2 only. This alone cannot certify the write.
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, &s2, report_time, "");
+    api.process_certifications();
+    assert_eq!(api.pending_writes()[0].status, CertificationStatus::Pending);
 
     // auth-1's own frontier will be auto-reported by the NodeRunner.
     let shared_api = Arc::new(Mutex::new(api));
@@ -195,7 +244,11 @@ async fn three_authority_node_runner_certification() {
         node_id("auth-1"),
         shared_api.clone(),
         engine,
-        fast_config(),
+        NodeRunnerConfig {
+            node_signer: Some(s1),
+            keyset_registry: Some(keys),
+            ..fast_config()
+        },
         Arc::new(RuntimeMetrics::default()),
     )
     .await;
@@ -204,14 +257,13 @@ async fn three_authority_node_runner_certification() {
     let handle = runner.shutdown_handle();
 
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
         let _ = handle.send(true);
     });
 
     runner.run().await;
 
-    // auth-1 frontier should have been auto-reported, giving 3/3 authorities.
-    // But only 2/3 are needed for majority. The write should be certified.
+    // auth-1's signed auto-report supplies the second vote.
     let api = shared_api.lock().await;
     assert_eq!(
         api.pending_writes()[0].status,
@@ -239,6 +291,8 @@ async fn single_authority_self_certification() {
         .unwrap();
 
     let mut api = CertifiedApi::new(node_id("auth-1"), wrap_ns(ns));
+    let s1 = signer("auth-1", 1);
+    let keys = registry(&[&s1]);
     api.certified_write("key1".into(), counter_value(10), OnTimeout::Pending)
         .unwrap();
     assert_eq!(
@@ -252,14 +306,18 @@ async fn single_authority_self_certification() {
         node_id("auth-1"),
         shared_api.clone(),
         engine,
-        fast_config(),
+        NodeRunnerConfig {
+            node_signer: Some(s1),
+            keyset_registry: Some(keys),
+            ..fast_config()
+        },
         Arc::new(RuntimeMetrics::default()),
     )
     .await;
     let handle = runner.shutdown_handle();
 
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
         let _ = handle.send(true);
     });
 
@@ -283,11 +341,11 @@ async fn single_authority_self_certification() {
 }
 
 // ---------------------------------------------------------------
-// Test 3: Timeout auto-detection during certification tick
+// Test 3: elapsed wait during certification tick
 // ---------------------------------------------------------------
 
 /// Pending writes that exceed the retention policy's `max_age_ms` should
-/// be automatically marked as `Timeout` during the certification tick.
+/// remain pending during the certification tick.
 #[tokio::test]
 async fn timeout_auto_detection() {
     let retention = RetentionPolicy {
@@ -334,13 +392,12 @@ async fn timeout_auto_detection() {
 
     runner.run().await;
 
-    // The write should be marked as Timeout because the certification tick
-    // detected that it exceeded max_age_ms.
+    // The elapsed client wait does not cancel the accepted write.
     let api = shared_api.lock().await;
     assert_eq!(
         api.pending_writes()[0].status,
-        CertificationStatus::Timeout,
-        "stale write should auto-transition to Timeout"
+        CertificationStatus::Pending,
+        "stale write remains eligible for later certification"
     );
 }
 
@@ -388,8 +445,8 @@ async fn rejected_transition_observable() {
 // ---------------------------------------------------------------
 
 /// The `CertificationTracker` mirrors the certification flow and
-/// transitions are observable: Pending -> Certified, Pending -> Timeout,
-/// Pending -> Rejected.
+/// transitions are observable: Pending -> Certified and Pending -> Rejected.
+/// An elapsed wait leaves the operation pending.
 #[tokio::test]
 async fn status_tracker_mirrors_certification_flow() {
     let mut tracker = CertificationTracker::with_timeout(100); // 100ms timeout
@@ -444,7 +501,7 @@ async fn status_tracker_mirrors_certification_flow() {
         "2 acks out of 2 required: certified"
     );
 
-    // Register a second write that will time out.
+    // Register a second write whose response wait will elapse.
     let wid2 = WriteId {
         key: "key2".into(),
         timestamp: HlcTimestamp {
@@ -455,7 +512,7 @@ async fn status_tracker_mirrors_certification_flow() {
     };
     tracker.register_write(wid2.clone(), 3, wid2.timestamp.clone());
 
-    // Check timeouts at a time > created_at + 100ms.
+    // Check elapsed wait at a time > created_at + 100ms.
     tracker.check_timeouts(&HlcTimestamp {
         physical: 2200,
         logical: 0,
@@ -463,8 +520,8 @@ async fn status_tracker_mirrors_certification_flow() {
     });
     assert_eq!(
         tracker.get_status(&wid2),
-        Some(CertificationStatus::Timeout),
-        "write should time out after 100ms"
+        Some(CertificationStatus::Pending),
+        "elapsed wait must not cancel the write"
     );
 
     // Register a third write that will be rejected.
@@ -503,13 +560,16 @@ async fn status_tracker_mirrors_certification_flow() {
 async fn majority_certification_requires_two_of_three() {
     let ns = three_authority_namespace_shared();
     let mut api = CertifiedApi::new(node_id("node-1"), ns);
+    let s1 = signer("auth-1", 1);
+    let s2 = signer("auth-2", 2);
 
     api.certified_write("data/x".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // 1 of 3: not enough.
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, &s1, report_time, "");
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("data/x"),
@@ -518,7 +578,7 @@ async fn majority_certification_requires_two_of_three() {
     );
 
     // 2 of 3: majority reached.
-    api.update_frontier(make_frontier("auth-2", write_ts + 200, ""));
+    add_signed_frontier(&mut api, &s2, report_time, "");
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("data/x"),
@@ -565,6 +625,8 @@ async fn mixed_outcomes_all_observable() {
         max_entries: 10_000,
     };
     let mut api = CertifiedApi::with_retention(node_id("node-1"), wrap_ns(ns), retention);
+    let s1 = signer("auth-1", 1);
+    let s2 = signer("auth-2", 2);
 
     // Write 3 keys to different ranges.
     api.certified_write("cert/key".into(), counter_value(1), OnTimeout::Pending)
@@ -578,13 +640,14 @@ async fn mixed_outcomes_all_observable() {
         .unwrap();
 
     // Certify cert/key via frontier advancement (cert/ range authorities).
-    api.update_frontier(make_frontier("auth-1", ts_cert + 100, "cert/"));
-    api.update_frontier(make_frontier("auth-2", ts_cert + 200, "cert/"));
+    let report_time = covering_report_time(ts_cert);
+    add_signed_frontier(&mut api, &s1, report_time, "cert/");
+    add_signed_frontier(&mut api, &s2, report_time, "cert/");
 
     // Reject rej/key explicitly.
     api.reject_write("rej/key");
 
-    // Process with a timestamp far enough for stale/key to expire.
+    // Process with a timestamp beyond the client wait threshold.
     api.process_certifications_with_timeout(ts_cert + 10_000);
 
     assert_eq!(
@@ -593,7 +656,7 @@ async fn mixed_outcomes_all_observable() {
     );
     assert_eq!(
         api.get_certification_status("stale/key"),
-        CertificationStatus::Timeout
+        CertificationStatus::Pending
     );
     assert_eq!(
         api.get_certification_status("rej/key"),
@@ -628,6 +691,8 @@ async fn cleanup_after_auto_certification() {
         .unwrap();
 
     let mut api = CertifiedApi::new(node_id("node-1"), wrap_ns(ns));
+    let s1 = signer("auth-1", 1);
+    let s2 = signer("auth-2", 2);
 
     api.certified_write("a/key1".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
@@ -637,8 +702,9 @@ async fn cleanup_after_auto_certification() {
     let ts = api.pending_writes()[0].timestamp.physical;
 
     // Certify a/key1 only (advance a/ range authorities).
-    api.update_frontier(make_frontier("auth-1", ts + 100, "a/"));
-    api.update_frontier(make_frontier("auth-2", ts + 100, "a/"));
+    let report_time = covering_report_time(ts);
+    add_signed_frontier(&mut api, &s1, report_time, "a/");
+    add_signed_frontier(&mut api, &s2, report_time, "a/");
     api.process_certifications();
 
     assert_eq!(api.pending_writes().len(), 2);

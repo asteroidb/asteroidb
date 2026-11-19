@@ -473,7 +473,7 @@ curl -s http://localhost:3001/api/certified/account/balance | jq .
 #    }
 ```
 
-Certified Read は値に加えて、認証ステータスと frontier（HLC タイムスタンプ）を返します。`certified` ステータスの場合、Authority の過半数がこの値を承認していることが暗号的に証明されています。
+Certified Read は値に加えて、認証ステータスと読み取り時に観測した frontier（HLC タイムスタンプ）を返します。`frontier` には未署名報告が含まれ得るため、それだけでは確定を示しません。確定の根拠は `status: "Certified"` と `proof` 内の証明書で確認してください。`proof.frontier` は証明書の checkpoint であり、外側の `frontier` と異なる場合があります。
 
 #### 証明の検証
 

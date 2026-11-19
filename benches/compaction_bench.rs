@@ -2,7 +2,7 @@
 //!
 //! Covers:
 //! - CompactionEngine: record_op, should_checkpoint, create_checkpoint,
-//!   is_compactable, run_compaction
+//!   is_compactable
 //! - TombstoneGc: mark_and_sweep at various store sizes
 //! - AdaptiveCompactionConfig: tune cycle
 
@@ -142,78 +142,18 @@ fn bench_is_compactable(c: &mut Criterion) {
             ));
         }
 
+        let roster: Vec<NodeId> = (0..n_authorities)
+            .map(|i| node(&format!("auth-{i}")))
+            .collect();
+
         group.bench_with_input(
             BenchmarkId::from_parameter(n_authorities),
             &n_authorities,
-            |b, &n| {
+            |b, _| {
                 b.iter(|| {
-                    let result = engine.is_compactable("user/", &frontiers, n);
+                    let result = engine.is_compactable("user/", &frontiers, &roster);
                     std::hint::black_box(result);
                 });
-            },
-        );
-    }
-    group.finish();
-}
-
-fn bench_run_compaction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("compaction/run_compaction");
-
-    for n_keys in [100, 500, 1000] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_keys),
-            &n_keys,
-            |b, &n_keys| {
-                b.iter_batched(
-                    || {
-                        let mut engine = CompactionEngine::new(CompactionConfig {
-                            time_threshold_ms: 30_000,
-                            ops_threshold: 3,
-                        });
-                        let kr = key_range("user/");
-
-                        // Record enough ops to trigger checkpoint.
-                        for _ in 0..5 {
-                            engine.record_op(&kr);
-                        }
-
-                        // Build a store with timestamps.
-                        let nid = node("bench-node");
-                        let mut store = Store::new();
-                        for i in 0..n_keys {
-                            let mut counter = PnCounter::new();
-                            counter.increment(&nid);
-                            store.put(format!("user/key-{i:06}"), CrdtValue::Counter(counter));
-                            // Half before checkpoint, half after.
-                            let phys = if i < n_keys / 2 { 50 } else { 200 };
-                            store.record_change(
-                                &format!("user/key-{i:06}"),
-                                ts(phys, i as u32, "bench-node"),
-                            );
-                        }
-
-                        // Build frontiers: all 3 authorities past t=100.
-                        let mut frontiers = AckFrontierSet::new();
-                        frontiers.update(make_frontier("auth-1", 200, "user/"));
-                        frontiers.update(make_frontier("auth-2", 300, "user/"));
-                        frontiers.update(make_frontier("auth-3", 150, "user/"));
-
-                        (engine, store, frontiers)
-                    },
-                    |(mut engine, mut store, frontiers)| {
-                        let pruned = engine.run_compaction(
-                            &key_range("user/"),
-                            ts(100, 0, "node-a"),
-                            "digest-100".into(),
-                            PolicyVersion(1),
-                            &frontiers,
-                            3,
-                            &mut store,
-                        );
-                        std::hint::black_box(pruned);
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
             },
         );
     }
@@ -305,11 +245,11 @@ fn bench_gc_tombstones(c: &mut Criterion) {
                     }
                     let mut gc = gc;
                     // Take the mark in setup; the measured pass is the sweep.
-                    gc.mark_and_sweep(&mut store, 0, true, false);
+                    gc.mark_and_sweep(&mut store, 0, true);
                     (gc, store)
                 },
                 |(mut gc, mut store)| {
-                    let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
+                    let collected = gc.mark_and_sweep(&mut store, 1_000, true).collected;
                     std::hint::black_box(collected);
                 },
                 criterion::BatchSize::SmallInput,
@@ -345,11 +285,11 @@ fn bench_gc_mixed_store(c: &mut Criterion) {
 
                 let mut gc = gc;
                 // Take the mark in setup; the measured pass is the sweep.
-                gc.mark_and_sweep(&mut store, 0, true, false);
+                gc.mark_and_sweep(&mut store, 0, true);
                 (gc, store)
             },
             |(mut gc, mut store)| {
-                let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true).collected;
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,
@@ -378,8 +318,8 @@ fn bench_gc_full_cycle(c: &mut Criterion) {
             },
             |(mut gc, mut store)| {
                 // Full cycle: mark pass + gated sweep pass.
-                gc.mark_and_sweep(&mut store, 0, true, false);
-                let collected = gc.mark_and_sweep(&mut store, 1_000, true, false).collected;
+                gc.mark_and_sweep(&mut store, 0, true);
+                let collected = gc.mark_and_sweep(&mut store, 1_000, true).collected;
                 std::hint::black_box(collected);
             },
             criterion::BatchSize::SmallInput,
@@ -393,7 +333,6 @@ criterion_group!(
     bench_should_checkpoint,
     bench_create_checkpoint,
     bench_is_compactable,
-    bench_run_compaction,
     bench_adaptive_tune,
     bench_write_rate_tracker,
     bench_gc_tombstones,

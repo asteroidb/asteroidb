@@ -64,14 +64,16 @@ ops-guide の env 表・メトリクス表・「Frontier 追跡と attestation p
 certified sweep(mark → retention → C-2 二重ゲート)は tombstone を floor の連続前進に
 畳み込む情報等価な圧縮になり、merge は floor を pointwise max で継承(撤回不能)して
 covered な stale tombstone / stale live dot を棄却する。digest は scheme v2 の正準形
-(live + counters + floor + uncovered deferred)。スナップショット v5 / WAL v2(旧形式は
-凍結 decode 型経由で読める・片方向)。Stage 2 hole-jump(`ASTEROIDB_GC_HOLE_JUMP`、既定 off)は
-inbound ゲート成立時のみ legacy hole を跨ぐ。
+(live + counters + floor + uncovered deferred)。現行のスナップショット v6 / WAL v7 は
+旧形式を読み込まない。Stage 2 hole-jump は安全性反例が見つかったため現在は
+実行せず、`ASTEROIDB_GC_HOLE_JUMP=1` は起動時に拒否する。mark 時に live dot を
+持っていた peer が registry から除外され、後で再参加すると、現在の peer 集合だけを
+使う inbound ゲートは誤って通り、前進済み floor がその dot を消し得る。
 
 **残タスク**:
 
-- (a) Stage 2 hole-jump の soak 後有効化(運用判断。手順は ops-guide 3.7。
-  `gc_floor_stalled_hole_dots` が恒常非ゼロのクラスタのみ)。
+- (a) Stage 2 hole-jump の有効化は見送る。再検討するには、mark 時の replica 集合を
+  永続的に固定し、除外・再参加した peer が保持する live dot も含めた不在証明が必要。
 - (b) dead peer による GC 停止 — C-2 既存限界は不変(registry に残る dead peer が
   outbound/inbound ゲートを塞ぐ)。floor 化により、将来の過半数ゲート +
   ラガードの floor 追認(復帰時に floor を継承するだけで安全)の下地はできた。
@@ -79,8 +81,9 @@ inbound ゲート成立時のみ legacy hole を跨ぐ。
   水増し floor は撤回不能に live dot を破壊できる(偽造 tombstone と同クラスの脅威だが
   一撃性が高い)。将来 authority 署名付き certificate へ昇格する拡張点。
 
-**受容した限界**: (1) 混在期間は GC 収束が発効しない(fail-safe)。(2) dead peer 停止は上記 (b)。
-(3) legacy hole は Stage 2 有効化まで停滞(`gc_floor_stalled_hole_dots` で可観測、fail-safe)。
+**受容した限界**: (1) 旧形式との混在運用は対象外。(2) dead peer 停止は上記 (b)。
+(3) legacy hole は安全な連続 floor 走査では停滞する
+(`gc_floor_stalled_hole_dots` で可観測、fail-safe)。
 (4) floor は per-(key,writer) ~50B(NodeId 文字列 + カウンタ、tombstone 1 件と同程度)が恒久残存(件数無制限の tombstone → writer 数定数への圧縮で優位)。
 (5) floor は無認証(上記 (c))。(6) sweep は per-key HLC を進めないため floor 伝播は
 digest/full sync 機会依存(意図的: GC ごとの delta ストーム回避)。

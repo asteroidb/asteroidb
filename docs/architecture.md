@@ -33,7 +33,7 @@ CRDT ベースのキーバリューデータの保存とレプリケーション
 |--------------|------|------|
 | CRDT Store | `src/store/` | バージョン管理付き KV ストレージ（PN-Counter, OR-Set, OR-Map, LWW-Register） |
 | Delta Sync | `src/network/sync.rs` | バッチ処理と指数バックオフ付き anti-entropy レプリケーション |
-| Compaction Engine | `src/compaction/engine.rs` | 圧縮可能な操作ログの削除（majority 確認済みのみ） |
+| Compaction Engine | `src/compaction/engine.rs` | HLC 更新時刻の圧縮。現行名簿の署名付き quorum checkpoint が必要 |
 | Adaptive Tuner | `src/compaction/tuner.rs` | 書き込みレートに基づく圧縮頻度の自動調整 |
 
 ### Authority Plane
@@ -663,7 +663,7 @@ poison を失ってフロンティアだけが残る「偽のセッション成�
 ### 書き込み経路と fsync
 
 ```
-(API Mutex 内)  型検査 → in-memory 適用 → post-state を WAL append (write)
+(API Mutex 内)  型検査・post-state 候補計算 → WAL append (write) → in-memory 適用
 (Mutex 解放後)  sync=always のときのみ group-commit fdatasync の完了を待機
 → HTTP ack（session token を含むレスポンス）
 ```
@@ -675,6 +675,9 @@ fdatasync は専用の WalSyncer タスク（`spawn_blocking`）が実行し、�
 abort）**——失敗後のページキャッシュ状態は不定であり（いわゆる fsyncgate）、
 リトライは偽の耐久性になる。一方 **append（write）の失敗は degrade**:
 HTTP 503 を返して読み取りは継続する（ディスクフル等）。
+ローカル Eventual/Certified 書き込みと Certified 複製受信では、append が失敗すると
+候補値を公開せず、前の値・証明・状態を保つ。公開 read/status は取得時に見た
+最新 WAL 位置の耐久化を待ってから応答する。
 
 ### チェックポイント
 
@@ -719,6 +722,9 @@ certified ストアの証明状態（pending_writes / frontiers / attestations /
 certified_cache）は**意図的に揮発**とする: 再起動後、値は復元されるが
 ステータスは `Certified` → `Pending` に退行する（fail-closed——偽の
 Certified は決して返さない。attestation の再収集で回復する）。
+稼働中の `certified_cache` は証明済みの現行値を件数だけで捨てない。
+証拠の破棄だけで公開状態が `Certified` から `Pending` に戻るのを防ぐためで、
+メモリ使用量は証明済みキー数に応じて増える。キーの値を置き換えると旧証拠は失効する。
 
 ### 既知の割り切り
 

@@ -18,6 +18,7 @@ use asteroidb_poc::authority::certificate::{
     AuthoritySignature, KeysetVersion, MajorityCertificate, create_certificate_message,
     sign_message,
 };
+use asteroidb_poc::authority::frontier_sig::NodeSigner;
 use asteroidb_poc::authority::verifier::verify_proof;
 use asteroidb_poc::compaction::CompactionEngine;
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
@@ -40,6 +41,29 @@ use tokio::sync::Mutex;
 
 fn node_id(s: &str) -> NodeId {
     NodeId(s.into())
+}
+
+fn trusted_keys_for_proof(
+    proof: &asteroidb_poc::api::certified::ProofBundle,
+) -> Vec<(NodeId, ed25519_dalek::VerifyingKey)> {
+    let mut keys: Vec<_> = proof
+        .certificate
+        .as_ref()
+        .map(|cert| {
+            cert.signatures
+                .iter()
+                .map(|sig| (sig.authority_id.clone(), sig.public_key))
+                .collect()
+        })
+        .unwrap_or_default();
+    while keys.len() < proof.total_authorities {
+        let sk = SigningKey::generate(&mut OsRng);
+        keys.push((
+            NodeId(format!("trusted-extra-{}", keys.len())),
+            sk.verifying_key(),
+        ));
+    }
+    keys
 }
 
 fn kr(prefix: &str) -> KeyRange {
@@ -78,6 +102,31 @@ fn far_frontier_hlc() -> HlcTimestamp {
         u32::MAX,
         "zzz",
     )
+}
+
+fn submit_signed_frontier(
+    api: &mut CertifiedApi,
+    authority: &str,
+    physical: u64,
+    prefix: &str,
+    version: PolicyVersion,
+) {
+    let mut seed = [0u8; 32];
+    seed[0] = *authority.as_bytes().last().unwrap();
+    #[cfg(feature = "native-crypto")]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed, false);
+    #[cfg(not(feature = "native-crypto"))]
+    let signer = NodeSigner::from_seed(node_id(authority), &seed);
+    let frontier = AckFrontier {
+        authority_id: node_id(authority),
+        frontier_hlc: ts(physical, 0, authority),
+        key_range: kr(prefix),
+        policy_version: version,
+        digest_hash: String::new(),
+    };
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let attestation = signer.self_verified(&frontier, &signature);
+    api.update_frontier_verified(frontier, Some(attestation));
 }
 
 fn counter_value(n: i64) -> CrdtValue {
@@ -172,13 +221,7 @@ async fn add_authority_while_writes_in_flight() {
     let far_hlc = far_frontier_hlc();
     let placement_pv = PolicyVersion(1);
     for auth in &["auth-1", "auth-2"] {
-        api.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api, auth, far_hlc.physical, "", placement_pv);
     }
 
     api.process_certifications();
@@ -226,13 +269,7 @@ async fn remove_authority_quorum_still_works() {
     let far_hlc = far_frontier_hlc();
     let placement_pv = PolicyVersion(1);
     for auth in &["auth-1", "auth-2"] {
-        api.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api, auth, far_hlc.physical, "", placement_pv);
     }
 
     api.process_certifications();
@@ -289,7 +326,7 @@ fn broken_quorum_proof_is_invalid() {
         bls_certificate: None,
     };
 
-    let result = verify_proof(&proof, None, 0);
+    let result = verify_proof(&proof, &trusted_keys_for_proof(&proof), None, 0);
     assert!(
         !result.valid,
         "proof with insufficient signers should not verify as valid"
@@ -556,7 +593,7 @@ fn empty_authority_set_rejects_certification() {
         bls_certificate: None,
     };
 
-    let result = verify_proof(&proof, None, 0);
+    let result = verify_proof(&proof, &trusted_keys_for_proof(&proof), None, 0);
     assert!(
         !result.valid,
         "empty authority set should not produce a valid proof"
@@ -641,17 +678,16 @@ fn residual_frontier_does_not_unblock_compaction_for_an_emptied_authority_set() 
         digest_hash: String::new(),
     });
 
-    // The count `NodeRunner::check_compaction` would pass, read from the
-    // namespace, before and after the set is emptied.
-    let total_before = shared_ns
+    // Read the current Authority roster from the namespace.
+    let roster_before = shared_ns
         .read()
         .unwrap()
         .get_authority_definition("")
         .unwrap()
         .authority_nodes
-        .len();
+        .clone();
     assert!(
-        engine.is_compactable("", &frontiers, total_before),
+        engine.is_compactable("", &frontiers, &roster_before),
         "baseline: the frontier does authorise compaction for a real set of 1"
     );
 
@@ -664,16 +700,16 @@ fn residual_frontier_does_not_unblock_compaction_for_an_emptied_authority_set() 
         });
     }
 
-    let total_after = shared_ns
+    let roster_after = shared_ns
         .read()
         .unwrap()
         .get_authority_definition("")
         .unwrap()
         .authority_nodes
-        .len();
-    assert_eq!(total_after, 0);
+        .clone();
+    assert!(roster_after.is_empty());
     assert!(
-        !engine.is_compactable("", &frontiers, total_after),
+        !engine.is_compactable("", &frontiers, &roster_after),
         "a single residual frontier must not authorise compaction against an \
          empty authority set"
     );
@@ -796,32 +832,14 @@ async fn partition_during_authority_change_then_converge() {
 
     // auth-1 hears from auth-1 and auth-2 (but NOT auth-3)
     for auth in &["auth-1", "auth-2"] {
-        api_1.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api_1, auth, far_hlc.physical, "", placement_pv);
     }
     // auth-2 hears from auth-1 and auth-2
     for auth in &["auth-1", "auth-2"] {
-        api_2.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api_2, auth, far_hlc.physical, "", placement_pv);
     }
     // auth-3 is partitioned — only hears from itself
-    api_3.update_frontier(AckFrontier {
-        authority_id: node_id("auth-3"),
-        frontier_hlc: far_hlc.clone(),
-        key_range: kr(""),
-        policy_version: placement_pv,
-        digest_hash: String::new(),
-    });
+    submit_signed_frontier(&mut api_3, "auth-3", far_hlc.physical, "", placement_pv);
 
     // Process certifications: auth-1 and auth-2 have majority (2 of 3),
     // auth-3 does not (1 of 3).
@@ -881,13 +899,7 @@ async fn partition_during_authority_change_then_converge() {
     // The new write was issued under the current namespace which now has
     // auth-1, auth-2, auth-4 as authorities (total=3).
     for auth in &["auth-1", "auth-2", "auth-4"] {
-        api_4.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api_4, auth, far_hlc.physical, "", placement_pv);
     }
     api_4.process_certifications();
 
@@ -905,13 +917,7 @@ async fn partition_during_authority_change_then_converge() {
     // certifiable once it receives enough frontier acks (2 of 3 from original set).
     // Feed the missing frontier acks to auth-3.
     for auth in &["auth-1", "auth-2"] {
-        api_3.update_frontier(AckFrontier {
-            authority_id: node_id(auth),
-            frontier_hlc: far_hlc.clone(),
-            key_range: kr(""),
-            policy_version: placement_pv,
-            digest_hash: String::new(),
-        });
+        submit_signed_frontier(&mut api_3, auth, far_hlc.physical, "", placement_pv);
     }
     api_3.process_certifications();
 

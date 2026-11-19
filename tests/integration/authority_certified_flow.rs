@@ -7,6 +7,7 @@ use asteroidb_poc::authority::certificate::{
     AuthoritySignature, EpochConfig, KeysetVersion, MajorityCertificate,
     create_certificate_message, sign_message,
 };
+use asteroidb_poc::authority::frontier_sig::{CHECKPOINT_INTERVAL_MS, NodeSigner, checkpoint_hlc};
 use asteroidb_poc::control_plane::system_namespace::{AuthorityDefinition, SystemNamespace};
 use asteroidb_poc::crdt::pn_counter::PnCounter;
 use asteroidb_poc::hlc::{Hlc, HlcTimestamp};
@@ -63,6 +64,38 @@ fn make_frontier_v(
         policy_version: PolicyVersion(version),
         digest_hash: format!("{authority}-{physical}-{logical}"),
     }
+}
+
+#[cfg(feature = "native-crypto")]
+fn report_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = authority.bytes().fold(0u8, u8::wrapping_add);
+    NodeSigner::from_seed(node(authority), &seed, false)
+}
+
+#[cfg(not(feature = "native-crypto"))]
+fn report_signer(authority: &str) -> NodeSigner {
+    let mut seed = [0u8; 32];
+    seed[0] = authority.bytes().fold(0u8, u8::wrapping_add);
+    NodeSigner::from_seed(node(authority), &seed)
+}
+
+fn covering_report_time(write_physical: u64) -> u64 {
+    (write_physical / CHECKPOINT_INTERVAL_MS + 1) * CHECKPOINT_INTERVAL_MS + 100
+}
+
+fn add_signed_frontier(
+    api: &mut CertifiedApi,
+    authority: &str,
+    physical: u64,
+    prefix: &str,
+    version: u64,
+) {
+    let signer = report_signer(authority);
+    let frontier = make_frontier_v(authority, physical, 0, prefix, version);
+    let signature = signer.sign_frontier(&frontier, KeysetVersion(1));
+    let verified = signer.self_verified(&frontier, &signature);
+    api.update_frontier_verified(frontier, Some(verified));
 }
 
 fn counter_value(n: i64) -> CrdtValue {
@@ -153,8 +186,9 @@ fn get_certified_returns_certified_after_majority_frontier_reached() {
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // Advance 2 of 3 authorities past the write timestamp
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
-    api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
 
     // Process certifications to promote pending → certified
     api.process_certifications();
@@ -187,7 +221,7 @@ fn pending_status_when_majority_not_reached() {
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // Only 1 of 3 authorities reports (not enough for majority)
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
+    add_signed_frontier(&mut api, "auth-1", covering_report_time(write_ts), "", 1);
     api.process_certifications();
 
     // Status should still be Pending
@@ -220,8 +254,9 @@ fn certification_succeeds_with_one_authority_failure() {
 
     // Authority 1 is DOWN (never sends frontier)
     // Authority 2 and 3 report successfully
-    api.update_frontier(make_frontier("auth-2", write_ts + 500, 0, ""));
-    api.update_frontier(make_frontier("auth-3", write_ts + 300, 0, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-3", report_time, "", 1);
 
     api.process_certifications();
 
@@ -243,19 +278,19 @@ fn certification_succeeds_with_one_authority_failure() {
 #[test]
 fn end_to_end_certificate_signing_to_certified_api() {
     // Step 1: Generate signing keys for 3 authorities
-    let (sk1, vk1) = make_key_pair();
-    let (sk2, vk2) = make_key_pair();
-    let (_sk3, _vk3) = make_key_pair(); // Authority 3 is slow/down
+    let signer1 = report_signer("auth-1");
+    let signer2 = report_signer("auth-2");
 
     let kr = key_range("user/");
     // A high frontier that still sits within MAX_CLOCK_SKEW_MS of the wall
     // clock, so the P0-6 future-skew guard admits these peer reports. (A
     // fixed far-future physical like 2e12 would now be rejected.)
-    let frontier_hlc = HlcTimestamp {
+    let report_hlc = HlcTimestamp {
         physical: asteroidb_poc::hlc::wall_clock_ms() + 30_000,
         logical: 0,
         node_id: "auth-1".into(),
     };
+    let frontier_hlc = checkpoint_hlc(&report_hlc);
     let pv = PolicyVersion(1);
 
     // Step 2: Create certificate message and sign with 2 authorities (majority)
@@ -263,18 +298,28 @@ fn end_to_end_certificate_signing_to_certified_api() {
 
     let mut cert = MajorityCertificate::new(kr.clone(), frontier_hlc.clone(), pv, KeysetVersion(1));
 
-    let sig1 = sign_message(&sk1, &message);
+    let mut report1 = make_frontier("auth-1", report_hlc.physical, 0, "user/");
+    report1.policy_version = pv;
+    let signed1 = signer1.sign_frontier(&report1, KeysetVersion(1));
+    let att1 = signer1.self_verified(&report1, &signed1);
+    let sig1 = ed25519_dalek::Signature::from_slice(&hex::decode(&signed1.cert_signature).unwrap())
+        .unwrap();
     cert.add_signature(AuthoritySignature {
         authority_id: node("auth-1"),
-        public_key: vk1,
+        public_key: signer1.verifying_key(),
         signature: sig1,
         keyset_version: KeysetVersion(1),
     });
 
-    let sig2 = sign_message(&sk2, &message);
+    let mut report2 = make_frontier("auth-2", report_hlc.physical, 0, "user/");
+    report2.policy_version = pv;
+    let signed2 = signer2.sign_frontier(&report2, KeysetVersion(1));
+    let att2 = signer2.self_verified(&report2, &signed2);
+    let sig2 = ed25519_dalek::Signature::from_slice(&hex::decode(&signed2.cert_signature).unwrap())
+        .unwrap();
     cert.add_signature(AuthoritySignature {
         authority_id: node("auth-2"),
-        public_key: vk2,
+        public_key: signer2.verifying_key(),
         signature: sig2,
         keyset_version: KeysetVersion(1),
     });
@@ -309,15 +354,11 @@ fn end_to_end_certificate_signing_to_certified_api() {
     api.certified_write("user/data".into(), counter_value(100), OnTimeout::Pending)
         .unwrap();
 
-    // Update frontiers from the certificate verification
-    for signer in &valid_signers {
-        api.update_frontier(AckFrontier {
-            authority_id: signer.clone(),
-            frontier_hlc: cert.frontier_hlc.clone(),
-            key_range: cert.key_range.clone(),
-            policy_version: pv,
-            digest_hash: format!("{}-certified", signer.0),
-        });
+    // Feed the same verified checkpoint signatures into the API's
+    // attestation pool, alongside each signer's report covering that
+    // checkpoint. An unsigned AckFrontierSet update alone cannot certify.
+    for (report, attestation) in [(report1, att1), (report2, att2)] {
+        api.update_frontier_verified(report, Some(attestation));
     }
 
     api.process_certifications();
@@ -345,54 +386,29 @@ fn full_flow_write_frontier_certificate_read() {
 
     let write_ts = api.pending_writes()[0].timestamp.clone();
 
-    // Phase 2: Simulate authority ack_frontier updates
-    // Each authority processes the write and advances their frontier
-    let frontier_physical = write_ts.physical + 1000;
-
-    api.update_frontier(make_frontier("auth-1", frontier_physical, 0, ""));
-    api.update_frontier(make_frontier("auth-2", frontier_physical + 500, 0, ""));
+    // Phase 2: two authorities sign reports for the same checkpoint.
+    let report_time = covering_report_time(write_ts.physical);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     // auth-3 not yet reported
 
-    // Phase 3: Meanwhile, create a MajorityCertificate for verification
-    let (sk1, vk1) = make_key_pair();
-    let (sk2, vk2) = make_key_pair();
-
-    let kr = key_range("sensor/");
-    let cert_frontier = HlcTimestamp {
-        physical: frontier_physical,
-        logical: 0,
-        node_id: "auth-1".into(),
-    };
-    let pv = PolicyVersion(1);
-    let message = create_certificate_message(&kr, &cert_frontier, &pv);
-
-    let mut cert = MajorityCertificate::new(kr, cert_frontier, pv, KeysetVersion(1));
-
-    cert.add_signature(AuthoritySignature {
-        authority_id: node("auth-1"),
-        public_key: vk1,
-        signature: sign_message(&sk1, &message),
-        keyset_version: KeysetVersion(1),
-    });
-    cert.add_signature(AuthoritySignature {
-        authority_id: node("auth-2"),
-        public_key: vk2,
-        signature: sign_message(&sk2, &message),
-        keyset_version: KeysetVersion(1),
-    });
-
-    // Verify certificate
-    assert!(cert.has_majority(3));
-    assert!(cert.verify_signatures(&message).is_ok());
-
-    // Phase 4: Process certifications
+    // Phase 3: Process certifications
     api.process_certifications();
 
-    // Phase 5: get_certified should return Certified
+    // Phase 4: get_certified returns a verifiable certificate.
     let read = api.get_certified("sensor/temp");
     assert_eq!(read.status, CertificationStatus::Certified);
     assert!(read.value.is_some());
     assert!(read.frontier.is_some());
+    let proof = read.proof.as_ref().expect("certified read has proof");
+    let cert = proof
+        .certificate
+        .as_ref()
+        .expect("signed majority certificate");
+    let message =
+        create_certificate_message(&proof.key_range, &proof.frontier_hlc, &proof.policy_version);
+    assert!(cert.has_majority(3));
+    assert_eq!(cert.verify_signatures(&message).unwrap().len(), 2);
 
     match read.value.unwrap() {
         CrdtValue::Counter(c) => assert_eq!(c.value(), 25),
@@ -432,9 +448,9 @@ fn certification_across_epoch_boundary() {
     // us. A high-but-in-skew frontier still sits past the write timestamp, so
     // the write certifies exactly as before. (The epoch-2 certificate below
     // keeps `next_epoch_ts` — a signed certificate is not skew-checked.)
-    let report_ts = write_ts + 30_000;
-    api.update_frontier(make_frontier("auth-1", report_ts, 0, ""));
-    api.update_frontier(make_frontier("auth-2", report_ts + 1000, 0, ""));
+    let report_ts = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_ts, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_ts, "", 1);
 
     api.process_certifications();
 
@@ -503,11 +519,11 @@ fn progressive_certification_of_multiple_writes() {
     // Write three values at different times
     api.certified_write("key-a".into(), counter_value(1), OnTimeout::Pending)
         .unwrap();
-    let ts_a = api.pending_writes()[0].timestamp.physical;
+    let ts_a = api.pending_writes()[0].timestamp.clone();
 
     api.certified_write("key-b".into(), counter_value(2), OnTimeout::Pending)
         .unwrap();
-    let ts_b = api.pending_writes()[1].timestamp.physical;
+    let ts_b = api.pending_writes()[1].timestamp.clone();
 
     api.certified_write("key-c".into(), counter_value(3), OnTimeout::Pending)
         .unwrap();
@@ -526,29 +542,37 @@ fn progressive_certification_of_multiple_writes() {
         CertificationStatus::Pending
     );
 
-    // Advance frontiers to certify only key-a (frontier between ts_a and ts_b)
-    let frontier_between = ts_a + 1;
-    // Only advance if ts_b is actually after ts_a + 1
-    // Due to HLC monotonicity, ts_b >= ts_a
-    api.update_frontier(make_frontier("auth-1", frontier_between, 0, ""));
-    api.update_frontier(make_frontier("auth-2", frontier_between, 0, ""));
+    // AckFrontierSet retains exact HLC ordering: a raw frontier at the
+    // first write covers it but cannot cover the later write.
+    assert!(ts_a < ts_b);
+    let mut raw_frontiers = AckFrontierSet::new();
+    for authority in ["auth-1", "auth-2"] {
+        raw_frontiers.update(AckFrontier {
+            authority_id: node(authority),
+            frontier_hlc: ts_a.clone(),
+            key_range: key_range(""),
+            policy_version: PolicyVersion(1),
+            digest_hash: format!("{authority}-first"),
+        });
+    }
+    assert!(raw_frontiers.is_certified_at(&ts_a, 3));
+    assert!(!raw_frontiers.is_certified_at(&ts_b, 3));
+
+    // API certificates are checkpoint-granular; these closely spaced
+    // writes cannot be certified selectively by a sub-second frontier.
     api.process_certifications();
 
     assert_eq!(
         api.get_certification_status("key-a"),
-        CertificationStatus::Certified
+        CertificationStatus::Pending
     );
-    // key-b and key-c may or may not be certified depending on timestamp ordering
-    // (they could share the same physical timestamp due to logical counter)
 
-    // Now advance frontier past all writes. The offset stays within
-    // MAX_CLOCK_SKEW_MS of the wall clock (writes are issued at ~wall) so the
-    // P0-6 future-skew guard admits these peer reports; +100s would now be
-    // rejected as an implausible far-future report.
-    let far_future = ts_b + 30_000;
-    api.update_frontier(make_frontier("auth-1", far_future, 0, ""));
-    api.update_frontier(make_frontier("auth-2", far_future, 0, ""));
-    api.update_frontier(make_frontier("auth-3", far_future, 0, ""));
+    // A signed checkpoint after the latest write covers all three.
+    let last_ts = api.pending_writes()[2].timestamp.physical;
+    let report_time = covering_report_time(last_ts);
+    for authority in ["auth-1", "auth-2", "auth-3"] {
+        add_signed_frontier(&mut api, authority, report_time, "", 1);
+    }
     api.process_certifications();
 
     // All should be certified now
@@ -586,8 +610,9 @@ fn on_timeout_error_still_tracks_write() {
 
     // Can still be certified later via frontier updates
     let write_ts = api.pending_writes()[0].timestamp.physical;
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
-    api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     api.process_certifications();
 
     assert_eq!(
@@ -678,8 +703,9 @@ fn frontier_regression_prevented_in_certified_flow() {
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // Advance auth-1 to a high frontier
-    api.update_frontier(make_frontier("auth-1", write_ts + 1000, 0, ""));
-    api.update_frontier(make_frontier("auth-2", write_ts + 500, 0, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("key1"),
@@ -694,9 +720,11 @@ fn frontier_regression_prevented_in_certified_flow() {
         .unwrap();
     let write_ts2 = api.pending_writes().last().unwrap().timestamp.physical;
 
-    // The regression should not have affected auth-1's frontier
-    // So we only need auth-2 to advance to certify key2
-    api.update_frontier(make_frontier("auth-2", write_ts2 + 100, 0, ""));
+    // The regression did not lower auth-1's frontier. A new signed
+    // checkpoint is needed if key2 falls after the old checkpoint.
+    let next_report = covering_report_time(write_ts2);
+    add_signed_frontier(&mut api, "auth-1", next_report, "", 1);
+    add_signed_frontier(&mut api, "auth-2", next_report, "", 1);
     api.process_certifications();
 
     // key2 should be certified because auth-1 still has its high frontier
@@ -756,8 +784,9 @@ fn five_authority_majority_certification() {
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // 2 of 5 → not enough
-    api.update_frontier(make_frontier("auth-1", write_ts + 100, 0, ""));
-    api.update_frontier(make_frontier("auth-2", write_ts + 200, 0, ""));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("five-auth"),
@@ -765,7 +794,7 @@ fn five_authority_majority_certification() {
     );
 
     // 3 of 5 → majority
-    api.update_frontier(make_frontier("auth-3", write_ts + 150, 0, ""));
+    add_signed_frontier(&mut api, "auth-3", report_time, "", 1);
     api.process_certifications();
     assert_eq!(
         api.get_certification_status("five-auth"),
@@ -805,23 +834,25 @@ fn hlc_ordering_in_certification() {
     // First write should have earlier timestamp
     assert!(ts_first < ts_second);
 
-    // Advance frontier between the two writes
-    // Only first write should be certified
-    api.update_frontier(AckFrontier {
-        authority_id: node("auth-1"),
-        frontier_hlc: ts_first.clone(),
-        key_range: key_range(""),
-        policy_version: PolicyVersion(1),
-        digest_hash: "auth-1-frontier".into(),
-    });
-    api.update_frontier(AckFrontier {
-        authority_id: node("auth-2"),
-        frontier_hlc: ts_first.clone(),
-        key_range: key_range(""),
-        policy_version: PolicyVersion(1),
-        digest_hash: "auth-2-frontier".into(),
-    });
+    // The raw AckFrontierSet distinguishes the two exact HLCs.
+    let mut raw = AckFrontierSet::new();
+    for authority in ["auth-1", "auth-2"] {
+        raw.update(AckFrontier {
+            authority_id: node(authority),
+            frontier_hlc: ts_first.clone(),
+            key_range: key_range(""),
+            policy_version: PolicyVersion(1),
+            digest_hash: format!("{authority}-first"),
+        });
+    }
+    assert!(raw.is_certified_at(&ts_first, 3));
+    assert!(!raw.is_certified_at(&ts_second, 3));
 
+    // A signed certificate is checkpoint-granular. Its first checkpoint
+    // after the second write covers both rather than only the first.
+    let report_time = covering_report_time(ts_second.physical);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     api.process_certifications();
 
     assert_eq!(
@@ -830,7 +861,7 @@ fn hlc_ordering_in_certification() {
     );
     assert_eq!(
         api.get_certification_status("ordered/second"),
-        CertificationStatus::Pending
+        CertificationStatus::Certified
     );
 }
 
@@ -860,14 +891,15 @@ fn certification_tracker_timeout_flow() {
     tracker.check_timeouts(&before);
     assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
 
-    // At timeout boundary: should timeout
+    // At the wait boundary, certification work remains pending.
     let at_timeout = HlcTimestamp {
         physical: 6000,
         logical: 0,
         node_id: "node-1".into(),
     };
     tracker.check_timeouts(&at_timeout);
-    assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Timeout));
+    assert!(tracker.wait_elapsed(&wid, &at_timeout));
+    assert_eq!(tracker.get_status(&wid), Some(CertificationStatus::Pending));
 }
 
 /// Overwriting a key and certifying the latest write
@@ -892,8 +924,9 @@ fn overwrite_and_certify_latest() {
 
     // Certify by advancing frontier past both writes
     let latest_ts = api.pending_writes().last().unwrap().timestamp.physical;
-    api.update_frontier(make_frontier("auth-1", latest_ts + 100, 0, ""));
-    api.update_frontier(make_frontier("auth-2", latest_ts + 200, 0, ""));
+    let report_time = covering_report_time(latest_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "", 1);
     api.process_certifications();
 
     // get_certified returns status of the latest write for that key
@@ -947,8 +980,9 @@ fn cross_range_certification_contamination_prevented() {
 
     // --- Phase 1: Only advance order/ authorities ---
 
-    api.update_frontier(make_frontier("auth-o1", order_ts + 100, 0, "order/"));
-    api.update_frontier(make_frontier("auth-o2", order_ts + 200, 0, "order/"));
+    let order_report = covering_report_time(order_ts);
+    add_signed_frontier(&mut api, "auth-o1", order_report, "order/", 1);
+    add_signed_frontier(&mut api, "auth-o2", order_report, "order/", 1);
 
     api.process_certifications();
 
@@ -981,8 +1015,9 @@ fn cross_range_certification_contamination_prevented() {
 
     // --- Phase 2: Advance user/ authorities ---
 
-    api.update_frontier(make_frontier("auth-u1", user_ts + 100, 0, "user/"));
-    api.update_frontier(make_frontier("auth-u2", user_ts + 200, 0, "user/"));
+    let user_report = covering_report_time(user_ts);
+    add_signed_frontier(&mut api, "auth-u1", user_report, "user/", 1);
+    add_signed_frontier(&mut api, "auth-u2", user_report, "user/", 1);
 
     api.process_certifications();
 
@@ -1017,8 +1052,9 @@ fn policy_version_transition_certification() {
     let write_ts = api.pending_writes()[0].timestamp.physical;
 
     // Frontiers at v1 should NOT certify the v2 write.
-    api.update_frontier(make_frontier_v("auth-1", write_ts + 100, 0, "data/", 1));
-    api.update_frontier(make_frontier_v("auth-2", write_ts + 200, 0, "data/", 1));
+    let report_time = covering_report_time(write_ts);
+    add_signed_frontier(&mut api, "auth-1", report_time, "data/", 1);
+    add_signed_frontier(&mut api, "auth-2", report_time, "data/", 1);
     api.process_certifications();
 
     assert_eq!(
@@ -1028,8 +1064,8 @@ fn policy_version_transition_certification() {
     );
 
     // Frontiers at v2 certify the write.
-    api.update_frontier(make_frontier_v("auth-1", write_ts + 100, 0, "data/", 2));
-    api.update_frontier(make_frontier_v("auth-2", write_ts + 200, 0, "data/", 2));
+    add_signed_frontier(&mut api, "auth-1", report_time, "data/", 2);
+    add_signed_frontier(&mut api, "auth-2", report_time, "data/", 2);
     api.process_certifications();
 
     assert_eq!(
@@ -1089,8 +1125,9 @@ fn longest_prefix_authority_resolution_in_integration() {
     let reg_ts = api.pending_writes()[1].timestamp.physical;
 
     // Only the VIP authorities report — should certify VIP but not regular.
-    api.update_frontier(make_frontier("auth-v1", vip_ts + 100, 0, "user/vip/"));
-    api.update_frontier(make_frontier("auth-v2", vip_ts + 200, 0, "user/vip/"));
+    let vip_report = covering_report_time(vip_ts);
+    add_signed_frontier(&mut api, "auth-v1", vip_report, "user/vip/", 1);
+    add_signed_frontier(&mut api, "auth-v2", vip_report, "user/vip/", 1);
     api.process_certifications();
 
     assert_eq!(
@@ -1103,8 +1140,9 @@ fn longest_prefix_authority_resolution_in_integration() {
     );
 
     // Now the regular authorities report.
-    api.update_frontier(make_frontier("auth-1", reg_ts + 100, 0, "user/"));
-    api.update_frontier(make_frontier("auth-2", reg_ts + 200, 0, "user/"));
+    let reg_report = covering_report_time(reg_ts);
+    add_signed_frontier(&mut api, "auth-1", reg_report, "user/", 1);
+    add_signed_frontier(&mut api, "auth-2", reg_report, "user/", 1);
     api.process_certifications();
 
     assert_eq!(

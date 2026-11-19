@@ -64,6 +64,11 @@ jobs:
       - name: Run Clippy (without native-crypto)
         run: cargo clippy --all-targets --no-default-features --features native-tls,native-storage -- -D warnings
 
+      # Native runtime is absent here; operation modules must respect that
+      # boundary so core-only dependents can compile.
+      - name: Check core-only feature set
+        run: cargo test --lib --no-run --no-default-features
+
   test:
     name: Test
     runs-on: ubuntu-latest
